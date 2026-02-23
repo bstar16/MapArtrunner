@@ -9,6 +9,7 @@ import net.minecraft.block.Blocks;
 import net.minecraft.nbt.NbtCompound;
 import net.minecraft.nbt.NbtElement;
 import net.minecraft.nbt.NbtIo;
+import net.minecraft.nbt.NbtSizeTracker;
 import net.minecraft.registry.Registries;
 import net.minecraft.server.command.ServerCommandSource;
 import net.minecraft.util.Identifier;
@@ -40,7 +41,7 @@ public class SchemNbtLoader implements PlanLoader {
 
     @Override
     public BuildPlan load(Path path, ServerCommandSource source) throws IOException {
-        NbtCompound root = NbtIo.readCompressed(path);
+        NbtCompound root = NbtIo.readCompressed(path, NbtSizeTracker.ofUnlimitedBytes());
         if (root == null) {
             throw new IllegalArgumentException("Could not read NBT payload from " + path);
         }
@@ -77,7 +78,9 @@ public class SchemNbtLoader implements PlanLoader {
                 continue;
             }
 
-            Registries.BLOCK.getOrEmpty(identifier).ifPresent(block -> palette.put(index, block));
+            if (Registries.BLOCK.containsId(identifier)) {
+                palette.put(index, Registries.BLOCK.get(identifier));
+            }
         }
 
         if (palette.isEmpty()) {
