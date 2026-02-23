@@ -21,6 +21,7 @@ public final class MapArtCommand {
     public static LiteralArgumentBuilder<ServerCommandSource> create(BuildPlanService planService) {
         return CommandManager.literal("mapart")
                 .then(CommandManager.literal("load")
+                        .requires(source -> source.hasPermissionLevel(2))
                         .then(CommandManager.argument("path", StringArgumentType.greedyString())
                                 .executes(context -> {
                                     String rawPath = StringArgumentType.getString(context, "path");
