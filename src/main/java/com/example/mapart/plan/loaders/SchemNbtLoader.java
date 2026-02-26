@@ -9,6 +9,8 @@ import net.minecraft.block.Blocks;
 import net.minecraft.nbt.NbtCompound;
 import net.minecraft.nbt.NbtElement;
 import net.minecraft.nbt.NbtIo;
+import net.minecraft.nbt.NbtList;
+import net.minecraft.nbt.NbtSizeTracker;
 import net.minecraft.registry.Registries;
 import net.minecraft.server.command.ServerCommandSource;
 import net.minecraft.util.Identifier;
@@ -40,9 +42,15 @@ public class SchemNbtLoader implements PlanLoader {
 
     @Override
     public BuildPlan load(Path path, ServerCommandSource source) throws IOException {
-        NbtCompound root = NbtIo.readCompressed(path);
-        if (root == null) {
+        NbtCompound fileRoot = NbtIo.readCompressed(path, NbtSizeTracker.ofUnlimitedBytes());
+        if (fileRoot == null) {
             throw new IllegalArgumentException("Could not read NBT payload from " + path);
+        }
+
+        NbtCompound root = unwrapSchematicRoot(fileRoot);
+
+        if (isStructureNbt(root)) {
+            return loadStructureNbt(path, root);
         }
 
         int width = getDimension(root, "Width");
@@ -59,11 +67,48 @@ public class SchemNbtLoader implements PlanLoader {
         return new BuildPlan(formatId(), path, dimensions, placements, materialCounts, regions);
     }
 
+    private BuildPlan loadStructureNbt(Path path, NbtCompound root) {
+        Vec3i dimensions = getStructureDimensions(root);
+        Map<Integer, Block> palette = parseStructurePalette(root.getList("palette", NbtElement.COMPOUND_TYPE));
+        List<Placement> placements = parseStructurePlacements(root.getList("blocks", NbtElement.COMPOUND_TYPE), palette);
+        Map<Block, Integer> materialCounts = countMaterials(placements);
+        List<Region> regions = splitIntoRegions(placements);
+
+        return new BuildPlan(formatId(), path, dimensions, placements, materialCounts, regions);
+    }
+
+    private NbtCompound unwrapSchematicRoot(NbtCompound root) {
+        if (root.contains("Schematic", NbtElement.COMPOUND_TYPE)) {
+            return root.getCompound("Schematic");
+        }
+        return root;
+    }
+
+    private boolean isStructureNbt(NbtCompound root) {
+        return root.contains("size", NbtElement.LIST_TYPE)
+                && root.contains("palette", NbtElement.LIST_TYPE)
+                && root.contains("blocks", NbtElement.LIST_TYPE);
+    }
+
+    private Vec3i getStructureDimensions(NbtCompound root) {
+        NbtList size = root.getList("size", NbtElement.INT_TYPE);
+        if (size.size() != 3) {
+            throw new IllegalArgumentException("Structure size must contain exactly 3 integers");
+        }
+        return new Vec3i(size.getInt(0), size.getInt(1), size.getInt(2));
+    }
+
     private int getDimension(NbtCompound root, String key) {
+        if (root.contains(key, NbtElement.SHORT_TYPE)) {
+            return root.getShort(key);
+        }
+        if (root.contains(key, NbtElement.INT_TYPE)) {
+            return root.getInt(key);
+        }
         if (!root.contains(key)) {
             throw new IllegalArgumentException("Missing schematic field: " + key);
         }
-        return root.getShort(key);
+        throw new IllegalArgumentException("Schematic field " + key + " must be a short or int");
     }
 
     private Map<Integer, Block> parsePalette(NbtCompound paletteNbt) {
@@ -77,13 +122,31 @@ public class SchemNbtLoader implements PlanLoader {
                 continue;
             }
 
-            Registries.BLOCK.getOrEmpty(identifier).ifPresent(block -> palette.put(index, block));
+            if (Registries.BLOCK.containsId(identifier)) {
+                palette.put(index, Registries.BLOCK.get(identifier));
+            }
         }
 
         if (palette.isEmpty()) {
             throw new IllegalArgumentException("Palette is empty or invalid");
         }
 
+        return palette;
+    }
+
+    private Map<Integer, Block> parseStructurePalette(NbtList paletteList) {
+        Map<Integer, Block> palette = new HashMap<>();
+        for (int i = 0; i < paletteList.size(); i++) {
+            NbtCompound entry = paletteList.getCompound(i);
+            Identifier identifier = Identifier.tryParse(entry.getString("Name"));
+            if (identifier != null && Registries.BLOCK.containsId(identifier)) {
+                palette.put(i, Registries.BLOCK.get(identifier));
+            }
+        }
+
+        if (palette.isEmpty()) {
+            throw new IllegalArgumentException("Palette is empty or invalid");
+        }
         return palette;
     }
 
@@ -136,6 +199,29 @@ public class SchemNbtLoader implements PlanLoader {
             int x = i % width;
             int y = i / (width * length);
             int z = (i / width) % length;
+            placements.add(new Placement(new BlockPos(x, y, z), block));
+        }
+        return placements;
+    }
+
+    private List<Placement> parseStructurePlacements(NbtList blocks, Map<Integer, Block> palette) {
+        List<Placement> placements = new ArrayList<>(blocks.size());
+        for (int i = 0; i < blocks.size(); i++) {
+            NbtCompound blockNbt = blocks.getCompound(i);
+            int stateIndex = blockNbt.getInt("state");
+            Block block = palette.get(stateIndex);
+            if (block == null || block == Blocks.AIR) {
+                continue;
+            }
+
+            NbtList pos = blockNbt.getList("pos", NbtElement.INT_TYPE);
+            if (pos.size() != 3) {
+                continue;
+            }
+
+            int x = pos.getInt(0);
+            int y = pos.getInt(1);
+            int z = pos.getInt(2);
             placements.add(new Placement(new BlockPos(x, y, z), block));
         }
         return placements;
