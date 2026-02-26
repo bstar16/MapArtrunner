@@ -123,20 +123,6 @@ If the standard commands fail even when typed correctly, check the items below.
    ./gradlew --refresh-dependencies build
    ```
 
-## Customization
-
-Edit `gradle.properties` to customize:
-- `mod_version` - Version of your mod
-- `maven_group` - Package group (e.g., `com.yourname`)
-- `archives_base_name` - JAR filename base
-
-Edit `src/main/resources/fabric.mod.json` to customize:
-- `name` - Display name of your mod
-- `description` - Mod description
-- `authors` - Your name
-- `license` - License type
-- `contact` - Links and contact info
-
 ## Mod Details
 
 - **Minecraft Version:** 1.21.1
