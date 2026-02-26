@@ -54,6 +54,7 @@ public class MapArtMod implements ModInitializer {
                         com.mojang.brigadier.CommandDispatcher<net.minecraft.server.command.ServerCommandSource> dispatcher =
                                 (com.mojang.brigadier.CommandDispatcher<net.minecraft.server.command.ServerCommandSource>) args[0];
                         dispatcher.register(MapArtCommand.create(buildPlanService));
+                        dispatcher.register(MapArtCommand.createAlias(buildPlanService));
                         return null;
                     }
             );
