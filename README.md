@@ -12,6 +12,7 @@ A Minecraft Fabric mod for Minecraft 1.21.1.
 
 1. **Clone and navigate to the project:**
    ```bash
+   git clone <your-repo-url>
    cd MapArtrunner
    ```
 
@@ -73,6 +74,54 @@ settings.gradle                          # Gradle settings
 ./gradlew genSources
 ./gradlew build
 ```
+
+## In-Game Commands
+
+The mod registers these command roots:
+- `/mapart` (primary)
+- `/maprunner` (legacy alias)
+- `/mapartrunner` (mod-name alias)
+
+Available subcommands:
+- `load <path>` (OP level 2 required)
+- `info`
+
+Example:
+```mcfunction
+/mapart load /absolute/path/to/build.schem
+/mapart info
+```
+
+If `/mapart` is unknown in game:
+- make sure the built JAR from `build/libs/` is in your server/client `mods/` folder
+- confirm Fabric API is also installed on the same instance
+- run `/help mapart` to verify command registration
+
+## Troubleshooting
+
+If the standard commands fail even when typed correctly, check the items below.
+
+1. **Verify Java version (must be 21+):**
+   ```bash
+   java -version
+   ```
+   If this shows a lower version, install JDK 21 and set `JAVA_HOME` to that installation.
+
+2. **Linux/macOS permission error (`./gradlew: Permission denied`):**
+   ```bash
+   chmod +x gradlew
+   ./gradlew build
+   ```
+
+3. **Use the correct Gradle wrapper command for your platform:**
+   - Linux/macOS: `./gradlew build`
+   - Windows PowerShell/CMD: `gradlew.bat build`
+
+4. **Refresh Gradle cache if dependencies are corrupted:**
+   ```bash
+   ./gradlew --stop
+   ./gradlew --refresh-dependencies build
+   ```
 
 ## Customization
 

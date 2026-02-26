@@ -17,6 +17,7 @@ import java.util.Map;
 public final class MapArtCommand {
     public static final String PRIMARY_COMMAND = "mapart";
     public static final String LEGACY_ALIAS = "maprunner";
+    public static final String MOD_NAME_ALIAS = "mapartrunner";
 
     private MapArtCommand() {
     }
@@ -27,6 +28,10 @@ public final class MapArtCommand {
 
     public static LiteralArgumentBuilder<ServerCommandSource> createAlias(BuildPlanService planService) {
         return createForName(LEGACY_ALIAS, planService);
+    }
+
+    public static LiteralArgumentBuilder<ServerCommandSource> createRunnerAlias(BuildPlanService planService) {
+        return createForName(MOD_NAME_ALIAS, planService);
     }
 
     private static LiteralArgumentBuilder<ServerCommandSource> createForName(
