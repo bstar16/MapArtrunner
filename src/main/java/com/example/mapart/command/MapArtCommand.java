@@ -15,11 +15,30 @@ import java.util.Comparator;
 import java.util.Map;
 
 public final class MapArtCommand {
+    public static final String PRIMARY_COMMAND = "mapart";
+    public static final String LEGACY_ALIAS = "maprunner";
+    public static final String MOD_NAME_ALIAS = "mapartrunner";
+
     private MapArtCommand() {
     }
 
     public static LiteralArgumentBuilder<ServerCommandSource> create(BuildPlanService planService) {
-        return CommandManager.literal("mapart")
+        return createForName(PRIMARY_COMMAND, planService);
+    }
+
+    public static LiteralArgumentBuilder<ServerCommandSource> createAlias(BuildPlanService planService) {
+        return createForName(LEGACY_ALIAS, planService);
+    }
+
+    public static LiteralArgumentBuilder<ServerCommandSource> createRunnerAlias(BuildPlanService planService) {
+        return createForName(MOD_NAME_ALIAS, planService);
+    }
+
+    private static LiteralArgumentBuilder<ServerCommandSource> createForName(
+            String commandName,
+            BuildPlanService planService
+    ) {
+        return CommandManager.literal(commandName)
                 .then(CommandManager.literal("load")
                         .requires(source -> source.hasPermissionLevel(2))
                         .then(CommandManager.argument("path", StringArgumentType.greedyString())
@@ -44,7 +63,9 @@ public final class MapArtCommand {
                         .executes(context -> {
                             BuildPlan plan = planService.currentPlan().orElse(null);
                             if (plan == null) {
-                                context.getSource().sendError(Text.literal("No build plan loaded. Use /mapart load <path> first."));
+                                context.getSource().sendError(Text.literal(
+                                        "No build plan loaded. Use /" + commandName + " load <path> first."
+                                ));
                                 return 0;
                             }
 
