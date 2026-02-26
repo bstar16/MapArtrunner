@@ -5,8 +5,9 @@ import com.example.mapart.persistence.ConfigStore;
 import com.example.mapart.persistence.ProgressStore;
 import com.example.mapart.plan.PlanLoaderRegistry;
 import com.example.mapart.plan.loaders.SchemNbtLoader;
+import com.example.mapart.plan.state.BuildCoordinator;
 import com.example.mapart.plan.state.BuildPlanService;
-import com.example.mapart.plan.state.BuildPlanState;
+import com.example.mapart.plan.state.WorldPlacementResolver;
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import org.slf4j.Logger;
@@ -21,13 +22,10 @@ public class MapArtMod implements ModInitializer {
         PlanLoaderRegistry loaderRegistry = new PlanLoaderRegistry();
         loaderRegistry.register(new SchemNbtLoader());
 
-        BuildPlanState buildPlanState = new BuildPlanState();
-        BuildPlanService buildPlanService = new BuildPlanService(
-                loaderRegistry,
-                buildPlanState,
-                new ConfigStore(),
-                new ProgressStore()
-        );
+        ConfigStore configStore = new ConfigStore();
+        ProgressStore progressStore = new ProgressStore();
+        BuildCoordinator buildCoordinator = new BuildCoordinator(new WorldPlacementResolver(), configStore, progressStore);
+        BuildPlanService buildPlanService = new BuildPlanService(loaderRegistry, buildCoordinator);
 
         CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) -> {
             dispatcher.register(MapArtCommand.create(buildPlanService));
