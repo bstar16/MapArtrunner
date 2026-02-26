@@ -1,7 +1,5 @@
 package com.example.mapart.plan.state;
 
-import com.example.mapart.persistence.ConfigStore;
-import com.example.mapart.persistence.ProgressStore;
 import com.example.mapart.plan.BuildPlan;
 import com.example.mapart.plan.PlanLoader;
 import com.example.mapart.plan.PlanLoaderRegistry;
@@ -13,15 +11,11 @@ import java.util.Optional;
 
 public class BuildPlanService {
     private final PlanLoaderRegistry loaderRegistry;
-    private final BuildPlanState state;
-    private final ConfigStore configStore;
-    private final ProgressStore progressStore;
+    private final BuildCoordinator buildCoordinator;
 
-    public BuildPlanService(PlanLoaderRegistry loaderRegistry, BuildPlanState state, ConfigStore configStore, ProgressStore progressStore) {
+    public BuildPlanService(PlanLoaderRegistry loaderRegistry, BuildCoordinator buildCoordinator) {
         this.loaderRegistry = loaderRegistry;
-        this.state = state;
-        this.configStore = configStore;
-        this.progressStore = progressStore;
+        this.buildCoordinator = buildCoordinator;
     }
 
     public BuildPlan load(Path path, ServerCommandSource source) throws Exception {
@@ -33,13 +27,19 @@ public class BuildPlanService {
                 .orElseThrow(() -> new IllegalArgumentException("No loader registered for path: " + path));
 
         BuildPlan plan = loader.load(path, source);
-        state.setCurrentPlan(plan);
-        configStore.rememberLoadedPlan(plan);
-        progressStore.initializePlanProgress(plan);
+        buildCoordinator.loadPlan(plan);
         return plan;
     }
 
     public Optional<BuildPlan> currentPlan() {
-        return state.getCurrentPlan();
+        return buildCoordinator.currentPlan();
+    }
+
+    public Optional<BuildSession> currentSession() {
+        return buildCoordinator.getSession();
+    }
+
+    public BuildCoordinator coordinator() {
+        return buildCoordinator;
     }
 }
