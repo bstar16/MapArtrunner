@@ -25,4 +25,9 @@ public class ConfigStore {
     public Optional<BlockPos> getLastOrigin() {
         return Optional.ofNullable(lastOrigin);
     }
+
+    public void clearRememberedState() {
+        lastLoadedPlanPath = null;
+        lastOrigin = null;
+    }
 }

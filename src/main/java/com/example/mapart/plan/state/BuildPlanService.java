@@ -39,6 +39,10 @@ public class BuildPlanService {
         return buildCoordinator.getSession();
     }
 
+    public boolean unload() {
+        return buildCoordinator.unload();
+    }
+
     public BuildCoordinator coordinator() {
         return buildCoordinator;
     }

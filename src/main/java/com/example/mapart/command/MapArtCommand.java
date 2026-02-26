@@ -65,6 +65,17 @@ public final class MapArtCommand {
                                         return 0;
                                     }
                                 })))
+                .then(CommandManager.literal("unload")
+                        .requires(source -> source.hasPermissionLevel(2))
+                        .executes(context -> {
+                            if (!planService.unload()) {
+                                context.getSource().sendFeedback(() -> Text.literal("No build plan loaded."), false);
+                                return 0;
+                            }
+
+                            context.getSource().sendFeedback(() -> Text.literal("Unloaded current build plan and cleared session progress."), false);
+                            return 1;
+                        }))
                 .then(CommandManager.literal("info")
                         .executes(context -> showPlanInfo(planService, commandName, context.getSource())))
                 .then(CommandManager.literal("setorigin")

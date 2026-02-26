@@ -45,6 +45,17 @@ public class BuildCoordinator {
         return getSession().map(BuildSession::getPlan);
     }
 
+    public boolean unload() {
+        if (session == null) {
+            return false;
+        }
+
+        session = null;
+        progressStore.clearProgress();
+        configStore.clearRememberedState();
+        return true;
+    }
+
     public Optional<String> setOrigin(BlockPos origin) {
         if (session == null) {
             return Optional.of("No build plan loaded.");
