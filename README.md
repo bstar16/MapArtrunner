@@ -85,11 +85,13 @@ The mod registers these command roots:
 Available subcommands:
 - `load <path>` (OP level 2 required)
 - `info`
+- `unload` (OP level 2 required)
 
 Example:
 ```mcfunction
 /mapart load /absolute/path/to/build.schem
 /mapart info
+/mapart unload
 ```
 
 If `/mapart` is unknown in game:

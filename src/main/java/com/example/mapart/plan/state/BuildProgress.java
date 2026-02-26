@@ -28,4 +28,10 @@ public class BuildProgress {
     public void incrementCompletedPlacements() {
         this.totalCompletedPlacements++;
     }
+
+    public void reset() {
+        this.currentRegionIndex = 0;
+        this.currentPlacementIndex = 0;
+        this.totalCompletedPlacements = 0;
+    }
 }

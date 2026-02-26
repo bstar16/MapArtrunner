@@ -45,6 +45,17 @@ public class BuildCoordinator {
         return getSession().map(BuildSession::getPlan);
     }
 
+    public boolean unload() {
+        if (session == null) {
+            return false;
+        }
+
+        session = null;
+        progressStore.clearProgress();
+        configStore.clearRememberedState();
+        return true;
+    }
+
     public Optional<String> setOrigin(BlockPos origin) {
         if (session == null) {
             return Optional.of("No build plan loaded.");
@@ -87,6 +98,28 @@ public class BuildCoordinator {
             return Optional.empty();
         } catch (IllegalStateException exception) {
             return Optional.of("Can only pause while BUILDING.");
+        }
+    }
+
+
+    public Optional<String> stop() {
+        if (session == null) {
+            return Optional.of("No build session.");
+        }
+
+        if (session.getState() == BuildPlanState.IDLE) {
+            return Optional.of("No active build session.");
+        }
+
+        try {
+            session.getProgress().reset();
+            if (session.getState() != BuildPlanState.LOADED) {
+                session.transitionTo(BuildPlanState.LOADED);
+            }
+            progressStore.saveProgress(session);
+            return Optional.empty();
+        } catch (IllegalStateException exception) {
+            return Optional.of("Cannot stop from state " + session.getState() + ".");
         }
     }
 

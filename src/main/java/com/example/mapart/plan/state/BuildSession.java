@@ -11,6 +11,8 @@ public class BuildSession {
     private static final Map<BuildPlanState, Set<BuildPlanState>> TRANSITIONS = Map.of(
             BuildPlanState.IDLE, EnumSet.of(BuildPlanState.LOADED),
             BuildPlanState.LOADED, EnumSet.of(BuildPlanState.BUILDING, BuildPlanState.ERROR),
+            BuildPlanState.BUILDING, EnumSet.of(BuildPlanState.PAUSED, BuildPlanState.COMPLETED, BuildPlanState.ERROR, BuildPlanState.LOADED),
+            BuildPlanState.PAUSED, EnumSet.of(BuildPlanState.BUILDING, BuildPlanState.ERROR, BuildPlanState.LOADED),
             BuildPlanState.BUILDING, EnumSet.of(BuildPlanState.PAUSED, BuildPlanState.COMPLETED, BuildPlanState.ERROR),
             BuildPlanState.PAUSED, EnumSet.of(BuildPlanState.BUILDING, BuildPlanState.ERROR),
             BuildPlanState.ERROR, EnumSet.of(BuildPlanState.LOADED),
