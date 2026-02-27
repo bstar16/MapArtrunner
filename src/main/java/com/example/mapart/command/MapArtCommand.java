@@ -171,7 +171,8 @@ public final class MapArtCommand {
                             }
 
                             if (result.done()) {
-                                context.getSource().sendFeedback(() -> Text.literal("Build completed."), false);
+                                planService.coordinator().unload();
+                                context.getSource().sendFeedback(() -> Text.literal("Build completed and schematic unloaded."), false);
                                 return 1;
                             }
 
