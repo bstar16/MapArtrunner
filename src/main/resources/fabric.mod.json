@@ -17,10 +17,12 @@
   "entrypoints": {
     "main": [
       "com.example.mapart.MapArtMod"
+    ],
+    "client": [
+      "com.example.mapart.MapArtClientMod"
     ]
   },
-  "mixins": [
-  ],
+  "mixins": [],
   "depends": {
     "fabricloader": ">=0.16.0",
     "fabric-api": "*",

@@ -6,13 +6,21 @@ import com.example.mapart.plan.state.BuildCoordinator;
 import com.example.mapart.plan.state.BuildPlanService;
 import com.example.mapart.plan.state.BuildPlanState;
 import com.example.mapart.plan.state.BuildSession;
+import com.example.mapart.settings.MapartSettings;
+import com.example.mapart.settings.MapartSettingsStore;
+import com.example.mapart.supply.SupplyPoint;
+import com.example.mapart.supply.SupplyStore;
+import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import com.mojang.brigadier.builder.LiteralArgumentBuilder;
 import net.minecraft.block.Block;
 import net.minecraft.registry.Registries;
 import net.minecraft.server.command.CommandManager;
 import net.minecraft.server.command.ServerCommandSource;
+import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.text.Text;
+import net.minecraft.util.hit.BlockHitResult;
+import net.minecraft.util.hit.HitResult;
 import net.minecraft.util.math.BlockPos;
 
 import java.nio.file.Path;
@@ -28,21 +36,23 @@ public final class MapArtCommand {
     private MapArtCommand() {
     }
 
-    public static LiteralArgumentBuilder<ServerCommandSource> create(BuildPlanService planService) {
-        return createForName(PRIMARY_COMMAND, planService);
+    public static LiteralArgumentBuilder<ServerCommandSource> create(BuildPlanService planService, MapartSettingsStore settingsStore, SupplyStore supplyStore) {
+        return createForName(PRIMARY_COMMAND, planService, settingsStore, supplyStore);
     }
 
-    public static LiteralArgumentBuilder<ServerCommandSource> createAlias(BuildPlanService planService) {
-        return createForName(LEGACY_ALIAS, planService);
+    public static LiteralArgumentBuilder<ServerCommandSource> createAlias(BuildPlanService planService, MapartSettingsStore settingsStore, SupplyStore supplyStore) {
+        return createForName(LEGACY_ALIAS, planService, settingsStore, supplyStore);
     }
 
-    public static LiteralArgumentBuilder<ServerCommandSource> createRunnerAlias(BuildPlanService planService) {
-        return createForName(MOD_NAME_ALIAS, planService);
+    public static LiteralArgumentBuilder<ServerCommandSource> createRunnerAlias(BuildPlanService planService, MapartSettingsStore settingsStore, SupplyStore supplyStore) {
+        return createForName(MOD_NAME_ALIAS, planService, settingsStore, supplyStore);
     }
 
     private static LiteralArgumentBuilder<ServerCommandSource> createForName(
             String commandName,
-            BuildPlanService planService
+            BuildPlanService planService,
+            MapartSettingsStore settingsStore,
+            SupplyStore supplyStore
     ) {
         return CommandManager.literal(commandName)
                 .then(CommandManager.literal("load")
@@ -158,6 +168,29 @@ public final class MapArtCommand {
                             ), false);
                             return 1;
                         }))
+                .then(CommandManager.literal("supply")
+                        .then(CommandManager.literal("add")
+                                .executes(context -> addSupply(context.getSource(), supplyStore, null))
+                                .then(CommandManager.argument("name", StringArgumentType.greedyString())
+                                        .executes(context -> addSupply(context.getSource(), supplyStore, StringArgumentType.getString(context, "name")))))
+                        .then(CommandManager.literal("list")
+                                .executes(context -> listSupplies(context.getSource(), supplyStore)))
+                        .then(CommandManager.literal("remove")
+                                .then(CommandManager.argument("id", IntegerArgumentType.integer(1))
+                                        .executes(context -> removeSupply(context.getSource(), supplyStore, IntegerArgumentType.getInteger(context, "id")))))
+                        .then(CommandManager.literal("clear")
+                                .executes(context -> clearSupplies(context.getSource(), supplyStore))))
+                .then(CommandManager.literal("settings")
+                        .executes(context -> showSettings(context.getSource(), settingsStore))
+                        .then(CommandManager.literal("set")
+                                .then(CommandManager.argument("key", StringArgumentType.word())
+                                        .then(CommandManager.argument("value", StringArgumentType.greedyString())
+                                                .executes(context -> setSetting(
+                                                        context.getSource(),
+                                                        settingsStore,
+                                                        StringArgumentType.getString(context, "key"),
+                                                        StringArgumentType.getString(context, "value")
+                                                ))))))
                 .then(CommandManager.literal("debug")
                         .requires(source -> source.hasPermissionLevel(2))
                         .then(CommandManager.literal("secondlast")
@@ -242,6 +275,84 @@ public final class MapArtCommand {
             source.sendFeedback(() -> Text.literal("Next target: " + nextPos.toShortString()), false);
         }
 
+        return 1;
+    }
+
+    private static int addSupply(ServerCommandSource source, SupplyStore supplyStore, String name) {
+        ServerPlayerEntity player;
+        try {
+            player = source.getPlayerOrThrow();
+        } catch (Exception exception) {
+            source.sendError(Text.literal("Supply registration requires a player."));
+            return 0;
+        }
+
+        BlockPos pos = player.getBlockPos();
+        HitResult hitResult = player.raycast(6.0, 0.0f, false);
+        if (hitResult.getType() == HitResult.Type.BLOCK) {
+            pos = ((BlockHitResult) hitResult).getBlockPos();
+        }
+
+        String dimension = source.getWorld().getRegistryKey().getValue().toString();
+        BlockPos savedPos = pos.toImmutable();
+        SupplyPoint point = supplyStore.add(savedPos, dimension, name);
+        source.sendFeedback(() -> Text.literal("Added supply #" + point.id() + " at " + savedPos.toShortString() + " in " + dimension +
+                (name == null ? "" : " (" + name + ")")), false);
+        return 1;
+    }
+
+    private static int listSupplies(ServerCommandSource source, SupplyStore supplyStore) {
+        var supplies = supplyStore.list();
+        if (supplies.isEmpty()) {
+            source.sendFeedback(() -> Text.literal("No supplies registered."), false);
+            return 1;
+        }
+
+        source.sendFeedback(() -> Text.literal("Supply points (" + supplies.size() + ")"), false);
+        for (SupplyPoint point : supplies) {
+            source.sendFeedback(() -> Text.literal("#" + point.id() + " " + point.pos().toShortString() + " " + point.dimensionKey()
+                    + (point.name() == null ? "" : " - " + point.name())), false);
+        }
+        return 1;
+    }
+
+    private static int removeSupply(ServerCommandSource source, SupplyStore supplyStore, int id) {
+        if (!supplyStore.removeById(id)) {
+            source.sendError(Text.literal("Supply id not found: " + id));
+            return 0;
+        }
+
+        source.sendFeedback(() -> Text.literal("Removed supply #" + id), false);
+        return 1;
+    }
+
+    private static int clearSupplies(ServerCommandSource source, SupplyStore supplyStore) {
+        int removed = supplyStore.clear();
+        source.sendFeedback(() -> Text.literal("Cleared " + removed + " supply point(s)."), false);
+        return 1;
+    }
+
+    private static int showSettings(ServerCommandSource source, MapartSettingsStore settingsStore) {
+        MapartSettings settings = settingsStore.current();
+        source.sendFeedback(() -> Text.literal("showHud=" + settings.showHud()), false);
+        source.sendFeedback(() -> Text.literal("showSchematicOverlay=" + settings.showSchematicOverlay()), false);
+        source.sendFeedback(() -> Text.literal("overlayCurrentRegionOnly=" + settings.overlayCurrentRegionOnly()), false);
+        source.sendFeedback(() -> Text.literal("overlayMaxRenderDistance=" + settings.overlayMaxRenderDistance()), false);
+        source.sendFeedback(() -> Text.literal("overlayShowOnlyIncorrect=" + settings.overlayShowOnlyIncorrect()), false);
+        source.sendFeedback(() -> Text.literal("hudCompact=" + settings.hudCompact()), false);
+        source.sendFeedback(() -> Text.literal("hudX=" + settings.hudX()), false);
+        source.sendFeedback(() -> Text.literal("hudY=" + settings.hudY()), false);
+        return 1;
+    }
+
+    private static int setSetting(ServerCommandSource source, MapartSettingsStore settingsStore, String key, String value) {
+        Optional<String> error = settingsStore.set(key, value);
+        if (error.isPresent()) {
+            source.sendError(Text.literal(error.get()));
+            return 0;
+        }
+
+        source.sendFeedback(() -> Text.literal("Updated " + key + " = " + value), false);
         return 1;
     }
 }
