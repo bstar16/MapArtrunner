@@ -50,7 +50,7 @@ public class BuildSession {
     }
 
     public void transitionTo(BuildPlanState nextState) {
-        Set<BuildPlanState> validTargets = TRANSITIONS.getOrDefault(state, Set.of());
+        Set<BuildPlanState> validTargets = VALID_TRANSITIONS_BY_STATE.getOrDefault(state, Set.of());
         if (!validTargets.contains(nextState)) {
             throw new IllegalStateException("Invalid transition: " + state + " -> " + nextState);
         }
