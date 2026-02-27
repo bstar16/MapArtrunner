@@ -60,24 +60,18 @@ public class SchematicOverlayRenderer implements WorldRenderEvents.AfterTransluc
             session = cloneWithPreviewOrigin(session, origin);
         }
 
+        BuildPlan plan = session.getPlan();
         Set<Placement> activeRegionPlacements = resolveRegionFilter(session, settings.overlayCurrentRegionOnly());
-        Vec3d camera = context.camera().getPos();
-        double maxDistanceSq = (double) settings.overlayMaxRenderDistance() * settings.overlayMaxRenderDistance();
-        boolean renderFullOverlay = !settings.overlayCurrentRegionOnly();
+        BlockPos finalOrigin = origin;
 
         List<PlacementStatusSnapshot> snapshots = statusResolver.resolve(client.world, session, snapshot -> {
             if (settings.overlayCurrentRegionOnly() && !activeRegionPlacements.contains(snapshot.placement())) {
                 return false;
             }
 
-            if (!renderFullOverlay) {
-                double centerX = snapshot.absolutePos().getX() + 0.5;
-                double centerY = snapshot.absolutePos().getY() + 0.5;
-                double centerZ = snapshot.absolutePos().getZ() + 0.5;
-                double distanceSq = camera.squaredDistanceTo(centerX, centerY, centerZ);
-                if (distanceSq > maxDistanceSq) {
-                    return false;
-                }
+            double distanceSq = snapshot.absolutePos().getSquaredDistance(finalOrigin);
+            if (distanceSq > (double) settings.overlayMaxRenderDistance() * settings.overlayMaxRenderDistance()) {
+                return false;
             }
 
             if (settings.overlayShowOnlyIncorrect() && snapshot.status() == PlacementStatus.CORRECT && !snapshot.nextTarget()) {
@@ -90,6 +84,7 @@ public class SchematicOverlayRenderer implements WorldRenderEvents.AfterTransluc
         MatrixStack matrices = context.matrixStack();
         VertexConsumerProvider.Immediate consumers = client.getBufferBuilders().getEntityVertexConsumers();
         VertexConsumer lines = consumers.getBuffer(RenderLayer.getLines());
+        Vec3d camera = context.camera().getPos();
 
         for (PlacementStatusSnapshot snapshot : snapshots) {
             int color = pickColor(snapshot);

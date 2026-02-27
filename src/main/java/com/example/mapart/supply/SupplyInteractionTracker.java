@@ -3,22 +3,17 @@ package com.example.mapart.supply;
 import net.fabricmc.fabric.api.event.player.UseBlockCallback;
 import net.minecraft.inventory.Inventory;
 import net.minecraft.server.network.ServerPlayerEntity;
-import net.minecraft.text.Text;
 import net.minecraft.util.ActionResult;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.world.World;
 
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
 public class SupplyInteractionTracker {
-    private final SupplyStore supplyStore;
-    private final Map<UUID, PendingSupplyRequest> pendingSupplyByPlayer = new ConcurrentHashMap<>();
-
-    public SupplyInteractionTracker(SupplyStore supplyStore) {
-        this.supplyStore = supplyStore;
-    }
+    private final Map<UUID, InteractionSnapshot> lastContainerByPlayer = new ConcurrentHashMap<>();
 
     public void registerCallbacks() {
         UseBlockCallback.EVENT.register((player, world, hand, hitResult) -> {
@@ -26,35 +21,31 @@ public class SupplyInteractionTracker {
                 return ActionResult.PASS;
             }
 
-            PendingSupplyRequest request = pendingSupplyByPlayer.get(player.getUuid());
-            if (request == null) {
-                return ActionResult.PASS;
-            }
-
             BlockPos pos = hitResult.getBlockPos();
             if (world.getBlockEntity(pos) instanceof Inventory) {
-                pendingSupplyByPlayer.remove(player.getUuid());
-                String dimension = world.getRegistryKey().getValue().toString();
-                SupplyPoint point = supplyStore.add(pos, dimension, request.name());
-                player.sendMessage(Text.literal("Added supply #" + point.id() + " at " + pos.toShortString() + " in " + dimension
-                        + (request.name() == null ? "" : " (" + request.name() + ")")), false);
-            } else {
-                player.sendMessage(Text.literal("That block is not a container. Right-click a container to register supply."
-                ), false);
+                lastContainerByPlayer.put(player.getUuid(), new InteractionSnapshot(world, pos.toImmutable()));
             }
 
             return ActionResult.PASS;
         });
     }
 
-    public void beginSupplyRegistration(ServerPlayerEntity player, String name) {
-        pendingSupplyByPlayer.put(player.getUuid(), new PendingSupplyRequest(name));
+    public Optional<BlockPos> lastContainer(ServerPlayerEntity player, World world) {
+        InteractionSnapshot snapshot = lastContainerByPlayer.get(player.getUuid());
+        if (snapshot == null) {
+            return Optional.empty();
+        }
+
+        if (!snapshot.dimension().equals(world.getRegistryKey().getValue().toString())) {
+            return Optional.empty();
+        }
+
+        return Optional.of(snapshot.pos());
     }
 
-    public boolean hasPendingRegistration(ServerPlayerEntity player) {
-        return pendingSupplyByPlayer.containsKey(player.getUuid());
-    }
-
-    private record PendingSupplyRequest(String name) {
+    private record InteractionSnapshot(String dimension, BlockPos pos) {
+        private InteractionSnapshot(World world, BlockPos pos) {
+            this(world.getRegistryKey().getValue().toString(), pos);
+        }
     }
 }
