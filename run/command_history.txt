@@ -1,0 +1,50 @@
+/mapart pause
+/mapart
+/mapart resume
+/mapart setorigin
+/mapart start
+/mapart status
+/mapart unload
+/mapart load
+/mapart load b
+/mapart load bedrock.nbt
+/mapart info
+/mapart setorigin
+/mapart status
+/mapart start
+/mapart debug secondlast
+/mapart next
+/mapart unload
+/mapart load bedrock.nbt
+/mapart load mapart.nbt
+/mapart load bedrock.nbt
+/mapart status
+/mapart info
+/mapart stop
+/mapart unload
+/mapart info
+/mapart load bedrock.nbto
+/mapart load bedrock.nbt
+/mapart unload
+/mapart resume
+/mapart info
+/mapart status
+/mapart info
+/mapart load bedrock.nbto
+/mapart load bedrock.nbt
+/mapart info
+/mapart status
+/mapart unload
+/mapart
+/mapart info
+/mapart status
+/mapart load bedrock.nbt
+/mapart load mapart.nbt
+/mapart status
+/mapart debug secondlast
+/mapart status
+/mapart info
+/mapart status
+/mapart next
+/help mapart
+/mapart debug secondlast
