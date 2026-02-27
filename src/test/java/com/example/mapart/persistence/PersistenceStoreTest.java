@@ -65,8 +65,10 @@ class PersistenceStoreTest {
                 List.of()
         );
         BuildSession session = new BuildSession(plan);
+        session.setOrigin(new BlockPos(11, 70, -4));
         session.getProgress().setCurrentRegionIndex(2);
         session.getProgress().setCurrentPlacementIndex(5);
+        session.getProgress().setTotalCompletedPlacements(4);
         store.saveProgress(session);
 
         ProgressStore restored = new ProgressStore(progressPath);
@@ -74,8 +76,10 @@ class PersistenceStoreTest {
 
         assertEquals(plan.sourcePath().toString(), snapshot.loadedPlanId());
         assertEquals("IDLE", snapshot.state());
+        assertEquals(new BlockPos(11, 70, -4), snapshot.origin());
         assertEquals(2, snapshot.currentRegionIndex());
         assertEquals(5, snapshot.currentPlacementIndex());
+        assertEquals(4, snapshot.totalCompletedPlacements());
     }
 
     @Test

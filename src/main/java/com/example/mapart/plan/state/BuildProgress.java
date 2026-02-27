@@ -29,6 +29,10 @@ public class BuildProgress {
         this.totalCompletedPlacements++;
     }
 
+    public void setTotalCompletedPlacements(int totalCompletedPlacements) {
+        this.totalCompletedPlacements = Math.max(0, totalCompletedPlacements);
+    }
+
     public void reset() {
         this.currentRegionIndex = 0;
         this.currentPlacementIndex = 0;

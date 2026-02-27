@@ -171,7 +171,8 @@ public final class MapArtCommand {
                             }
 
                             if (result.done()) {
-                                context.getSource().sendFeedback(() -> Text.literal("Build completed."), false);
+                                planService.coordinator().unload();
+                                context.getSource().sendFeedback(() -> Text.literal("Build completed and schematic unloaded."), false);
                                 return 1;
                             }
 
@@ -275,14 +276,18 @@ public final class MapArtCommand {
         source.sendFeedback(() -> Text.literal("Plan: " + status.planId()), false);
         source.sendFeedback(() -> Text.literal("State: " + status.state()), false);
         source.sendFeedback(() -> Text.literal("Origin: " + (status.origin() == null ? "not set" : status.origin().toShortString())), false);
-        source.sendFeedback(() -> Text.literal("Region: " + status.currentRegionIndex() + "/" + status.totalRegions()), false);
-        source.sendFeedback(() -> Text.literal("Placement: " + status.currentPlacementIndex() + "/" + status.totalPlacements()), false);
+        source.sendFeedback(() -> Text.literal("Region: " + status.currentRegionIndex() + " / " + status.totalRegions()), false);
+        source.sendFeedback(() -> Text.literal("Placement: " + status.currentPlacementIndex() + " / " + status.totalPlacements()), false);
         source.sendFeedback(() -> Text.literal("Completed placements: " + status.totalCompletedPlacements()), false);
 
-        status.nextTarget().ifPresent(nextTarget -> {
+        if (status.nextTarget().isPresent()) {
+            BuildCoordinator.NextTarget nextTarget = status.nextTarget().get();
             source.sendFeedback(() -> Text.literal("Next block: " + Registries.BLOCK.getId(nextTarget.placement().block())), false);
             source.sendFeedback(() -> Text.literal("Next target: " + nextTarget.absolutePos().toShortString()), false);
-        });
+        } else {
+            source.sendFeedback(() -> Text.literal("Next block: none"), false);
+            source.sendFeedback(() -> Text.literal("Next target: none"), false);
+        }
 
         return 1;
     }

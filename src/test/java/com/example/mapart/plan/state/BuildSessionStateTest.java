@@ -66,6 +66,41 @@ class BuildSessionStateTest {
         assertTrue(status.nextTarget().isPresent());
     }
 
+
+    @Test
+    void coordinatorRestoresPersistedProgressForSamePlan() {
+        Path configPath = tempDir.resolve("config-restore.json");
+        Path progressPath = tempDir.resolve("progress-restore.json");
+        BuildPlan plan = plan(tempDir.resolve("restore.nbt"));
+
+        BuildCoordinator firstCoordinator = new BuildCoordinator(
+                new WorldPlacementResolver(),
+                new ConfigStore(configPath),
+                new ProgressStore(progressPath)
+        );
+
+        BuildSession firstSession = firstCoordinator.loadPlan(plan);
+        firstSession.setOrigin(new BlockPos(8, 64, 8));
+        firstSession.setCurrentPlacementIndex(1);
+        firstSession.setCurrentRegionIndex(1);
+        firstSession.getProgress().setTotalCompletedPlacements(1);
+        firstSession.transitionTo(BuildPlanState.BUILDING);
+        firstCoordinator.pause();
+
+        BuildCoordinator restoredCoordinator = new BuildCoordinator(
+                new WorldPlacementResolver(),
+                new ConfigStore(configPath),
+                new ProgressStore(progressPath)
+        );
+        BuildSession restoredSession = restoredCoordinator.loadPlan(plan);
+
+        assertEquals(new BlockPos(8, 64, 8), restoredSession.getOrigin());
+        assertEquals(1, restoredSession.getCurrentPlacementIndex());
+        assertEquals(1, restoredSession.getCurrentRegionIndex());
+        assertEquals(1, restoredSession.getTotalCompletedPlacements());
+        assertEquals(BuildPlanState.PAUSED, restoredSession.getState());
+    }
+
     @Test
     void setOriginFailsWithoutLoadedPlan() {
         BuildCoordinator coordinator = new BuildCoordinator(
