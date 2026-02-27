@@ -10,8 +10,6 @@ import java.util.Map;
 import java.util.Set;
 
 public class BuildSession {
-    // Keep a single TRANSITIONS declaration. A prior duplicate Map.of(...) initializer
-    // caused both compile-time redeclaration errors and runtime duplicate-key crashes.
     private static final Map<BuildPlanState, Set<BuildPlanState>> TRANSITIONS = createTransitions();
 
     private final BuildPlan plan;
@@ -50,7 +48,7 @@ public class BuildSession {
     }
 
     public void transitionTo(BuildPlanState nextState) {
-        Set<BuildPlanState> validTargets = VALID_TRANSITIONS_BY_STATE.getOrDefault(state, Set.of());
+        Set<BuildPlanState> validTargets = TRANSITIONS.getOrDefault(state, Set.of());
         if (!validTargets.contains(nextState)) {
             throw new IllegalStateException("Invalid transition: " + state + " -> " + nextState);
         }

@@ -13,7 +13,7 @@ import net.minecraft.util.math.BlockPos;
 import java.util.List;
 import java.util.Optional;
 
-public class BuildCoordinator {
+public class    BuildCoordinator {
     private final WorldPlacementResolver placementResolver;
     private final ConfigStore configStore;
     private final ProgressStore progressStore;
@@ -157,7 +157,7 @@ public class BuildCoordinator {
 
             ServerWorld world = source.getWorld();
             BlockPos absolute = targetPos.get();
-            if (!world.isChunkLoaded(absolute)) {
+            if (!world.isChunkLoaded(absolute.getX() >> 4, absolute.getZ() >> 4)) {
                 return StepResult.error("Target chunk is not loaded at " + absolute.toShortString() + ".");
             }
 
