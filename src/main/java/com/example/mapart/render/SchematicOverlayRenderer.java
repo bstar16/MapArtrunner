@@ -62,15 +62,8 @@ public class SchematicOverlayRenderer implements WorldRenderEvents.AfterTransluc
 
         BuildPlan plan = session.getPlan();
         Set<Placement> activeRegionPlacements = resolveRegionFilter(session, settings.overlayCurrentRegionOnly());
-        BlockPos finalOrigin = origin;
-
         List<PlacementStatusSnapshot> snapshots = statusResolver.resolve(client.world, session, snapshot -> {
             if (settings.overlayCurrentRegionOnly() && !activeRegionPlacements.contains(snapshot.placement())) {
-                return false;
-            }
-
-            double distanceSq = snapshot.absolutePos().getSquaredDistance(finalOrigin);
-            if (distanceSq > (double) settings.overlayMaxRenderDistance() * settings.overlayMaxRenderDistance()) {
                 return false;
             }
 

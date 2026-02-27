@@ -39,21 +39,19 @@ public class MapartSettingsStore {
         try {
             switch (normalized) {
                 case "showhud" -> settings = new MapartSettings(parseBoolean(value), settings.showSchematicOverlay(), settings.overlayCurrentRegionOnly(),
-                        settings.overlayMaxRenderDistance(), settings.overlayShowOnlyIncorrect(), settings.hudCompact(), settings.hudX(), settings.hudY());
+                        settings.overlayShowOnlyIncorrect(), settings.hudCompact(), settings.hudX(), settings.hudY());
                 case "showschematicoverlay" -> settings = new MapartSettings(settings.showHud(), parseBoolean(value), settings.overlayCurrentRegionOnly(),
-                        settings.overlayMaxRenderDistance(), settings.overlayShowOnlyIncorrect(), settings.hudCompact(), settings.hudX(), settings.hudY());
+                        settings.overlayShowOnlyIncorrect(), settings.hudCompact(), settings.hudX(), settings.hudY());
                 case "overlaycurrentregiononly" -> settings = new MapartSettings(settings.showHud(), settings.showSchematicOverlay(), parseBoolean(value),
-                        settings.overlayMaxRenderDistance(), settings.overlayShowOnlyIncorrect(), settings.hudCompact(), settings.hudX(), settings.hudY());
-                case "overlaymaxrenderdistance" -> settings = new MapartSettings(settings.showHud(), settings.showSchematicOverlay(), settings.overlayCurrentRegionOnly(),
-                        parseInt(value), settings.overlayShowOnlyIncorrect(), settings.hudCompact(), settings.hudX(), settings.hudY());
+                        settings.overlayShowOnlyIncorrect(), settings.hudCompact(), settings.hudX(), settings.hudY());
                 case "overlayshowonlyincorrect" -> settings = new MapartSettings(settings.showHud(), settings.showSchematicOverlay(), settings.overlayCurrentRegionOnly(),
-                        settings.overlayMaxRenderDistance(), parseBoolean(value), settings.hudCompact(), settings.hudX(), settings.hudY());
+                        parseBoolean(value), settings.hudCompact(), settings.hudX(), settings.hudY());
                 case "hudcompact" -> settings = new MapartSettings(settings.showHud(), settings.showSchematicOverlay(), settings.overlayCurrentRegionOnly(),
-                        settings.overlayMaxRenderDistance(), settings.overlayShowOnlyIncorrect(), parseBoolean(value), settings.hudX(), settings.hudY());
+                        settings.overlayShowOnlyIncorrect(), parseBoolean(value), settings.hudX(), settings.hudY());
                 case "hudx" -> settings = new MapartSettings(settings.showHud(), settings.showSchematicOverlay(), settings.overlayCurrentRegionOnly(),
-                        settings.overlayMaxRenderDistance(), settings.overlayShowOnlyIncorrect(), settings.hudCompact(), parseInt(value), settings.hudY());
+                        settings.overlayShowOnlyIncorrect(), settings.hudCompact(), parseInt(value), settings.hudY());
                 case "hudy" -> settings = new MapartSettings(settings.showHud(), settings.showSchematicOverlay(), settings.overlayCurrentRegionOnly(),
-                        settings.overlayMaxRenderDistance(), settings.overlayShowOnlyIncorrect(), settings.hudCompact(), settings.hudX(), parseInt(value));
+                        settings.overlayShowOnlyIncorrect(), settings.hudCompact(), settings.hudX(), parseInt(value));
                 default -> {
                     return Optional.of("Unknown settings key: " + key);
                 }
@@ -97,7 +95,6 @@ public class MapartSettingsStore {
                     stored.showHud == null ? defaults.showHud() : stored.showHud,
                     stored.showSchematicOverlay == null ? defaults.showSchematicOverlay() : stored.showSchematicOverlay,
                     stored.overlayCurrentRegionOnly == null ? defaults.overlayCurrentRegionOnly() : stored.overlayCurrentRegionOnly,
-                    stored.overlayMaxRenderDistance == null ? defaults.overlayMaxRenderDistance() : stored.overlayMaxRenderDistance,
                     stored.overlayShowOnlyIncorrect == null ? defaults.overlayShowOnlyIncorrect() : stored.overlayShowOnlyIncorrect,
                     stored.hudCompact == null ? defaults.hudCompact() : stored.hudCompact,
                     stored.hudX == null ? defaults.hudX() : stored.hudX,
@@ -142,7 +139,6 @@ public class MapartSettingsStore {
         Boolean showHud;
         Boolean showSchematicOverlay;
         Boolean overlayCurrentRegionOnly;
-        Integer overlayMaxRenderDistance;
         Boolean overlayShowOnlyIncorrect;
         Boolean hudCompact;
         Integer hudX;
@@ -155,7 +151,6 @@ public class MapartSettingsStore {
             this.showHud = settings.showHud();
             this.showSchematicOverlay = settings.showSchematicOverlay();
             this.overlayCurrentRegionOnly = settings.overlayCurrentRegionOnly();
-            this.overlayMaxRenderDistance = settings.overlayMaxRenderDistance();
             this.overlayShowOnlyIncorrect = settings.overlayShowOnlyIncorrect();
             this.hudCompact = settings.hudCompact();
             this.hudX = settings.hudX();
