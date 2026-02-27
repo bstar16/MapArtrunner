@@ -3,15 +3,7 @@ package com.example.mapart.plan.state;
 import com.example.mapart.plan.BuildPlan;
 import net.minecraft.util.math.BlockPos;
 
-import java.util.Collections;
-import java.util.EnumMap;
-import java.util.EnumSet;
-import java.util.Map;
-import java.util.Set;
-
 public class BuildSession {
-    private static final Map<BuildPlanState, Set<BuildPlanState>> TRANSITIONS = createTransitions();
-
     private final BuildPlan plan;
     private final BuildProgress progress;
     private BlockPos origin;
@@ -43,35 +35,34 @@ public class BuildSession {
         return state;
     }
 
+    public int getCurrentRegionIndex() {
+        return progress.getCurrentRegionIndex();
+    }
+
+    public void setCurrentRegionIndex(int currentRegionIndex) {
+        progress.setCurrentRegionIndex(currentRegionIndex);
+    }
+
+    public int getCurrentPlacementIndex() {
+        return progress.getCurrentPlacementIndex();
+    }
+
+    public void setCurrentPlacementIndex(int currentPlacementIndex) {
+        progress.setCurrentPlacementIndex(currentPlacementIndex);
+    }
+
     public int getTotalCompletedPlacements() {
         return progress.getTotalCompletedPlacements();
     }
 
+    public void incrementCompletedPlacements() {
+        progress.incrementCompletedPlacements();
+    }
+
     public void transitionTo(BuildPlanState nextState) {
-        Set<BuildPlanState> validTargets = TRANSITIONS.getOrDefault(state, Set.of());
-        if (!validTargets.contains(nextState)) {
+        if (!state.canTransitionTo(nextState)) {
             throw new IllegalStateException("Invalid transition: " + state + " -> " + nextState);
         }
         this.state = nextState;
-    }
-
-    private static Map<BuildPlanState, Set<BuildPlanState>> createTransitions() {
-        EnumMap<BuildPlanState, Set<BuildPlanState>> transitions = new EnumMap<>(BuildPlanState.class);
-        transitions.put(BuildPlanState.IDLE, EnumSet.of(BuildPlanState.LOADED));
-        transitions.put(BuildPlanState.LOADED, EnumSet.of(BuildPlanState.BUILDING, BuildPlanState.ERROR));
-        transitions.put(BuildPlanState.BUILDING, EnumSet.of(
-                BuildPlanState.PAUSED,
-                BuildPlanState.COMPLETED,
-                BuildPlanState.ERROR,
-                BuildPlanState.LOADED
-        ));
-        transitions.put(BuildPlanState.PAUSED, EnumSet.of(
-                BuildPlanState.BUILDING,
-                BuildPlanState.ERROR,
-                BuildPlanState.LOADED
-        ));
-        transitions.put(BuildPlanState.ERROR, EnumSet.of(BuildPlanState.LOADED));
-        transitions.put(BuildPlanState.COMPLETED, EnumSet.of(BuildPlanState.BUILDING, BuildPlanState.LOADED));
-        return Collections.unmodifiableMap(transitions);
     }
 }

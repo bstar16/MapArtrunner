@@ -13,7 +13,7 @@ import net.minecraft.util.math.BlockPos;
 import java.util.List;
 import java.util.Optional;
 
-public class    BuildCoordinator {
+public class BuildCoordinator {
     private final WorldPlacementResolver placementResolver;
     private final ConfigStore configStore;
     private final ProgressStore progressStore;
@@ -60,9 +60,10 @@ public class    BuildCoordinator {
         if (session == null) {
             return Optional.of("No build plan loaded.");
         }
+
         session.setOrigin(origin.toImmutable());
-        configStore.rememberOrigin(origin);
         progressStore.saveProgress(session);
+        configStore.rememberOrigin(origin);
         return Optional.empty();
     }
 
@@ -74,17 +75,11 @@ public class    BuildCoordinator {
             return Optional.of("Origin is not set. Use /mapart setorigin first.");
         }
 
-        try {
-            if (session.getState() == BuildPlanState.COMPLETED) {
-                session.getProgress().setCurrentPlacementIndex(0);
-                session.getProgress().setCurrentRegionIndex(0);
-            }
-            session.transitionTo(BuildPlanState.BUILDING);
-            progressStore.saveProgress(session);
-            return Optional.empty();
-        } catch (IllegalStateException exception) {
-            return Optional.of("Cannot start from state " + session.getState() + ".");
+        if (session.getState() == BuildPlanState.COMPLETED) {
+            session.getProgress().reset();
         }
+
+        return transitionSession(BuildPlanState.BUILDING, "Cannot start from state " + session.getState() + ".");
     }
 
     public Optional<String> pause() {
@@ -92,35 +87,21 @@ public class    BuildCoordinator {
             return Optional.of("No build session.");
         }
 
-        try {
-            session.transitionTo(BuildPlanState.PAUSED);
-            progressStore.saveProgress(session);
-            return Optional.empty();
-        } catch (IllegalStateException exception) {
-            return Optional.of("Can only pause while BUILDING.");
-        }
+        return transitionSession(BuildPlanState.PAUSED, "Can only pause while BUILDING.");
     }
-
 
     public Optional<String> stop() {
         if (session == null) {
             return Optional.of("No build session.");
         }
 
-        if (session.getState() == BuildPlanState.IDLE) {
-            return Optional.of("No active build session.");
-        }
-
-        try {
-            session.getProgress().reset();
-            if (session.getState() != BuildPlanState.LOADED) {
-                session.transitionTo(BuildPlanState.LOADED);
-            }
+        session.getProgress().reset();
+        if (session.getState() == BuildPlanState.LOADED) {
             progressStore.saveProgress(session);
             return Optional.empty();
-        } catch (IllegalStateException exception) {
-            return Optional.of("Cannot stop from state " + session.getState() + ".");
         }
+
+        return transitionSession(BuildPlanState.LOADED, "Cannot stop from state " + session.getState() + ".");
     }
 
     public Optional<String> resume() {
@@ -128,13 +109,7 @@ public class    BuildCoordinator {
             return Optional.of("No build session.");
         }
 
-        try {
-            session.transitionTo(BuildPlanState.BUILDING);
-            progressStore.saveProgress(session);
-            return Optional.empty();
-        } catch (IllegalStateException exception) {
-            return Optional.of("Can only resume while PAUSED.");
-        }
+        return transitionSession(BuildPlanState.BUILDING, "Can only resume while PAUSED.");
     }
 
     public Optional<String> debugSkipToSecondLastPlacement() {
@@ -147,9 +122,8 @@ public class    BuildCoordinator {
             return Optional.of("Plan must contain at least 2 placements to skip to the second last.");
         }
 
-        BuildProgress progress = session.getProgress();
-        progress.setCurrentPlacementIndex(plan.placements().size() - 2);
-        updateRegionIndex(progress, plan.regions());
+        session.setCurrentPlacementIndex(plan.placements().size() - 2);
+        updateRegionIndex(session.getProgress(), plan.regions());
         progressStore.saveProgress(session);
         return Optional.empty();
     }
@@ -162,40 +136,91 @@ public class    BuildCoordinator {
 
         BuildPlan plan = session.getPlan();
         List<Placement> placements = plan.placements();
-        BuildProgress progress = session.getProgress();
 
-        while (progress.getCurrentPlacementIndex() < placements.size()) {
-            Placement placement = placements.get(progress.getCurrentPlacementIndex());
-            Optional<BlockPos> targetPos = placementResolver.resolveAbsolute(session.getOrigin(), placement);
+        while (session.getCurrentPlacementIndex() < placements.size()) {
+            Placement placement = placements.get(session.getCurrentPlacementIndex());
+            Optional<BlockPos> targetPos = placementResolver.resolveAbsolute(session, placement);
             if (targetPos.isEmpty()) {
-                session.transitionTo(BuildPlanState.ERROR);
+                markSessionError();
                 return StepResult.error("Failed to resolve target block position.");
             }
 
             ServerWorld world = source.getWorld();
             BlockPos absolute = targetPos.get();
-            if (!world.isChunkLoaded(absolute.getX() >> 4, absolute.getZ() >> 4)) {
+            if (!world.isPosLoaded(absolute)) {
                 return StepResult.error("Target chunk is not loaded at " + absolute.toShortString() + ".");
             }
 
             BlockState currentState = world.getBlockState(absolute);
+            session.incrementCompletedPlacements();
+            session.setCurrentPlacementIndex(session.getCurrentPlacementIndex() + 1);
+            updateRegionIndex(session.getProgress(), plan.regions());
+
             if (currentState.isOf(placement.block())) {
-                progress.incrementCompletedPlacements();
-                progress.setCurrentPlacementIndex(progress.getCurrentPlacementIndex() + 1);
-                updateRegionIndex(progress, plan.regions());
                 continue;
             }
 
-            progress.incrementCompletedPlacements();
-            progress.setCurrentPlacementIndex(progress.getCurrentPlacementIndex() + 1);
-            updateRegionIndex(progress, plan.regions());
             progressStore.saveProgress(session);
             return StepResult.actionable(placement, absolute);
         }
 
-        session.transitionTo(BuildPlanState.COMPLETED);
-        progressStore.saveProgress(session);
-        return StepResult.completed();
+        if (transitionToCompleted()) {
+            return StepResult.completed();
+        }
+
+        return StepResult.error("Failed to transition session to COMPLETED state.");
+    }
+
+    public Optional<SessionStatus> sessionStatus() {
+        if (session == null) {
+            return Optional.empty();
+        }
+
+        BuildPlan plan = session.getPlan();
+        return Optional.of(new SessionStatus(
+                plan.sourcePath().getFileName().toString(),
+                session.getState(),
+                session.getOrigin(),
+                session.getCurrentRegionIndex(),
+                plan.regions().size(),
+                session.getCurrentPlacementIndex(),
+                plan.placements().size(),
+                session.getTotalCompletedPlacements(),
+                resolveNextTarget(session)
+        ));
+    }
+
+    private Optional<String> transitionSession(BuildPlanState targetState, String invalidTransitionMessage) {
+        try {
+            session.transitionTo(targetState);
+            progressStore.saveProgress(session);
+            return Optional.empty();
+        } catch (IllegalStateException exception) {
+            return Optional.of(invalidTransitionMessage);
+        }
+    }
+
+    private boolean transitionToCompleted() {
+        try {
+            session.transitionTo(BuildPlanState.COMPLETED);
+            progressStore.saveProgress(session);
+            return true;
+        } catch (IllegalStateException exception) {
+            return false;
+        }
+    }
+
+    private void markSessionError() {
+        if (session == null || session.getState() == BuildPlanState.ERROR) {
+            return;
+        }
+
+        try {
+            session.transitionTo(BuildPlanState.ERROR);
+            progressStore.saveProgress(session);
+        } catch (IllegalStateException ignored) {
+            // Keep the existing state if transition is not valid.
+        }
     }
 
     private ValidationResult validateForNext(ServerCommandSource source) {
@@ -208,25 +233,34 @@ public class    BuildCoordinator {
         if (session.getOrigin() == null) {
             return ValidationResult.error("Origin is not set.");
         }
-
         if (source.getWorld() == null) {
             return ValidationResult.error("World is unavailable.");
         }
 
-        BuildProgress progress = session.getProgress();
         BuildPlan plan = session.getPlan();
-
-        if (progress.getCurrentRegionIndex() < 0 || progress.getCurrentRegionIndex() > plan.regions().size()) {
-            session.transitionTo(BuildPlanState.ERROR);
+        if (session.getCurrentRegionIndex() < 0 || session.getCurrentRegionIndex() > plan.regions().size()) {
+            markSessionError();
             return ValidationResult.error("Invalid current region index.");
         }
 
-        if (progress.getCurrentPlacementIndex() < 0 || progress.getCurrentPlacementIndex() > plan.placements().size()) {
-            session.transitionTo(BuildPlanState.ERROR);
+        if (session.getCurrentPlacementIndex() < 0 || session.getCurrentPlacementIndex() > plan.placements().size()) {
+            markSessionError();
             return ValidationResult.error("Invalid current placement index.");
         }
 
         return ValidationResult.success();
+    }
+
+    private Optional<NextTarget> resolveNextTarget(BuildSession activeSession) {
+        int nextIndex = activeSession.getCurrentPlacementIndex();
+        BuildPlan plan = activeSession.getPlan();
+        if (nextIndex < 0 || nextIndex >= plan.placements().size()) {
+            return Optional.empty();
+        }
+
+        Placement placement = plan.placements().get(nextIndex);
+        return placementResolver.resolveAbsolute(activeSession, placement)
+                .map(pos -> new NextTarget(placement, pos));
     }
 
     private void updateRegionIndex(BuildProgress progress, List<Region> regions) {
@@ -250,6 +284,22 @@ public class    BuildCoordinator {
         static ValidationResult error(String message) {
             return new ValidationResult(false, message);
         }
+    }
+
+    public record NextTarget(Placement placement, BlockPos absolutePos) {
+    }
+
+    public record SessionStatus(
+            String planId,
+            BuildPlanState state,
+            BlockPos origin,
+            int currentRegionIndex,
+            int totalRegions,
+            int currentPlacementIndex,
+            int totalPlacements,
+            int totalCompletedPlacements,
+            Optional<NextTarget> nextTarget
+    ) {
     }
 
     public record StepResult(boolean done, boolean actionable, String message, Placement placement, BlockPos targetPos) {

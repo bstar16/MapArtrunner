@@ -6,6 +6,14 @@ import net.minecraft.util.math.BlockPos;
 import java.util.Optional;
 
 public class WorldPlacementResolver {
+    public Optional<BlockPos> resolveAbsolute(BuildSession session, Placement placement) {
+        if (session == null) {
+            return Optional.empty();
+        }
+
+        return resolveAbsolute(session.getOrigin(), placement);
+    }
+
     public Optional<BlockPos> resolveAbsolute(BlockPos origin, Placement placement) {
         if (origin == null || placement == null || placement.relativePos() == null) {
             return Optional.empty();

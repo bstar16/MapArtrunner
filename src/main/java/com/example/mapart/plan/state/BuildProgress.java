@@ -10,7 +10,7 @@ public class BuildProgress {
     }
 
     public void setCurrentRegionIndex(int currentRegionIndex) {
-        this.currentRegionIndex = currentRegionIndex;
+        this.currentRegionIndex = Math.max(0, currentRegionIndex);
     }
 
     public int getCurrentPlacementIndex() {
@@ -18,7 +18,7 @@ public class BuildProgress {
     }
 
     public void setCurrentPlacementIndex(int currentPlacementIndex) {
-        this.currentPlacementIndex = currentPlacementIndex;
+        this.currentPlacementIndex = Math.max(0, currentPlacementIndex);
     }
 
     public int getTotalCompletedPlacements() {

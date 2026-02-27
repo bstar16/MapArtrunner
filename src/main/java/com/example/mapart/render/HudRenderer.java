@@ -48,8 +48,8 @@ public class HudRenderer implements HudRenderCallback {
         lines.add("State: " + session.getState());
         lines.add("Plan: " + plan.sourcePath().getFileName());
         lines.add("Size: " + plan.dimensions().getX() + "x" + plan.dimensions().getY() + "x" + plan.dimensions().getZ());
-        lines.add("Region: " + session.getProgress().getCurrentRegionIndex() + "/" + plan.regions().size());
-        lines.add("Placement: " + session.getProgress().getCurrentPlacementIndex() + "/" + plan.placements().size());
+        lines.add("Region: " + session.getCurrentRegionIndex() + "/" + plan.regions().size());
+        lines.add("Placement: " + session.getCurrentPlacementIndex() + "/" + plan.placements().size());
 
         if (session.getOrigin() == null) {
             lines.add("Origin: not set");

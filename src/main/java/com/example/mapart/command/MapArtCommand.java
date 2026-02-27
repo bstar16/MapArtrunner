@@ -4,7 +4,6 @@ import com.example.mapart.plan.BuildPlan;
 import com.example.mapart.plan.Placement;
 import com.example.mapart.plan.state.BuildCoordinator;
 import com.example.mapart.plan.state.BuildPlanService;
-import com.example.mapart.plan.state.BuildPlanState;
 import com.example.mapart.plan.state.BuildSession;
 import com.example.mapart.settings.MapartSettings;
 import com.example.mapart.settings.MapartSettingsStore;
@@ -266,29 +265,24 @@ public final class MapArtCommand {
     }
 
     private static int showStatus(BuildPlanService planService, ServerCommandSource source) {
-        Optional<BuildSession> sessionOptional = planService.currentSession();
-        if (sessionOptional.isEmpty()) {
+        Optional<BuildCoordinator.SessionStatus> statusOptional = planService.coordinator().sessionStatus();
+        if (statusOptional.isEmpty()) {
             source.sendFeedback(() -> Text.literal("State: IDLE (no plan loaded)."), false);
             return 1;
         }
 
-        BuildSession session = sessionOptional.get();
-        BuildPlan plan = session.getPlan();
-        source.sendFeedback(() -> Text.literal("Plan: " + plan.sourcePath().getFileName()), false);
-        source.sendFeedback(() -> Text.literal("State: " + session.getState()), false);
-        source.sendFeedback(() -> Text.literal("Origin: " + (session.getOrigin() == null ? "not set" : session.getOrigin().toShortString())), false);
-        source.sendFeedback(() -> Text.literal("Region: " + session.getProgress().getCurrentRegionIndex() + "/" + plan.regions().size()), false);
-        source.sendFeedback(() -> Text.literal("Placement: " + session.getProgress().getCurrentPlacementIndex() + "/" + plan.placements().size()), false);
-        source.sendFeedback(() -> Text.literal("Completed placements: " + session.getTotalCompletedPlacements()), false);
+        BuildCoordinator.SessionStatus status = statusOptional.get();
+        source.sendFeedback(() -> Text.literal("Plan: " + status.planId()), false);
+        source.sendFeedback(() -> Text.literal("State: " + status.state()), false);
+        source.sendFeedback(() -> Text.literal("Origin: " + (status.origin() == null ? "not set" : status.origin().toShortString())), false);
+        source.sendFeedback(() -> Text.literal("Region: " + status.currentRegionIndex() + "/" + status.totalRegions()), false);
+        source.sendFeedback(() -> Text.literal("Placement: " + status.currentPlacementIndex() + "/" + status.totalPlacements()), false);
+        source.sendFeedback(() -> Text.literal("Completed placements: " + status.totalCompletedPlacements()), false);
 
-        int nextIndex = session.getProgress().getCurrentPlacementIndex();
-        if (nextIndex >= 0 && nextIndex < plan.placements().size() && session.getOrigin() != null
-                && session.getState() != BuildPlanState.COMPLETED) {
-            Placement nextPlacement = plan.placements().get(nextIndex);
-            BlockPos nextPos = session.getOrigin().add(nextPlacement.relativePos());
-            source.sendFeedback(() -> Text.literal("Next block: " + Registries.BLOCK.getId(nextPlacement.block())), false);
-            source.sendFeedback(() -> Text.literal("Next target: " + nextPos.toShortString()), false);
-        }
+        status.nextTarget().ifPresent(nextTarget -> {
+            source.sendFeedback(() -> Text.literal("Next block: " + Registries.BLOCK.getId(nextTarget.placement().block())), false);
+            source.sendFeedback(() -> Text.literal("Next target: " + nextTarget.absolutePos().toShortString()), false);
+        });
 
         return 1;
     }

@@ -112,7 +112,7 @@ public class SchematicOverlayRenderer implements WorldRenderEvents.AfterTransluc
             return Set.of();
         }
 
-        int index = session.getProgress().getCurrentRegionIndex();
+        int index = session.getCurrentRegionIndex();
         if (index < 0 || index >= session.getPlan().regions().size()) {
             return Set.of();
         }
@@ -122,8 +122,8 @@ public class SchematicOverlayRenderer implements WorldRenderEvents.AfterTransluc
 
     private static BuildSession cloneWithPreviewOrigin(BuildSession session, BlockPos origin) {
         BuildSession preview = new BuildSession(session.getPlan());
-        preview.getProgress().setCurrentPlacementIndex(session.getProgress().getCurrentPlacementIndex());
-        preview.getProgress().setCurrentRegionIndex(session.getProgress().getCurrentRegionIndex());
+        preview.setCurrentPlacementIndex(session.getCurrentPlacementIndex());
+        preview.setCurrentRegionIndex(session.getCurrentRegionIndex());
         preview.setOrigin(origin);
         return preview;
     }
