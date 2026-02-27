@@ -10,6 +10,8 @@ import java.util.Map;
 import java.util.Set;
 
 public class BuildSession {
+    // Keep a single TRANSITIONS declaration. A prior duplicate Map.of(...) initializer
+    // caused both compile-time redeclaration errors and runtime duplicate-key crashes.
     private static final Map<BuildPlanState, Set<BuildPlanState>> TRANSITIONS = createTransitions();
 
     private final BuildPlan plan;
