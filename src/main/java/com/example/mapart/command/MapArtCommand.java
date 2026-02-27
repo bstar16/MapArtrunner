@@ -8,6 +8,7 @@ import com.example.mapart.plan.state.BuildPlanState;
 import com.example.mapart.plan.state.BuildSession;
 import com.example.mapart.settings.MapartSettings;
 import com.example.mapart.settings.MapartSettingsStore;
+import com.example.mapart.supply.SupplyInteractionTracker;
 import com.example.mapart.supply.SupplyPoint;
 import com.example.mapart.supply.SupplyStore;
 import com.mojang.brigadier.arguments.IntegerArgumentType;
@@ -19,8 +20,6 @@ import net.minecraft.server.command.CommandManager;
 import net.minecraft.server.command.ServerCommandSource;
 import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.text.Text;
-import net.minecraft.util.hit.BlockHitResult;
-import net.minecraft.util.hit.HitResult;
 import net.minecraft.util.math.BlockPos;
 
 import java.nio.file.Path;
@@ -36,23 +35,39 @@ public final class MapArtCommand {
     private MapArtCommand() {
     }
 
-    public static LiteralArgumentBuilder<ServerCommandSource> create(BuildPlanService planService, MapartSettingsStore settingsStore, SupplyStore supplyStore) {
-        return createForName(PRIMARY_COMMAND, planService, settingsStore, supplyStore);
+    public static LiteralArgumentBuilder<ServerCommandSource> create(
+            BuildPlanService planService,
+            MapartSettingsStore settingsStore,
+            SupplyStore supplyStore,
+            SupplyInteractionTracker supplyInteractionTracker
+    ) {
+        return createForName(PRIMARY_COMMAND, planService, settingsStore, supplyStore, supplyInteractionTracker);
     }
 
-    public static LiteralArgumentBuilder<ServerCommandSource> createAlias(BuildPlanService planService, MapartSettingsStore settingsStore, SupplyStore supplyStore) {
-        return createForName(LEGACY_ALIAS, planService, settingsStore, supplyStore);
+    public static LiteralArgumentBuilder<ServerCommandSource> createAlias(
+            BuildPlanService planService,
+            MapartSettingsStore settingsStore,
+            SupplyStore supplyStore,
+            SupplyInteractionTracker supplyInteractionTracker
+    ) {
+        return createForName(LEGACY_ALIAS, planService, settingsStore, supplyStore, supplyInteractionTracker);
     }
 
-    public static LiteralArgumentBuilder<ServerCommandSource> createRunnerAlias(BuildPlanService planService, MapartSettingsStore settingsStore, SupplyStore supplyStore) {
-        return createForName(MOD_NAME_ALIAS, planService, settingsStore, supplyStore);
+    public static LiteralArgumentBuilder<ServerCommandSource> createRunnerAlias(
+            BuildPlanService planService,
+            MapartSettingsStore settingsStore,
+            SupplyStore supplyStore,
+            SupplyInteractionTracker supplyInteractionTracker
+    ) {
+        return createForName(MOD_NAME_ALIAS, planService, settingsStore, supplyStore, supplyInteractionTracker);
     }
 
     private static LiteralArgumentBuilder<ServerCommandSource> createForName(
             String commandName,
             BuildPlanService planService,
             MapartSettingsStore settingsStore,
-            SupplyStore supplyStore
+            SupplyStore supplyStore,
+            SupplyInteractionTracker supplyInteractionTracker
     ) {
         return CommandManager.literal(commandName)
                 .then(CommandManager.literal("load")
@@ -170,9 +185,9 @@ public final class MapArtCommand {
                         }))
                 .then(CommandManager.literal("supply")
                         .then(CommandManager.literal("add")
-                                .executes(context -> addSupply(context.getSource(), supplyStore, null))
+                                .executes(context -> addSupply(context.getSource(), supplyInteractionTracker, null))
                                 .then(CommandManager.argument("name", StringArgumentType.greedyString())
-                                        .executes(context -> addSupply(context.getSource(), supplyStore, StringArgumentType.getString(context, "name")))))
+                                        .executes(context -> addSupply(context.getSource(), supplyInteractionTracker, StringArgumentType.getString(context, "name")))))
                         .then(CommandManager.literal("list")
                                 .executes(context -> listSupplies(context.getSource(), supplyStore)))
                         .then(CommandManager.literal("remove")
@@ -278,7 +293,7 @@ public final class MapArtCommand {
         return 1;
     }
 
-    private static int addSupply(ServerCommandSource source, SupplyStore supplyStore, String name) {
+    private static int addSupply(ServerCommandSource source, SupplyInteractionTracker supplyInteractionTracker, String name) {
         ServerPlayerEntity player;
         try {
             player = source.getPlayerOrThrow();
@@ -287,17 +302,9 @@ public final class MapArtCommand {
             return 0;
         }
 
-        BlockPos pos = player.getBlockPos();
-        HitResult hitResult = player.raycast(6.0, 0.0f, false);
-        if (hitResult.getType() == HitResult.Type.BLOCK) {
-            pos = ((BlockHitResult) hitResult).getBlockPos();
-        }
-
-        String dimension = source.getWorld().getRegistryKey().getValue().toString();
-        BlockPos savedPos = pos.toImmutable();
-        SupplyPoint point = supplyStore.add(savedPos, dimension, name);
-        source.sendFeedback(() -> Text.literal("Added supply #" + point.id() + " at " + savedPos.toShortString() + " in " + dimension +
-                (name == null ? "" : " (" + name + ")")), false);
+        supplyInteractionTracker.beginRegistration(player, name);
+        source.sendFeedback(() -> Text.literal("Right-click a container to register a supply point"
+                + (name == null ? "." : " named '" + name + "'.")), false);
         return 1;
     }
 
@@ -337,7 +344,6 @@ public final class MapArtCommand {
         source.sendFeedback(() -> Text.literal("showHud=" + settings.showHud()), false);
         source.sendFeedback(() -> Text.literal("showSchematicOverlay=" + settings.showSchematicOverlay()), false);
         source.sendFeedback(() -> Text.literal("overlayCurrentRegionOnly=" + settings.overlayCurrentRegionOnly()), false);
-        source.sendFeedback(() -> Text.literal("overlayMaxRenderDistance=" + settings.overlayMaxRenderDistance()), false);
         source.sendFeedback(() -> Text.literal("overlayShowOnlyIncorrect=" + settings.overlayShowOnlyIncorrect()), false);
         source.sendFeedback(() -> Text.literal("hudCompact=" + settings.hudCompact()), false);
         source.sendFeedback(() -> Text.literal("hudX=" + settings.hudX()), false);
