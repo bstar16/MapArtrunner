@@ -56,16 +56,4 @@ class SettingsAndSupplyStoreTest {
         SupplyStore store = new SupplyStore(suppliesPath);
         assertTrue(store.list().isEmpty());
     }
-
-    @Test
-    void supplyStoreClearResetsIds() {
-        Path suppliesPath = tempDir.resolve("supplies-clear.json");
-        SupplyStore store = new SupplyStore(suppliesPath);
-        store.add(new BlockPos(1, 2, 3), "minecraft:overworld", null);
-
-        assertEquals(1, store.clear());
-        assertTrue(store.list().isEmpty());
-
-        assertEquals(1, store.add(new BlockPos(4, 5, 6), "minecraft:overworld", null).id());
-    }
 }

@@ -60,20 +60,17 @@ public class SchematicOverlayRenderer implements WorldRenderEvents.AfterTransluc
             session = cloneWithPreviewOrigin(session, origin);
         }
 
+        BuildPlan plan = session.getPlan();
         Set<Placement> activeRegionPlacements = resolveRegionFilter(session, settings.overlayCurrentRegionOnly());
-        Vec3d camera = context.camera().getPos();
-        double maxDistanceSq = (double) settings.overlayMaxRenderDistance() * settings.overlayMaxRenderDistance();
+        BlockPos finalOrigin = origin;
 
         List<PlacementStatusSnapshot> snapshots = statusResolver.resolve(client.world, session, snapshot -> {
             if (settings.overlayCurrentRegionOnly() && !activeRegionPlacements.contains(snapshot.placement())) {
                 return false;
             }
 
-            double centerX = snapshot.absolutePos().getX() + 0.5;
-            double centerY = snapshot.absolutePos().getY() + 0.5;
-            double centerZ = snapshot.absolutePos().getZ() + 0.5;
-            double distanceSq = camera.squaredDistanceTo(centerX, centerY, centerZ);
-            if (distanceSq > maxDistanceSq) {
+            double distanceSq = snapshot.absolutePos().getSquaredDistance(finalOrigin);
+            if (distanceSq > (double) settings.overlayMaxRenderDistance() * settings.overlayMaxRenderDistance()) {
                 return false;
             }
 
@@ -87,6 +84,7 @@ public class SchematicOverlayRenderer implements WorldRenderEvents.AfterTransluc
         MatrixStack matrices = context.matrixStack();
         VertexConsumerProvider.Immediate consumers = client.getBufferBuilders().getEntityVertexConsumers();
         VertexConsumer lines = consumers.getBuffer(RenderLayer.getLines());
+        Vec3d camera = context.camera().getPos();
 
         for (PlacementStatusSnapshot snapshot : snapshots) {
             int color = pickColor(snapshot);

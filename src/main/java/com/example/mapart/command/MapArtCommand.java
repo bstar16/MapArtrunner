@@ -8,7 +8,6 @@ import com.example.mapart.plan.state.BuildPlanState;
 import com.example.mapart.plan.state.BuildSession;
 import com.example.mapart.settings.MapartSettings;
 import com.example.mapart.settings.MapartSettingsStore;
-import com.example.mapart.supply.SupplyInteractionTracker;
 import com.example.mapart.supply.SupplyPoint;
 import com.example.mapart.supply.SupplyStore;
 import com.mojang.brigadier.arguments.IntegerArgumentType;
@@ -37,39 +36,23 @@ public final class MapArtCommand {
     private MapArtCommand() {
     }
 
-    public static LiteralArgumentBuilder<ServerCommandSource> create(
-            BuildPlanService planService,
-            MapartSettingsStore settingsStore,
-            SupplyStore supplyStore,
-            SupplyInteractionTracker interactionTracker
-    ) {
-        return createForName(PRIMARY_COMMAND, planService, settingsStore, supplyStore, interactionTracker);
+    public static LiteralArgumentBuilder<ServerCommandSource> create(BuildPlanService planService, MapartSettingsStore settingsStore, SupplyStore supplyStore) {
+        return createForName(PRIMARY_COMMAND, planService, settingsStore, supplyStore);
     }
 
-    public static LiteralArgumentBuilder<ServerCommandSource> createAlias(
-            BuildPlanService planService,
-            MapartSettingsStore settingsStore,
-            SupplyStore supplyStore,
-            SupplyInteractionTracker interactionTracker
-    ) {
-        return createForName(LEGACY_ALIAS, planService, settingsStore, supplyStore, interactionTracker);
+    public static LiteralArgumentBuilder<ServerCommandSource> createAlias(BuildPlanService planService, MapartSettingsStore settingsStore, SupplyStore supplyStore) {
+        return createForName(LEGACY_ALIAS, planService, settingsStore, supplyStore);
     }
 
-    public static LiteralArgumentBuilder<ServerCommandSource> createRunnerAlias(
-            BuildPlanService planService,
-            MapartSettingsStore settingsStore,
-            SupplyStore supplyStore,
-            SupplyInteractionTracker interactionTracker
-    ) {
-        return createForName(MOD_NAME_ALIAS, planService, settingsStore, supplyStore, interactionTracker);
+    public static LiteralArgumentBuilder<ServerCommandSource> createRunnerAlias(BuildPlanService planService, MapartSettingsStore settingsStore, SupplyStore supplyStore) {
+        return createForName(MOD_NAME_ALIAS, planService, settingsStore, supplyStore);
     }
 
     private static LiteralArgumentBuilder<ServerCommandSource> createForName(
             String commandName,
             BuildPlanService planService,
             MapartSettingsStore settingsStore,
-            SupplyStore supplyStore,
-            SupplyInteractionTracker interactionTracker
+            SupplyStore supplyStore
     ) {
         return CommandManager.literal(commandName)
                 .then(CommandManager.literal("load")
@@ -187,9 +170,9 @@ public final class MapArtCommand {
                         }))
                 .then(CommandManager.literal("supply")
                         .then(CommandManager.literal("add")
-                                .executes(context -> addSupply(context.getSource(), supplyStore, interactionTracker, null))
+                                .executes(context -> addSupply(context.getSource(), supplyStore, null))
                                 .then(CommandManager.argument("name", StringArgumentType.greedyString())
-                                        .executes(context -> addSupply(context.getSource(), supplyStore, interactionTracker, StringArgumentType.getString(context, "name")))))
+                                        .executes(context -> addSupply(context.getSource(), supplyStore, StringArgumentType.getString(context, "name")))))
                         .then(CommandManager.literal("list")
                                 .executes(context -> listSupplies(context.getSource(), supplyStore)))
                         .then(CommandManager.literal("remove")
@@ -295,7 +278,7 @@ public final class MapArtCommand {
         return 1;
     }
 
-    private static int addSupply(ServerCommandSource source, SupplyStore supplyStore, SupplyInteractionTracker interactionTracker, String name) {
+    private static int addSupply(ServerCommandSource source, SupplyStore supplyStore, String name) {
         ServerPlayerEntity player;
         try {
             player = source.getPlayerOrThrow();
@@ -304,13 +287,11 @@ public final class MapArtCommand {
             return 0;
         }
 
-        BlockPos pos = interactionTracker.lastContainer(player, source.getWorld()).orElseGet(() -> {
-            HitResult hitResult = player.raycast(6.0, 0.0f, false);
-            if (hitResult.getType() == HitResult.Type.BLOCK) {
-                return ((BlockHitResult) hitResult).getBlockPos();
-            }
-            return player.getBlockPos();
-        });
+        BlockPos pos = player.getBlockPos();
+        HitResult hitResult = player.raycast(6.0, 0.0f, false);
+        if (hitResult.getType() == HitResult.Type.BLOCK) {
+            pos = ((BlockHitResult) hitResult).getBlockPos();
+        }
 
         String dimension = source.getWorld().getRegistryKey().getValue().toString();
         BlockPos savedPos = pos.toImmutable();

@@ -14,6 +14,7 @@ import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Optional;
 
 public class SupplyStore {
     private static final Gson GSON = new Gson();
@@ -52,9 +53,10 @@ public class SupplyStore {
 
     public synchronized int clear() {
         int removed = supplies.size();
-        supplies.clear();
-        nextId = 1;
-        saveToDisk();
+        if (removed > 0) {
+            supplies.clear();
+            saveToDisk();
+        }
         return removed;
     }
 
