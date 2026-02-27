@@ -10,17 +10,8 @@ import java.util.Map;
 import java.util.Set;
 
 public class BuildSession {
-    private static final Map<BuildPlanState, Set<BuildPlanState>> TRANSITIONS = createTransitions();
-    private static final Map<BuildPlanState, Set<BuildPlanState>> TRANSITIONS = Map.of(
-            BuildPlanState.IDLE, EnumSet.of(BuildPlanState.LOADED),
-            BuildPlanState.LOADED, EnumSet.of(BuildPlanState.BUILDING, BuildPlanState.ERROR),
-            BuildPlanState.BUILDING, EnumSet.of(BuildPlanState.PAUSED, BuildPlanState.COMPLETED, BuildPlanState.ERROR, BuildPlanState.LOADED),
-            BuildPlanState.PAUSED, EnumSet.of(BuildPlanState.BUILDING, BuildPlanState.ERROR, BuildPlanState.LOADED),
-            BuildPlanState.BUILDING, EnumSet.of(BuildPlanState.PAUSED, BuildPlanState.COMPLETED, BuildPlanState.ERROR),
-            BuildPlanState.PAUSED, EnumSet.of(BuildPlanState.BUILDING, BuildPlanState.ERROR),
-            BuildPlanState.ERROR, EnumSet.of(BuildPlanState.LOADED),
-            BuildPlanState.COMPLETED, EnumSet.of(BuildPlanState.BUILDING, BuildPlanState.LOADED)
-    );
+    // Transition rules are centralized in createTransitions() to avoid duplicate-key and redeclaration regressions.
+    private static final Map<BuildPlanState, Set<BuildPlanState>> VALID_TRANSITIONS_BY_STATE = createTransitions();
 
     private final BuildPlan plan;
     private final BuildProgress progress;
@@ -58,7 +49,7 @@ public class BuildSession {
     }
 
     public void transitionTo(BuildPlanState nextState) {
-        Set<BuildPlanState> validTargets = TRANSITIONS.getOrDefault(state, Set.of());
+        Set<BuildPlanState> validTargets = VALID_TRANSITIONS_BY_STATE.getOrDefault(state, Set.of());
         if (!validTargets.contains(nextState)) {
             throw new IllegalStateException("Invalid transition: " + state + " -> " + nextState);
         }
