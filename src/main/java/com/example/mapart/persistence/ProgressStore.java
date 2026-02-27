@@ -5,6 +5,7 @@ import com.example.mapart.plan.state.BuildPlanState;
 import com.example.mapart.plan.state.BuildSession;
 import com.google.gson.Gson;
 import net.fabricmc.loader.api.FabricLoader;
+import net.minecraft.util.math.BlockPos;
 
 import java.io.IOException;
 import java.io.Reader;
@@ -36,6 +37,7 @@ public class ProgressStore {
     public void saveProgress(BuildSession session) {
         snapshot = new Snapshot(
                 session.getPlan().sourcePath().toString(),
+                session.getOrigin(),
                 session.getState().name(),
                 session.getProgress().getCurrentRegionIndex(),
                 session.getProgress().getCurrentPlacementIndex(),
@@ -60,16 +62,17 @@ public class ProgressStore {
 
         try (Reader reader = Files.newBufferedReader(storagePath)) {
             StoredSnapshot stored = GSON.fromJson(reader, StoredSnapshot.class);
-            if (stored == null) {
+            if (stored == null || stored.loadedPlanId == null || stored.loadedPlanId.isBlank()) {
                 return;
             }
 
             this.snapshot = new Snapshot(
                     stored.loadedPlanId,
+                    stored.origin == null ? null : stored.origin.toBlockPos(),
                     stored.state,
-                    stored.currentRegionIndex,
-                    stored.currentPlacementIndex,
-                    stored.totalCompletedPlacements
+                    Math.max(0, stored.currentRegionIndex),
+                    Math.max(0, stored.currentPlacementIndex),
+                    Math.max(0, stored.totalCompletedPlacements)
             );
         } catch (RuntimeException exception) {
             MapArtMod.LOGGER.warn("Progress file {} is malformed; skipping restore.", storagePath, exception);
@@ -82,9 +85,10 @@ public class ProgressStore {
 
     private void saveToDisk() {
         StoredSnapshot stored = snapshot == null
-                ? new StoredSnapshot(null, null, 0, 0, 0)
+                ? new StoredSnapshot(null, null, null, 0, 0, 0)
                 : new StoredSnapshot(
                         snapshot.loadedPlanId(),
+                        snapshot.origin() == null ? null : StoredOrigin.from(snapshot.origin()),
                         snapshot.state(),
                         snapshot.currentRegionIndex(),
                         snapshot.currentPlacementIndex(),
@@ -116,6 +120,7 @@ public class ProgressStore {
 
     public record Snapshot(
             String loadedPlanId,
+            BlockPos origin,
             String state,
             int currentRegionIndex,
             int currentPlacementIndex,
@@ -132,14 +137,29 @@ public class ProgressStore {
                 return Optional.empty();
             }
         }
+
+        public Optional<BlockPos> originPos() {
+            return Optional.ofNullable(origin);
+        }
     }
 
     private record StoredSnapshot(
             String loadedPlanId,
+            StoredOrigin origin,
             String state,
             int currentRegionIndex,
             int currentPlacementIndex,
             int totalCompletedPlacements
     ) {
+    }
+
+    private record StoredOrigin(int x, int y, int z) {
+        static StoredOrigin from(BlockPos pos) {
+            return new StoredOrigin(pos.getX(), pos.getY(), pos.getZ());
+        }
+
+        BlockPos toBlockPos() {
+            return new BlockPos(x, y, z);
+        }
     }
 }

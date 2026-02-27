@@ -29,7 +29,8 @@ public class BuildCoordinator {
         session = new BuildSession(plan);
         session.transitionTo(BuildPlanState.LOADED);
         configStore.rememberLoadedPlan(plan);
-        progressStore.initializePlanProgress(session);
+        restoreProgressForLoadedPlan(session);
+        progressStore.saveProgress(session);
         return session;
     }
 
@@ -224,6 +225,9 @@ public class BuildCoordinator {
     }
 
     private ValidationResult validateForNext(ServerCommandSource source) {
+        if (source == null || source.getServer() == null) {
+            return ValidationResult.error("Client/server context is unavailable.");
+        }
         if (session == null) {
             return ValidationResult.error("No plan loaded.");
         }
@@ -239,12 +243,10 @@ public class BuildCoordinator {
 
         BuildPlan plan = session.getPlan();
         if (session.getCurrentRegionIndex() < 0 || session.getCurrentRegionIndex() > plan.regions().size()) {
-            markSessionError();
             return ValidationResult.error("Invalid current region index.");
         }
 
         if (session.getCurrentPlacementIndex() < 0 || session.getCurrentPlacementIndex() > plan.placements().size()) {
-            markSessionError();
             return ValidationResult.error("Invalid current placement index.");
         }
 
@@ -261,6 +263,46 @@ public class BuildCoordinator {
         Placement placement = plan.placements().get(nextIndex);
         return placementResolver.resolveAbsolute(activeSession, placement)
                 .map(pos -> new NextTarget(placement, pos));
+    }
+
+    private void restoreProgressForLoadedPlan(BuildSession activeSession) {
+        ProgressStore.Snapshot snapshot = progressStore.getSnapshot().orElse(null);
+        if (snapshot == null || !activeSession.getPlan().sourcePath().toString().equals(snapshot.loadedPlanId())) {
+            configStore.getLastOrigin().ifPresent(activeSession::setOrigin);
+            return;
+        }
+
+        snapshot.originPos().ifPresent(activeSession::setOrigin);
+        activeSession.setCurrentPlacementIndex(snapshot.currentPlacementIndex());
+        activeSession.setCurrentRegionIndex(snapshot.currentRegionIndex());
+        activeSession.getProgress().setTotalCompletedPlacements(snapshot.totalCompletedPlacements());
+        applyRestoredState(activeSession, snapshot.parsedState().orElse(BuildPlanState.LOADED));
+    }
+
+    private void applyRestoredState(BuildSession activeSession, BuildPlanState restoredState) {
+        if (restoredState == BuildPlanState.LOADED) {
+            return;
+        }
+
+        try {
+            switch (restoredState) {
+                case BUILDING -> activeSession.transitionTo(BuildPlanState.BUILDING);
+                case PAUSED -> {
+                    activeSession.transitionTo(BuildPlanState.BUILDING);
+                    activeSession.transitionTo(BuildPlanState.PAUSED);
+                }
+                case COMPLETED -> {
+                    activeSession.transitionTo(BuildPlanState.BUILDING);
+                    activeSession.transitionTo(BuildPlanState.COMPLETED);
+                }
+                case ERROR -> activeSession.transitionTo(BuildPlanState.ERROR);
+                case IDLE -> {
+                    // Keep LOADED for invalid restore state.
+                }
+            }
+        } catch (IllegalStateException ignored) {
+            // Keep LOADED if restore transitions are invalid.
+        }
     }
 
     private void updateRegionIndex(BuildProgress progress, List<Region> regions) {
