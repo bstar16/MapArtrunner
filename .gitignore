@@ -31,3 +31,4 @@ nb-configuration.xml
 # Environment
 .env
 .env.local
+/run/
