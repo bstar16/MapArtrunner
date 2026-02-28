@@ -1,7 +1,5 @@
 package com.example.mapart.plan;
 
-import net.minecraft.server.command.ServerCommandSource;
-
 import java.nio.file.Path;
 
 public interface PlanLoader {
@@ -9,5 +7,5 @@ public interface PlanLoader {
 
     String formatId();
 
-    BuildPlan load(Path path, ServerCommandSource source) throws Exception;
+    BuildPlan load(Path path) throws Exception;
 }

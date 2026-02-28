@@ -6,8 +6,8 @@ import com.example.mapart.plan.BuildPlan;
 import com.example.mapart.plan.Placement;
 import com.example.mapart.plan.Region;
 import net.minecraft.block.BlockState;
-import net.minecraft.server.command.ServerCommandSource;
-import net.minecraft.server.world.ServerWorld;
+import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.world.ClientWorld;
 import net.minecraft.util.math.BlockPos;
 
 import java.util.List;
@@ -129,8 +129,8 @@ public class BuildCoordinator {
         return Optional.empty();
     }
 
-    public StepResult next(ServerCommandSource source) {
-        ValidationResult validation = validateForNext(source);
+    public StepResult next(MinecraftClient client) {
+        ValidationResult validation = validateForNext(client);
         if (!validation.valid()) {
             return StepResult.error(validation.message());
         }
@@ -146,7 +146,7 @@ public class BuildCoordinator {
                 return StepResult.error("Failed to resolve target block position.");
             }
 
-            ServerWorld world = source.getWorld();
+            ClientWorld world = client.world;
             BlockPos absolute = targetPos.get();
             if (!world.isPosLoaded(absolute)) {
                 return StepResult.error("Target chunk is not loaded at " + absolute.toShortString() + ".");
@@ -224,9 +224,9 @@ public class BuildCoordinator {
         }
     }
 
-    private ValidationResult validateForNext(ServerCommandSource source) {
-        if (source == null || source.getServer() == null) {
-            return ValidationResult.error("Client/server context is unavailable.");
+    private ValidationResult validateForNext(MinecraftClient client) {
+        if (client == null || client.player == null) {
+            return ValidationResult.error("Client context is unavailable.");
         }
         if (session == null) {
             return ValidationResult.error("No plan loaded.");
@@ -237,7 +237,7 @@ public class BuildCoordinator {
         if (session.getOrigin() == null) {
             return ValidationResult.error("Origin is not set.");
         }
-        if (source.getWorld() == null) {
+        if (client.world == null) {
             return ValidationResult.error("World is unavailable.");
         }
 

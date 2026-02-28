@@ -1,8 +1,8 @@
 package com.example.mapart.supply;
 
 import net.fabricmc.fabric.api.event.player.UseBlockCallback;
+import net.minecraft.client.network.ClientPlayerEntity;
 import net.minecraft.inventory.Inventory;
-import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.text.Text;
 import net.minecraft.util.ActionResult;
 import net.minecraft.util.math.BlockPos;
@@ -21,7 +21,7 @@ public class SupplyInteractionTracker {
 
     public void registerCallbacks() {
         UseBlockCallback.EVENT.register((player, world, hand, hitResult) -> {
-            if (world.isClient()) {
+            if (!world.isClient()) {
                 return ActionResult.PASS;
             }
 
@@ -47,7 +47,7 @@ public class SupplyInteractionTracker {
         });
     }
 
-    public void beginRegistration(ServerPlayerEntity player, String name) {
+    public void beginRegistration(ClientPlayerEntity player, String name) {
         pendingByPlayer.put(player.getUuid(), new PendingRegistration(name));
     }
 
