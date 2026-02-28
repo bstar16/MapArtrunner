@@ -1,5 +1,7 @@
 package com.example.mapart;
 
+import com.example.mapart.baritone.BaritoneFacade;
+import com.example.mapart.baritone.BaritoneFacadeFactory;
 import com.example.mapart.command.MapArtCommand;
 import com.example.mapart.persistence.ConfigStore;
 import com.example.mapart.persistence.ProgressStore;
@@ -32,9 +34,10 @@ public class MapArtClientMod implements ClientModInitializer {
         SupplyStore supplyStore = new SupplyStore();
         SupplyInteractionTracker supplyInteractionTracker = new SupplyInteractionTracker(supplyStore);
         supplyInteractionTracker.registerCallbacks();
+        BaritoneFacade baritoneFacade = BaritoneFacadeFactory.create();
         BuildCoordinator buildCoordinator = new BuildCoordinator(new WorldPlacementResolver(), configStore, progressStore);
         BuildPlanService buildPlanService = new BuildPlanService(loaderRegistry, buildCoordinator);
-        MapArtRuntime.initialize(buildPlanService, configStore, progressStore, settingsStore, supplyStore);
+        MapArtRuntime.initialize(buildPlanService, configStore, progressStore, settingsStore, supplyStore, baritoneFacade);
 
         ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) -> {
             dispatcher.register(MapArtCommand.create(buildPlanService, settingsStore, supplyStore, supplyInteractionTracker));
@@ -47,5 +50,6 @@ public class MapArtClientMod implements ClientModInitializer {
         WorldRenderEvents.AFTER_TRANSLUCENT.register(new SchematicOverlayRenderer(resolver));
 
         MapArtMod.LOGGER.info("Initialized mapart client command pipeline with /mapart, /maprunner, and /mapartrunner");
+        MapArtMod.LOGGER.info("Baritone facade backend: {}", baritoneFacade.getClass().getSimpleName());
     }
 }
