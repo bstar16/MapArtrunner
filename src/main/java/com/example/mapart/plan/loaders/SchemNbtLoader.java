@@ -12,7 +12,6 @@ import net.minecraft.nbt.NbtIo;
 import net.minecraft.nbt.NbtList;
 import net.minecraft.nbt.NbtSizeTracker;
 import net.minecraft.registry.Registries;
-import net.minecraft.server.command.ServerCommandSource;
 import net.minecraft.util.Identifier;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.ChunkPos;
@@ -41,7 +40,7 @@ public class SchemNbtLoader implements PlanLoader {
     }
 
     @Override
-    public BuildPlan load(Path path, ServerCommandSource source) throws IOException {
+    public BuildPlan load(Path path) throws IOException {
         NbtCompound fileRoot = NbtIo.readCompressed(path, NbtSizeTracker.ofUnlimitedBytes());
         if (fileRoot == null) {
             throw new IllegalArgumentException("Could not read NBT payload from " + path);

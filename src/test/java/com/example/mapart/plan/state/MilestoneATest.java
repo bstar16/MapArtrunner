@@ -8,7 +8,6 @@ import com.example.mapart.plan.PlanLoader;
 import com.example.mapart.plan.PlanLoaderRegistry;
 import com.example.mapart.plan.Region;
 import net.minecraft.block.Block;
-import net.minecraft.server.command.ServerCommandSource;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Vec3i;
 import org.junit.jupiter.api.Test;
@@ -35,7 +34,7 @@ class MilestoneATest {
         BuildPlanService service = createService(tempDir);
         Path fixturePath = writeFixture(tempDir.resolve("valid.fixture"));
 
-        BuildPlan plan = service.load(fixturePath, null);
+        BuildPlan plan = service.load(fixturePath);
 
         assertNotNull(plan);
         assertEquals(fixturePath, plan.sourcePath());
@@ -44,7 +43,7 @@ class MilestoneATest {
     @Test
     void validFixtureHasNonEmptyPlacements() throws Exception {
         BuildPlanService service = createService(tempDir);
-        BuildPlan plan = service.load(writeFixture(tempDir.resolve("placements.fixture")), null);
+        BuildPlan plan = service.load(writeFixture(tempDir.resolve("placements.fixture")));
 
         assertFalse(plan.placements().isEmpty());
     }
@@ -52,7 +51,7 @@ class MilestoneATest {
     @Test
     void regionSplittingIsChunkAligned() throws Exception {
         BuildPlanService service = createService(tempDir);
-        BuildPlan plan = service.load(writeFixture(tempDir.resolve("regions.fixture")), null);
+        BuildPlan plan = service.load(writeFixture(tempDir.resolve("regions.fixture")));
 
         assertTrue(plan.regions().size() >= 2, "fixture should span at least two chunks");
         for (Region region : plan.regions()) {
@@ -70,7 +69,7 @@ class MilestoneATest {
     @Test
     void materialCountsAreComputed() throws Exception {
         BuildPlanService service = createService(tempDir);
-        BuildPlan plan = service.load(writeFixture(tempDir.resolve("materials.fixture")), null);
+        BuildPlan plan = service.load(writeFixture(tempDir.resolve("materials.fixture")));
 
         assertEquals(2, plan.materialCounts().getOrDefault(TestFixturePlanLoader.STONE_BLOCK, 0));
         assertEquals(1, plan.materialCounts().getOrDefault(TestFixturePlanLoader.DIRT_BLOCK, 0));
@@ -79,7 +78,7 @@ class MilestoneATest {
     @Test
     void loadedPlanInfoEquivalentIsAvailableFromService() throws Exception {
         BuildPlanService service = createService(tempDir);
-        service.load(writeFixture(tempDir.resolve("info.fixture")), null);
+        service.load(writeFixture(tempDir.resolve("info.fixture")));
 
         assertTrue(service.currentPlan().isPresent());
         assertTrue(service.currentSession().isPresent());
@@ -88,7 +87,7 @@ class MilestoneATest {
     @Test
     void unloadClearsCurrentPlan() throws Exception {
         BuildPlanService service = createService(tempDir);
-        service.load(writeFixture(tempDir.resolve("unload.fixture")), null);
+        service.load(writeFixture(tempDir.resolve("unload.fixture")));
 
         assertTrue(service.unload());
         assertTrue(service.currentPlan().isEmpty());
@@ -101,11 +100,11 @@ class MilestoneATest {
 
         Path unsupportedPath = tempDir.resolve("unsupported.txt");
         Files.writeString(unsupportedPath, "0,0,0,stone\n");
-        assertThrows(IllegalArgumentException.class, () -> service.load(unsupportedPath, null));
+        assertThrows(IllegalArgumentException.class, () -> service.load(unsupportedPath));
 
         Path malformedPath = tempDir.resolve("malformed.fixture");
         Files.writeString(malformedPath, "not,valid\n");
-        assertThrows(IllegalArgumentException.class, () -> service.load(malformedPath, null));
+        assertThrows(IllegalArgumentException.class, () -> service.load(malformedPath));
     }
 
     private static BuildPlanService createService(Path tempDir) {
@@ -156,7 +155,7 @@ class MilestoneATest {
         }
 
         @Override
-        public BuildPlan load(Path path, ServerCommandSource source) throws Exception {
+        public BuildPlan load(Path path) throws Exception {
             List<String> lines = Files.readAllLines(path);
             List<Placement> placements = new ArrayList<>();
             Map<Block, Integer> counts = new LinkedHashMap<>();

@@ -13,11 +13,10 @@ import com.example.mapart.supply.SupplyStore;
 import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import com.mojang.brigadier.builder.LiteralArgumentBuilder;
+import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager;
+import net.fabricmc.fabric.api.client.command.v2.FabricClientCommandSource;
 import net.minecraft.block.Block;
 import net.minecraft.registry.Registries;
-import net.minecraft.server.command.CommandManager;
-import net.minecraft.server.command.ServerCommandSource;
-import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.text.Text;
 import net.minecraft.util.math.BlockPos;
 
@@ -34,7 +33,7 @@ public final class MapArtCommand {
     private MapArtCommand() {
     }
 
-    public static LiteralArgumentBuilder<ServerCommandSource> create(
+    public static LiteralArgumentBuilder<FabricClientCommandSource> create(
             BuildPlanService planService,
             MapartSettingsStore settingsStore,
             SupplyStore supplyStore,
@@ -43,7 +42,7 @@ public final class MapArtCommand {
         return createForName(PRIMARY_COMMAND, planService, settingsStore, supplyStore, supplyInteractionTracker);
     }
 
-    public static LiteralArgumentBuilder<ServerCommandSource> createAlias(
+    public static LiteralArgumentBuilder<FabricClientCommandSource> createAlias(
             BuildPlanService planService,
             MapartSettingsStore settingsStore,
             SupplyStore supplyStore,
@@ -52,7 +51,7 @@ public final class MapArtCommand {
         return createForName(LEGACY_ALIAS, planService, settingsStore, supplyStore, supplyInteractionTracker);
     }
 
-    public static LiteralArgumentBuilder<ServerCommandSource> createRunnerAlias(
+    public static LiteralArgumentBuilder<FabricClientCommandSource> createRunnerAlias(
             BuildPlanService planService,
             MapartSettingsStore settingsStore,
             SupplyStore supplyStore,
@@ -61,48 +60,43 @@ public final class MapArtCommand {
         return createForName(MOD_NAME_ALIAS, planService, settingsStore, supplyStore, supplyInteractionTracker);
     }
 
-    private static LiteralArgumentBuilder<ServerCommandSource> createForName(
+    private static LiteralArgumentBuilder<FabricClientCommandSource> createForName(
             String commandName,
             BuildPlanService planService,
             MapartSettingsStore settingsStore,
             SupplyStore supplyStore,
             SupplyInteractionTracker supplyInteractionTracker
     ) {
-        return CommandManager.literal(commandName)
-                .then(CommandManager.literal("load")
-                        .requires(source -> source.hasPermissionLevel(2))
-                        .then(CommandManager.argument("path", StringArgumentType.greedyString())
+        return ClientCommandManager.literal(commandName)
+                .then(ClientCommandManager.literal("load")
+                        .then(ClientCommandManager.argument("path", StringArgumentType.greedyString())
                                 .executes(context -> {
                                     String rawPath = StringArgumentType.getString(context, "path");
                                     Path path = Path.of(rawPath).toAbsolutePath().normalize();
                                     try {
-                                        BuildPlan plan = planService.load(path, context.getSource());
-                                        context.getSource().sendFeedback(
-                                                () -> Text.literal("Loaded plan " + path.getFileName() + " ("
-                                                        + plan.placements().size() + " placements, "
-                                                        + plan.regions().size() + " regions)."),
-                                                false
-                                        );
+                                        BuildPlan plan = planService.load(path);
+                                        context.getSource().sendFeedback(Text.literal("Loaded plan " + path.getFileName() + " ("
+                                                + plan.placements().size() + " placements, "
+                                                + plan.regions().size() + " regions)."));
                                         return 1;
                                     } catch (Exception exception) {
                                         context.getSource().sendError(Text.literal("Failed to load plan: " + exception.getMessage()));
                                         return 0;
                                     }
                                 })))
-                .then(CommandManager.literal("unload")
-                        .requires(source -> source.hasPermissionLevel(2))
+                .then(ClientCommandManager.literal("unload")
                         .executes(context -> {
                             if (!planService.unload()) {
-                                context.getSource().sendFeedback(() -> Text.literal("No build plan loaded."), false);
+                                context.getSource().sendFeedback(Text.literal("No build plan loaded."));
                                 return 0;
                             }
 
-                            context.getSource().sendFeedback(() -> Text.literal("Unloaded current build plan and cleared session progress."), false);
+                            context.getSource().sendFeedback(Text.literal("Unloaded current build plan and cleared session progress."));
                             return 1;
                         }))
-                .then(CommandManager.literal("info")
+                .then(ClientCommandManager.literal("info")
                         .executes(context -> showPlanInfo(planService, commandName, context.getSource())))
-                .then(CommandManager.literal("setorigin")
+                .then(ClientCommandManager.literal("setorigin")
                         .executes(context -> {
                             Optional<BuildSession> session = planService.currentSession();
                             if (session.isEmpty()) {
@@ -117,54 +111,58 @@ public final class MapArtCommand {
                                 return 0;
                             }
 
-                            context.getSource().sendFeedback(() -> Text.literal("Build origin set to " + playerPos.toShortString() + "."), false);
+                            context.getSource().sendFeedback(Text.literal("Origin set to " + playerPos.toShortString()));
                             return 1;
                         }))
-                .then(CommandManager.literal("status")
+                .then(ClientCommandManager.literal("status")
                         .executes(context -> showStatus(planService, context.getSource())))
-                .then(CommandManager.literal("start")
+                .then(ClientCommandManager.literal("start")
                         .executes(context -> {
                             Optional<String> error = planService.coordinator().start();
                             if (error.isPresent()) {
                                 context.getSource().sendError(Text.literal(error.get()));
                                 return 0;
                             }
-                            context.getSource().sendFeedback(() -> Text.literal("Build session started."), false);
+
+                            context.getSource().sendFeedback(Text.literal("Build session started."));
                             return 1;
                         }))
-                .then(CommandManager.literal("pause")
+                .then(ClientCommandManager.literal("pause")
                         .executes(context -> {
                             Optional<String> error = planService.coordinator().pause();
                             if (error.isPresent()) {
                                 context.getSource().sendError(Text.literal(error.get()));
                                 return 0;
                             }
-                            context.getSource().sendFeedback(() -> Text.literal("Build session paused."), false);
+
+                            context.getSource().sendFeedback(Text.literal("Build session paused."));
                             return 1;
                         }))
-                .then(CommandManager.literal("resume")
+                .then(ClientCommandManager.literal("resume")
                         .executes(context -> {
                             Optional<String> error = planService.coordinator().resume();
                             if (error.isPresent()) {
                                 context.getSource().sendError(Text.literal(error.get()));
                                 return 0;
                             }
-                            context.getSource().sendFeedback(() -> Text.literal("Build session resumed."), false);
+
+                            context.getSource().sendFeedback(Text.literal("Build session resumed."));
                             return 1;
                         }))
-                .then(CommandManager.literal("stop")
+                .then(ClientCommandManager.literal("stop")
                         .executes(context -> {
                             Optional<String> error = planService.coordinator().stop();
                             if (error.isPresent()) {
                                 context.getSource().sendError(Text.literal(error.get()));
                                 return 0;
                             }
-                            context.getSource().sendFeedback(() -> Text.literal("Build stopped and progress reset."), false);
+
+                            context.getSource().sendFeedback(Text.literal("Build session stopped and progress reset."));
                             return 1;
                         }))
-                .then(CommandManager.literal("next")
+                .then(ClientCommandManager.literal("next")
                         .executes(context -> {
-                            BuildCoordinator.StepResult result = planService.coordinator().next(context.getSource());
+                            BuildCoordinator.StepResult result = planService.coordinator().next(context.getSource().getClient());
                             if (!result.actionable() && !result.done()) {
                                 context.getSource().sendError(Text.literal(result.message()));
                                 return 0;
@@ -172,43 +170,42 @@ public final class MapArtCommand {
 
                             if (result.done()) {
                                 planService.coordinator().unload();
-                                context.getSource().sendFeedback(() -> Text.literal("Build completed and schematic unloaded."), false);
+                                context.getSource().sendFeedback(Text.literal("Build completed and schematic unloaded."));
                                 return 1;
                             }
 
                             Placement placement = result.placement();
-                            context.getSource().sendFeedback(() -> Text.literal(
+                            context.getSource().sendFeedback(Text.literal(
                                     "Next placement: " + Registries.BLOCK.getId(placement.block())
                                             + " at " + result.targetPos().toShortString()
-                            ), false);
+                            ));
                             return 1;
                         }))
-                .then(CommandManager.literal("supply")
-                        .then(CommandManager.literal("add")
+                .then(ClientCommandManager.literal("supply")
+                        .then(ClientCommandManager.literal("add")
                                 .executes(context -> addSupply(context.getSource(), supplyInteractionTracker, null))
-                                .then(CommandManager.argument("name", StringArgumentType.greedyString())
+                                .then(ClientCommandManager.argument("name", StringArgumentType.greedyString())
                                         .executes(context -> addSupply(context.getSource(), supplyInteractionTracker, StringArgumentType.getString(context, "name")))))
-                        .then(CommandManager.literal("list")
+                        .then(ClientCommandManager.literal("list")
                                 .executes(context -> listSupplies(context.getSource(), supplyStore)))
-                        .then(CommandManager.literal("remove")
-                                .then(CommandManager.argument("id", IntegerArgumentType.integer(1))
+                        .then(ClientCommandManager.literal("remove")
+                                .then(ClientCommandManager.argument("id", IntegerArgumentType.integer(1))
                                         .executes(context -> removeSupply(context.getSource(), supplyStore, IntegerArgumentType.getInteger(context, "id")))))
-                        .then(CommandManager.literal("clear")
+                        .then(ClientCommandManager.literal("clear")
                                 .executes(context -> clearSupplies(context.getSource(), supplyStore))))
-                .then(CommandManager.literal("settings")
+                .then(ClientCommandManager.literal("settings")
                         .executes(context -> showSettings(context.getSource(), settingsStore))
-                        .then(CommandManager.literal("set")
-                                .then(CommandManager.argument("key", StringArgumentType.word())
-                                        .then(CommandManager.argument("value", StringArgumentType.greedyString())
+                        .then(ClientCommandManager.literal("set")
+                                .then(ClientCommandManager.argument("key", StringArgumentType.word())
+                                        .then(ClientCommandManager.argument("value", StringArgumentType.greedyString())
                                                 .executes(context -> setSetting(
                                                         context.getSource(),
                                                         settingsStore,
                                                         StringArgumentType.getString(context, "key"),
                                                         StringArgumentType.getString(context, "value")
                                                 ))))))
-                .then(CommandManager.literal("debug")
-                        .requires(source -> source.hasPermissionLevel(2))
-                        .then(CommandManager.literal("secondlast")
+                .then(ClientCommandManager.literal("debug")
+                        .then(ClientCommandManager.literal("secondlast")
                                 .executes(context -> {
                                     Optional<String> error = planService.coordinator().debugSkipToSecondLastPlacement();
                                     if (error.isPresent()) {
@@ -216,17 +213,14 @@ public final class MapArtCommand {
                                         return 0;
                                     }
 
-                                    context.getSource().sendFeedback(
-                                            () -> Text.literal("Debug: moved progress to the second last placement. Use /"
-                                                    + commandName + " next to continue."),
-                                            false
-                                    );
+                                    context.getSource().sendFeedback(Text.literal("Debug: moved progress to the second last placement. Use /"
+                                            + commandName + " next to continue."));
                                     return 1;
                                 }))
-                        );
+                );
     }
 
-    private static int showPlanInfo(BuildPlanService planService, String commandName, ServerCommandSource source) {
+    private static int showPlanInfo(BuildPlanService planService, String commandName, FabricClientCommandSource source) {
         BuildPlan plan = planService.currentPlan().orElse(null);
         if (plan == null) {
             source.sendError(Text.literal(
@@ -235,129 +229,118 @@ public final class MapArtCommand {
             return 0;
         }
 
-        source.sendFeedback(
-                () -> Text.literal("Plan format: " + plan.sourceFormat() + ", source: " + plan.sourcePath()),
-                false
-        );
-        source.sendFeedback(
-                () -> Text.literal("Dimensions: " + plan.dimensions().getX() + "x"
-                        + plan.dimensions().getY() + "x" + plan.dimensions().getZ()
-                        + ", placements: " + plan.placements().size()
-                        + ", chunk regions: " + plan.regions().size()),
-                false
-        );
+        source.sendFeedback(Text.literal("Plan format: " + plan.sourceFormat() + ", source: " + plan.sourcePath()));
+        source.sendFeedback(Text.literal("Dimensions: " + plan.dimensions().getX() + "x"
+                + plan.dimensions().getY() + "x" + plan.dimensions().getZ()
+                + ", placements: " + plan.placements().size()
+                + ", chunk regions: " + plan.regions().size()));
 
-        source.sendFeedback(() -> Text.literal("Required materials:"), false);
+        source.sendFeedback(Text.literal("Required materials:"));
         plan.materialCounts().entrySet().stream()
                 .sorted(Map.Entry.<Block, Integer>comparingByValue(Comparator.reverseOrder()))
                 .limit(10)
-                .forEach(entry -> source.sendFeedback(() -> Text.literal("- "
-                        + Registries.BLOCK.getId(entry.getKey()) + ": " + entry.getValue()), false));
+                .forEach(entry -> source.sendFeedback(Text.literal("- "
+                        + Registries.BLOCK.getId(entry.getKey()) + ": " + entry.getValue())));
 
         if (plan.materialCounts().size() > 10) {
             int remainder = plan.materialCounts().size() - 10;
-            source.sendFeedback(
-                    () -> Text.literal("... and " + remainder + " more materials."),
-                    false
-            );
+            source.sendFeedback(Text.literal("... and " + remainder + " more materials."));
         }
 
         return 1;
     }
 
-    private static int showStatus(BuildPlanService planService, ServerCommandSource source) {
+    private static int showStatus(BuildPlanService planService, FabricClientCommandSource source) {
         Optional<BuildCoordinator.SessionStatus> statusOptional = planService.coordinator().sessionStatus();
         if (statusOptional.isEmpty()) {
-            source.sendFeedback(() -> Text.literal("State: IDLE (no plan loaded)."), false);
+            source.sendFeedback(Text.literal("State: IDLE (no plan loaded)."));
             return 1;
         }
 
         BuildCoordinator.SessionStatus status = statusOptional.get();
-        source.sendFeedback(() -> Text.literal("Plan: " + status.planId()), false);
-        source.sendFeedback(() -> Text.literal("State: " + status.state()), false);
-        source.sendFeedback(() -> Text.literal("Origin: " + (status.origin() == null ? "not set" : status.origin().toShortString())), false);
-        source.sendFeedback(() -> Text.literal("Region: " + status.currentRegionIndex() + " / " + status.totalRegions()), false);
-        source.sendFeedback(() -> Text.literal("Placement: " + status.currentPlacementIndex() + " / " + status.totalPlacements()), false);
-        source.sendFeedback(() -> Text.literal("Completed placements: " + status.totalCompletedPlacements()), false);
+        source.sendFeedback(Text.literal("Plan: " + status.planId()));
+        source.sendFeedback(Text.literal("State: " + status.state()));
+        source.sendFeedback(Text.literal("Origin: " + (status.origin() == null ? "not set" : status.origin().toShortString())));
+        source.sendFeedback(Text.literal("Region: " + status.currentRegionIndex() + " / " + status.totalRegions()));
+        source.sendFeedback(Text.literal("Placement: " + status.currentPlacementIndex() + " / " + status.totalPlacements()));
+        source.sendFeedback(Text.literal("Completed placements: " + status.totalCompletedPlacements()));
 
         if (status.nextTarget().isPresent()) {
             BuildCoordinator.NextTarget nextTarget = status.nextTarget().get();
-            source.sendFeedback(() -> Text.literal("Next block: " + Registries.BLOCK.getId(nextTarget.placement().block())), false);
-            source.sendFeedback(() -> Text.literal("Next target: " + nextTarget.absolutePos().toShortString()), false);
+            source.sendFeedback(Text.literal("Next block: " + Registries.BLOCK.getId(nextTarget.placement().block())));
+            source.sendFeedback(Text.literal("Next target: " + nextTarget.absolutePos().toShortString()));
         } else {
-            source.sendFeedback(() -> Text.literal("Next block: none"), false);
-            source.sendFeedback(() -> Text.literal("Next target: none"), false);
+            source.sendFeedback(Text.literal("Next block: none"));
+            source.sendFeedback(Text.literal("Next target: none"));
         }
 
         return 1;
     }
 
-    private static int addSupply(ServerCommandSource source, SupplyInteractionTracker supplyInteractionTracker, String name) {
-        ServerPlayerEntity player;
-        try {
-            player = source.getPlayerOrThrow();
-        } catch (Exception exception) {
+    private static int addSupply(FabricClientCommandSource source, SupplyInteractionTracker supplyInteractionTracker, String name) {
+        var player = source.getPlayer();
+        if (player == null) {
             source.sendError(Text.literal("Supply registration requires a player."));
             return 0;
         }
 
         supplyInteractionTracker.beginRegistration(player, name);
-        source.sendFeedback(() -> Text.literal("Right-click a container to register a supply point"
-                + (name == null ? "." : " named '" + name + "'.")), false);
+        source.sendFeedback(Text.literal("Right-click a container to register a supply point"
+                + (name == null ? "." : " named '" + name + "'.")));
         return 1;
     }
 
-    private static int listSupplies(ServerCommandSource source, SupplyStore supplyStore) {
+    private static int listSupplies(FabricClientCommandSource source, SupplyStore supplyStore) {
         var supplies = supplyStore.list();
         if (supplies.isEmpty()) {
-            source.sendFeedback(() -> Text.literal("No supplies registered."), false);
+            source.sendFeedback(Text.literal("No supplies registered."));
             return 1;
         }
 
-        source.sendFeedback(() -> Text.literal("Supply points (" + supplies.size() + ")"), false);
+        source.sendFeedback(Text.literal("Supply points (" + supplies.size() + ")"));
         for (SupplyPoint point : supplies) {
-            source.sendFeedback(() -> Text.literal("#" + point.id() + " " + point.pos().toShortString() + " " + point.dimensionKey()
-                    + (point.name() == null ? "" : " - " + point.name())), false);
+            source.sendFeedback(Text.literal("#" + point.id() + " " + point.pos().toShortString() + " " + point.dimensionKey()
+                    + (point.name() == null ? "" : " - " + point.name())));
         }
         return 1;
     }
 
-    private static int removeSupply(ServerCommandSource source, SupplyStore supplyStore, int id) {
+    private static int removeSupply(FabricClientCommandSource source, SupplyStore supplyStore, int id) {
         if (!supplyStore.removeById(id)) {
             source.sendError(Text.literal("Supply id not found: " + id));
             return 0;
         }
 
-        source.sendFeedback(() -> Text.literal("Removed supply #" + id), false);
+        source.sendFeedback(Text.literal("Removed supply #" + id));
         return 1;
     }
 
-    private static int clearSupplies(ServerCommandSource source, SupplyStore supplyStore) {
+    private static int clearSupplies(FabricClientCommandSource source, SupplyStore supplyStore) {
         int removed = supplyStore.clear();
-        source.sendFeedback(() -> Text.literal("Cleared " + removed + " supply point(s)."), false);
+        source.sendFeedback(Text.literal("Cleared " + removed + " supply point(s)."));
         return 1;
     }
 
-    private static int showSettings(ServerCommandSource source, MapartSettingsStore settingsStore) {
+    private static int showSettings(FabricClientCommandSource source, MapartSettingsStore settingsStore) {
         MapartSettings settings = settingsStore.current();
-        source.sendFeedback(() -> Text.literal("showHud=" + settings.showHud()), false);
-        source.sendFeedback(() -> Text.literal("showSchematicOverlay=" + settings.showSchematicOverlay()), false);
-        source.sendFeedback(() -> Text.literal("overlayCurrentRegionOnly=" + settings.overlayCurrentRegionOnly()), false);
-        source.sendFeedback(() -> Text.literal("overlayShowOnlyIncorrect=" + settings.overlayShowOnlyIncorrect()), false);
-        source.sendFeedback(() -> Text.literal("hudCompact=" + settings.hudCompact()), false);
-        source.sendFeedback(() -> Text.literal("hudX=" + settings.hudX()), false);
-        source.sendFeedback(() -> Text.literal("hudY=" + settings.hudY()), false);
+        source.sendFeedback(Text.literal("showHud=" + settings.showHud()));
+        source.sendFeedback(Text.literal("showSchematicOverlay=" + settings.showSchematicOverlay()));
+        source.sendFeedback(Text.literal("overlayCurrentRegionOnly=" + settings.overlayCurrentRegionOnly()));
+        source.sendFeedback(Text.literal("overlayShowOnlyIncorrect=" + settings.overlayShowOnlyIncorrect()));
+        source.sendFeedback(Text.literal("hudCompact=" + settings.hudCompact()));
+        source.sendFeedback(Text.literal("hudX=" + settings.hudX()));
+        source.sendFeedback(Text.literal("hudY=" + settings.hudY()));
         return 1;
     }
 
-    private static int setSetting(ServerCommandSource source, MapartSettingsStore settingsStore, String key, String value) {
+    private static int setSetting(FabricClientCommandSource source, MapartSettingsStore settingsStore, String key, String value) {
         Optional<String> error = settingsStore.set(key, value);
         if (error.isPresent()) {
             source.sendError(Text.literal(error.get()));
             return 0;
         }
 
-        source.sendFeedback(() -> Text.literal("Updated " + key + " = " + value), false);
+        source.sendFeedback(Text.literal("Updated " + key + " = " + value));
         return 1;
     }
 }

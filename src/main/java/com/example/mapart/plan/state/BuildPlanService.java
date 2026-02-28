@@ -3,8 +3,6 @@ package com.example.mapart.plan.state;
 import com.example.mapart.plan.BuildPlan;
 import com.example.mapart.plan.PlanLoader;
 import com.example.mapart.plan.PlanLoaderRegistry;
-import net.minecraft.server.command.ServerCommandSource;
-
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Optional;
@@ -18,7 +16,7 @@ public class BuildPlanService {
         this.buildCoordinator = buildCoordinator;
     }
 
-    public BuildPlan load(Path path, ServerCommandSource source) throws Exception {
+    public BuildPlan load(Path path) throws Exception {
         if (!Files.exists(path)) {
             throw new IllegalArgumentException("Path does not exist: " + path);
         }
@@ -26,7 +24,7 @@ public class BuildPlanService {
         PlanLoader loader = loaderRegistry.findLoader(path)
                 .orElseThrow(() -> new IllegalArgumentException("No loader registered for path: " + path));
 
-        BuildPlan plan = loader.load(path, source);
+        BuildPlan plan = loader.load(path);
         buildCoordinator.loadPlan(plan);
         return plan;
     }
