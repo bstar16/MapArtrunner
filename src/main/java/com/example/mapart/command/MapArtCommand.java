@@ -133,27 +133,9 @@ public final class MapArtCommand {
                             return 1;
                         }))
                 .then(ClientCommandManager.literal("pause")
-                        .executes(context -> {
-                            Optional<String> error = planService.coordinator().pause();
-                            if (error.isPresent()) {
-                                context.getSource().sendError(Text.literal(error.get()));
-                                return 0;
-                            }
-
-                            context.getSource().sendFeedback(Text.literal("Build session paused."));
-                            return 1;
-                        }))
+                        .executes(context -> pauseBuild(context.getSource(), planService, baritoneFacade)))
                 .then(ClientCommandManager.literal("resume")
-                        .executes(context -> {
-                            Optional<String> error = planService.coordinator().resume();
-                            if (error.isPresent()) {
-                                context.getSource().sendError(Text.literal(error.get()));
-                                return 0;
-                            }
-
-                            context.getSource().sendFeedback(Text.literal("Build session resumed."));
-                            return 1;
-                        }))
+                        .executes(context -> resumeBuild(context.getSource(), planService, baritoneFacade)))
                 .then(ClientCommandManager.literal("stop")
                         .executes(context -> {
                             Optional<String> error = planService.coordinator().stop();
@@ -238,6 +220,42 @@ public final class MapArtCommand {
                                     return 1;
                                 }))
                 );
+    }
+
+
+    private static int pauseBuild(FabricClientCommandSource source, BuildPlanService planService, BaritoneFacade baritoneFacade) {
+        Optional<String> error = planService.coordinator().pause();
+        if (error.isPresent()) {
+            source.sendError(Text.literal(error.get()));
+            return 0;
+        }
+
+        BaritoneFacade.CommandResult result = baritoneFacade.pause();
+        if (!result.success()) {
+            source.sendError(Text.literal("Build session paused, but failed to pause Baritone: " + result.message()));
+            return 0;
+        }
+
+        source.sendFeedback(Text.literal("Build session paused."));
+        return 1;
+    }
+
+    private static int resumeBuild(FabricClientCommandSource source, BuildPlanService planService, BaritoneFacade baritoneFacade) {
+        Optional<String> error = planService.coordinator().resume();
+        if (error.isPresent()) {
+            source.sendError(Text.literal(error.get()));
+            return 0;
+        }
+
+        BaritoneFacade.CommandResult result = baritoneFacade.resume();
+        if (!result.success()) {
+            source.sendFeedback(Text.literal("Build session resumed."));
+            source.sendError(Text.literal("Baritone was not resumed: " + result.message()));
+            return 1;
+        }
+
+        source.sendFeedback(Text.literal("Build session resumed."));
+        return 1;
     }
 
     private static int debugGoto(FabricClientCommandSource source, BaritoneFacade baritoneFacade, int x, int y, int z) {

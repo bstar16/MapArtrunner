@@ -12,29 +12,53 @@ public class RealBaritoneFacade implements BaritoneFacade {
     private static final String GOAL_BLOCK = "baritone.api.pathing.goals.GoalBlock";
     private static final String GOAL_NEAR = "baritone.api.pathing.goals.GoalNear";
 
+    private GoalRequest lastIssuedGoal;
+    private GoalRequest pausedGoal;
+
     @Override
-    public CommandResult goTo(BlockPos target) {
-        return sendGoal(target, 0);
+    public synchronized CommandResult goTo(BlockPos target) {
+        return sendGoal(new GoalRequest(target.toImmutable(), 0));
     }
 
     @Override
-    public CommandResult goNear(BlockPos target, int range) {
+    public synchronized CommandResult goNear(BlockPos target, int range) {
         if (range < 0) {
             return CommandResult.failure("Range must be >= 0.");
         }
-        return sendGoal(target, range);
+        return sendGoal(new GoalRequest(target.toImmutable(), range));
     }
 
     @Override
-    public CommandResult cancel() {
-        try {
-            Object baritone = getPrimaryBaritone();
-            Object customGoalProcess = invoke(baritone, "getCustomGoalProcess");
-            invoke(customGoalProcess, "onLostControl");
-            return CommandResult.success("Cancelled active Baritone movement.");
-        } catch (ReflectiveOperationException | RuntimeException exception) {
-            return CommandResult.failure("Failed to cancel Baritone movement: " + exception.getMessage());
+    public synchronized CommandResult pause() {
+        if (!isBusy()) {
+            return CommandResult.success("No active Baritone movement to pause.");
         }
+
+        CommandResult cancelResult = cancelInternal();
+        if (!cancelResult.success()) {
+            return cancelResult;
+        }
+
+        pausedGoal = lastIssuedGoal;
+        return CommandResult.success("Paused active Baritone movement.");
+    }
+
+    @Override
+    public synchronized CommandResult resume() {
+        if (pausedGoal == null) {
+            return CommandResult.failure("No paused Baritone movement to resume.");
+        }
+
+        return sendGoal(pausedGoal);
+    }
+
+    @Override
+    public synchronized CommandResult cancel() {
+        CommandResult result = cancelInternal();
+        if (result.success()) {
+            pausedGoal = null;
+        }
+        return result;
     }
 
     @Override
@@ -55,18 +79,31 @@ public class RealBaritoneFacade implements BaritoneFacade {
         }
     }
 
-    private CommandResult sendGoal(BlockPos target, int range) {
-        Objects.requireNonNull(target, "target");
+    private CommandResult cancelInternal() {
+        try {
+            Object baritone = getPrimaryBaritone();
+            Object customGoalProcess = invoke(baritone, "getCustomGoalProcess");
+            invoke(customGoalProcess, "onLostControl");
+            return CommandResult.success("Cancelled active Baritone movement.");
+        } catch (ReflectiveOperationException | RuntimeException exception) {
+            return CommandResult.failure("Failed to cancel Baritone movement: " + exception.getMessage());
+        }
+    }
+
+    private CommandResult sendGoal(GoalRequest request) {
+        Objects.requireNonNull(request, "request");
 
         try {
             Object baritone = getPrimaryBaritone();
             Object customGoalProcess = invoke(baritone, "getCustomGoalProcess");
-            Object goal = range == 0 ? createGoalBlock(target) : createGoalNear(target, range);
+            Object goal = request.range() == 0 ? createGoalBlock(request.target()) : createGoalNear(request.target(), request.range());
             Class<?> goalClass = Class.forName(GOAL_INTERFACE);
             Method setGoalAndPath = customGoalProcess.getClass().getMethod("setGoalAndPath", goalClass);
             setGoalAndPath.invoke(customGoalProcess, goal);
-            String suffix = range == 0 ? "" : " within range " + range;
-            return CommandResult.success("Pathing to " + target.toShortString() + suffix + ".");
+            String suffix = request.range() == 0 ? "" : " within range " + request.range();
+            lastIssuedGoal = request;
+            pausedGoal = null;
+            return CommandResult.success("Pathing to " + request.target().toShortString() + suffix + ".");
         } catch (ReflectiveOperationException | RuntimeException exception) {
             return CommandResult.failure("Failed to issue Baritone movement request: " + exception.getMessage());
         }
@@ -94,5 +131,8 @@ public class RealBaritoneFacade implements BaritoneFacade {
     private Object invoke(Object target, String methodName) throws ReflectiveOperationException {
         Method method = target.getClass().getMethod(methodName);
         return method.invoke(target);
+    }
+
+    private record GoalRequest(BlockPos target, int range) {
     }
 }

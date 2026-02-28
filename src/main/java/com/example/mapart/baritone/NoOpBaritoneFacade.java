@@ -14,6 +14,16 @@ public class NoOpBaritoneFacade implements BaritoneFacade {
     }
 
     @Override
+    public CommandResult pause() {
+        return CommandResult.success("No active Baritone movement to pause.");
+    }
+
+    @Override
+    public CommandResult resume() {
+        return CommandResult.failure("No paused Baritone movement to resume.");
+    }
+
+    @Override
     public CommandResult cancel() {
         return CommandResult.success("No active movement to cancel.");
     }

@@ -7,6 +7,10 @@ public interface BaritoneFacade {
 
     CommandResult goNear(BlockPos target, int range);
 
+    CommandResult pause();
+
+    CommandResult resume();
+
     CommandResult cancel();
 
     boolean isBusy();
