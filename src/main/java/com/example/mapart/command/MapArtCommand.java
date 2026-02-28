@@ -1,5 +1,6 @@
 package com.example.mapart.command;
 
+import com.example.mapart.baritone.BaritoneFacade;
 import com.example.mapart.plan.BuildPlan;
 import com.example.mapart.plan.Placement;
 import com.example.mapart.plan.state.BuildCoordinator;
@@ -37,27 +38,30 @@ public final class MapArtCommand {
             BuildPlanService planService,
             MapartSettingsStore settingsStore,
             SupplyStore supplyStore,
-            SupplyInteractionTracker supplyInteractionTracker
+            SupplyInteractionTracker supplyInteractionTracker,
+            BaritoneFacade baritoneFacade
     ) {
-        return createForName(PRIMARY_COMMAND, planService, settingsStore, supplyStore, supplyInteractionTracker);
+        return createForName(PRIMARY_COMMAND, planService, settingsStore, supplyStore, supplyInteractionTracker, baritoneFacade);
     }
 
     public static LiteralArgumentBuilder<FabricClientCommandSource> createAlias(
             BuildPlanService planService,
             MapartSettingsStore settingsStore,
             SupplyStore supplyStore,
-            SupplyInteractionTracker supplyInteractionTracker
+            SupplyInteractionTracker supplyInteractionTracker,
+            BaritoneFacade baritoneFacade
     ) {
-        return createForName(LEGACY_ALIAS, planService, settingsStore, supplyStore, supplyInteractionTracker);
+        return createForName(LEGACY_ALIAS, planService, settingsStore, supplyStore, supplyInteractionTracker, baritoneFacade);
     }
 
     public static LiteralArgumentBuilder<FabricClientCommandSource> createRunnerAlias(
             BuildPlanService planService,
             MapartSettingsStore settingsStore,
             SupplyStore supplyStore,
-            SupplyInteractionTracker supplyInteractionTracker
+            SupplyInteractionTracker supplyInteractionTracker,
+            BaritoneFacade baritoneFacade
     ) {
-        return createForName(MOD_NAME_ALIAS, planService, settingsStore, supplyStore, supplyInteractionTracker);
+        return createForName(MOD_NAME_ALIAS, planService, settingsStore, supplyStore, supplyInteractionTracker, baritoneFacade);
     }
 
     private static LiteralArgumentBuilder<FabricClientCommandSource> createForName(
@@ -65,7 +69,8 @@ public final class MapArtCommand {
             BuildPlanService planService,
             MapartSettingsStore settingsStore,
             SupplyStore supplyStore,
-            SupplyInteractionTracker supplyInteractionTracker
+            SupplyInteractionTracker supplyInteractionTracker,
+            BaritoneFacade baritoneFacade
     ) {
         return ClientCommandManager.literal(commandName)
                 .then(ClientCommandManager.literal("load")
@@ -205,6 +210,21 @@ public final class MapArtCommand {
                                                         StringArgumentType.getString(context, "value")
                                                 ))))))
                 .then(ClientCommandManager.literal("debug")
+                        .then(ClientCommandManager.literal("goto")
+                                .then(ClientCommandManager.argument("x", IntegerArgumentType.integer())
+                                        .then(ClientCommandManager.argument("y", IntegerArgumentType.integer())
+                                                .then(ClientCommandManager.argument("z", IntegerArgumentType.integer())
+                                                        .executes(context -> debugGoto(
+                                                                context.getSource(),
+                                                                baritoneFacade,
+                                                                IntegerArgumentType.getInteger(context, "x"),
+                                                                IntegerArgumentType.getInteger(context, "y"),
+                                                                IntegerArgumentType.getInteger(context, "z")
+                                                        ))))))
+                        .then(ClientCommandManager.literal("cancel")
+                                .executes(context -> debugCancel(context.getSource(), baritoneFacade)))
+                        .then(ClientCommandManager.literal("busy")
+                                .executes(context -> debugBusy(context.getSource(), baritoneFacade)))
                         .then(ClientCommandManager.literal("secondlast")
                                 .executes(context -> {
                                     Optional<String> error = planService.coordinator().debugSkipToSecondLastPlacement();
@@ -218,6 +238,33 @@ public final class MapArtCommand {
                                     return 1;
                                 }))
                 );
+    }
+
+    private static int debugGoto(FabricClientCommandSource source, BaritoneFacade baritoneFacade, int x, int y, int z) {
+        BaritoneFacade.CommandResult result = baritoneFacade.goTo(new BlockPos(x, y, z));
+        if (!result.success()) {
+            source.sendError(Text.literal(result.message()));
+            return 0;
+        }
+
+        source.sendFeedback(Text.literal(result.message()));
+        return 1;
+    }
+
+    private static int debugCancel(FabricClientCommandSource source, BaritoneFacade baritoneFacade) {
+        BaritoneFacade.CommandResult result = baritoneFacade.cancel();
+        if (!result.success()) {
+            source.sendError(Text.literal(result.message()));
+            return 0;
+        }
+
+        source.sendFeedback(Text.literal(result.message()));
+        return 1;
+    }
+
+    private static int debugBusy(FabricClientCommandSource source, BaritoneFacade baritoneFacade) {
+        source.sendFeedback(Text.literal("Baritone busy: " + (baritoneFacade.isBusy() ? "yes" : "no")));
+        return 1;
     }
 
     private static int showPlanInfo(BuildPlanService planService, String commandName, FabricClientCommandSource source) {
