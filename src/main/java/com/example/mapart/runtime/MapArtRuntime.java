@@ -3,6 +3,7 @@ package com.example.mapart.runtime;
 import com.example.mapart.persistence.ConfigStore;
 import com.example.mapart.persistence.ProgressStore;
 import com.example.mapart.plan.state.BuildPlanService;
+import com.example.mapart.baritone.BaritoneFacade;
 import com.example.mapart.settings.MapartSettingsStore;
 import com.example.mapart.supply.SupplyStore;
 
@@ -12,6 +13,7 @@ public final class MapArtRuntime {
     private static ProgressStore progressStore;
     private static MapartSettingsStore settingsStore;
     private static SupplyStore supplyStore;
+    private static BaritoneFacade baritoneFacade;
 
     private MapArtRuntime() {
     }
@@ -21,13 +23,15 @@ public final class MapArtRuntime {
             ConfigStore config,
             ProgressStore progress,
             MapartSettingsStore settings,
-            SupplyStore supplies
+            SupplyStore supplies,
+            BaritoneFacade facade
     ) {
         buildPlanService = planService;
         configStore = config;
         progressStore = progress;
         settingsStore = settings;
         supplyStore = supplies;
+        baritoneFacade = facade;
     }
 
     public static BuildPlanService buildPlanService() {
@@ -40,5 +44,9 @@ public final class MapArtRuntime {
 
     public static SupplyStore supplyStore() {
         return supplyStore;
+    }
+
+    public static BaritoneFacade baritoneFacade() {
+        return baritoneFacade;
     }
 }

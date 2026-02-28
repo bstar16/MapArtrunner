@@ -4,13 +4,18 @@ import net.minecraft.util.math.BlockPos;
 
 public class NoOpBaritoneFacade implements BaritoneFacade {
     @Override
-    public void goTo(BlockPos target) {
-        // Milestone B stub: movement is not integrated yet.
+    public CommandResult goTo(BlockPos target) {
+        return CommandResult.failure("Baritone integration is unavailable.");
     }
 
     @Override
-    public void cancel() {
-        // Milestone B stub: movement is not integrated yet.
+    public CommandResult goNear(BlockPos target, int range) {
+        return CommandResult.failure("Baritone integration is unavailable.");
+    }
+
+    @Override
+    public CommandResult cancel() {
+        return CommandResult.success("No active movement to cancel.");
     }
 
     @Override
