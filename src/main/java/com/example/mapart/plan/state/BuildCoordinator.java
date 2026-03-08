@@ -169,7 +169,7 @@ public class BuildCoordinator {
             return monitorActiveMovement(client);
         }
 
-        StepResult stepResult = next(client);
+        StepResult stepResult = computeNextStep(client, false);
         if (!stepResult.actionable() && !stepResult.done()) {
             return pauseForRecoverableFailure(stepResult.message());
         }
@@ -206,6 +206,10 @@ public class BuildCoordinator {
     }
 
     public StepResult next(MinecraftClient client) {
+        return computeNextStep(client, true);
+    }
+
+    private StepResult computeNextStep(MinecraftClient client, boolean advanceOnActionable) {
         ValidationResult validation = validateForNext(client);
         if (!validation.valid()) {
             return StepResult.error(validation.message());
@@ -217,8 +221,11 @@ public class BuildCoordinator {
         BuildPlan plan = session.getPlan();
         List<Placement> placements = plan.placements();
 
-        while (session.getCurrentPlacementIndex() < placements.size()) {
-            Placement placement = placements.get(session.getCurrentPlacementIndex());
+        int placementIndex = session.getCurrentPlacementIndex();
+        int completedPlacements = 0;
+
+        while (placementIndex < placements.size()) {
+            Placement placement = placements.get(placementIndex);
             Optional<BlockPos> targetPos = placementResolver.resolveAbsolute(session, placement);
             if (targetPos.isEmpty()) {
                 markSessionError();
@@ -232,23 +239,42 @@ public class BuildCoordinator {
             }
 
             BlockState currentState = world.getBlockState(absolute);
-            session.incrementCompletedPlacements();
-            session.setCurrentPlacementIndex(session.getCurrentPlacementIndex() + 1);
-            updateRegionIndex(session.getProgress(), plan.regions());
-
             if (currentState.isOf(placement.block())) {
+                completedPlacements++;
+                placementIndex++;
                 continue;
             }
 
-            progressStore.saveProgress(session);
+            if (advanceOnActionable) {
+                completedPlacements++;
+                placementIndex++;
+            }
+
+            applyProgressAdvance(plan, placementIndex, completedPlacements);
+
             return StepResult.actionable(placement, absolute);
         }
+
+        applyProgressAdvance(plan, placementIndex, completedPlacements);
 
         if (transitionToCompleted()) {
             return StepResult.completed();
         }
 
         return StepResult.error("Failed to transition session to COMPLETED state.");
+    }
+
+    private void applyProgressAdvance(BuildPlan plan, int placementIndex, int completedPlacements) {
+        if (completedPlacements <= 0 && placementIndex == session.getCurrentPlacementIndex()) {
+            return;
+        }
+
+        session.setCurrentPlacementIndex(placementIndex);
+        for (int i = 0; i < completedPlacements; i++) {
+            session.incrementCompletedPlacements();
+        }
+        updateRegionIndex(session.getProgress(), plan.regions());
+        progressStore.saveProgress(session);
     }
 
     public Optional<SessionStatus> sessionStatus() {
