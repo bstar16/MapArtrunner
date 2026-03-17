@@ -117,8 +117,16 @@ public class RealBaritoneFacade implements BaritoneFacade {
 
     private Object createGoalNear(BlockPos target, int range) throws ReflectiveOperationException {
         Class<?> goalNearClass = Class.forName(GOAL_NEAR);
-        Constructor<?> constructor = goalNearClass.getConstructor(int.class, int.class, int.class, int.class);
-        return constructor.newInstance(target.getX(), target.getY(), target.getZ(), range);
+
+        try {
+            Constructor<?> constructor = goalNearClass.getConstructor(int.class, int.class, int.class, int.class);
+            return constructor.newInstance(target.getX(), target.getY(), target.getZ(), range);
+        } catch (NoSuchMethodException ignored) {
+            // Some Baritone versions expose GoalNear(int x, int y, int z) with a fixed heuristic range.
+            // Falling back to this signature is preferable to failing the command entirely.
+            Constructor<?> constructor = goalNearClass.getConstructor(int.class, int.class, int.class);
+            return constructor.newInstance(target.getX(), target.getY(), target.getZ());
+        }
     }
 
     private Object getPrimaryBaritone() throws ReflectiveOperationException {
