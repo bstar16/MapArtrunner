@@ -3,6 +3,7 @@ package com.example.mapart.baritone;
 import net.minecraft.util.math.BlockPos;
 
 import java.lang.reflect.Constructor;
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.util.Objects;
 
@@ -118,64 +119,15 @@ public class RealBaritoneFacade implements BaritoneFacade {
     private Object createGoalNear(BlockPos target, int range) throws ReflectiveOperationException {
         Class<?> goalNearClass = Class.forName(GOAL_NEAR);
 
-        for (Constructor<?> constructor : goalNearClass.getConstructors()) {
-            Class<?>[] parameterTypes = constructor.getParameterTypes();
-
-            if (isCoordinateAndRangeSignature(parameterTypes)) {
-                return constructor.newInstance(target.getX(), target.getY(), target.getZ(), range);
-            }
-
-            if (isCoordinateOnlySignature(parameterTypes)) {
-                return constructor.newInstance(target.getX(), target.getY(), target.getZ());
-            }
-
-            if (isPositionAndRangeSignature(parameterTypes)) {
-                Object positionArgument = createPositionArgument(parameterTypes[0], target);
-                return constructor.newInstance(positionArgument, range);
-            }
+        try {
+            Constructor<?> constructor = goalNearClass.getConstructor(int.class, int.class, int.class, int.class);
+            return constructor.newInstance(target.getX(), target.getY(), target.getZ(), range);
+        } catch (NoSuchMethodException ignored) {
+            // Some Baritone versions expose GoalNear(int x, int y, int z) with a fixed heuristic range.
+            // Falling back to this signature is preferable to failing the command entirely.
+            Constructor<?> constructor = goalNearClass.getConstructor(int.class, int.class, int.class);
+            return constructor.newInstance(target.getX(), target.getY(), target.getZ());
         }
-
-        throw new NoSuchMethodException("No supported GoalNear constructor found.");
-    }
-
-    private boolean isCoordinateAndRangeSignature(Class<?>[] parameterTypes) {
-        return parameterTypes.length == 4
-                && isIntegerLikeType(parameterTypes[0])
-                && isIntegerLikeType(parameterTypes[1])
-                && isIntegerLikeType(parameterTypes[2])
-                && isIntegerLikeType(parameterTypes[3]);
-    }
-
-    private boolean isCoordinateOnlySignature(Class<?>[] parameterTypes) {
-        return parameterTypes.length == 3
-                && isIntegerLikeType(parameterTypes[0])
-                && isIntegerLikeType(parameterTypes[1])
-                && isIntegerLikeType(parameterTypes[2]);
-    }
-
-    private boolean isPositionAndRangeSignature(Class<?>[] parameterTypes) {
-        return parameterTypes.length == 2
-                && isIntegerLikeType(parameterTypes[1])
-                && isPositionType(parameterTypes[0]);
-    }
-
-    private boolean isIntegerLikeType(Class<?> type) {
-        return type == int.class || type == Integer.class;
-    }
-
-    private boolean isPositionType(Class<?> type) {
-        return type.isAssignableFrom(BlockPos.class)
-                || type.getName().endsWith("BlockPos")
-                || type.getName().endsWith("BetterBlockPos");
-    }
-
-    private Object createPositionArgument(Class<?> positionType, BlockPos target) throws ReflectiveOperationException {
-        if (positionType.isAssignableFrom(BlockPos.class)) {
-            return target;
-        }
-
-        Constructor<?> constructor = positionType.getConstructor(int.class, int.class, int.class);
-        return constructor.newInstance(target.getX(), target.getY(), target.getZ());
     }
 
     private Object getPrimaryBaritone() throws ReflectiveOperationException {
