@@ -5,13 +5,16 @@ import net.minecraft.util.math.BlockPos;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
+import java.util.Arrays;
 import java.util.Objects;
+import java.util.stream.Collectors;
 
 public class RealBaritoneFacade implements BaritoneFacade {
     private static final String BARITONE_API = "baritone.api.BaritoneAPI";
     private static final String GOAL_INTERFACE = "baritone.api.pathing.goals.Goal";
     private static final String GOAL_BLOCK = "baritone.api.pathing.goals.GoalBlock";
     private static final String GOAL_NEAR = "baritone.api.pathing.goals.GoalNear";
+    private static final String GOAL_GET_TO_BLOCK = "baritone.api.pathing.goals.GoalGetToBlock";
 
     private GoalRequest lastIssuedGoal;
     private GoalRequest pausedGoal;
@@ -106,27 +109,88 @@ public class RealBaritoneFacade implements BaritoneFacade {
             pausedGoal = null;
             return CommandResult.success("Pathing to " + request.target().toShortString() + suffix + ".");
         } catch (ReflectiveOperationException | RuntimeException exception) {
-            return CommandResult.failure("Failed to issue Baritone movement request: " + exception.getMessage());
+            return CommandResult.failure("Failed to issue Baritone movement request: " + friendlyBaritoneFailure(exception));
         }
+    }
+
+    private String friendlyBaritoneFailure(Throwable throwable) {
+        Throwable root = unwrap(throwable);
+        if (root instanceof ClassNotFoundException || root instanceof NoSuchMethodException || root instanceof NoSuchMethodError) {
+            return "Baritone API mismatch or missing runtime mod. Install a compatible baritone-api-fabric jar for this Minecraft version.";
+        }
+        if (root.getMessage() == null || root.getMessage().isBlank()) {
+            return root.getClass().getSimpleName();
+        }
+        return root.getMessage();
+    }
+
+    private Throwable unwrap(Throwable throwable) {
+        Throwable current = throwable;
+        while (current instanceof InvocationTargetException ite && ite.getCause() != null) {
+            current = ite.getCause();
+        }
+        return current;
     }
 
     private Object createGoalBlock(BlockPos target) throws ReflectiveOperationException {
         Class<?> goalBlockClass = Class.forName(GOAL_BLOCK);
-        Constructor<?> constructor = goalBlockClass.getConstructor(int.class, int.class, int.class);
-        return constructor.newInstance(target.getX(), target.getY(), target.getZ());
+
+        try {
+            Constructor<?> blockPosConstructor = goalBlockClass.getConstructor(BlockPos.class);
+            return blockPosConstructor.newInstance(target);
+        } catch (NoSuchMethodException ignored) {
+            Constructor<?> xyzConstructor = goalBlockClass.getConstructor(int.class, int.class, int.class);
+            return xyzConstructor.newInstance(target.getX(), target.getY(), target.getZ());
+        }
     }
 
     private Object createGoalNear(BlockPos target, int range) throws ReflectiveOperationException {
         Class<?> goalNearClass = Class.forName(GOAL_NEAR);
+        Constructor<?> constructor = resolveGoalNearConstructor(goalNearClass);
+        Class<?>[] parameterTypes = constructor.getParameterTypes();
 
-        try {
-            Constructor<?> constructor = goalNearClass.getConstructor(int.class, int.class, int.class, int.class);
+        if (Arrays.equals(parameterTypes, new Class<?>[]{BlockPos.class, int.class})) {
+            return constructor.newInstance(target, range);
+        }
+        if (Arrays.equals(parameterTypes, new Class<?>[]{int.class, int.class, int.class, int.class})) {
             return constructor.newInstance(target.getX(), target.getY(), target.getZ(), range);
-        } catch (NoSuchMethodException ignored) {
-            // Some Baritone versions expose GoalNear(int x, int y, int z) with a fixed heuristic range.
-            // Falling back to this signature is preferable to failing the command entirely.
-            Constructor<?> constructor = goalNearClass.getConstructor(int.class, int.class, int.class);
+        }
+        if (Arrays.equals(parameterTypes, new Class<?>[]{int.class, int.class, int.class})) {
             return constructor.newInstance(target.getX(), target.getY(), target.getZ());
+        }
+
+        return createGoalGetToBlock(target);
+    }
+
+    static Constructor<?> resolveGoalNearConstructor(Class<?> goalNearClass) throws NoSuchMethodException {
+        try {
+            return goalNearClass.getConstructor(BlockPos.class, int.class);
+        } catch (NoSuchMethodException ignored) {
+            try {
+                return goalNearClass.getConstructor(int.class, int.class, int.class, int.class);
+            } catch (NoSuchMethodException ignoredAgain) {
+                try {
+                    return goalNearClass.getConstructor(int.class, int.class, int.class);
+                } catch (NoSuchMethodException noKnownConstructor) {
+                    throw new NoSuchMethodException("No supported GoalNear constructor found. Available constructors: "
+                            + Arrays.stream(goalNearClass.getConstructors())
+                            .map(constructor -> Arrays.stream(constructor.getParameterTypes())
+                                    .map(Class::getSimpleName)
+                                    .collect(Collectors.joining(", ", "(", ")")))
+                            .collect(Collectors.joining(", ")));
+                }
+            }
+        }
+    }
+
+    private Object createGoalGetToBlock(BlockPos target) throws ReflectiveOperationException {
+        Class<?> goalGetToBlockClass = Class.forName(GOAL_GET_TO_BLOCK);
+        try {
+            Constructor<?> blockPosConstructor = goalGetToBlockClass.getConstructor(BlockPos.class);
+            return blockPosConstructor.newInstance(target);
+        } catch (NoSuchMethodException ignored) {
+            Constructor<?> xyzConstructor = goalGetToBlockClass.getConstructor(int.class, int.class, int.class);
+            return xyzConstructor.newInstance(target.getX(), target.getY(), target.getZ());
         }
     }
 
