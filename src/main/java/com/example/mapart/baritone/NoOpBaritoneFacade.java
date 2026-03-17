@@ -3,14 +3,26 @@ package com.example.mapart.baritone;
 import net.minecraft.util.math.BlockPos;
 
 public class NoOpBaritoneFacade implements BaritoneFacade {
+    private static final String DEFAULT_REASON = "Baritone integration is unavailable. Install a compatible baritone-api-fabric mod for this Minecraft version.";
+
+    private final String reason;
+
+    public NoOpBaritoneFacade() {
+        this(DEFAULT_REASON);
+    }
+
+    public NoOpBaritoneFacade(String reason) {
+        this.reason = reason == null || reason.isBlank() ? DEFAULT_REASON : reason;
+    }
+
     @Override
     public CommandResult goTo(BlockPos target) {
-        return CommandResult.failure("Baritone integration is unavailable.");
+        return CommandResult.failure(reason);
     }
 
     @Override
     public CommandResult goNear(BlockPos target, int range) {
-        return CommandResult.failure("Baritone integration is unavailable.");
+        return CommandResult.failure(reason);
     }
 
     @Override

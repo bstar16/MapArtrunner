@@ -99,6 +99,15 @@ If `/mapart` is unknown in game:
 - confirm Fabric API is also installed on the same instance
 - run `/help mapart` to verify command registration
 
+
+## Baritone Integration
+
+MapArtRunner integrates with Baritone through `baritone-api-fabric` at runtime.
+
+- Install a Baritone jar that exposes the `baritone-api-fabric` API for your exact Minecraft version (1.21.4 in this project).
+- If Baritone is missing or the API is mismatched, `/mapart start` now reports a friendly in-game error and assisted movement is disabled until a compatible Baritone jar is installed.
+- Goal creation prefers `GoalNear(BlockPos, int)` and falls back to other compatible constructors when needed.
+
 ## Troubleshooting
 
 If the standard commands fail even when typed correctly, check the items below.
