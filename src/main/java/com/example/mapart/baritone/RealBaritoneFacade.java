@@ -4,6 +4,7 @@ import net.minecraft.util.math.BlockPos;
 
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
+import java.util.Arrays;
 import java.util.Objects;
 
 public class RealBaritoneFacade implements BaritoneFacade {
@@ -117,8 +118,61 @@ public class RealBaritoneFacade implements BaritoneFacade {
 
     private Object createGoalNear(BlockPos target, int range) throws ReflectiveOperationException {
         Class<?> goalNearClass = Class.forName(GOAL_NEAR);
-        Constructor<?> constructor = goalNearClass.getConstructor(int.class, int.class, int.class, int.class);
-        return constructor.newInstance(target.getX(), target.getY(), target.getZ(), range);
+
+        ReflectiveOperationException lastFailure = null;
+
+        try {
+            Constructor<?> constructor = goalNearClass.getConstructor(BlockPos.class, int.class);
+            return constructor.newInstance(target, range);
+        } catch (ReflectiveOperationException exception) {
+            lastFailure = exception;
+        }
+
+        for (Constructor<?> constructor : goalNearClass.getConstructors()) {
+            Class<?>[] parameterTypes = constructor.getParameterTypes();
+            if (parameterTypes.length != 4) {
+                continue;
+            }
+
+            try {
+                return constructor.newInstance(
+                        coerceNumeric(parameterTypes[0], target.getX()),
+                        coerceNumeric(parameterTypes[1], target.getY()),
+                        coerceNumeric(parameterTypes[2], target.getZ()),
+                        coerceNumeric(parameterTypes[3], range)
+                );
+            } catch (IllegalArgumentException exception) {
+                // Not a numeric-compatible signature; keep searching.
+            } catch (ReflectiveOperationException exception) {
+                lastFailure = exception;
+            }
+        }
+
+        if (lastFailure != null) {
+            throw new ReflectiveOperationException("No compatible GoalNear constructor found on "
+                    + GOAL_NEAR + " with available signatures "
+                    + Arrays.toString(goalNearClass.getConstructors()), lastFailure);
+        }
+
+        throw new ReflectiveOperationException("No compatible GoalNear constructor found on "
+                + GOAL_NEAR + " with available signatures "
+                + Arrays.toString(goalNearClass.getConstructors()));
+    }
+
+    private Object coerceNumeric(Class<?> parameterType, int value) {
+        if (parameterType == int.class || parameterType == Integer.class) {
+            return value;
+        }
+        if (parameterType == double.class || parameterType == Double.class) {
+            return (double) value;
+        }
+        if (parameterType == float.class || parameterType == Float.class) {
+            return (float) value;
+        }
+        if (parameterType == long.class || parameterType == Long.class) {
+            return (long) value;
+        }
+        throw new IllegalArgumentException("Unsupported non-numeric GoalNear constructor parameter: " + parameterType.getName());
     }
 
     private Object getPrimaryBaritone() throws ReflectiveOperationException {

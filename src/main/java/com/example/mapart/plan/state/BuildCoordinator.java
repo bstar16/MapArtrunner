@@ -169,6 +169,7 @@ public class BuildCoordinator {
             return monitorActiveMovement(client);
         }
 
+        StepResult stepResult = next(client);
         StepResult stepResult = computeNextStep(client, false);
         if (!stepResult.actionable() && !stepResult.done()) {
             return pauseForRecoverableFailure(stepResult.message());
