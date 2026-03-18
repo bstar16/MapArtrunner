@@ -42,6 +42,7 @@ import java.util.stream.Collectors;
 public class BuildCoordinator {
     private static final int TARGET_APPROACH_RANGE = 3;
     private static final int REFILL_ACTION_DELAY_TICKS = 4;
+    private static final int MAX_SUPPLY_SCREEN_WAIT_POLLS = 5;
 
     private final WorldPlacementResolver placementResolver;
     private final ConfigStore configStore;
@@ -54,6 +55,7 @@ public class BuildCoordinator {
     private MovementPurpose activeMovementPurpose = MovementPurpose.BUILD;
     private int refillActionCooldown;
     private boolean awaitingSupplyScreen;
+    private int supplyScreenWaitPollsRemaining;
 
     public BuildCoordinator(
             WorldPlacementResolver placementResolver,
@@ -170,8 +172,7 @@ public class BuildCoordinator {
         session.getProgress().reset();
         session.setRefillStatus(null);
         session.setStateBeforePause(null);
-        awaitingSupplyScreen = false;
-        refillActionCooldown = 0;
+        resetRefillInteractionState();
         if (session.getState() == BuildPlanState.LOADED) {
             progressStore.saveProgress(session);
             return Optional.empty();
@@ -449,16 +450,20 @@ public class BuildCoordinator {
         Map<Identifier, Integer> remaining = computeRemainingDeficits(client.player, refillStatus.missingMaterials());
         if (remaining.isEmpty()) {
             closeHandledScreen(client);
-            awaitingSupplyScreen = false;
+            resetRefillInteractionState();
             return continueReturnToBuild(client, refillStatus);
         }
 
         HandledScreen<?> handledScreen = currentSupplyScreen(client);
         if (handledScreen == null) {
             if (awaitingSupplyScreen) {
-                awaitingSupplyScreen = false;
-                return failRefill("Failed to open the supply container at "
-                        + refillStatus.supplyPoint().pos().toShortString() + ".");
+                if (supplyScreenWaitPollsRemaining > 0) {
+                    supplyScreenWaitPollsRemaining--;
+                    return AssistedStepResult.noop();
+                }
+
+                return failRefill("Timed out waiting for the supply container at "
+                        + refillStatus.supplyPoint().pos().toShortString() + " to open.");
             }
 
             ActionResult interactResult = client.interactionManager == null
@@ -479,12 +484,14 @@ public class BuildCoordinator {
             }
 
             awaitingSupplyScreen = true;
+            supplyScreenWaitPollsRemaining = MAX_SUPPLY_SCREEN_WAIT_POLLS;
             refillActionCooldown = REFILL_ACTION_DELAY_TICKS;
             return AssistedStepResult.arrived("Opening supply container at "
                     + refillStatus.supplyPoint().pos().toShortString() + ".");
         }
 
         awaitingSupplyScreen = false;
+        supplyScreenWaitPollsRemaining = 0;
         ScreenHandler handler = handledScreen.getScreenHandler();
         int containerSlotCount = Math.max(0, handler.slots.size() - PlayerInventory.MAIN_SIZE);
         if (containerSlotCount <= 0) {
@@ -533,7 +540,7 @@ public class BuildCoordinator {
         }
 
         closeHandledScreen(client);
-        awaitingSupplyScreen = false;
+        resetRefillInteractionState();
         session.setRefillStatus(null);
         progressStore.saveProgress(session);
         return continueBuildReturnMovement(client);
@@ -807,7 +814,7 @@ public class BuildCoordinator {
 
         movementPaused = false;
         closeHandledScreen(MinecraftClient.getInstance());
-        awaitingSupplyScreen = false;
+        resetRefillInteractionState();
         return AssistedStepResult.failure(message, false);
     }
 
@@ -840,8 +847,7 @@ public class BuildCoordinator {
 
     private AssistedStepResult failRefill(String message) {
         closeHandledScreen(MinecraftClient.getInstance());
-        awaitingSupplyScreen = false;
-        refillActionCooldown = 0;
+        resetRefillInteractionState();
         Map<Identifier, Integer> remaining = session == null || session.getRefillStatus() == null
                 ? Map.of()
                 : computeRemainingDeficits(MinecraftClient.getInstance().player, session.getRefillStatus().missingMaterials());
@@ -859,6 +865,12 @@ public class BuildCoordinator {
             return null;
         }
         return handledScreen;
+    }
+
+    private void resetRefillInteractionState() {
+        awaitingSupplyScreen = false;
+        supplyScreenWaitPollsRemaining = 0;
+        refillActionCooldown = 0;
     }
 
     private void closeHandledScreen(MinecraftClient client) {
