@@ -209,6 +209,12 @@ public class BuildCoordinator {
             }
         }
 
+        if (session.getState() == BuildPlanState.NEED_REFILL
+                || session.getState() == BuildPlanState.REFILLING
+                || session.getState() == BuildPlanState.RETURNING) {
+            return continueRefillWorkflow(client);
+        }
+
         if (session.getState() != BuildPlanState.BUILDING) {
             return AssistedStepResult.noop();
         }
@@ -381,6 +387,74 @@ public class BuildCoordinator {
         return AssistedStepResult.moving("Missing materials for region " + session.getCurrentRegionIndex()
                 + " (" + missingText + "). Moving to supply #" + refillCheck.supplyPoint().id()
                 + " at " + refillCheck.supplyPoint().pos().toShortString() + ".");
+    }
+
+    private AssistedStepResult continueRefillWorkflow(MinecraftClient client) {
+        RefillStatus refillStatus = session == null ? null : session.getRefillStatus();
+        if (refillStatus == null) {
+            Optional<String> transitionError = transitionSession(BuildPlanState.BUILDING, "Cannot resume building without refill status.");
+            return transitionError.isPresent()
+                    ? AssistedStepResult.failure(transitionError.get(), false)
+                    : AssistedStepResult.noop();
+        }
+
+        return switch (session.getState()) {
+            case NEED_REFILL -> {
+                if (refillStatus.supplyPoint() == null) {
+                    yield AssistedStepResult.noop();
+                }
+
+                yield beginRefillMovement(new RefillCheck(
+                        session.getPlan().regions().get(session.getCurrentRegionIndex()),
+                        refillStatus.missingMaterials(),
+                        refillStatus.supplyPoint()
+                ));
+            }
+            case REFILLING -> continueReturnToBuild(client, refillStatus);
+            case RETURNING -> continueBuildReturnMovement(client);
+            default -> AssistedStepResult.noop();
+        };
+    }
+
+    private AssistedStepResult continueReturnToBuild(MinecraftClient client, RefillStatus refillStatus) {
+        Map<Identifier, Integer> inventory = countInventoryMaterials(client.player);
+        boolean stillMissingMaterials = refillStatus.missingMaterials().entrySet().stream()
+                .anyMatch(entry -> inventory.getOrDefault(entry.getKey(), 0) < entry.getValue());
+        if (stillMissingMaterials) {
+            return AssistedStepResult.noop();
+        }
+
+        Optional<String> transitionError = transitionSession(BuildPlanState.RETURNING, "Cannot switch to RETURNING.");
+        if (transitionError.isPresent()) {
+            return AssistedStepResult.failure(transitionError.get(), false);
+        }
+
+        session.setRefillStatus(null);
+        progressStore.saveProgress(session);
+        return continueBuildReturnMovement(client);
+    }
+
+    private AssistedStepResult continueBuildReturnMovement(MinecraftClient client) {
+        StepResult stepResult = computeNextStep(client, false);
+        if (stepResult.done()) {
+            cancelActiveMovement();
+            return AssistedStepResult.completed(stepResult.message());
+        }
+        if (!stepResult.actionable()) {
+            return pauseForRecoverableFailure(stepResult.message());
+        }
+
+        BaritoneFacade.CommandResult movementRequest = baritoneFacade.goNear(stepResult.targetPos(), TARGET_APPROACH_RANGE);
+        if (!movementRequest.success()) {
+            return pauseForRecoverableFailure("Failed to return to build area near "
+                    + stepResult.targetPos().toShortString() + ": " + movementRequest.message());
+        }
+
+        activeMovementTarget = stepResult.targetPos().toImmutable();
+        activeMovementPurpose = MovementPurpose.BUILD;
+        movementPaused = false;
+        return AssistedStepResult.moving("Materials refilled. Returning to build near "
+                + activeMovementTarget.toShortString() + ".");
     }
 
     private Map<Identifier, Integer> computeRequiredMaterialsForCurrentRegion() {
@@ -579,11 +653,16 @@ public class BuildCoordinator {
                 activeMovementPurpose = MovementPurpose.BUILD;
                 if (session.getRefillStatus() != null) {
                     session.setRefillStatus(new RefillStatus(session.getRefillStatus().supplyPoint(), session.getRefillStatus().missingMaterials(), true));
+                    progressStore.saveProgress(session);
                 }
                 if (session.getState() == BuildPlanState.NEED_REFILL) {
                     transitionSession(BuildPlanState.REFILLING, "Cannot switch to REFILLING.");
                 }
                 return AssistedStepResult.arrived("Arrived at supply point " + reachedTarget.toShortString() + ". Ready to refill.");
+            }
+
+            if (session.getState() == BuildPlanState.RETURNING) {
+                transitionSession(BuildPlanState.BUILDING, "Cannot switch to BUILDING.");
             }
 
             return AssistedStepResult.arrived("Reached target area.");
