@@ -1,4 +1,4 @@
-[22:23:04] [Test worker/WARN]: Config file C:\Users\Sarg\AppData\Local\Temp\junit7696002365521567027\config-malformed.json is malformed; using defaults.
+[17:47:21] [Test worker/WARN]: Config file C:\Users\Sarg\AppData\Local\Temp\junit12149524130390406076\config-malformed.json is malformed; using defaults.
 com.google.gson.JsonSyntaxException: com.google.gson.stream.MalformedJsonException: Expected ':' at line 1 column 12 path $.invalid
 See https://github.com/google/gson/blob/main/Troubleshooting.md#malformed-json
 	at com.google.gson.Gson.fromJson(Gson.java:1375) ~[gson-2.11.0.jar:?]
@@ -96,16 +96,16 @@ See https://github.com/google/gson/blob/main/Troubleshooting.md#malformed-json
 	at com.google.gson.internal.bind.ReflectiveTypeAdapterFactory$Adapter.read(ReflectiveTypeAdapterFactory.java:514) ~[gson-2.11.0.jar:?]
 	at com.google.gson.Gson.fromJson(Gson.java:1361) ~[gson-2.11.0.jar:?]
 	... 86 more
-[22:23:05] [Test worker/WARN]: Progress file C:\Users\Sarg\AppData\Local\Temp\junit16228624279763596881\progress-malformed.json is malformed; skipping restore.
+[17:47:21] [Test worker/WARN]: Progress file C:\Users\Sarg\AppData\Local\Temp\junit12586061653944088409\progress-malformed.json is malformed; skipping restore.
 com.google.gson.JsonSyntaxException: java.lang.IllegalStateException: Expected BEGIN_OBJECT but was STRING at line 1 column 1 path $
 See https://github.com/google/gson/blob/main/Troubleshooting.md#unexpected-json-structure
 	at com.google.gson.internal.bind.ReflectiveTypeAdapterFactory$Adapter.read(ReflectiveTypeAdapterFactory.java:520) ~[gson-2.11.0.jar:?]
 	at com.google.gson.Gson.fromJson(Gson.java:1361) ~[gson-2.11.0.jar:?]
 	at com.google.gson.Gson.fromJson(Gson.java:1262) ~[gson-2.11.0.jar:?]
 	at com.google.gson.Gson.fromJson(Gson.java:1199) ~[gson-2.11.0.jar:?]
-	at com.example.mapart.persistence.ProgressStore.loadFromDisk(ProgressStore.java:62) ~[main/:?]
-	at com.example.mapart.persistence.ProgressStore.<init>(ProgressStore.java:29) ~[main/:?]
-	at com.example.mapart.persistence.PersistenceStoreTest.progressStoreMalformedJsonFallsBackSafely(PersistenceStoreTest.java:86) ~[test/:?]
+	at com.example.mapart.persistence.ProgressStore.loadFromDisk(ProgressStore.java:64) ~[main/:?]
+	at com.example.mapart.persistence.ProgressStore.<init>(ProgressStore.java:30) ~[main/:?]
+	at com.example.mapart.persistence.PersistenceStoreTest.progressStoreMalformedJsonFallsBackSafely(PersistenceStoreTest.java:90) ~[test/:?]
 	at java.base/jdk.internal.reflect.DirectMethodHandleAccessor.invoke(DirectMethodHandleAccessor.java:103) ~[?:?]
 	at java.base/java.lang.reflect.Method.invoke(Method.java:580) ~[?:?]
 	at org.junit.platform.commons.util.ReflectionUtils.invokeMethod(ReflectionUtils.java:728) ~[junit-platform-commons-1.10.2.jar:1.10.2]
@@ -193,7 +193,7 @@ See https://github.com/google/gson/blob/main/Troubleshooting.md#unexpected-json-
 	at com.google.gson.stream.JsonReader.beginObject(JsonReader.java:469) ~[gson-2.11.0.jar:?]
 	at com.google.gson.internal.bind.ReflectiveTypeAdapterFactory$Adapter.read(ReflectiveTypeAdapterFactory.java:509) ~[gson-2.11.0.jar:?]
 	... 87 more
-[22:23:05] [Test worker/WARN]: Supplies file C:\Users\Sarg\AppData\Local\Temp\junit10763421238665817434\supplies-bad.json is malformed; using empty list.
+[17:47:21] [Test worker/WARN]: Supplies file C:\Users\Sarg\AppData\Local\Temp\junit11554098504315989978\supplies-bad.json is malformed; using empty list.
 com.google.gson.JsonSyntaxException: java.lang.IllegalStateException: Expected BEGIN_OBJECT but was STRING at line 1 column 1 path $
 See https://github.com/google/gson/blob/main/Troubleshooting.md#unexpected-json-structure
 	at com.google.gson.internal.bind.ReflectiveTypeAdapterFactory$Adapter.read(ReflectiveTypeAdapterFactory.java:520) ~[gson-2.11.0.jar:?]
@@ -290,7 +290,7 @@ See https://github.com/google/gson/blob/main/Troubleshooting.md#unexpected-json-
 	at com.google.gson.stream.JsonReader.beginObject(JsonReader.java:469) ~[gson-2.11.0.jar:?]
 	at com.google.gson.internal.bind.ReflectiveTypeAdapterFactory$Adapter.read(ReflectiveTypeAdapterFactory.java:509) ~[gson-2.11.0.jar:?]
 	... 87 more
-[22:23:05] [Test worker/WARN]: Settings file C:\Users\Sarg\AppData\Local\Temp\junit17652336951175153231\settings-bad.json is malformed; using defaults.
+[17:47:21] [Test worker/WARN]: Settings file C:\Users\Sarg\AppData\Local\Temp\junit11257298638710148682\settings-bad.json is malformed; using defaults.
 com.google.gson.JsonSyntaxException: com.google.gson.stream.MalformedJsonException: Expected ':' at line 1 column 7 path $.bad
 See https://github.com/google/gson/blob/main/Troubleshooting.md#malformed-json
 	at com.google.gson.Gson.fromJson(Gson.java:1375) ~[gson-2.11.0.jar:?]

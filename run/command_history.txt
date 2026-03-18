@@ -1,50 +1,50 @@
+/mapart start
+/mapart stop
+/gamemode creative
+/gamemode survival
+/mapart start
+/mapart resume
+/gamemode creative
+/mapart start
+/mapart next
+/mapart next/
+/mapart next
+/
+/mapart debug secondlast
+/mapart next
+/mapart resume
+/mapart next
+/mapart start
+/mapart pause
+/mapart start\
+/mapart start
+/mapart resume
+/mapart pause
+/mapart resume
+/mapart pause
+/mapart resume
+/mapart start
+/mapart resume
+/mapart load bedrock.nbt
+/mapart resume
+/mapart load bedrock.nbt
 /mapart
-/mapart debug secondlast
-/mapart load bedrock
-/mapart load bedrock.nbt
-/mapart debug secondlast
 /mapart next
-/mapart start
-/mapart next
-/mapart start
-/mapart setorigin
-/mapart next
-/mapart start
-/mapart next
+/mapart resume
+/mapart pause
 /mapart unload
-/mapart info
-/mapart status
 /mapart load bedrock.nbt
 /mapart setorigin
-/mapart settings
-/mapart settings set maxoverlaydistance 1
-/mapart settings set overlaymaxrenderdistance 1
-/mapart settings set overlaymaxrenderdistance 256
-/mapart supply add
-/mapart unload
-/mapart supply list
-/mapart supply add
-/mapart supply list
-/mapart info
-/mapart supply clear
-/mapart supply list\
-/mapart supply list
-/mapart supply clear
-/mapart info
-/mapart settings
-/mapart status
-/mapart supply add
-/mapart supply list
-/mapart supply clear
-/mapart supply add
-/mapart supply clear
+/mapart start
+/mapart pause
+/mapart stop
 /mapart load bedrock.nbt
-/mapart settings
-/mapart settings set overlaycurrentregiononly true
-/mapart setorigin
-/mapart settings set overlaycurrentregiononly false
-/mapart settings set overlaycurrentregiononly true
-/mapart settings set overlaycurrentregiononly false
-/mapart unload
+/mapart start
+/mapart resume
 /mapart status
 /mapart info
+/mapart load bedrock.nbt
+/mapart unload
+/mapart load bedrock.nbt
+/mapart setorigin 1 1 1
+/mapart setorigin
