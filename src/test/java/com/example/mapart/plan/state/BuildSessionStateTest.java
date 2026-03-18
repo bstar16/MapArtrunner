@@ -6,6 +6,7 @@ import com.example.mapart.persistence.ProgressStore;
 import com.example.mapart.plan.BuildPlan;
 import com.example.mapart.plan.Placement;
 import com.example.mapart.plan.Region;
+import com.example.mapart.util.MaterialCountFormatter;
 import net.minecraft.block.Block;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Vec3i;
@@ -45,6 +46,25 @@ class BuildSessionStateTest {
         session.transitionTo(BuildPlanState.REFILLING);
 
         assertDoesNotThrow(() -> session.transitionTo(BuildPlanState.NEED_REFILL));
+    }
+
+    @Test
+    void returningCanResumeBuildingAfterRefill() {
+        BuildSession session = new BuildSession(plan(tempDir.resolve("returning.nbt")));
+
+        session.transitionTo(BuildPlanState.LOADED);
+        session.transitionTo(BuildPlanState.BUILDING);
+        session.transitionTo(BuildPlanState.NEED_REFILL);
+        session.transitionTo(BuildPlanState.REFILLING);
+        session.transitionTo(BuildPlanState.RETURNING);
+
+        assertDoesNotThrow(() -> session.transitionTo(BuildPlanState.BUILDING));
+    }
+
+    @Test
+    void materialFormatterUsesStacksPlusRemainder() {
+        assertEquals("2+2", MaterialCountFormatter.formatCount(130, null));
+        assertEquals("0+0", MaterialCountFormatter.formatCount(-15, null));
     }
 
     @Test
