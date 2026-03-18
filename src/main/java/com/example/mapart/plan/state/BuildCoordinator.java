@@ -875,6 +875,7 @@ public class BuildCoordinator {
                 transitionSession(BuildPlanState.BUILDING, "Cannot switch to BUILDING.");
             }
 
+            advanceBuildCursorAfterArrival(reachedTarget);
             debugToChatAndFile("Reached build target area near " + reachedTarget.toShortString() + ".");
             return AssistedStepResult.arrived("Reached target area.");
         }
@@ -891,6 +892,32 @@ public class BuildCoordinator {
         }
 
         return AssistedStepResult.noop();
+    }
+
+    private void advanceBuildCursorAfterArrival(BlockPos reachedTarget) {
+        if (session == null || reachedTarget == null) {
+            return;
+        }
+        if (session.getState() != BuildPlanState.BUILDING && session.getState() != BuildPlanState.RETURNING) {
+            return;
+        }
+
+        Optional<NextTarget> nextTarget = resolveNextTarget(session);
+        if (nextTarget.isEmpty() || !reachedTarget.equals(nextTarget.get().absolutePos())) {
+            return;
+        }
+
+        BuildPlan plan = session.getPlan();
+        int nextPlacementIndex = Math.min(plan.placements().size(), session.getCurrentPlacementIndex() + 1);
+        if (nextPlacementIndex == session.getCurrentPlacementIndex()) {
+            return;
+        }
+
+        session.setCurrentPlacementIndex(nextPlacementIndex);
+        updateRegionIndex(session.getProgress(), plan.regions());
+        progressStore.saveProgress(session);
+        debugToChatAndFile("Advanced to placement " + nextPlacementIndex + " after reaching "
+                + reachedTarget.toShortString() + ".");
     }
 
     private AssistedStepResult pauseForRecoverableFailure(String message) {
