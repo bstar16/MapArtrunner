@@ -8,6 +8,8 @@ public class BuildSession {
     private final BuildProgress progress;
     private BlockPos origin;
     private BuildPlanState state;
+    private RefillStatus refillStatus;
+    private BuildPlanState stateBeforePause;
 
     public BuildSession(BuildPlan plan) {
         this.plan = plan;
@@ -57,6 +59,22 @@ public class BuildSession {
 
     public void incrementCompletedPlacements() {
         progress.incrementCompletedPlacements();
+    }
+
+    public RefillStatus getRefillStatus() {
+        return refillStatus;
+    }
+
+    public void setRefillStatus(RefillStatus refillStatus) {
+        this.refillStatus = refillStatus;
+    }
+
+    public BuildPlanState getStateBeforePause() {
+        return stateBeforePause;
+    }
+
+    public void setStateBeforePause(BuildPlanState stateBeforePause) {
+        this.stateBeforePause = stateBeforePause;
     }
 
     public void transitionTo(BuildPlanState nextState) {

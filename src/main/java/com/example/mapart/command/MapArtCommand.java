@@ -8,6 +8,7 @@ import com.example.mapart.plan.state.BuildPlanService;
 import com.example.mapart.plan.state.BuildSession;
 import com.example.mapart.settings.MapartSettings;
 import com.example.mapart.settings.MapartSettingsStore;
+import com.example.mapart.plan.state.RefillStatus;
 import com.example.mapart.supply.SupplyInteractionTracker;
 import com.example.mapart.supply.SupplyPoint;
 import com.example.mapart.supply.SupplyStore;
@@ -17,6 +18,7 @@ import com.mojang.brigadier.builder.LiteralArgumentBuilder;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager;
 import net.fabricmc.fabric.api.client.command.v2.FabricClientCommandSource;
 import net.minecraft.block.Block;
+import net.minecraft.item.Item;
 import net.minecraft.registry.Registries;
 import net.minecraft.text.Text;
 import net.minecraft.util.math.BlockPos;
@@ -25,6 +27,8 @@ import java.nio.file.Path;
 import java.util.Comparator;
 import java.util.Map;
 import java.util.Optional;
+
+import com.example.mapart.util.MaterialCountFormatter;
 
 public final class MapArtCommand {
     public static final String PRIMARY_COMMAND = "mapart";
@@ -311,7 +315,8 @@ public final class MapArtCommand {
                 .sorted(Map.Entry.<Block, Integer>comparingByValue(Comparator.reverseOrder()))
                 .limit(10)
                 .forEach(entry -> source.sendFeedback(Text.literal("- "
-                        + Registries.BLOCK.getId(entry.getKey()) + ": " + entry.getValue())));
+                        + Registries.BLOCK.getId(entry.getKey()) + ": "
+                        + MaterialCountFormatter.formatCount(entry.getValue(), entry.getKey().asItem()))));
 
         if (plan.materialCounts().size() > 10) {
             int remainder = plan.materialCounts().size() - 10;
@@ -335,6 +340,25 @@ public final class MapArtCommand {
         source.sendFeedback(Text.literal("Region: " + status.currentRegionIndex() + " / " + status.totalRegions()));
         source.sendFeedback(Text.literal("Placement: " + status.currentPlacementIndex() + " / " + status.totalPlacements()));
         source.sendFeedback(Text.literal("Completed placements: " + status.totalCompletedPlacements()));
+
+        if (status.refillStatus().isPresent()) {
+            RefillStatus refillStatus = status.refillStatus().get();
+            if (refillStatus.supplyPoint() == null) {
+                source.sendFeedback(Text.literal("Refill target: none in current dimension"));
+            } else {
+                source.sendFeedback(Text.literal("Refill target: #" + refillStatus.supplyPoint().id() + " @ "
+                        + refillStatus.supplyPoint().pos().toShortString()));
+            }
+            source.sendFeedback(Text.literal("Missing materials:"));
+            refillStatus.missingMaterials().entrySet().stream()
+                    .sorted(Map.Entry.<net.minecraft.util.Identifier, Integer>comparingByValue(Comparator.reverseOrder()))
+                    .limit(5)
+                    .forEach(entry -> {
+                        Item item = Registries.ITEM.get(entry.getKey());
+                        source.sendFeedback(Text.literal("- " + entry.getKey() + ": "
+                                + MaterialCountFormatter.formatCount(entry.getValue(), item)));
+                    });
+        }
 
         if (status.nextTarget().isPresent()) {
             BuildCoordinator.NextTarget nextTarget = status.nextTarget().get();

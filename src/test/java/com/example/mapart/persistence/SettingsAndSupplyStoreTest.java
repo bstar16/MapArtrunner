@@ -56,4 +56,17 @@ class SettingsAndSupplyStoreTest {
         SupplyStore store = new SupplyStore(suppliesPath);
         assertTrue(store.list().isEmpty());
     }
+
+    @Test
+    void supplyStoreFindsNearestMatchingDimension() {
+        Path suppliesPath = tempDir.resolve("supplies-nearest.json");
+        SupplyStore store = new SupplyStore(suppliesPath);
+        store.add(new BlockPos(100, 70, 100), "minecraft:overworld", "far");
+        store.add(new BlockPos(5, 64, 5), "minecraft:overworld", "near");
+        store.add(new BlockPos(1, 64, 1), "minecraft:the_nether", "wrong-dimension");
+
+        var selected = store.findNearestInDimension("minecraft:overworld", new BlockPos(0, 64, 0)).orElseThrow();
+
+        assertEquals("near", selected.name());
+    }
 }

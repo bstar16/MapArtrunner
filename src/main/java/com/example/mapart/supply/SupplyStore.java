@@ -51,6 +51,16 @@ public class SupplyStore {
         return removed;
     }
 
+    public synchronized Optional<SupplyPoint> findNearestInDimension(String dimensionKey, BlockPos origin) {
+        if (dimensionKey == null || origin == null) {
+            return Optional.empty();
+        }
+
+        return supplies.stream()
+                .filter(point -> dimensionKey.equals(point.dimensionKey()))
+                .min(Comparator.comparingDouble(point -> squaredDistance(origin, point.pos())));
+    }
+
     public synchronized int clear() {
         int removed = supplies.size();
         if (removed > 0) {
@@ -58,6 +68,13 @@ public class SupplyStore {
             saveToDisk();
         }
         return removed;
+    }
+
+    private static double squaredDistance(BlockPos a, BlockPos b) {
+        long dx = (long) a.getX() - b.getX();
+        long dy = (long) a.getY() - b.getY();
+        long dz = (long) a.getZ() - b.getZ();
+        return (double) dx * dx + (double) dy * dy + (double) dz * dz;
     }
 
     private void loadFromDisk() {

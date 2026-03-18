@@ -6,13 +6,28 @@ import com.example.mapart.persistence.ProgressStore;
 import com.example.mapart.plan.BuildPlan;
 import com.example.mapart.plan.Placement;
 import com.example.mapart.plan.Region;
+import com.example.mapart.supply.SupplyPoint;
+import com.example.mapart.supply.SupplyStore;
+import com.example.mapart.util.MaterialCountFormatter;
+import net.minecraft.block.Block;
 import net.minecraft.block.BlockState;
 import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.network.ClientPlayerEntity;
 import net.minecraft.client.world.ClientWorld;
+import net.minecraft.item.Item;
+import net.minecraft.item.ItemStack;
+import net.minecraft.item.Items;
+import net.minecraft.registry.Registries;
+import net.minecraft.util.Identifier;
 import net.minecraft.util.math.BlockPos;
 
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.stream.Collectors;
 
 public class BuildCoordinator {
     private static final int TARGET_APPROACH_RANGE = 3;
@@ -20,20 +35,24 @@ public class BuildCoordinator {
     private final WorldPlacementResolver placementResolver;
     private final ConfigStore configStore;
     private final ProgressStore progressStore;
+    private final SupplyStore supplyStore;
     private final BaritoneFacade baritoneFacade;
     private BuildSession session;
     private BlockPos activeMovementTarget;
     private boolean movementPaused;
+    private MovementPurpose activeMovementPurpose = MovementPurpose.BUILD;
 
     public BuildCoordinator(
             WorldPlacementResolver placementResolver,
             ConfigStore configStore,
             ProgressStore progressStore,
+            SupplyStore supplyStore,
             BaritoneFacade baritoneFacade
     ) {
         this.placementResolver = placementResolver;
         this.configStore = configStore;
         this.progressStore = progressStore;
+        this.supplyStore = supplyStore;
         this.baritoneFacade = baritoneFacade;
     }
 
@@ -91,6 +110,7 @@ public class BuildCoordinator {
 
         if (session.getState() == BuildPlanState.COMPLETED) {
             session.getProgress().reset();
+            session.setRefillStatus(null);
         }
 
         return transitionSession(BuildPlanState.BUILDING, "Cannot start from state " + session.getState() + ".");
@@ -100,9 +120,15 @@ public class BuildCoordinator {
         if (session == null) {
             return Optional.of("No build session.");
         }
+        if (session.getState() == BuildPlanState.PAUSED) {
+            return Optional.of("Build session is already paused.");
+        }
 
-        Optional<String> sessionTransitionError = transitionSession(BuildPlanState.PAUSED, "Can only pause while BUILDING.");
+        BuildPlanState currentState = session.getState();
+        session.setStateBeforePause(currentState);
+        Optional<String> sessionTransitionError = transitionSession(BuildPlanState.PAUSED, "Cannot pause while " + currentState + ".");
         if (sessionTransitionError.isPresent()) {
+            session.setStateBeforePause(null);
             return sessionTransitionError;
         }
 
@@ -126,6 +152,8 @@ public class BuildCoordinator {
 
         cancelActiveMovement();
         session.getProgress().reset();
+        session.setRefillStatus(null);
+        session.setStateBeforePause(null);
         if (session.getState() == BuildPlanState.LOADED) {
             progressStore.saveProgress(session);
             return Optional.empty();
@@ -138,11 +166,16 @@ public class BuildCoordinator {
         if (session == null) {
             return Optional.of("No build session.");
         }
+        if (session.getState() != BuildPlanState.PAUSED) {
+            return Optional.of("Can only resume while PAUSED.");
+        }
 
-        Optional<String> sessionTransitionError = transitionSession(BuildPlanState.BUILDING, "Can only resume while PAUSED.");
+        BuildPlanState resumeState = session.getStateBeforePause() == null ? BuildPlanState.BUILDING : session.getStateBeforePause();
+        Optional<String> sessionTransitionError = transitionSession(resumeState, "Can only resume while PAUSED.");
         if (sessionTransitionError.isPresent()) {
             return sessionTransitionError;
         }
+        session.setStateBeforePause(null);
 
         if (!movementPaused) {
             return Optional.empty();
@@ -160,13 +193,24 @@ public class BuildCoordinator {
     }
 
     public AssistedStepResult tickAssisted(MinecraftClient client) {
-        ValidationResult validation = validateForNext(client);
+        ValidationResult validation = validateForTick(client);
         if (!validation.valid()) {
             return AssistedStepResult.noop();
         }
 
         if (activeMovementTarget != null) {
             return monitorActiveMovement(client);
+        }
+
+        if (session.getState() == BuildPlanState.BUILDING) {
+            Optional<RefillCheck> refillCheck = checkForRefill(client);
+            if (refillCheck.isPresent()) {
+                return beginRefillMovement(refillCheck.get());
+            }
+        }
+
+        if (session.getState() != BuildPlanState.BUILDING) {
+            return AssistedStepResult.noop();
         }
 
         StepResult stepResult = computeNextStep(client, false);
@@ -185,6 +229,7 @@ public class BuildCoordinator {
         }
 
         activeMovementTarget = stepResult.targetPos().toImmutable();
+        activeMovementPurpose = MovementPurpose.BUILD;
         movementPaused = false;
         return AssistedStepResult.moving("Moving near " + activeMovementTarget.toShortString() + ".");
     }
@@ -209,8 +254,12 @@ public class BuildCoordinator {
         return computeNextStep(client, true);
     }
 
+    public Optional<RefillStatus> refillStatus() {
+        return session == null ? Optional.empty() : Optional.ofNullable(session.getRefillStatus());
+    }
+
     private StepResult computeNextStep(MinecraftClient client, boolean advanceOnActionable) {
-        ValidationResult validation = validateForNext(client);
+        ValidationResult validation = validateForBuildActions(client);
         if (!validation.valid()) {
             return StepResult.error(validation.message());
         }
@@ -264,6 +313,146 @@ public class BuildCoordinator {
         return StepResult.error("Failed to transition session to COMPLETED state.");
     }
 
+    private Optional<RefillCheck> checkForRefill(MinecraftClient client) {
+        if (session == null || client.player == null || client.world == null) {
+            return Optional.empty();
+        }
+
+        int regionIndex = session.getCurrentRegionIndex();
+        List<Region> regions = session.getPlan().regions();
+        if (regionIndex < 0 || regionIndex >= regions.size()) {
+            return Optional.empty();
+        }
+
+        Region region = regions.get(regionIndex);
+        Map<Identifier, Integer> required = computeRequiredMaterialsForCurrentRegion();
+        if (required.isEmpty()) {
+            session.setRefillStatus(null);
+            return Optional.empty();
+        }
+
+        Map<Identifier, Integer> inventory = countInventoryMaterials(client.player);
+        Map<Identifier, Integer> missing = new LinkedHashMap<>();
+        required.forEach((id, count) -> {
+            int deficit = count - inventory.getOrDefault(id, 0);
+            if (deficit > 0) {
+                missing.put(id, deficit);
+            }
+        });
+
+        if (missing.isEmpty()) {
+            session.setRefillStatus(null);
+            return Optional.empty();
+        }
+
+        String dimensionKey = client.world.getRegistryKey().getValue().toString();
+        SupplyPoint supplyPoint = supplyStore.findNearestInDimension(dimensionKey, client.player.getBlockPos()).orElse(null);
+        session.setRefillStatus(new RefillStatus(supplyPoint, missing, false));
+        progressStore.saveProgress(session);
+        return Optional.of(new RefillCheck(region, missing, supplyPoint));
+    }
+
+    private AssistedStepResult beginRefillMovement(RefillCheck refillCheck) {
+        List<String> missingSummary = formatMaterialMap(refillCheck.missingMaterials(), 5);
+        String missingText = missingSummary.isEmpty() ? "missing materials" : String.join(", ", missingSummary);
+
+        if (refillCheck.supplyPoint() == null) {
+            transitionSession(BuildPlanState.NEED_REFILL, "Cannot switch to NEED_REFILL.");
+            return pauseForRecoverableFailure("Need refill for region " + session.getCurrentRegionIndex()
+                    + ", but no supply point is registered in this dimension. Missing: " + missingText);
+        }
+
+        if (session.getState() != BuildPlanState.NEED_REFILL) {
+            Optional<String> transitionError = transitionSession(BuildPlanState.NEED_REFILL, "Cannot switch to NEED_REFILL.");
+            if (transitionError.isPresent()) {
+                return AssistedStepResult.failure(transitionError.get(), false);
+            }
+        }
+
+        BaritoneFacade.CommandResult movementRequest = baritoneFacade.goNear(refillCheck.supplyPoint().pos(), TARGET_APPROACH_RANGE);
+        if (!movementRequest.success()) {
+            return pauseForRecoverableFailure("Failed to start refill movement to supply #" + refillCheck.supplyPoint().id()
+                    + " at " + refillCheck.supplyPoint().pos().toShortString() + ": " + movementRequest.message());
+        }
+
+        activeMovementTarget = refillCheck.supplyPoint().pos().toImmutable();
+        activeMovementPurpose = MovementPurpose.REFILL;
+        movementPaused = false;
+        return AssistedStepResult.moving("Missing materials for region " + session.getCurrentRegionIndex()
+                + " (" + missingText + "). Moving to supply #" + refillCheck.supplyPoint().id()
+                + " at " + refillCheck.supplyPoint().pos().toShortString() + ".");
+    }
+
+    private Map<Identifier, Integer> computeRequiredMaterialsForCurrentRegion() {
+        if (session == null) {
+            return Map.of();
+        }
+
+        List<Region> regions = session.getPlan().regions();
+        int regionIndex = session.getCurrentRegionIndex();
+        if (regionIndex < 0 || regionIndex >= regions.size()) {
+            return Map.of();
+        }
+
+        Region region = regions.get(regionIndex);
+        int regionStartIndex = regionStartIndex(regions, regionIndex);
+        int localStartIndex = Math.max(0, session.getCurrentPlacementIndex() - regionStartIndex);
+        if (localStartIndex >= region.placements().size()) {
+            return Map.of();
+        }
+
+        Map<Identifier, Integer> required = new LinkedHashMap<>();
+        for (int i = localStartIndex; i < region.placements().size(); i++) {
+            Placement placement = region.placements().get(i);
+            Identifier id = Registries.BLOCK.getId(placement.block());
+            required.merge(id, 1, Integer::sum);
+        }
+        return required;
+    }
+
+    private Map<Identifier, Integer> countInventoryMaterials(ClientPlayerEntity player) {
+        if (player == null) {
+            return Map.of();
+        }
+
+        Map<Identifier, Integer> inventory = new LinkedHashMap<>();
+        for (int slot = 0; slot < player.getInventory().size(); slot++) {
+            ItemStack stack = player.getInventory().getStack(slot);
+            if (stack.isEmpty()) {
+                continue;
+            }
+            Identifier id = Registries.ITEM.getId(stack.getItem());
+            inventory.merge(id, stack.getCount(), Integer::sum);
+        }
+        return inventory;
+    }
+
+    private int regionStartIndex(List<Region> regions, int regionIndex) {
+        int index = 0;
+        for (int i = 0; i < regionIndex; i++) {
+            index += regions.get(i).placements().size();
+        }
+        return index;
+    }
+
+    private List<String> formatMaterialMap(Map<Identifier, Integer> counts, int limit) {
+        return counts.entrySet().stream()
+                .sorted(Map.Entry.<Identifier, Integer>comparingByValue(Comparator.reverseOrder())
+                        .thenComparing(entry -> entry.getKey().toString()))
+                .limit(limit)
+                .map(entry -> entry.getKey() + "=" + MaterialCountFormatter.formatCount(entry.getValue(), resolveItem(entry.getKey())))
+                .collect(Collectors.toList());
+    }
+
+    private Item resolveItem(Identifier id) {
+        Block block = Registries.BLOCK.get(id);
+        if (block == null) {
+            return Items.AIR;
+        }
+        Item item = block.asItem();
+        return item == null ? Items.AIR : item;
+    }
+
     private void applyProgressAdvance(BuildPlan plan, int placementIndex, int completedPlacements) {
         if (completedPlacements <= 0 && placementIndex == session.getCurrentPlacementIndex()) {
             return;
@@ -292,7 +481,8 @@ public class BuildCoordinator {
                 session.getCurrentPlacementIndex(),
                 plan.placements().size(),
                 session.getTotalCompletedPlacements(),
-                resolveNextTarget(session)
+                resolveNextTarget(session),
+                Optional.ofNullable(session.getRefillStatus())
         ));
     }
 
@@ -329,21 +519,20 @@ public class BuildCoordinator {
         }
     }
 
-    private ValidationResult validateForNext(MinecraftClient client) {
-        if (client == null || client.player == null) {
+    private ValidationResult validateForTick(MinecraftClient client) {
+        if (client == null || client.player == null || client.world == null) {
             return ValidationResult.error("Client context is unavailable.");
         }
         if (session == null) {
             return ValidationResult.error("No plan loaded.");
         }
-        if (session.getState() != BuildPlanState.BUILDING) {
-            return ValidationResult.error("Build is not active. Use /mapart start or /mapart resume.");
+        if (session.getState() == BuildPlanState.PAUSED || session.getState() == BuildPlanState.ERROR
+                || session.getState() == BuildPlanState.COMPLETED || session.getState() == BuildPlanState.LOADED
+                || session.getState() == BuildPlanState.IDLE) {
+            return ValidationResult.error("Build is not active.");
         }
         if (session.getOrigin() == null) {
             return ValidationResult.error("Origin is not set.");
-        }
-        if (client.world == null) {
-            return ValidationResult.error("World is unavailable.");
         }
 
         BuildPlan plan = session.getPlan();
@@ -358,8 +547,22 @@ public class BuildCoordinator {
         return ValidationResult.success();
     }
 
+    private ValidationResult validateForBuildActions(MinecraftClient client) {
+        ValidationResult validation = validateForTick(client);
+        if (!validation.valid()) {
+            return validation;
+        }
+        if (session.getState() != BuildPlanState.BUILDING) {
+            return ValidationResult.error("Build is not active. Use /mapart start or /mapart resume.");
+        }
+        return ValidationResult.success();
+    }
+
     private AssistedStepResult monitorActiveMovement(MinecraftClient client) {
-        if (session == null || session.getState() != BuildPlanState.BUILDING || client.player == null) {
+        if (session == null || client.player == null) {
+            return AssistedStepResult.noop();
+        }
+        if (session.getState() == BuildPlanState.PAUSED) {
             return AssistedStepResult.noop();
         }
 
@@ -369,8 +572,20 @@ public class BuildCoordinator {
                 baritoneFacade.cancel();
             }
 
+            BlockPos reachedTarget = activeMovementTarget;
             activeMovementTarget = null;
             movementPaused = false;
+            if (activeMovementPurpose == MovementPurpose.REFILL) {
+                activeMovementPurpose = MovementPurpose.BUILD;
+                if (session.getRefillStatus() != null) {
+                    session.setRefillStatus(new RefillStatus(session.getRefillStatus().supplyPoint(), session.getRefillStatus().missingMaterials(), true));
+                }
+                if (session.getState() == BuildPlanState.NEED_REFILL) {
+                    transitionSession(BuildPlanState.REFILLING, "Cannot switch to REFILLING.");
+                }
+                return AssistedStepResult.arrived("Arrived at supply point " + reachedTarget.toShortString() + ". Ready to refill.");
+            }
+
             return AssistedStepResult.arrived("Reached target area.");
         }
 
@@ -381,16 +596,17 @@ public class BuildCoordinator {
         if (!baritoneFacade.isBusy()) {
             String message = "Movement ended before reaching " + activeMovementTarget.toShortString() + ". Run /mapart resume to retry.";
             activeMovementTarget = null;
+            activeMovementPurpose = MovementPurpose.BUILD;
             return pauseForRecoverableFailure(message);
         }
 
         return AssistedStepResult.noop();
     }
 
-
     private AssistedStepResult pauseForRecoverableFailure(String message) {
-        if (session != null && session.getState() == BuildPlanState.BUILDING) {
-            transitionSession(BuildPlanState.PAUSED, "Can only pause while BUILDING.");
+        if (session != null && session.getState() != BuildPlanState.PAUSED) {
+            session.setStateBeforePause(session.getState());
+            transitionSession(BuildPlanState.PAUSED, "Cannot pause current state.");
         }
 
         movementPaused = false;
@@ -409,6 +625,7 @@ public class BuildCoordinator {
         }
 
         activeMovementTarget = null;
+        activeMovementPurpose = MovementPurpose.BUILD;
         movementPaused = false;
     }
 
@@ -445,7 +662,7 @@ public class BuildCoordinator {
 
         try {
             switch (restoredState) {
-                case BUILDING -> activeSession.transitionTo(BuildPlanState.BUILDING);
+                case BUILDING, NEED_REFILL, REFILLING, RETURNING -> activeSession.transitionTo(restoredState);
                 case PAUSED -> {
                     activeSession.transitionTo(BuildPlanState.BUILDING);
                     activeSession.transitionTo(BuildPlanState.PAUSED);
@@ -477,6 +694,11 @@ public class BuildCoordinator {
         progress.setCurrentRegionIndex(regions.size());
     }
 
+    private enum MovementPurpose {
+        BUILD,
+        REFILL
+    }
+
     private record ValidationResult(boolean valid, String message) {
         static ValidationResult success() {
             return new ValidationResult(true, "");
@@ -485,6 +707,9 @@ public class BuildCoordinator {
         static ValidationResult error(String message) {
             return new ValidationResult(false, message);
         }
+    }
+
+    private record RefillCheck(Region region, Map<Identifier, Integer> missingMaterials, SupplyPoint supplyPoint) {
     }
 
     public record NextTarget(Placement placement, BlockPos absolutePos) {
@@ -499,7 +724,8 @@ public class BuildCoordinator {
             int currentPlacementIndex,
             int totalPlacements,
             int totalCompletedPlacements,
-            Optional<NextTarget> nextTarget
+            Optional<NextTarget> nextTarget,
+            Optional<RefillStatus> refillStatus
     ) {
     }
 
@@ -521,27 +747,26 @@ public class BuildCoordinator {
             boolean didWork,
             boolean done,
             boolean failed,
-            boolean unrecoverable,
             String message
     ) {
         static AssistedStepResult noop() {
-            return new AssistedStepResult(false, false, false, false, "");
+            return new AssistedStepResult(false, false, false, "");
         }
 
         static AssistedStepResult moving(String message) {
-            return new AssistedStepResult(true, false, false, false, message);
+            return new AssistedStepResult(true, false, false, message);
         }
 
         static AssistedStepResult arrived(String message) {
-            return new AssistedStepResult(true, false, false, false, message);
+            return new AssistedStepResult(true, false, false, message);
         }
 
         static AssistedStepResult completed(String message) {
-            return new AssistedStepResult(true, true, false, false, message);
+            return new AssistedStepResult(true, true, false, message);
         }
 
-        static AssistedStepResult failure(String message, boolean unrecoverable) {
-            return new AssistedStepResult(true, false, true, unrecoverable, message);
+        static AssistedStepResult failure(String message, boolean done) {
+            return new AssistedStepResult(true, done, true, message);
         }
     }
 }

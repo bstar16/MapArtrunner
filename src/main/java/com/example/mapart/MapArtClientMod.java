@@ -36,7 +36,7 @@ public class MapArtClientMod implements ClientModInitializer {
         SupplyInteractionTracker supplyInteractionTracker = new SupplyInteractionTracker(supplyStore);
         supplyInteractionTracker.registerCallbacks();
         BaritoneFacade baritoneFacade = BaritoneFacadeFactory.create();
-        BuildCoordinator buildCoordinator = new BuildCoordinator(new WorldPlacementResolver(), configStore, progressStore, baritoneFacade);
+        BuildCoordinator buildCoordinator = new BuildCoordinator(new WorldPlacementResolver(), configStore, progressStore, supplyStore, baritoneFacade);
         BuildPlanService buildPlanService = new BuildPlanService(loaderRegistry, buildCoordinator);
         MapArtRuntime.initialize(buildPlanService, configStore, progressStore, settingsStore, supplyStore, baritoneFacade);
 

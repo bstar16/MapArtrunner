@@ -10,6 +10,9 @@ public enum BuildPlanState {
     IDLE,
     LOADED,
     BUILDING,
+    NEED_REFILL,
+    REFILLING,
+    RETURNING,
     PAUSED,
     ERROR,
     COMPLETED;
@@ -28,8 +31,11 @@ public enum BuildPlanState {
         EnumMap<BuildPlanState, Set<BuildPlanState>> transitions = new EnumMap<>(BuildPlanState.class);
         transitions.put(IDLE, EnumSet.of(LOADED));
         transitions.put(LOADED, EnumSet.of(BUILDING, ERROR));
-        transitions.put(BUILDING, EnumSet.of(PAUSED, COMPLETED, ERROR, LOADED));
-        transitions.put(PAUSED, EnumSet.of(BUILDING, ERROR, LOADED));
+        transitions.put(BUILDING, EnumSet.of(NEED_REFILL, PAUSED, COMPLETED, ERROR, LOADED));
+        transitions.put(NEED_REFILL, EnumSet.of(REFILLING, PAUSED, ERROR, LOADED));
+        transitions.put(REFILLING, EnumSet.of(RETURNING, PAUSED, ERROR, LOADED));
+        transitions.put(RETURNING, EnumSet.of(BUILDING, PAUSED, ERROR, LOADED));
+        transitions.put(PAUSED, EnumSet.of(BUILDING, NEED_REFILL, REFILLING, RETURNING, ERROR, LOADED));
         transitions.put(ERROR, EnumSet.of(LOADED));
         transitions.put(COMPLETED, EnumSet.of(BUILDING, LOADED));
         return Collections.unmodifiableMap(transitions);

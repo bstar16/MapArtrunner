@@ -54,6 +54,7 @@ class BuildSessionStateTest {
                 new WorldPlacementResolver(),
                 new ConfigStore(tempDir.resolve("config.json")),
                 new ProgressStore(tempDir.resolve("progress.json")),
+                new com.example.mapart.supply.SupplyStore(tempDir.resolve("supplies.json")),
                 new NoOpBaritoneFacade()
         );
 
@@ -80,6 +81,7 @@ class BuildSessionStateTest {
                 new WorldPlacementResolver(),
                 new ConfigStore(configPath),
                 new ProgressStore(progressPath),
+                new com.example.mapart.supply.SupplyStore(tempDir.resolve("supplies-restore.json")),
                 new NoOpBaritoneFacade()
         );
 
@@ -95,6 +97,7 @@ class BuildSessionStateTest {
                 new WorldPlacementResolver(),
                 new ConfigStore(configPath),
                 new ProgressStore(progressPath),
+                new com.example.mapart.supply.SupplyStore(tempDir.resolve("supplies-restore.json")),
                 new NoOpBaritoneFacade()
         );
         BuildSession restoredSession = restoredCoordinator.loadPlan(plan);
@@ -113,6 +116,7 @@ class BuildSessionStateTest {
                 new WorldPlacementResolver(),
                 new ConfigStore(tempDir.resolve("config-explicit.json")),
                 new ProgressStore(tempDir.resolve("progress-explicit.json")),
+                new com.example.mapart.supply.SupplyStore(tempDir.resolve("supplies-explicit.json")),
                 new NoOpBaritoneFacade()
         );
 
@@ -130,6 +134,7 @@ class BuildSessionStateTest {
                 new WorldPlacementResolver(),
                 new ConfigStore(tempDir.resolve("config2.json")),
                 new ProgressStore(tempDir.resolve("progress2.json")),
+                new com.example.mapart.supply.SupplyStore(tempDir.resolve("supplies2.json")),
                 new NoOpBaritoneFacade()
         );
 

@@ -116,6 +116,7 @@ class MilestoneATest {
                 new WorldPlacementResolver(),
                 new ConfigStore(tempDir.resolve("config.json")),
                 new ProgressStore(tempDir.resolve("progress.json")),
+                new com.example.mapart.supply.SupplyStore(tempDir.resolve("supplies.json")),
                 new NoOpBaritoneFacade()
         );
         return new BuildPlanService(registry, coordinator);
