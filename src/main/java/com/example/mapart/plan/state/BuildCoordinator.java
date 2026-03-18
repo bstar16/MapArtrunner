@@ -525,6 +525,7 @@ public class BuildCoordinator {
             return failRefill("Opened screen is not a supported supply container.");
         }
 
+        boolean attemptedTransfer = false;
         for (int slotIndex = 0; slotIndex < containerSlotCount; slotIndex++) {
             Slot slot = handler.slots.get(slotIndex);
             ItemStack stack = slot.getStack();
@@ -546,9 +547,18 @@ public class BuildCoordinator {
             client.interactionManager.clickSlot(handler.syncId, slotIndex, 0, SlotActionType.QUICK_MOVE, client.player);
             refillActionCooldown = REFILL_ACTION_DELAY_TICKS;
             int moved = Math.max(0, countPlayerItem(client.player, stack.getItem()) - beforeCount);
+            attemptedTransfer = true;
+            if (moved <= 0) {
+                continue;
+            }
             debugToChatAndFile("Withdrew " + MaterialCountFormatter.formatCount(moved, stack.getItem()) + " of " + itemId + " from supply.");
             return AssistedStepResult.arrived("Withdrew " + MaterialCountFormatter.formatCount(moved, stack.getItem())
                     + " of " + itemId + " from supply.");
+        }
+
+        if (attemptedTransfer) {
+            return advanceToNextSupplyOrPause(client, refillStatus,
+                    "Supply #" + refillStatus.supplyPoint().id() + " could not transfer the required materials into the player inventory.");
         }
 
         return advanceToNextSupplyOrPause(client, refillStatus,
