@@ -36,6 +36,18 @@ class BuildSessionStateTest {
     }
 
     @Test
+    void refillingCanReturnToNeedRefillWhenSupplyIsIncomplete() {
+        BuildSession session = new BuildSession(plan(tempDir.resolve("refill.nbt")));
+
+        session.transitionTo(BuildPlanState.LOADED);
+        session.transitionTo(BuildPlanState.BUILDING);
+        session.transitionTo(BuildPlanState.NEED_REFILL);
+        session.transitionTo(BuildPlanState.REFILLING);
+
+        assertDoesNotThrow(() -> session.transitionTo(BuildPlanState.NEED_REFILL));
+    }
+
+    @Test
     void originResolutionUsesSessionOrigin() {
         WorldPlacementResolver resolver = new WorldPlacementResolver();
         BuildSession session = new BuildSession(plan(tempDir.resolve("two.nbt")));
