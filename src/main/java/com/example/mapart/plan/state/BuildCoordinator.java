@@ -14,12 +14,22 @@ import net.minecraft.block.BlockState;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.network.ClientPlayerEntity;
 import net.minecraft.client.world.ClientWorld;
+import net.minecraft.client.gui.screen.ingame.HandledScreen;
+import net.minecraft.entity.player.PlayerInventory;
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
 import net.minecraft.registry.Registries;
+import net.minecraft.screen.ScreenHandler;
+import net.minecraft.screen.slot.Slot;
+import net.minecraft.screen.slot.SlotActionType;
+import net.minecraft.util.ActionResult;
+import net.minecraft.util.Hand;
 import net.minecraft.util.Identifier;
+import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Direction;
+import net.minecraft.util.math.Vec3d;
 
 import java.util.Collections;
 import java.util.Comparator;
@@ -31,6 +41,7 @@ import java.util.stream.Collectors;
 
 public class BuildCoordinator {
     private static final int TARGET_APPROACH_RANGE = 3;
+    private static final int REFILL_ACTION_DELAY_TICKS = 4;
 
     private final WorldPlacementResolver placementResolver;
     private final ConfigStore configStore;
@@ -41,6 +52,8 @@ public class BuildCoordinator {
     private BlockPos activeMovementTarget;
     private boolean movementPaused;
     private MovementPurpose activeMovementPurpose = MovementPurpose.BUILD;
+    private int refillActionCooldown;
+    private boolean awaitingSupplyScreen;
 
     public BuildCoordinator(
             WorldPlacementResolver placementResolver,
@@ -132,6 +145,8 @@ public class BuildCoordinator {
             return sessionTransitionError;
         }
 
+        closeHandledScreen(MinecraftClient.getInstance());
+
         if (activeMovementTarget == null) {
             return Optional.empty();
         }
@@ -151,9 +166,12 @@ public class BuildCoordinator {
         }
 
         cancelActiveMovement();
+        closeHandledScreen(MinecraftClient.getInstance());
         session.getProgress().reset();
         session.setRefillStatus(null);
         session.setStateBeforePause(null);
+        awaitingSupplyScreen = false;
+        refillActionCooldown = 0;
         if (session.getState() == BuildPlanState.LOADED) {
             progressStore.saveProgress(session);
             return Optional.empty();
@@ -410,10 +428,95 @@ public class BuildCoordinator {
                         refillStatus.supplyPoint()
                 ));
             }
-            case REFILLING -> continueReturnToBuild(client, refillStatus);
+            case REFILLING -> performRefill(client, refillStatus);
             case RETURNING -> continueBuildReturnMovement(client);
             default -> AssistedStepResult.noop();
         };
+    }
+
+    private AssistedStepResult performRefill(MinecraftClient client, RefillStatus refillStatus) {
+        if (client.player == null || client.world == null || refillStatus.supplyPoint() == null) {
+            return AssistedStepResult.noop();
+        }
+        if (!refillStatus.arrivedAtSupply()) {
+            return AssistedStepResult.noop();
+        }
+        if (refillActionCooldown > 0) {
+            refillActionCooldown--;
+            return AssistedStepResult.noop();
+        }
+
+        Map<Identifier, Integer> remaining = computeRemainingDeficits(client.player, refillStatus.missingMaterials());
+        if (remaining.isEmpty()) {
+            closeHandledScreen(client);
+            awaitingSupplyScreen = false;
+            return continueReturnToBuild(client, refillStatus);
+        }
+
+        HandledScreen<?> handledScreen = currentSupplyScreen(client);
+        if (handledScreen == null) {
+            if (awaitingSupplyScreen) {
+                awaitingSupplyScreen = false;
+                return failRefill("Failed to open the supply container at "
+                        + refillStatus.supplyPoint().pos().toShortString() + ".");
+            }
+
+            ActionResult interactResult = client.interactionManager == null
+                    ? ActionResult.FAIL
+                    : client.interactionManager.interactBlock(
+                    client.player,
+                    Hand.MAIN_HAND,
+                    new BlockHitResult(
+                            Vec3d.ofCenter(refillStatus.supplyPoint().pos()),
+                            Direction.UP,
+                            refillStatus.supplyPoint().pos(),
+                            false
+                    )
+            );
+            if (!interactResult.isAccepted()) {
+                return failRefill("Failed to interact with the supply container at "
+                        + refillStatus.supplyPoint().pos().toShortString() + ".");
+            }
+
+            awaitingSupplyScreen = true;
+            refillActionCooldown = REFILL_ACTION_DELAY_TICKS;
+            return AssistedStepResult.arrived("Opening supply container at "
+                    + refillStatus.supplyPoint().pos().toShortString() + ".");
+        }
+
+        awaitingSupplyScreen = false;
+        ScreenHandler handler = handledScreen.getScreenHandler();
+        int containerSlotCount = Math.max(0, handler.slots.size() - PlayerInventory.MAIN_SIZE);
+        if (containerSlotCount <= 0) {
+            return failRefill("Opened screen is not a supported supply container.");
+        }
+
+        for (int slotIndex = 0; slotIndex < containerSlotCount; slotIndex++) {
+            Slot slot = handler.slots.get(slotIndex);
+            ItemStack stack = slot.getStack();
+            if (stack.isEmpty()) {
+                continue;
+            }
+
+            Identifier itemId = Registries.ITEM.getId(stack.getItem());
+            Integer deficit = remaining.get(itemId);
+            if (deficit == null || deficit <= 0) {
+                continue;
+            }
+
+            int beforeCount = countPlayerItem(client.player, stack.getItem());
+            if (client.interactionManager == null) {
+                return failRefill("Cannot transfer materials because the interaction manager is unavailable.");
+            }
+
+            client.interactionManager.clickSlot(handler.syncId, slotIndex, 0, SlotActionType.QUICK_MOVE, client.player);
+            refillActionCooldown = REFILL_ACTION_DELAY_TICKS;
+            int moved = Math.max(0, countPlayerItem(client.player, stack.getItem()) - beforeCount);
+            return AssistedStepResult.arrived("Withdrew " + MaterialCountFormatter.formatCount(moved, stack.getItem())
+                    + " of " + itemId + " from supply.");
+        }
+
+        return failRefill("Supply is missing " + String.join(", ", formatMaterialMap(remaining, 5)) + ".");
     }
 
     private AssistedStepResult continueReturnToBuild(MinecraftClient client, RefillStatus refillStatus) {
@@ -429,6 +532,8 @@ public class BuildCoordinator {
             return AssistedStepResult.failure(transitionError.get(), false);
         }
 
+        closeHandledScreen(client);
+        awaitingSupplyScreen = false;
         session.setRefillStatus(null);
         progressStore.saveProgress(session);
         return continueBuildReturnMovement(client);
@@ -499,6 +604,18 @@ public class BuildCoordinator {
             inventory.merge(id, stack.getCount(), Integer::sum);
         }
         return inventory;
+    }
+
+    private Map<Identifier, Integer> computeRemainingDeficits(ClientPlayerEntity player, Map<Identifier, Integer> targetDeficits) {
+        Map<Identifier, Integer> inventory = countInventoryMaterials(player);
+        Map<Identifier, Integer> remaining = new LinkedHashMap<>();
+        targetDeficits.forEach((id, count) -> {
+            int deficit = count - inventory.getOrDefault(id, 0);
+            if (deficit > 0) {
+                remaining.put(id, deficit);
+            }
+        });
+        return remaining;
     }
 
     private int regionStartIndex(List<Region> regions, int regionIndex) {
@@ -689,6 +806,8 @@ public class BuildCoordinator {
         }
 
         movementPaused = false;
+        closeHandledScreen(MinecraftClient.getInstance());
+        awaitingSupplyScreen = false;
         return AssistedStepResult.failure(message, false);
     }
 
@@ -706,6 +825,49 @@ public class BuildCoordinator {
         activeMovementTarget = null;
         activeMovementPurpose = MovementPurpose.BUILD;
         movementPaused = false;
+    }
+
+    private int countPlayerItem(ClientPlayerEntity player, Item item) {
+        int total = 0;
+        for (int slot = 0; slot < player.getInventory().size(); slot++) {
+            ItemStack stack = player.getInventory().getStack(slot);
+            if (stack.isOf(item)) {
+                total += stack.getCount();
+            }
+        }
+        return total;
+    }
+
+    private AssistedStepResult failRefill(String message) {
+        closeHandledScreen(MinecraftClient.getInstance());
+        awaitingSupplyScreen = false;
+        refillActionCooldown = 0;
+        Map<Identifier, Integer> remaining = session == null || session.getRefillStatus() == null
+                ? Map.of()
+                : computeRemainingDeficits(MinecraftClient.getInstance().player, session.getRefillStatus().missingMaterials());
+        if (session != null && session.getRefillStatus() != null) {
+            RefillStatus current = session.getRefillStatus();
+            session.setRefillStatus(new RefillStatus(current.supplyPoint(), remaining, true));
+            transitionSession(BuildPlanState.NEED_REFILL, "Cannot switch to NEED_REFILL.");
+            progressStore.saveProgress(session);
+        }
+        return AssistedStepResult.failure(message, false);
+    }
+
+    private HandledScreen<?> currentSupplyScreen(MinecraftClient client) {
+        if (!(client.currentScreen instanceof HandledScreen<?> handledScreen)) {
+            return null;
+        }
+        return handledScreen;
+    }
+
+    private void closeHandledScreen(MinecraftClient client) {
+        if (client == null || client.player == null) {
+            return;
+        }
+        if (client.currentScreen instanceof HandledScreen<?>) {
+            client.player.closeHandledScreen();
+        }
     }
 
     private Optional<NextTarget> resolveNextTarget(BuildSession activeSession) {
