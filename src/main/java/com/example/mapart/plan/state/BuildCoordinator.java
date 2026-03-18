@@ -375,7 +375,14 @@ public class BuildCoordinator {
         String dimensionKey = client.world.getRegistryKey().getValue().toString();
         List<SupplyPoint> supplyPoints = supplyStore.listInDimensionByDistance(dimensionKey, client.player.getBlockPos());
         SupplyPoint supplyPoint = supplyPoints.isEmpty() ? null : supplyPoints.getFirst();
-        session.setRefillStatus(new RefillStatus(supplyPoint, supplyPoints, 0, missing, false));
+        session.setRefillStatus(new RefillStatus(
+                supplyPoint,
+                supplyPoints,
+                0,
+                missing,
+                false,
+                determineReturnTarget()
+        ));
         progressStore.saveProgress(session);
         return Optional.of(new RefillCheck(region, missing, supplyPoints, 0));
     }
@@ -434,7 +441,7 @@ public class BuildCoordinator {
                 ));
             }
             case REFILLING -> performRefill(client, refillStatus);
-            case RETURNING -> continueBuildReturnMovement(client);
+            case RETURNING -> continueBuildReturnMovement(client, refillStatus.returnTarget());
             default -> AssistedStepResult.noop();
         };
     }
@@ -554,26 +561,29 @@ public class BuildCoordinator {
         resetRefillInteractionState();
         session.setRefillStatus(null);
         progressStore.saveProgress(session);
-        return continueBuildReturnMovement(client);
+        return continueBuildReturnMovement(client, refillStatus.returnTarget());
     }
 
-    private AssistedStepResult continueBuildReturnMovement(MinecraftClient client) {
-        StepResult stepResult = computeNextStep(client, false);
-        if (stepResult.done()) {
-            cancelActiveMovement();
-            return AssistedStepResult.completed(stepResult.message());
+    private AssistedStepResult continueBuildReturnMovement(MinecraftClient client, BlockPos returnTarget) {
+        BlockPos target = returnTarget == null ? null : returnTarget.toImmutable();
+        if (target == null) {
+            StepResult stepResult = computeNextStep(client, false);
+            if (stepResult.done()) {
+                cancelActiveMovement();
+                return AssistedStepResult.completed(stepResult.message());
+            }
+            if (!stepResult.actionable()) {
+                return pauseForRecoverableFailure(stepResult.message());
+            }
+            target = stepResult.targetPos();
         }
-        if (!stepResult.actionable()) {
-            return pauseForRecoverableFailure(stepResult.message());
-        }
-
-        BaritoneFacade.CommandResult movementRequest = baritoneFacade.goNear(stepResult.targetPos(), TARGET_APPROACH_RANGE);
+        BaritoneFacade.CommandResult movementRequest = baritoneFacade.goNear(target, TARGET_APPROACH_RANGE);
         if (!movementRequest.success()) {
             return pauseForRecoverableFailure("Failed to return to build area near "
-                    + stepResult.targetPos().toShortString() + ": " + movementRequest.message());
+                    + target.toShortString() + ": " + movementRequest.message());
         }
 
-        activeMovementTarget = stepResult.targetPos().toImmutable();
+        activeMovementTarget = target;
         activeMovementPurpose = MovementPurpose.BUILD;
         movementPaused = false;
         return AssistedStepResult.moving("Materials refilled. Returning to build near "
@@ -657,7 +667,14 @@ public class BuildCoordinator {
             }
 
             Map<Identifier, Integer> remaining = computeRemainingDeficits(client.player, refillStatus.missingMaterials());
-            session.setRefillStatus(new RefillStatus(nextSupply, supplyPoints, nextIndex, remaining, false));
+            session.setRefillStatus(new RefillStatus(
+                    nextSupply,
+                    supplyPoints,
+                    nextIndex,
+                    remaining,
+                    false,
+                    refillStatus.returnTarget()
+            ));
             progressStore.saveProgress(session);
             return beginRefillMovement(new RefillCheck(
                     session.getPlan().regions().get(session.getCurrentRegionIndex()),
@@ -819,7 +836,8 @@ public class BuildCoordinator {
                             currentRefill.supplyPoints(),
                             currentRefill.supplyIndex(),
                             currentRefill.missingMaterials(),
-                            true
+                            true,
+                            currentRefill.returnTarget()
                     ));
                     progressStore.saveProgress(session);
                 }
@@ -898,7 +916,14 @@ public class BuildCoordinator {
                 : computeRemainingDeficits(client.player, session.getRefillStatus().missingMaterials());
         if (session != null && session.getRefillStatus() != null) {
             RefillStatus current = session.getRefillStatus();
-            session.setRefillStatus(new RefillStatus(current.supplyPoint(), current.supplyPoints(), current.supplyIndex(), remaining, true));
+            session.setRefillStatus(new RefillStatus(
+                    current.supplyPoint(),
+                    current.supplyPoints(),
+                    current.supplyIndex(),
+                    remaining,
+                    true,
+                    current.returnTarget()
+            ));
             progressStore.saveProgress(session);
         }
         return pauseForRecoverableFailure(message);
@@ -936,6 +961,27 @@ public class BuildCoordinator {
         Placement placement = plan.placements().get(nextIndex);
         return placementResolver.resolveAbsolute(activeSession, placement)
                 .map(pos -> new NextTarget(placement, pos));
+    }
+
+    private BlockPos determineReturnTarget() {
+        if (session == null) {
+            return null;
+        }
+
+        Optional<NextTarget> nextTarget = resolveNextTarget(session);
+        if (nextTarget.isPresent()) {
+            return nextTarget.get().absolutePos().toImmutable();
+        }
+
+        int previousPlacementIndex = session.getCurrentPlacementIndex() - 1;
+        if (previousPlacementIndex < 0 || previousPlacementIndex >= session.getPlan().placements().size()) {
+            return null;
+        }
+
+        Placement previousPlacement = session.getPlan().placements().get(previousPlacementIndex);
+        return placementResolver.resolveAbsolute(session, previousPlacement)
+                .map(BlockPos::toImmutable)
+                .orElse(null);
     }
 
     private void restoreProgressForLoadedPlan(BuildSession activeSession) {
