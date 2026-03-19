@@ -60,6 +60,7 @@ public class BuildCoordinator {
     private int refillActionCooldown;
     private boolean awaitingSupplyScreen;
     private int supplyScreenWaitPollsRemaining;
+    private PendingTransfer pendingTransfer;
 
     public BuildCoordinator(
             WorldPlacementResolver placementResolver,
@@ -516,6 +517,11 @@ public class BuildCoordinator {
             return failRefill("Opened screen is not a supported supply container.");
         }
 
+        AssistedStepResult pendingTransferResult = resolvePendingTransfer(client);
+        if (pendingTransferResult != null) {
+            return pendingTransferResult;
+        }
+
         boolean attemptedTransfer = false;
         for (int slotIndex = 0; slotIndex < containerSlotCount; slotIndex++) {
             Slot slot = handler.slots.get(slotIndex);
@@ -537,14 +543,9 @@ public class BuildCoordinator {
 
             client.interactionManager.clickSlot(handler.syncId, slotIndex, 0, SlotActionType.QUICK_MOVE, client.player);
             refillActionCooldown = REFILL_ACTION_DELAY_TICKS;
-            int moved = Math.max(0, countPlayerItem(client.player, stack.getItem()) - beforeCount);
             attemptedTransfer = true;
-            if (moved <= 0) {
-                continue;
-            }
-            debugToChatAndFile("Withdrew " + MaterialCountFormatter.formatCount(moved, stack.getItem()) + " of " + itemId + " from supply.");
-            return AssistedStepResult.arrived("Withdrew " + MaterialCountFormatter.formatCount(moved, stack.getItem())
-                    + " of " + itemId + " from supply.");
+            pendingTransfer = new PendingTransfer(stack.getItem(), itemId, beforeCount);
+            return AssistedStepResult.arrived("Attempting to withdraw " + itemId + " from supply.");
         }
 
         if (attemptedTransfer) {
@@ -996,6 +997,7 @@ public class BuildCoordinator {
         awaitingSupplyScreen = false;
         supplyScreenWaitPollsRemaining = 0;
         refillActionCooldown = 0;
+        pendingTransfer = null;
     }
 
     private void closeHandledScreen(MinecraftClient client) {
@@ -1005,6 +1007,28 @@ public class BuildCoordinator {
         if (client.currentScreen instanceof HandledScreen<?>) {
             client.player.closeHandledScreen();
         }
+    }
+
+    private AssistedStepResult resolvePendingTransfer(MinecraftClient client) {
+        if (pendingTransfer == null || client.player == null) {
+            return null;
+        }
+        if (refillActionCooldown > 0) {
+            refillActionCooldown--;
+            return AssistedStepResult.noop();
+        }
+
+        int moved = Math.max(0, countPlayerItem(client.player, pendingTransfer.item()) - pendingTransfer.beforeCount());
+        PendingTransfer completedTransfer = pendingTransfer;
+        pendingTransfer = null;
+        if (moved <= 0) {
+            return null;
+        }
+
+        debugToChatAndFile("Withdrew " + MaterialCountFormatter.formatCount(moved, completedTransfer.item())
+                + " of " + completedTransfer.itemId() + " from supply.");
+        return AssistedStepResult.arrived("Withdrew " + MaterialCountFormatter.formatCount(moved, completedTransfer.item())
+                + " of " + completedTransfer.itemId() + " from supply.");
     }
 
     private Optional<NextTarget> resolveNextTarget(BuildSession activeSession) {
@@ -1109,6 +1133,9 @@ public class BuildCoordinator {
     private enum MovementPurpose {
         BUILD,
         REFILL
+    }
+
+    private record PendingTransfer(Item item, Identifier itemId, int beforeCount) {
     }
 
     private record ValidationResult(boolean valid, String message) {
