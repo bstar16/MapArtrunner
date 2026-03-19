@@ -42,7 +42,9 @@ import java.util.Optional;
 import java.util.stream.Collectors;
 
 public class BuildCoordinator {
-    private static final int TARGET_APPROACH_RANGE = 3;
+    private static final int BUILD_APPROACH_RANGE = 2;
+    private static final int REFILL_APPROACH_RANGE = 3;
+    private static final double PLACE_REACH_DISTANCE = 4.0;
     private static final int REFILL_ACTION_DELAY_TICKS = 4;
     private static final int MAX_SUPPLY_SCREEN_WAIT_POLLS = 5;
     private static final int MAX_REFILL_LOOKAHEAD_ITEMS = PlayerInventory.MAIN_SIZE * 64;
@@ -281,7 +283,7 @@ public class BuildCoordinator {
             cancelActiveMovement();
             return AssistedStepResult.completed(stepResult.message());
         }
-        if (isWithinRange(client.player.getBlockPos(), stepResult.targetPos(), TARGET_APPROACH_RANGE)) {
+        if (isWithinPlacementReach(client, stepResult.targetPos())) {
             return executePlacement(client, stepResult);
         }
 
@@ -446,7 +448,7 @@ public class BuildCoordinator {
             }
         }
 
-        BaritoneFacade.CommandResult movementRequest = baritoneFacade.goNear(refillCheck.supplyPoint().pos(), TARGET_APPROACH_RANGE);
+        BaritoneFacade.CommandResult movementRequest = baritoneFacade.goNear(refillCheck.supplyPoint().pos(), REFILL_APPROACH_RANGE);
         if (!movementRequest.success()) {
             return pauseForRecoverableFailure("Failed to start refill movement to supply #" + refillCheck.supplyPoint().id()
                     + " at " + refillCheck.supplyPoint().pos().toShortString() + ": " + movementRequest.message());
@@ -628,7 +630,7 @@ public class BuildCoordinator {
             }
             target = stepResult.targetPos();
         }
-        BaritoneFacade.CommandResult movementRequest = baritoneFacade.goNear(target, TARGET_APPROACH_RANGE);
+        BaritoneFacade.CommandResult movementRequest = baritoneFacade.goNear(target, BUILD_APPROACH_RANGE);
         if (!movementRequest.success()) {
             return pauseForRecoverableFailure("Failed to return to build area near "
                     + target.toShortString() + ": " + movementRequest.message());
@@ -878,8 +880,10 @@ public class BuildCoordinator {
             return AssistedStepResult.noop();
         }
 
-        BlockPos playerPos = client.player.getBlockPos();
-        if (isWithinRange(playerPos, activeMovementTarget, TARGET_APPROACH_RANGE)) {
+        boolean reachedMovementTarget = activeMovementPurpose == MovementPurpose.REFILL
+                ? isWithinBlockRange(client.player.getBlockPos(), activeMovementTarget, REFILL_APPROACH_RANGE)
+                : isWithinPlacementReach(client, activeMovementTarget);
+        if (reachedMovementTarget) {
             if (baritoneFacade.isBusy()) {
                 baritoneFacade.cancel();
             }
@@ -932,7 +936,7 @@ public class BuildCoordinator {
 
 
     private AssistedStepResult beginBuildMovement(StepResult stepResult) {
-        BaritoneFacade.CommandResult movementRequest = baritoneFacade.goNear(stepResult.targetPos(), TARGET_APPROACH_RANGE);
+        BaritoneFacade.CommandResult movementRequest = baritoneFacade.goNear(stepResult.targetPos(), BUILD_APPROACH_RANGE);
         if (!movementRequest.success()) {
             return pauseForRecoverableFailure("Failed to start movement to "
                     + stepResult.targetPos().toShortString() + ": " + movementRequest.message());
@@ -982,10 +986,20 @@ public class BuildCoordinator {
         return AssistedStepResult.failure(message, false);
     }
 
-    private boolean isWithinRange(BlockPos playerPos, BlockPos target, int range) {
+    private boolean isWithinBlockRange(BlockPos playerPos, BlockPos target, int range) {
+        if (playerPos == null || target == null) {
+            return false;
+        }
         return Math.abs(playerPos.getX() - target.getX()) <= range
                 && Math.abs(playerPos.getY() - target.getY()) <= range
                 && Math.abs(playerPos.getZ() - target.getZ()) <= range;
+    }
+
+    private boolean isWithinPlacementReach(MinecraftClient client, BlockPos target) {
+        if (client == null || client.player == null || target == null) {
+            return false;
+        }
+        return client.player.getEyePos().squaredDistanceTo(Vec3d.ofCenter(target)) <= PLACE_REACH_DISTANCE * PLACE_REACH_DISTANCE;
     }
 
     private void cancelActiveMovement() {
