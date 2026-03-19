@@ -20,6 +20,7 @@ import net.minecraft.util.math.Vec3i;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
@@ -59,7 +60,7 @@ public class SchemNbtLoader implements PlanLoader {
 
         Map<Integer, Block> palette = parsePalette(root.getCompound("Palette"));
         int[] blockIndices = decodeBlockData(root, width * height * length);
-        List<Placement> placements = toPlacements(blockIndices, palette, width, length);
+        List<Placement> placements = orderPlacementsForTraversal(toPlacements(blockIndices, palette, width, length));
         Map<Block, Integer> materialCounts = countMaterials(placements);
         List<Region> regions = splitIntoRegions(placements);
 
@@ -69,7 +70,7 @@ public class SchemNbtLoader implements PlanLoader {
     private BuildPlan loadStructureNbt(Path path, NbtCompound root) {
         Vec3i dimensions = getStructureDimensions(root);
         Map<Integer, Block> palette = parseStructurePalette(root.getList("palette", NbtElement.COMPOUND_TYPE));
-        List<Placement> placements = parseStructurePlacements(root.getList("blocks", NbtElement.COMPOUND_TYPE), palette);
+        List<Placement> placements = orderPlacementsForTraversal(parseStructurePlacements(root.getList("blocks", NbtElement.COMPOUND_TYPE), palette));
         Map<Block, Integer> materialCounts = countMaterials(placements);
         List<Region> regions = splitIntoRegions(placements);
 
@@ -224,6 +225,46 @@ public class SchemNbtLoader implements PlanLoader {
             placements.add(new Placement(new BlockPos(x, y, z), block));
         }
         return placements;
+    }
+
+    static List<Placement> orderPlacementsForTraversal(List<Placement> placements) {
+        List<Placement> ordered = new ArrayList<>(placements);
+        ordered.sort(Comparator
+                .comparingInt((Placement placement) -> placement.relativePos().getY())
+                .thenComparingInt(placement -> placement.relativePos().getZ())
+                .thenComparingInt(placement -> placement.relativePos().getX()));
+
+        List<Placement> serpentine = new ArrayList<>(ordered.size());
+        int index = 0;
+        int currentLayer = Integer.MIN_VALUE;
+        int rowNumber = 0;
+        while (index < ordered.size()) {
+            Placement first = ordered.get(index);
+            int y = first.relativePos().getY();
+            int z = first.relativePos().getZ();
+            if (y != currentLayer) {
+                currentLayer = y;
+                rowNumber = 0;
+            }
+            int rowEnd = index + 1;
+            while (rowEnd < ordered.size()) {
+                Placement candidate = ordered.get(rowEnd);
+                if (candidate.relativePos().getY() != y || candidate.relativePos().getZ() != z) {
+                    break;
+                }
+                rowEnd++;
+            }
+
+            List<Placement> row = new ArrayList<>(ordered.subList(index, rowEnd));
+            if ((rowNumber & 1) == 1) {
+                Collections.reverse(row);
+            }
+            serpentine.addAll(row);
+            index = rowEnd;
+            rowNumber++;
+        }
+
+        return serpentine;
     }
 
     private Map<Block, Integer> countMaterials(List<Placement> placements) {
