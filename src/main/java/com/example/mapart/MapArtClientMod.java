@@ -18,13 +18,21 @@ import com.example.mapart.runtime.MapArtRuntime;
 import com.example.mapart.settings.MapartSettingsStore;
 import com.example.mapart.supply.SupplyInteractionTracker;
 import com.example.mapart.supply.SupplyStore;
+import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.rendering.v1.HudRenderCallback;
 import net.fabricmc.fabric.api.client.rendering.v1.WorldRenderEvents;
+import net.minecraft.client.option.KeyBinding;
+import net.minecraft.client.util.InputUtil;
+import net.minecraft.text.Text;
+import org.lwjgl.glfw.GLFW;
 
 public class MapArtClientMod implements ClientModInitializer {
+    private static final String KEY_CATEGORY = "key.categories.mapart";
+    private static final String PANIC_KEY_TRANSLATION = "key.mapart.panic";
+
     @Override
     public void onInitializeClient() {
         PlanLoaderRegistry loaderRegistry = new PlanLoaderRegistry();
@@ -41,6 +49,12 @@ public class MapArtClientMod implements ClientModInitializer {
         BuildCoordinator buildCoordinator = new BuildCoordinator(new WorldPlacementResolver(), configStore, progressStore, supplyStore, baritoneFacade);
         BuildPlanService buildPlanService = new BuildPlanService(loaderRegistry, buildCoordinator);
         MapArtRuntime.initialize(buildPlanService, configStore, progressStore, settingsStore, supplyStore, baritoneFacade, debugReporter);
+        KeyBinding panicKeyBinding = KeyBindingHelper.registerKeyBinding(new KeyBinding(
+                PANIC_KEY_TRANSLATION,
+                InputUtil.Type.KEYSYM,
+                GLFW.GLFW_KEY_UNKNOWN,
+                KEY_CATEGORY
+        ));
 
         ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) -> {
             dispatcher.register(MapArtCommand.create(buildPlanService, settingsStore, supplyStore, supplyInteractionTracker, baritoneFacade));
@@ -50,6 +64,15 @@ public class MapArtClientMod implements ClientModInitializer {
 
 
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
+            while (panicKeyBinding.wasPressed()) {
+                if (client.player != null) {
+                    boolean didAnything = MapArtCommand.triggerPanic(buildPlanService).didAnything();
+                    client.player.sendMessage(Text.literal(didAnything
+                            ? "MapArt panic button triggered."
+                            : "MapArt panic button pressed, but nothing was active."), true);
+                }
+            }
+
             BuildCoordinator.AssistedStepResult assistedStep = buildCoordinator.tickAssisted(client);
             if (!assistedStep.didWork() || client.player == null || assistedStep.message().isBlank()) {
                 return;

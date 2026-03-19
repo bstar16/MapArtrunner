@@ -86,13 +86,23 @@ Available subcommands:
 - `load <path>` (OP level 2 required)
 - `info`
 - `unload` (OP level 2 required)
+- `panic` (client-side emergency stop + unload)
 
 Example:
 ```mcfunction
 /mapart load /absolute/path/to/build.schem or .nbt
 /mapart info
 /mapart unload
+/mapart panic
 ```
+
+## Panic Button
+
+The mod now exposes a client keybind named **MapArt → Panic unload** in the Minecraft Controls menu.
+
+- Bind it to any keyboard or mouse button you want.
+- Pressing it immediately cancels active automation, closes any open supply container UI, and unloads the current plan.
+- The same action is also available as `/mapart panic`.
 
 If `/mapart` is unknown in game:
 - make sure the built JAR from `build/libs/` is in your server/client `mods/` folder

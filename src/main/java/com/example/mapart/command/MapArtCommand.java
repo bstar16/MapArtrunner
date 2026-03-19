@@ -147,6 +147,8 @@ public final class MapArtCommand {
                             context.getSource().sendFeedback(Text.literal("Build session stopped and progress reset."));
                             return 1;
                         }))
+                .then(ClientCommandManager.literal("panic")
+                        .executes(context -> panic(planService, context.getSource())))
                 .then(ClientCommandManager.literal("next")
                         .executes(context -> {
                             BuildCoordinator.StepResult result = planService.coordinator().next(context.getSource().getClient());
@@ -243,6 +245,26 @@ public final class MapArtCommand {
 
         source.sendFeedback(Text.literal("Build session resumed."));
         return 1;
+    }
+
+    public static int panic(BuildPlanService planService, FabricClientCommandSource source) {
+        BuildCoordinator.PanicResult result = triggerPanic(planService);
+        if (!result.didAnything()) {
+            source.sendFeedback(Text.literal("Panic button pressed, but nothing was active."));
+            return 0;
+        }
+
+        StringBuilder message = new StringBuilder("Panic button pressed: cancelled active automation");
+        if (result.unloadedPlan()) {
+            message.append(", unloaded the current build plan");
+        }
+        message.append(".");
+        source.sendFeedback(Text.literal(message.toString()));
+        return 1;
+    }
+
+    public static BuildCoordinator.PanicResult triggerPanic(BuildPlanService planService) {
+        return planService.coordinator().panicUnload();
     }
 
     private static int debugGoto(FabricClientCommandSource source, BaritoneFacade baritoneFacade, int x, int y, int z) {

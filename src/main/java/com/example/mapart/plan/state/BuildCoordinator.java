@@ -112,6 +112,28 @@ public class BuildCoordinator {
         return true;
     }
 
+    public PanicResult panicUnload() {
+        boolean hadSession = session != null;
+        boolean hadMovement = activeMovementTarget != null || movementPaused || baritoneFacade.isBusy();
+
+        debugToChatAndFile("Panic button triggered: stopping automation, cancelling movement, and unloading the current plan.");
+        cancelActiveMovement();
+        closeHandledScreen(MinecraftClient.getInstance());
+        resetRefillInteractionState();
+
+        boolean unloaded = false;
+        if (hadSession) {
+            session.setRefillStatus(null);
+            session.setStateBeforePause(null);
+            session = null;
+            progressStore.clearProgress();
+            configStore.clearRememberedState();
+            unloaded = true;
+        }
+
+        return new PanicResult(hadSession, hadMovement, unloaded);
+    }
+
     public Optional<String> setOrigin(BlockPos origin) {
         if (session == null) {
             return Optional.of("No build plan loaded.");
@@ -1169,6 +1191,12 @@ public class BuildCoordinator {
             Optional<NextTarget> nextTarget,
             Optional<RefillStatus> refillStatus
     ) {
+    }
+
+    public record PanicResult(boolean hadSession, boolean hadMovement, boolean unloadedPlan) {
+        public boolean didAnything() {
+            return hadSession || hadMovement;
+        }
     }
 
     public record StepResult(boolean done, boolean actionable, String message, Placement placement, BlockPos targetPos) {
