@@ -42,7 +42,7 @@ import java.util.Optional;
 import java.util.stream.Collectors;
 
 public class BuildCoordinator {
-    private static final int BUILD_APPROACH_RANGE = 2;
+    private static final int BUILD_APPROACH_RANGE = 1;
     private static final int REFILL_APPROACH_RANGE = 3;
     private static final double PLACE_REACH_DISTANCE = 4.0;
     private static final int REFILL_ACTION_DELAY_TICKS = 4;
@@ -254,10 +254,6 @@ public class BuildCoordinator {
             return AssistedStepResult.noop();
         }
 
-        if (activeMovementTarget != null) {
-            return monitorActiveMovement(client);
-        }
-
         if (session.getState() == BuildPlanState.BUILDING) {
             Optional<RefillCheck> refillCheck = checkForRefill(client);
             if (refillCheck.isPresent()) {
@@ -272,6 +268,9 @@ public class BuildCoordinator {
         }
 
         if (session.getState() != BuildPlanState.BUILDING) {
+            if (activeMovementTarget != null) {
+                return monitorActiveMovement(client);
+            }
             return AssistedStepResult.noop();
         }
 
@@ -285,6 +284,9 @@ public class BuildCoordinator {
         }
         if (isWithinPlacementReach(client, stepResult.targetPos())) {
             return executePlacement(client, stepResult);
+        }
+        if (activeMovementTarget != null) {
+            return monitorActiveMovement(client);
         }
 
         return beginBuildMovement(stepResult);
@@ -955,7 +957,7 @@ public class BuildCoordinator {
             case PLACED, ALREADY_CORRECT -> {
                 applyProgressAdvance(session.getPlan(), session.getCurrentPlacementIndex() + 1, 1);
                 debugToChatAndFile(result.message());
-                yield AssistedStepResult.arrived(result.message());
+                yield continueBuildingAfterPlacement(client, result.message());
             }
             case MISSING_ITEM -> {
                 Optional<RefillCheck> refillCheck = checkForRefill(client);
@@ -971,6 +973,27 @@ public class BuildCoordinator {
             }
             case ERROR -> pauseForRecoverableFailure(result.message());
         };
+    }
+
+    private AssistedStepResult continueBuildingAfterPlacement(MinecraftClient client, String placementMessage) {
+        StepResult nextStep = computeNextStep(client, false);
+        if (nextStep.done()) {
+            cancelActiveMovement();
+            return AssistedStepResult.completed(placementMessage + " " + nextStep.message());
+        }
+        if (!nextStep.actionable()) {
+            cancelActiveMovement();
+            return AssistedStepResult.arrived(placementMessage);
+        }
+
+        if (activeMovementTarget == null || !activeMovementTarget.equals(nextStep.targetPos())) {
+            AssistedStepResult movementResult = beginBuildMovement(nextStep);
+            if (movementResult.failed()) {
+                return movementResult;
+            }
+        }
+
+        return AssistedStepResult.arrived(placementMessage);
     }
 
     private AssistedStepResult pauseForRecoverableFailure(String message) {
