@@ -403,21 +403,6 @@ public class BuildCoordinator {
             return Optional.empty();
         }
 
-        Optional<StepResult> nextPlacement = previewNextPlacement(client);
-        if (nextPlacement.isPresent() && nextPlacement.get().actionable()) {
-            Identifier nextBlockId = Registries.BLOCK.getId(nextPlacement.get().placement().block());
-            if (!missing.containsKey(nextBlockId)) {
-                session.setRefillStatus(null);
-                return Optional.empty();
-            }
-
-            Item nextItem = resolveItem(nextBlockId);
-            if (nextItem != Items.AIR && countPlayerItem(client.player, nextItem) > 0) {
-                session.setRefillStatus(null);
-                return Optional.empty();
-            }
-        }
-
         String dimensionKey = client.world.getRegistryKey().getValue().toString();
         List<SupplyPoint> supplyPoints = supplyStore.listInDimensionByDistance(dimensionKey, client.player.getBlockPos());
         SupplyPoint supplyPoint = supplyPoints.isEmpty() ? null : supplyPoints.getFirst();
@@ -644,14 +629,6 @@ public class BuildCoordinator {
         movementPaused = false;
         return AssistedStepResult.moving("Materials refilled. Returning to build near "
                 + activeMovementTarget.toShortString() + ".");
-    }
-
-    private Optional<StepResult> previewNextPlacement(MinecraftClient client) {
-        StepResult stepResult = computeNextStep(client, false);
-        if (!stepResult.actionable()) {
-            return Optional.empty();
-        }
-        return Optional.of(stepResult);
     }
 
     private Map<Identifier, Integer> computeRequiredMaterialsForRefillWindow() {
