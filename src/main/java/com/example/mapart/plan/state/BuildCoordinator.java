@@ -259,10 +259,6 @@ public class BuildCoordinator {
             return AssistedStepResult.completed(stepResult.message());
         }
         if (isWithinRange(client.player.getBlockPos(), stepResult.targetPos(), TARGET_APPROACH_RANGE)) {
-            return executePlacement(client, stepResult.placement(), stepResult.targetPos());
-        }
-
-        if (isWithinRange(client.player.getBlockPos(), stepResult.targetPos(), TARGET_APPROACH_RANGE)) {
             return executePlacement(client, stepResult);
         }
 
