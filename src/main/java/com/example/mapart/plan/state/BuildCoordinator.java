@@ -280,13 +280,12 @@ public class BuildCoordinator {
             return AssistedStepResult.completed(stepResult.message());
         }
 
-        if (isWithinPlacementReach(client, stepResult.targetPos())) {
-            return executePlacement(client, stepResult);
-        }
-
         Optional<RefillCheck> refillCheck = checkForRefill(client);
         if (refillCheck.isPresent()) {
             return beginRefillMovement(refillCheck.get());
+        }
+        if (isWithinPlacementReach(client, stepResult.targetPos())) {
+            return executePlacement(client, stepResult);
         }
 
         return beginBuildMovement(stepResult);
