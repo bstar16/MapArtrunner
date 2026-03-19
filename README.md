@@ -93,7 +93,7 @@ Example:
 ```mcfunction
 /mapart load /absolute/path/to/build.schem or .nbt
 /mapart info
-/mapart clienttimerspeed 4
+/mapart clienttimerspeed 2.0
 /mapart unload
 /mapart panic
 ```

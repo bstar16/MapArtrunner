@@ -61,8 +61,6 @@ public class MapArtClientMod implements ClientModInitializer {
             dispatcher.register(MapArtCommand.createAlias(buildPlanService, settingsStore, supplyStore, supplyInteractionTracker, baritoneFacade));
             dispatcher.register(MapArtCommand.createRunnerAlias(buildPlanService, settingsStore, supplyStore, supplyInteractionTracker, baritoneFacade));
         });
-
-
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
             while (panicKeyBinding.wasPressed()) {
                 if (client.player != null) {
