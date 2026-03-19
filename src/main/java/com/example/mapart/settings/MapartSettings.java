@@ -6,10 +6,11 @@ public record MapartSettings(
         boolean overlayCurrentRegionOnly,
         boolean overlayShowOnlyIncorrect,
         boolean hudCompact,
+        int clientTimerSpeed,
         int hudX,
         int hudY
 ) {
     public static MapartSettings defaults() {
-        return new MapartSettings(true, true, true, false, false, 8, 8);
+        return new MapartSettings(true, true, true, false, false, 1, 8, 8);
     }
 }

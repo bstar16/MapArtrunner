@@ -39,19 +39,21 @@ public class MapartSettingsStore {
         try {
             switch (normalized) {
                 case "showhud" -> settings = new MapartSettings(parseBoolean(value), settings.showSchematicOverlay(), settings.overlayCurrentRegionOnly(),
-                        settings.overlayShowOnlyIncorrect(), settings.hudCompact(), settings.hudX(), settings.hudY());
+                        settings.overlayShowOnlyIncorrect(), settings.hudCompact(), settings.clientTimerSpeed(), settings.hudX(), settings.hudY());
                 case "showschematicoverlay" -> settings = new MapartSettings(settings.showHud(), parseBoolean(value), settings.overlayCurrentRegionOnly(),
-                        settings.overlayShowOnlyIncorrect(), settings.hudCompact(), settings.hudX(), settings.hudY());
+                        settings.overlayShowOnlyIncorrect(), settings.hudCompact(), settings.clientTimerSpeed(), settings.hudX(), settings.hudY());
                 case "overlaycurrentregiononly" -> settings = new MapartSettings(settings.showHud(), settings.showSchematicOverlay(), parseBoolean(value),
-                        settings.overlayShowOnlyIncorrect(), settings.hudCompact(), settings.hudX(), settings.hudY());
+                        settings.overlayShowOnlyIncorrect(), settings.hudCompact(), settings.clientTimerSpeed(), settings.hudX(), settings.hudY());
                 case "overlayshowonlyincorrect" -> settings = new MapartSettings(settings.showHud(), settings.showSchematicOverlay(), settings.overlayCurrentRegionOnly(),
-                        parseBoolean(value), settings.hudCompact(), settings.hudX(), settings.hudY());
+                        parseBoolean(value), settings.hudCompact(), settings.clientTimerSpeed(), settings.hudX(), settings.hudY());
                 case "hudcompact" -> settings = new MapartSettings(settings.showHud(), settings.showSchematicOverlay(), settings.overlayCurrentRegionOnly(),
-                        settings.overlayShowOnlyIncorrect(), parseBoolean(value), settings.hudX(), settings.hudY());
+                        settings.overlayShowOnlyIncorrect(), parseBoolean(value), settings.clientTimerSpeed(), settings.hudX(), settings.hudY());
+                case "clienttimerspeed" -> settings = new MapartSettings(settings.showHud(), settings.showSchematicOverlay(), settings.overlayCurrentRegionOnly(),
+                        settings.overlayShowOnlyIncorrect(), settings.hudCompact(), parseClientTimerSpeed(value), settings.hudX(), settings.hudY());
                 case "hudx" -> settings = new MapartSettings(settings.showHud(), settings.showSchematicOverlay(), settings.overlayCurrentRegionOnly(),
-                        settings.overlayShowOnlyIncorrect(), settings.hudCompact(), parseInt(value), settings.hudY());
+                        settings.overlayShowOnlyIncorrect(), settings.hudCompact(), settings.clientTimerSpeed(), parseInt(value), settings.hudY());
                 case "hudy" -> settings = new MapartSettings(settings.showHud(), settings.showSchematicOverlay(), settings.overlayCurrentRegionOnly(),
-                        settings.overlayShowOnlyIncorrect(), settings.hudCompact(), settings.hudX(), parseInt(value));
+                        settings.overlayShowOnlyIncorrect(), settings.hudCompact(), settings.clientTimerSpeed(), settings.hudX(), parseInt(value));
                 default -> {
                     return Optional.of("Unknown settings key: " + key);
                 }
@@ -79,6 +81,17 @@ public class MapartSettingsStore {
         }
     }
 
+    private static int parseClientTimerSpeed(String value) {
+        int parsed = parseInt(value);
+        if (parsed < 1) {
+            throw new IllegalArgumentException("clientTimerSpeed must be >= 1.");
+        }
+        if (parsed > 20) {
+            throw new IllegalArgumentException("clientTimerSpeed must be <= 20.");
+        }
+        return parsed;
+    }
+
     private void loadFromDisk() {
         if (!Files.exists(storagePath)) {
             return;
@@ -97,6 +110,7 @@ public class MapartSettingsStore {
                     stored.overlayCurrentRegionOnly == null ? defaults.overlayCurrentRegionOnly() : stored.overlayCurrentRegionOnly,
                     stored.overlayShowOnlyIncorrect == null ? defaults.overlayShowOnlyIncorrect() : stored.overlayShowOnlyIncorrect,
                     stored.hudCompact == null ? defaults.hudCompact() : stored.hudCompact,
+                    stored.clientTimerSpeed == null ? defaults.clientTimerSpeed() : parseClientTimerSpeed(Integer.toString(stored.clientTimerSpeed)),
                     stored.hudX == null ? defaults.hudX() : stored.hudX,
                     stored.hudY == null ? defaults.hudY() : stored.hudY
             );
@@ -141,6 +155,7 @@ public class MapartSettingsStore {
         Boolean overlayCurrentRegionOnly;
         Boolean overlayShowOnlyIncorrect;
         Boolean hudCompact;
+        Integer clientTimerSpeed;
         Integer hudX;
         Integer hudY;
 
@@ -153,6 +168,7 @@ public class MapartSettingsStore {
             this.overlayCurrentRegionOnly = settings.overlayCurrentRegionOnly();
             this.overlayShowOnlyIncorrect = settings.overlayShowOnlyIncorrect();
             this.hudCompact = settings.hudCompact();
+            this.clientTimerSpeed = settings.clientTimerSpeed();
             this.hudX = settings.hudX();
             this.hudY = settings.hudY();
         }

@@ -73,12 +73,21 @@ public class MapArtClientMod implements ClientModInitializer {
                 }
             }
 
-            BuildCoordinator.AssistedStepResult assistedStep = buildCoordinator.tickAssisted(client);
-            if (!assistedStep.didWork() || client.player == null || assistedStep.message().isBlank()) {
-                return;
-            }
+            int clientTimerSpeed = settingsStore.current().clientTimerSpeed();
+            for (int iteration = 0; iteration < clientTimerSpeed; iteration++) {
+                BuildCoordinator.AssistedStepResult assistedStep = buildCoordinator.tickAssisted(client);
+                if (!assistedStep.didWork()) {
+                    break;
+                }
 
-            debugReporter.logToFile("Assisted tick: " + assistedStep.message());
+                if (client.player != null && !assistedStep.message().isBlank()) {
+                    debugReporter.logToFile("Assisted tick: " + assistedStep.message());
+                }
+
+                if (assistedStep.done() || assistedStep.failed()) {
+                    break;
+                }
+            }
         });
 
         PlacementStatusResolver resolver = new PlacementStatusResolver();

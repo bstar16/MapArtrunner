@@ -87,11 +87,13 @@ Available subcommands:
 - `info`
 - `unload` (OP level 2 required)
 - `panic` (client-side emergency stop + unload)
+- `clienttimerspeed <multiplier>` (sets how many assisted automation passes run each client tick; useful for testing)
 
 Example:
 ```mcfunction
 /mapart load /absolute/path/to/build.schem or .nbt
 /mapart info
+/mapart clienttimerspeed 4
 /mapart unload
 /mapart panic
 ```

@@ -193,6 +193,13 @@ public final class MapArtCommand {
                                                         StringArgumentType.getString(context, "key"),
                                                         StringArgumentType.getString(context, "value")
                                                 ))))))
+                .then(ClientCommandManager.literal("clienttimerspeed")
+                        .then(ClientCommandManager.argument("multiplier", IntegerArgumentType.integer(1))
+                                .executes(context -> setClientTimerSpeed(
+                                        context.getSource(),
+                                        settingsStore,
+                                        IntegerArgumentType.getInteger(context, "multiplier")
+                                ))))
                 .then(ClientCommandManager.literal("debug")
                         .then(ClientCommandManager.literal("goto")
                                 .then(ClientCommandManager.argument("x", IntegerArgumentType.integer())
@@ -445,6 +452,7 @@ public final class MapArtCommand {
         source.sendFeedback(Text.literal("overlayCurrentRegionOnly=" + settings.overlayCurrentRegionOnly()));
         source.sendFeedback(Text.literal("overlayShowOnlyIncorrect=" + settings.overlayShowOnlyIncorrect()));
         source.sendFeedback(Text.literal("hudCompact=" + settings.hudCompact()));
+        source.sendFeedback(Text.literal("clientTimerSpeed=" + settings.clientTimerSpeed()));
         source.sendFeedback(Text.literal("hudX=" + settings.hudX()));
         source.sendFeedback(Text.literal("hudY=" + settings.hudY()));
         return 1;
@@ -458,6 +466,17 @@ public final class MapArtCommand {
         }
 
         source.sendFeedback(Text.literal("Updated " + key + " = " + value));
+        return 1;
+    }
+
+    private static int setClientTimerSpeed(FabricClientCommandSource source, MapartSettingsStore settingsStore, int multiplier) {
+        Optional<String> error = settingsStore.set("clientTimerSpeed", Integer.toString(multiplier));
+        if (error.isPresent()) {
+            source.sendError(Text.literal(error.get()));
+            return 0;
+        }
+
+        source.sendFeedback(Text.literal("Client timer speed set to " + multiplier + "x."));
         return 1;
     }
 }
