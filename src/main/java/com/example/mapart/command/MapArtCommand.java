@@ -6,6 +6,7 @@ import com.example.mapart.plan.Placement;
 import com.example.mapart.plan.state.BuildCoordinator;
 import com.example.mapart.plan.state.BuildPlanService;
 import com.example.mapart.plan.state.BuildSession;
+import com.example.mapart.runtime.ClientTimerController;
 import com.example.mapart.settings.MapartSettings;
 import com.example.mapart.settings.MapartSettingsStore;
 import com.example.mapart.plan.state.RefillStatus;
@@ -14,6 +15,7 @@ import com.example.mapart.supply.SupplyPoint;
 import com.example.mapart.supply.SupplyStore;
 import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.brigadier.arguments.StringArgumentType;
+import com.mojang.brigadier.arguments.DoubleArgumentType;
 import com.mojang.brigadier.builder.LiteralArgumentBuilder;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager;
 import net.fabricmc.fabric.api.client.command.v2.FabricClientCommandSource;
@@ -193,6 +195,12 @@ public final class MapArtCommand {
                                                         StringArgumentType.getString(context, "key"),
                                                         StringArgumentType.getString(context, "value")
                                                 ))))))
+                .then(ClientCommandManager.literal("clienttimerspeed")
+                        .then(ClientCommandManager.argument("multiplier", DoubleArgumentType.doubleArg(ClientTimerController.MIN_MULTIPLIER))
+                                .executes(context -> setClientTimerSpeed(
+                                        context.getSource(),
+                                        DoubleArgumentType.getDouble(context, "multiplier")
+                                ))))
                 .then(ClientCommandManager.literal("debug")
                         .then(ClientCommandManager.literal("goto")
                                 .then(ClientCommandManager.argument("x", IntegerArgumentType.integer())
@@ -447,6 +455,7 @@ public final class MapArtCommand {
         source.sendFeedback(Text.literal("hudCompact=" + settings.hudCompact()));
         source.sendFeedback(Text.literal("hudX=" + settings.hudX()));
         source.sendFeedback(Text.literal("hudY=" + settings.hudY()));
+        source.sendFeedback(Text.literal("clientTimerSpeed=" + ClientTimerController.getMultiplier()));
         return 1;
     }
 
@@ -458,6 +467,12 @@ public final class MapArtCommand {
         }
 
         source.sendFeedback(Text.literal("Updated " + key + " = " + value));
+        return 1;
+    }
+
+    private static int setClientTimerSpeed(FabricClientCommandSource source, double multiplier) {
+        ClientTimerController.setMultiplier(multiplier);
+        source.sendFeedback(Text.literal("Client timer speed set to " + ClientTimerController.getMultiplier() + "x."));
         return 1;
     }
 }

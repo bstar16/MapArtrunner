@@ -87,11 +87,13 @@ Available subcommands:
 - `info`
 - `unload` (OP level 2 required)
 - `panic` (client-side emergency stop + unload)
+- `clienttimerspeed <multiplier>` (sets the actual client timer multiplier; `1` is normal speed and decimal values like `0.5` or `2.0` work)
 
 Example:
 ```mcfunction
 /mapart load /absolute/path/to/build.schem or .nbt
 /mapart info
+/mapart clienttimerspeed 2.0
 /mapart unload
 /mapart panic
 ```
