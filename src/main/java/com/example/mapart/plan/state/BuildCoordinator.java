@@ -254,13 +254,6 @@ public class BuildCoordinator {
             return AssistedStepResult.noop();
         }
 
-        if (session.getState() == BuildPlanState.BUILDING) {
-            Optional<RefillCheck> refillCheck = checkForRefill(client);
-            if (refillCheck.isPresent()) {
-                return beginRefillMovement(refillCheck.get());
-            }
-        }
-
         if (session.getState() == BuildPlanState.NEED_REFILL
                 || session.getState() == BuildPlanState.REFILLING
                 || session.getState() == BuildPlanState.RETURNING) {
@@ -274,6 +267,10 @@ public class BuildCoordinator {
             return AssistedStepResult.noop();
         }
 
+        if (activeMovementTarget != null) {
+            return monitorActiveMovement(client);
+        }
+
         StepResult stepResult = computeNextStep(client, false);
         if (!stepResult.actionable() && !stepResult.done()) {
             return pauseForRecoverableFailure(stepResult.message());
@@ -282,11 +279,13 @@ public class BuildCoordinator {
             cancelActiveMovement();
             return AssistedStepResult.completed(stepResult.message());
         }
+
+        Optional<RefillCheck> refillCheck = checkForRefill(client);
+        if (refillCheck.isPresent()) {
+            return beginRefillMovement(refillCheck.get());
+        }
         if (isWithinPlacementReach(client, stepResult.targetPos())) {
             return executePlacement(client, stepResult);
-        }
-        if (activeMovementTarget != null) {
-            return monitorActiveMovement(client);
         }
 
         return beginBuildMovement(stepResult);
