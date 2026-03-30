@@ -45,6 +45,7 @@ public class BuildCoordinator {
     private static final int BUILD_APPROACH_RANGE = 1;
     private static final int REFILL_APPROACH_RANGE = 3;
     private static final double PLACE_REACH_DISTANCE = 4.0;
+    private static final int MOVEMENT_IDLE_GRACE_TICKS = 10;
     private static final int REFILL_ACTION_DELAY_TICKS = 4;
     private static final int MAX_SUPPLY_SCREEN_WAIT_POLLS = 5;
     private static final int MAX_REFILL_LOOKAHEAD_ITEMS = PlayerInventory.MAIN_SIZE * 64;
@@ -60,6 +61,8 @@ public class BuildCoordinator {
     private boolean movementPaused;
     private boolean skipRefillCheckOnce;
     private MovementPurpose activeMovementPurpose = MovementPurpose.BUILD;
+    private int movementIdleTicks;
+    private boolean movementRetryIssued;
     private int refillActionCooldown;
     private boolean awaitingSupplyScreen;
     private int supplyScreenWaitPollsRemaining;
@@ -454,6 +457,8 @@ public class BuildCoordinator {
         debugToChatAndFile("Heading to supply #" + refillCheck.supplyPoint().id() + " at " + refillCheck.supplyPoint().pos().toShortString() + " for refill.");
         activeMovementTarget = refillCheck.supplyPoint().pos().toImmutable();
         activeMovementPurpose = MovementPurpose.REFILL;
+        movementIdleTicks = 0;
+        movementRetryIssued = false;
         movementPaused = false;
         return AssistedStepResult.moving("Missing materials for region " + session.getCurrentRegionIndex()
                 + " (" + missingText + "). Moving to supply #" + refillCheck.supplyPoint().id()
@@ -641,6 +646,8 @@ public class BuildCoordinator {
         debugToChatAndFile("Returning to build area near " + target.toShortString() + ".");
         activeMovementTarget = target;
         activeMovementPurpose = MovementPurpose.BUILD;
+        movementIdleTicks = 0;
+        movementRetryIssued = false;
         movementPaused = false;
         return AssistedStepResult.moving("Materials refilled. Returning to build near "
                 + activeMovementTarget.toShortString() + ".");
@@ -885,6 +892,8 @@ public class BuildCoordinator {
             BlockPos reachedTarget = activeMovementTarget;
             activeMovementTarget = null;
             movementPaused = false;
+            movementIdleTicks = 0;
+            movementRetryIssued = false;
             if (activeMovementPurpose == MovementPurpose.REFILL) {
                 activeMovementPurpose = MovementPurpose.BUILD;
                 if (session.getRefillStatus() != null) {
@@ -918,10 +927,37 @@ public class BuildCoordinator {
             return AssistedStepResult.noop();
         }
 
+        if (baritoneFacade.isBusy()) {
+            movementIdleTicks = 0;
+            return AssistedStepResult.noop();
+        }
+
+        movementIdleTicks++;
+        if (movementIdleTicks <= MOVEMENT_IDLE_GRACE_TICKS) {
+            debugToFile("Movement idle tick " + movementIdleTicks + "/" + MOVEMENT_IDLE_GRACE_TICKS
+                    + " while traveling to " + activeMovementTarget.toShortString() + ".");
+            return AssistedStepResult.noop();
+        }
+
+        if (!movementRetryIssued) {
+            int approachRange = activeMovementPurpose == MovementPurpose.REFILL ? REFILL_APPROACH_RANGE : BUILD_APPROACH_RANGE;
+            BaritoneFacade.CommandResult retry = baritoneFacade.goNear(activeMovementTarget, approachRange);
+            if (retry.success()) {
+                movementRetryIssued = true;
+                movementIdleTicks = 0;
+                debugToChatAndFile("Re-issued movement to " + activeMovementTarget.toShortString()
+                        + " after Baritone went idle before arrival.");
+                return AssistedStepResult.moving("Re-trying movement near " + activeMovementTarget.toShortString() + ".");
+            }
+            debugToFile("Failed to re-issue movement to " + activeMovementTarget.toShortString() + ": " + retry.message());
+        }
+
         if (!baritoneFacade.isBusy()) {
             String message = "Movement ended before reaching " + activeMovementTarget.toShortString() + ". Run /mapart resume to retry.";
             activeMovementTarget = null;
             activeMovementPurpose = MovementPurpose.BUILD;
+            movementIdleTicks = 0;
+            movementRetryIssued = false;
             return pauseForRecoverableFailure(message);
         }
 
@@ -939,6 +975,8 @@ public class BuildCoordinator {
         debugToChatAndFile("Next placement target is " + stepResult.targetPos().toShortString() + " for block " + Registries.BLOCK.getId(stepResult.placement().block()) + ".");
         activeMovementTarget = stepResult.targetPos().toImmutable();
         activeMovementPurpose = MovementPurpose.BUILD;
+        movementIdleTicks = 0;
+        movementRetryIssued = false;
         movementPaused = false;
         return AssistedStepResult.moving("Moving near " + activeMovementTarget.toShortString() + ".");
     }
@@ -995,6 +1033,8 @@ public class BuildCoordinator {
         }
 
         movementPaused = false;
+        movementIdleTicks = 0;
+        movementRetryIssued = false;
         closeHandledScreen(MinecraftClient.getInstance());
         resetRefillInteractionState();
         debugToChatAndFile("Build paused after recoverable failure: " + message);
@@ -1024,6 +1064,8 @@ public class BuildCoordinator {
 
         activeMovementTarget = null;
         activeMovementPurpose = MovementPurpose.BUILD;
+        movementIdleTicks = 0;
+        movementRetryIssued = false;
         movementPaused = false;
     }
 
