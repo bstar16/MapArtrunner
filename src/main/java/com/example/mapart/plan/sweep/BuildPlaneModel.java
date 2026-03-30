@@ -76,6 +76,13 @@ public final class BuildPlaneModel {
                 .toList();
     }
 
+    public List<LanePlacement> incompletePlacements() {
+        return lanePlacements.values().stream()
+                .flatMap(List::stream)
+                .filter(placement -> !completedPlacementIndex.test(placement.placementIndex()))
+                .toList();
+    }
+
     public double projectProgress(BuildLane lane, Vec3d position) {
         return coordinateMapper.projectProgress(lane, position);
     }
