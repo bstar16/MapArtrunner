@@ -1,5 +1,6 @@
 package com.example.mapart.plan.state;
 
+import com.example.mapart.MapArtMod;
 import com.example.mapart.plan.Placement;
 import net.minecraft.block.BlockState;
 import net.minecraft.client.MinecraftClient;
@@ -9,6 +10,7 @@ import net.minecraft.entity.player.PlayerInventory;
 import net.minecraft.item.BlockItem;
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
+import net.minecraft.network.packet.c2s.play.UpdateSelectedSlotC2SPacket;
 import net.minecraft.registry.Registries;
 import net.minecraft.screen.slot.SlotActionType;
 import net.minecraft.util.ActionResult;
@@ -78,6 +80,15 @@ public class PlacementExecutor {
             return PlacementResult.retry("No valid neighbor face is available to place at " + targetPos.toShortString() + ".");
         }
 
+        MapArtMod.LOGGER.debug(
+                "Placement trace at {}: expectedItem={}, selectedSlot={}, mainHandItem={}, movedToHotbar={}",
+                targetPos.toShortString(),
+                Registries.ITEM.getId(expectedItem),
+                selection.selectedSlot(),
+                Registries.ITEM.getId(player.getMainHandStack().getItem()),
+                selection.movedToHotbar()
+        );
+
         ActionResult result = client.interactionManager.interactBlock(player, Hand.MAIN_HAND, hitResult.get());
         if (result.isAccepted()) {
             player.swingHand(Hand.MAIN_HAND);
@@ -104,6 +115,7 @@ public class PlacementExecutor {
         for (int hotbarSlot = 0; hotbarSlot < PlayerInventory.getHotbarSize(); hotbarSlot++) {
             if (inventory.getStack(hotbarSlot).isOf(expectedItem)) {
                 inventory.selectedSlot = hotbarSlot;
+                syncSelectedSlotWithServer(player, hotbarSlot);
                 return InventorySelection.selected(hotbarSlot, false);
             }
         }
@@ -116,11 +128,19 @@ public class PlacementExecutor {
             client.interactionManager.clickSlot(player.playerScreenHandler.syncId, slot, swapHotbarSlot, SlotActionType.SWAP, player);
             if (inventory.getStack(swapHotbarSlot).isOf(expectedItem)) {
                 inventory.selectedSlot = swapHotbarSlot;
+                syncSelectedSlotWithServer(player, swapHotbarSlot);
                 return InventorySelection.selected(swapHotbarSlot, true);
             }
         }
 
         return InventorySelection.missing();
+    }
+
+    private void syncSelectedSlotWithServer(ClientPlayerEntity player, int selectedSlot) {
+        if (selectedSlot < 0 || selectedSlot >= PlayerInventory.getHotbarSize() || player.networkHandler == null) {
+            return;
+        }
+        player.networkHandler.sendPacket(new UpdateSelectedSlotC2SPacket(selectedSlot));
     }
 
     private Optional<BlockHitResult> resolvePlacementHit(ClientWorld world, BlockPos targetPos) {
