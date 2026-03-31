@@ -1,5 +1,9 @@
 package com.example.mapart.plan.sweep;
 
+import com.example.mapart.plan.sweep.flight.ElytraFlightController;
+import com.example.mapart.plan.sweep.flight.ElytraFlightResult;
+import com.example.mapart.plan.sweep.flight.ElytraFlightState;
+import com.example.mapart.plan.sweep.flight.FlightFailureReason;
 import net.minecraft.util.math.Vec3d;
 
 import java.util.HashMap;
@@ -7,6 +11,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.TreeSet;
 
@@ -22,6 +27,8 @@ public final class SweepPassController {
     private final SweepPlacementController placementController;
     private final PlacementAttemptExecutor attemptExecutor;
     private final SweepPassControllerSettings settings;
+    private final ElytraFlightController flightController;
+    private final LeftoverTracker leftoverTracker;
 
     private SweepPassState state;
     private int currentProgress;
@@ -40,6 +47,16 @@ public final class SweepPassController {
                                SweepPlacementController placementController,
                                PlacementAttemptExecutor attemptExecutor,
                                SweepPassControllerSettings settings) {
+        this(passIndex, model, lane, placementController, attemptExecutor, settings, null);
+    }
+
+    public SweepPassController(int passIndex,
+                               BuildPlaneModel model,
+                               BuildLane lane,
+                               SweepPlacementController placementController,
+                               PlacementAttemptExecutor attemptExecutor,
+                               SweepPassControllerSettings settings,
+                               ElytraFlightController flightController) {
         if (passIndex < 0) {
             throw new IllegalArgumentException("passIndex must be >= 0");
         }
@@ -49,6 +66,8 @@ public final class SweepPassController {
         this.placementController = Objects.requireNonNull(placementController, "placementController");
         this.attemptExecutor = Objects.requireNonNull(attemptExecutor, "attemptExecutor");
         this.settings = Objects.requireNonNull(settings, "settings");
+        this.flightController = flightController;
+        this.leftoverTracker = new LeftoverTracker();
         this.state = SweepPassState.PREPARE;
         this.currentProgress = lane.direction() == LaneDirection.FORWARD ? lane.minProgress() : lane.maxProgress();
     }
@@ -62,7 +81,12 @@ public final class SweepPassController {
     }
 
     public void tick(Vec3d playerPosition) {
-        Objects.requireNonNull(playerPosition, "playerPosition");
+        tick(PassTickInput.grounded(playerPosition));
+    }
+
+    public void tick(PassTickInput input) {
+        Objects.requireNonNull(input, "input");
+        Vec3d playerPosition = input.playerPosition();
         if (isTerminal()) {
             return;
         }
@@ -72,8 +96,24 @@ public final class SweepPassController {
             state = SweepPassState.ACTIVE;
         }
 
+        if (flightController != null) {
+            flightController.tick(ElytraFlightController.FlightTickInput.currentLaneOnly(playerPosition, input.fallFlying()));
+            if (flightController.state() == ElytraFlightState.FAILED) {
+                state = SweepPassState.FAILED;
+                return;
+            }
+            if (flightController.state() == ElytraFlightState.INTERRUPTED) {
+                state = SweepPassState.INTERRUPTED;
+                return;
+            }
+            if (flightController.state() == ElytraFlightState.COMPLETE) {
+                state = SweepPassState.COMPLETE;
+                return;
+            }
+        }
+
         updateProgressFromPlayer(playerPosition);
-        if (isEndpointReached(playerPosition)) {
+        if (flightController == null && isEndpointReached(playerPosition)) {
             state = SweepPassState.COMPLETE;
             return;
         }
@@ -94,7 +134,10 @@ public final class SweepPassController {
         SweepPlacementSelection selection = placementController.selectCandidates(model, lane, snapshot, playerPosition);
         selection.deferredCandidates().stream()
                 .filter(candidate -> !isResolved(candidate.placementIndex()))
-                .forEach(candidate -> deferredPlacements.add(candidate.placementIndex()));
+                .forEach(candidate -> {
+                    deferredPlacements.add(candidate.placementIndex());
+                    leftoverTracker.mark(candidate.placementIndex(), LeftoverTracker.LeftoverReason.DEFERRED);
+                });
 
         List<SweepPlacementCandidate> ranked = selection.rankedCandidates().stream()
                 .filter(candidate -> !isResolved(candidate.placementIndex()))
@@ -109,6 +152,8 @@ public final class SweepPassController {
         if (attemptCounts.getOrDefault(top.placementIndex(), 0) >= settings.maxAttemptsPerTarget()) {
             exhaustedPlacements.add(top.placementIndex());
             missedPlacements.add(top.placementIndex());
+            leftoverTracker.mark(top.placementIndex(), LeftoverTracker.LeftoverReason.MISSED);
+            leftoverTracker.mark(top.placementIndex(), LeftoverTracker.LeftoverReason.EXHAUSTED);
             return;
         }
 
@@ -118,24 +163,32 @@ public final class SweepPassController {
         PlacementAttemptResult attemptResult = Objects.requireNonNull(attemptExecutor.attempt(top), "attemptResult");
         if (attemptResult.placedBlock()) {
             successfulPlacements.add(top.placementIndex());
+            leftoverTracker.clear(top.placementIndex());
             return;
         }
 
         if (attemptResult.skipped()) {
             skippedPlacements.add(top.placementIndex());
             deferredPlacements.add(top.placementIndex());
+            leftoverTracker.mark(top.placementIndex(), LeftoverTracker.LeftoverReason.DEFERRED);
         } else {
             missedPlacements.add(top.placementIndex());
+            leftoverTracker.mark(top.placementIndex(), LeftoverTracker.LeftoverReason.MISSED);
+            leftoverTracker.mark(top.placementIndex(), LeftoverTracker.LeftoverReason.FAILED);
         }
 
         if (attempts >= settings.maxAttemptsPerTarget()) {
             exhaustedPlacements.add(top.placementIndex());
+            leftoverTracker.mark(top.placementIndex(), LeftoverTracker.LeftoverReason.EXHAUSTED);
         }
     }
 
     public void interrupt() {
         if (!isTerminal()) {
             state = SweepPassState.INTERRUPTED;
+            if (flightController != null) {
+                flightController.interrupt();
+            }
         }
     }
 
@@ -144,8 +197,14 @@ public final class SweepPassController {
         model.placementsForLane(lane.laneIndex()).forEach(lp -> {
             if (!successfulPlacements.contains(lp.placementIndex())) {
                 leftovers.add(lp.placementIndex());
+                leftoverTracker.mark(lp.placementIndex(), LeftoverTracker.LeftoverReason.NOT_REACHED);
             }
         });
+
+        Optional<ElytraFlightResult> flightResult = flightController == null
+                ? Optional.empty()
+                : Optional.of(flightController.result());
+        Optional<FlightFailureReason> flightFailureReason = flightResult.flatMap(ElytraFlightResult::failureReason);
 
         return new SweepPassResult(
                 passIndex,
@@ -157,7 +216,10 @@ public final class SweepPassController {
                 deferredPlacements.size(),
                 skippedPlacements.size(),
                 List.copyOf(leftovers),
-                Set.copyOf(exhaustedPlacements)
+                leftoverTracker.snapshot(),
+                Set.copyOf(exhaustedPlacements),
+                flightResult,
+                flightFailureReason
         );
     }
 
@@ -198,5 +260,15 @@ public final class SweepPassController {
 
     private boolean isResolved(int placementIndex) {
         return successfulPlacements.contains(placementIndex) || exhaustedPlacements.contains(placementIndex);
+    }
+
+    public record PassTickInput(Vec3d playerPosition, boolean fallFlying) {
+        public PassTickInput {
+            Objects.requireNonNull(playerPosition, "playerPosition");
+        }
+
+        public static PassTickInput grounded(Vec3d playerPosition) {
+            return new PassTickInput(playerPosition, false);
+        }
     }
 }

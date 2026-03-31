@@ -1,6 +1,12 @@
 package com.example.mapart.plan.sweep;
 
 import com.example.mapart.plan.Placement;
+import com.example.mapart.plan.sweep.flight.ElytraFlightController;
+import com.example.mapart.plan.sweep.flight.ElytraFlightControllerSettings;
+import com.example.mapart.plan.sweep.flight.FlightFailureReason;
+import com.example.mapart.plan.sweep.flight.FlightRecoveryHandler;
+import com.example.mapart.plan.sweep.flight.LaneEntryPlanner;
+import com.example.mapart.plan.sweep.flight.TurnPlanner;
 import net.minecraft.block.Block;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Vec3d;
@@ -11,6 +17,7 @@ import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class SweepPassControllerTest {
@@ -139,6 +146,75 @@ class SweepPassControllerTest {
         assertEquals(0, result.successCount());
         assertEquals(1, result.missedCount());
         assertEquals(List.of(0), result.leftoverPlacementIndices());
+        assertFalse(result.leftoverRecords().isEmpty());
+    }
+
+    @Test
+    void integratedFlightPathCompletesAtEndpointAndContinuesThroughPlacementMisses() {
+        BuildLane lane = lanes().getFirst();
+        BuildPlaneModel model = modelFor(List.of(placement(2, lane.fixedCoordinate()), placement(6, lane.fixedCoordinate())));
+
+        ElytraFlightController flightController = new ElytraFlightController(
+                lane,
+                new ElytraFlightControllerSettings(65.0, 80.0, 0.75, 6.0, 20, 20, 20, 0),
+                new LaneEntryPlanner(),
+                new TurnPlanner(),
+                new FlightRecoveryHandler()
+        );
+
+        SweepPassController controller = new SweepPassController(
+                5,
+                model,
+                lane,
+                new SweepPlacementController(SweepPlacementControllerSettings.defaults()),
+                candidate -> candidate.placementProgress() <= 2
+                        ? PlacementAttemptResult.failed("first miss")
+                        : PlacementAttemptResult.placed(),
+                new SweepPassControllerSettings(2, 1, 64),
+                flightController
+        );
+
+        controller.tick(new SweepPassController.PassTickInput(new Vec3d(0.5, 70.0, lane.fixedCoordinate() + 0.5), false));
+        controller.tick(new SweepPassController.PassTickInput(new Vec3d(1.5, 70.0, lane.fixedCoordinate() + 0.5), true));
+        controller.tick(new SweepPassController.PassTickInput(new Vec3d(2.5, 70.0, lane.fixedCoordinate() + 0.5), true));
+        controller.tick(new SweepPassController.PassTickInput(new Vec3d(7.0, 70.0, lane.fixedCoordinate() + 0.5), true));
+        controller.tick(new SweepPassController.PassTickInput(new Vec3d(8.5, 70.0, lane.fixedCoordinate() + 0.5), true));
+
+        SweepPassResult result = controller.result();
+        assertEquals(SweepPassState.COMPLETE, result.finalState());
+        assertEquals(1, result.successCount());
+        assertEquals(1, result.missedCount());
+        assertTrue(result.flightResult().isPresent());
+    }
+
+    @Test
+    void flightFailurePropagatesToSweepFailure() {
+        BuildLane lane = lanes().getFirst();
+        BuildPlaneModel model = modelFor(List.of(placement(3, lane.fixedCoordinate())));
+        ElytraFlightController flightController = new ElytraFlightController(
+                lane,
+                new ElytraFlightControllerSettings(65.0, 80.0, 0.75, 6.0, 1, 10, 10, 0),
+                new LaneEntryPlanner(),
+                new TurnPlanner(),
+                new FlightRecoveryHandler()
+        );
+        SweepPassController controller = new SweepPassController(
+                6,
+                model,
+                lane,
+                new SweepPlacementController(SweepPlacementControllerSettings.defaults()),
+                candidate -> PlacementAttemptResult.placed(),
+                SweepPassControllerSettings.defaults(),
+                flightController
+        );
+
+        controller.tick(new SweepPassController.PassTickInput(new Vec3d(0.5, 70.0, lane.fixedCoordinate() + 0.5), false));
+        controller.tick(new SweepPassController.PassTickInput(new Vec3d(0.5, 70.0, lane.fixedCoordinate() + 0.5), false));
+        controller.tick(new SweepPassController.PassTickInput(new Vec3d(0.5, 70.0, lane.fixedCoordinate() + 0.5), false));
+
+        SweepPassResult result = controller.result();
+        assertEquals(SweepPassState.FAILED, result.finalState());
+        assertEquals(FlightFailureReason.RECOVERY_EXHAUSTED, result.flightFailureReason().orElseThrow());
     }
 
     private BuildPlaneModel modelFor(List<Placement> placements) {
