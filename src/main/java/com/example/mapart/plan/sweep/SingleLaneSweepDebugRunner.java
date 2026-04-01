@@ -11,6 +11,7 @@ import com.example.mapart.plan.sweep.flight.ElytraFlightControllerSettings;
 import com.example.mapart.plan.sweep.flight.FlightRecoveryHandler;
 import com.example.mapart.plan.sweep.flight.LaneEntryPlanner;
 import com.example.mapart.plan.sweep.flight.TurnPlanner;
+import net.minecraft.client.option.KeyBinding;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.item.Item;
 import net.minecraft.util.Hand;
@@ -67,7 +68,8 @@ public final class SingleLaneSweepDebugRunner {
                 ElytraFlightControllerSettings.defaults(),
                 new LaneEntryPlanner(),
                 new TurnPlanner(),
-                new FlightRecoveryHandler()
+                new FlightRecoveryHandler(),
+                session.getOrigin()
         );
 
         activeController = new SweepPassController(
@@ -94,15 +96,18 @@ public final class SingleLaneSweepDebugRunner {
             if (lastResult == null) {
                 lastResult = activeController.result();
             }
+            clearFlightControls(client);
             return;
         }
 
         Vec3d worldPlayerPos = client.player.getPos();
         Vec3d relativePlayerPos = toRelative(worldPlayerPos, activeSession.getOrigin());
-        activeController.tick(new SweepPassController.PassTickInput(relativePlayerPos, client.player.isGliding()));
+        activeController.tick(SweepPassController.PassTickInput.withWorldAndRelative(worldPlayerPos, relativePlayerPos, client.player.isGliding()));
+        applyFlightControls(client);
 
         if (isTerminal(activeController.state())) {
             lastResult = activeController.result();
+            clearFlightControls(client);
         }
     }
 
@@ -114,6 +119,10 @@ public final class SingleLaneSweepDebugRunner {
             activeController.interrupt();
         }
         lastResult = activeController.result();
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client != null) {
+            clearFlightControls(client);
+        }
         return Optional.empty();
     }
 
@@ -180,5 +189,32 @@ public final class SingleLaneSweepDebugRunner {
 
     private static Vec3d toRelative(Vec3d world, BlockPos origin) {
         return new Vec3d(world.x - origin.getX(), world.y - origin.getY(), world.z - origin.getZ());
+    }
+
+    private void applyFlightControls(MinecraftClient client) {
+        if (activeController == null || client.player == null || client.options == null) {
+            return;
+        }
+        var command = activeController.currentFlightCommand().orElse(ElytraFlightController.FlightControlCommand.idle());
+        client.player.setYaw(command.yaw());
+        client.player.setPitch(command.pitch());
+        client.player.setSprinting(command.sprinting());
+        setKey(client.options.forwardKey, command.forwardPressed());
+        setKey(client.options.jumpKey, command.jumpPressed());
+    }
+
+    private static void clearFlightControls(MinecraftClient client) {
+        if (client.options == null || client.player == null) {
+            return;
+        }
+        setKey(client.options.forwardKey, false);
+        setKey(client.options.jumpKey, false);
+        client.player.setSprinting(false);
+    }
+
+    private static void setKey(KeyBinding key, boolean pressed) {
+        if (key != null) {
+            key.setPressed(pressed);
+        }
     }
 }
