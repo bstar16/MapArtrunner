@@ -200,7 +200,11 @@ public final class SingleLaneSweepDebugRunner {
         client.player.setPitch(command.pitch());
         client.player.setSprinting(command.sprinting());
         setKey(client.options.forwardKey, command.forwardPressed());
+        setKey(client.options.backKey, command.backPressed());
+        setKey(client.options.leftKey, command.leftPressed());
+        setKey(client.options.rightKey, command.rightPressed());
         setKey(client.options.jumpKey, command.jumpPressed());
+        setKey(client.options.sneakKey, command.sneakPressed());
     }
 
     private static void clearFlightControls(MinecraftClient client) {
@@ -208,7 +212,11 @@ public final class SingleLaneSweepDebugRunner {
             return;
         }
         setKey(client.options.forwardKey, false);
+        setKey(client.options.backKey, false);
+        setKey(client.options.leftKey, false);
+        setKey(client.options.rightKey, false);
         setKey(client.options.jumpKey, false);
+        setKey(client.options.sneakKey, false);
         client.player.setSprinting(false);
     }
 
