@@ -26,6 +26,9 @@ import java.util.Optional;
 
 public final class SingleLaneSweepDebugRunner {
     private static final LanePlannerSettings LANE_SETTINGS = new LanePlannerSettings(2, 2, 1.0);
+    private static final double ELYTRA_HORIZONTAL_SPEED = 1.15;
+    private static final double ELYTRA_VERTICAL_SPEED = 0.42;
+    private static final double ELYTRA_VELOCITY_BLEND = 0.35;
 
     private final AirPlacementEngine airPlacementEngine = new AirPlacementEngine();
     private final LanePlanner lanePlanner = new LanePlanner();
@@ -205,6 +208,34 @@ public final class SingleLaneSweepDebugRunner {
         setKey(client.options.rightKey, command.rightPressed());
         setKey(client.options.jumpKey, command.jumpPressed());
         setKey(client.options.sneakKey, command.sneakPressed());
+        applyElytraVelocityControl(client, command);
+    }
+
+    private static void applyElytraVelocityControl(MinecraftClient client, ElytraFlightController.FlightControlCommand command) {
+        if (client.player == null || !client.player.isGliding()) {
+            return;
+        }
+
+        double yawRad = Math.toRadians(command.yaw());
+        Vec3d forward = new Vec3d(-Math.sin(yawRad), 0.0, Math.cos(yawRad));
+        Vec3d right = new Vec3d(Math.cos(yawRad), 0.0, Math.sin(yawRad));
+
+        double forwardIntent = (command.forwardPressed() ? 1.0 : 0.0) - (command.backPressed() ? 1.0 : 0.0);
+        double strafeIntent = (command.rightPressed() ? 1.0 : 0.0) - (command.leftPressed() ? 1.0 : 0.0);
+        Vec3d horizontalIntent = forward.multiply(forwardIntent).add(right.multiply(strafeIntent));
+        if (horizontalIntent.lengthSquared() > 0.0001) {
+            horizontalIntent = horizontalIntent.normalize().multiply(ELYTRA_HORIZONTAL_SPEED);
+        }
+
+        double verticalIntent = (command.jumpPressed() ? 1.0 : 0.0) - (command.sneakPressed() ? 1.0 : 0.0);
+        double targetY = verticalIntent * ELYTRA_VERTICAL_SPEED;
+
+        Vec3d current = client.player.getVelocity();
+        Vec3d target = new Vec3d(horizontalIntent.x, targetY, horizontalIntent.z);
+        Vec3d blended = current.multiply(1.0 - ELYTRA_VELOCITY_BLEND).add(target.multiply(ELYTRA_VELOCITY_BLEND));
+
+        client.player.setVelocity(blended);
+        client.player.velocityModified = true;
     }
 
     private static void clearFlightControls(MinecraftClient client) {
