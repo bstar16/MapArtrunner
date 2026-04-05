@@ -222,6 +222,10 @@ public final class SingleLaneSweepDebugRunner {
 
         double forwardIntent = (command.forwardPressed() ? 1.0 : 0.0) - (command.backPressed() ? 1.0 : 0.0);
         double strafeIntent = (command.rightPressed() ? 1.0 : 0.0) - (command.leftPressed() ? 1.0 : 0.0);
+        if (Math.abs(forwardIntent) > 0.01) {
+            // Keep travel in a straight line while sweeping by prioritizing forward motion.
+            strafeIntent = 0.0;
+        }
         Vec3d horizontalIntent = forward.multiply(forwardIntent).add(right.multiply(strafeIntent));
         if (horizontalIntent.lengthSquared() > 0.0001) {
             horizontalIntent = horizontalIntent.normalize().multiply(ELYTRA_HORIZONTAL_SPEED);
@@ -233,6 +237,12 @@ public final class SingleLaneSweepDebugRunner {
         Vec3d current = client.player.getVelocity();
         Vec3d target = new Vec3d(horizontalIntent.x, targetY, horizontalIntent.z);
         Vec3d blended = current.multiply(1.0 - ELYTRA_VELOCITY_BLEND).add(target.multiply(ELYTRA_VELOCITY_BLEND));
+        if (Math.abs(forwardIntent) < 0.01 && Math.abs(strafeIntent) < 0.01) {
+            blended = new Vec3d(0.0, blended.y, 0.0);
+        }
+        if (Math.abs(verticalIntent) < 0.01) {
+            blended = new Vec3d(blended.x, 0.0, blended.z);
+        }
 
         client.player.setVelocity(blended);
         client.player.velocityModified = true;

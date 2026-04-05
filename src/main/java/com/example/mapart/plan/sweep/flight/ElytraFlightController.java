@@ -237,7 +237,7 @@ public final class ElytraFlightController {
     private FlightControlCommand buildControlCommand(Vec3d worldPlayerPosition) {
         return switch (state) {
             case TAKEOFF -> buildTakeoffCommand(worldPlayerPosition);
-            case LANE_ENTRY_ALIGNMENT -> buildLaneCommand(worldPlayerPosition, progressTargetWorldPosition(worldPlayerPosition, 6.0), true);
+            case LANE_ENTRY_ALIGNMENT -> buildLaneCommand(worldPlayerPosition, holdPositionTarget(worldPlayerPosition), true, false);
             case LANE_FOLLOWING -> buildLaneCommand(worldPlayerPosition, progressTargetWorldPosition(worldPlayerPosition, 8.0), false);
             case APPROACH_ENDPOINT -> buildLaneCommand(worldPlayerPosition, toWorldCenter(lane.endPoint()), false);
             case SOFT_TURN -> buildLaneCommand(worldPlayerPosition, toWorldCenter(lane.endPoint()), false);
@@ -259,6 +259,13 @@ public final class ElytraFlightController {
     }
 
     private FlightControlCommand buildLaneCommand(Vec3d worldPlayerPosition, Vec3d worldTarget, boolean aggressiveClimb) {
+        return buildLaneCommand(worldPlayerPosition, worldTarget, aggressiveClimb, true);
+    }
+
+    private FlightControlCommand buildLaneCommand(Vec3d worldPlayerPosition,
+                                                  Vec3d worldTarget,
+                                                  boolean aggressiveClimb,
+                                                  boolean allowForwardMotion) {
         double laneYaw = laneHeadingYaw();
         double lateralOffset = laneLateralOffset(worldPlayerPosition);
         double forwardError = forwardDistance(worldPlayerPosition, worldTarget);
@@ -268,8 +275,8 @@ public final class ElytraFlightController {
         boolean left = lateralIntent > 0.18;
         boolean right = lateralIntent < -0.18;
 
-        boolean forward = forwardError > 0.35;
-        boolean back = forwardError < -0.45;
+        boolean forward = allowForwardMotion && forwardError > 0.35;
+        boolean back = allowForwardMotion && forwardError < -0.45;
 
         double verticalIntent = clamp(altitudeError * 0.22, -1.0, 1.0);
         if (aggressiveClimb && worldPlayerPosition.y < settings.minAltitude() + 2.0) {
@@ -329,6 +336,15 @@ public final class ElytraFlightController {
         Vec3d relativeTarget = lane.axis() == LaneAxis.X
                 ? new Vec3d(desiredProgress, relativePlayer.y, lane.fixedCoordinate() + 0.5)
                 : new Vec3d(lane.fixedCoordinate() + 0.5, relativePlayer.y, desiredProgress);
+        return toWorld(relativeTarget);
+    }
+
+    private Vec3d holdPositionTarget(Vec3d worldPlayerPosition) {
+        Vec3d relativePlayer = toRelative(worldPlayerPosition);
+        double currentProgress = lane.axis() == LaneAxis.X ? relativePlayer.x : relativePlayer.z;
+        Vec3d relativeTarget = lane.axis() == LaneAxis.X
+                ? new Vec3d(currentProgress, relativePlayer.y, lane.fixedCoordinate() + 0.5)
+                : new Vec3d(lane.fixedCoordinate() + 0.5, relativePlayer.y, currentProgress);
         return toWorld(relativeTarget);
     }
 

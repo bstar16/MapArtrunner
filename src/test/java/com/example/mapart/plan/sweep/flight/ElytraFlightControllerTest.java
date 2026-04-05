@@ -83,6 +83,20 @@ class ElytraFlightControllerTest {
     }
 
     @Test
+    void laneEntryAlignmentHoldsPositionInsteadOfDrivingForward() {
+        BuildLane lane = lane(0, LaneDirection.FORWARD, 3, 0, 8);
+        ElytraFlightController controller = controller(lane, settings(0));
+
+        controller.tick(ElytraFlightController.FlightTickInput.currentLaneOnly(new Vec3d(0.5, 70.0, 0.5), false));
+        controller.tick(ElytraFlightController.FlightTickInput.currentLaneOnly(new Vec3d(0.5, 70.0, 0.5), true));
+
+        ElytraFlightController.FlightControlCommand command = controller.currentCommand();
+        assertEquals(ElytraFlightState.LANE_ENTRY_ALIGNMENT, controller.state());
+        assertFalse(command.forwardPressed());
+        assertFalse(command.backPressed());
+    }
+
+    @Test
     void failureResultPreservesTypedFailureMetadata() {
         BuildLane lane = lane(0, LaneDirection.FORWARD, 3, 0, 8);
         ElytraFlightController controller = controller(lane,
