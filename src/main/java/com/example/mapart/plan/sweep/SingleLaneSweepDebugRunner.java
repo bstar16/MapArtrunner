@@ -11,8 +11,8 @@ import com.example.mapart.plan.sweep.flight.ElytraFlightControllerSettings;
 import com.example.mapart.plan.sweep.flight.FlightRecoveryHandler;
 import com.example.mapart.plan.sweep.flight.LaneEntryPlanner;
 import com.example.mapart.plan.sweep.flight.TurnPlanner;
-import net.minecraft.client.option.KeyBinding;
 import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.option.KeyBinding;
 import net.minecraft.item.Item;
 import net.minecraft.util.Hand;
 import net.minecraft.util.math.BlockPos;
@@ -26,9 +26,12 @@ import java.util.Optional;
 
 public final class SingleLaneSweepDebugRunner {
     private static final LanePlannerSettings LANE_SETTINGS = new LanePlannerSettings(2, 2, 1.0);
-    private static final double ELYTRA_HORIZONTAL_SPEED = 1.15;
-    private static final double ELYTRA_VERTICAL_SPEED = 0.42;
-    private static final double ELYTRA_VELOCITY_BLEND = 0.35;
+    private static final double ELYTRA_HORIZONTAL_SPEED = 1.20;
+    private static final double ELYTRA_VERTICAL_SPEED = 0.40;
+    private static final double ELYTRA_VELOCITY_BLEND = 0.25;
+    private static final double ENVELOPE_MARGIN = 2.0;
+    private static final double LANE_LATERAL_PADDING = 2.5;
+    private static final double LANE_PROGRESS_PADDING = 3.0;
 
     private final AirPlacementEngine airPlacementEngine = new AirPlacementEngine();
     private final LanePlanner lanePlanner = new LanePlanner();
@@ -37,6 +40,8 @@ public final class SingleLaneSweepDebugRunner {
     private BuildSession activeSession;
     private BuildLane activeLane;
     private SweepPassResult lastResult;
+    private SweepEnvelope activeEnvelope;
+    private SweepEnvelope.LaneCorridor activeLaneCorridor;
 
     public Optional<String> start(BuildSession session, int laneIndex) {
         Objects.requireNonNull(session, "session");
@@ -86,31 +91,44 @@ public final class SingleLaneSweepDebugRunner {
         );
         activeSession = session;
         activeLane = selectedLane;
+        activeEnvelope = SweepEnvelope.fromPlan(plan, session.getOrigin());
+        activeLaneCorridor = activeEnvelope.activeLaneCorridor(selectedLane, LANE_LATERAL_PADDING, LANE_PROGRESS_PADDING);
         lastResult = null;
         return Optional.empty();
     }
 
     public void tick(MinecraftClient client) {
-        if (client == null || client.player == null || activeController == null || activeSession == null || activeLane == null) {
+        if (client == null || client.player == null || activeController == null || activeSession == null || activeLane == null
+                || activeEnvelope == null || activeLaneCorridor == null) {
             return;
         }
 
         if (isTerminal(activeController.state())) {
-            if (lastResult == null) {
-                lastResult = activeController.result();
-            }
-            clearFlightControls(client);
+            lastResult = activeController.result();
+            deactivate(client);
             return;
         }
 
         Vec3d worldPlayerPos = client.player.getPos();
         Vec3d relativePlayerPos = toRelative(worldPlayerPos, activeSession.getOrigin());
-        activeController.tick(SweepPassController.PassTickInput.withWorldAndRelative(worldPlayerPos, relativePlayerPos, client.player.isGliding()));
+        boolean inBounds = activeEnvelope.inSchematicBounds(worldPlayerPos, ENVELOPE_MARGIN);
+        boolean inCorridor = activeLaneCorridor.contains(worldPlayerPos);
+        Optional<Vec3d> corridorTarget = Optional.of(activeLaneCorridor.clampCenterlineTarget(worldPlayerPos));
+
+        activeController.tick(SweepPassController.PassTickInput.withWorldAndRelative(
+                worldPlayerPos,
+                relativePlayerPos,
+                client.player.isGliding(),
+                client.player.isOnGround(),
+                inBounds,
+                inCorridor,
+                corridorTarget
+        ));
         applyFlightControls(client);
 
         if (isTerminal(activeController.state())) {
             lastResult = activeController.result();
-            clearFlightControls(client);
+            deactivate(client);
         }
     }
 
@@ -123,9 +141,7 @@ public final class SingleLaneSweepDebugRunner {
         }
         lastResult = activeController.result();
         MinecraftClient client = MinecraftClient.getInstance();
-        if (client != null) {
-            clearFlightControls(client);
-        }
+        deactivate(client);
         return Optional.empty();
     }
 
@@ -222,10 +238,6 @@ public final class SingleLaneSweepDebugRunner {
 
         double forwardIntent = (command.forwardPressed() ? 1.0 : 0.0) - (command.backPressed() ? 1.0 : 0.0);
         double strafeIntent = (command.rightPressed() ? 1.0 : 0.0) - (command.leftPressed() ? 1.0 : 0.0);
-        if (Math.abs(forwardIntent) > 0.01) {
-            // Keep travel in a straight line while sweeping by prioritizing forward motion.
-            strafeIntent = 0.0;
-        }
         Vec3d horizontalIntent = forward.multiply(forwardIntent).add(right.multiply(strafeIntent));
         if (horizontalIntent.lengthSquared() > 0.0001) {
             horizontalIntent = horizontalIntent.normalize().multiply(ELYTRA_HORIZONTAL_SPEED);
@@ -237,12 +249,6 @@ public final class SingleLaneSweepDebugRunner {
         Vec3d current = client.player.getVelocity();
         Vec3d target = new Vec3d(horizontalIntent.x, targetY, horizontalIntent.z);
         Vec3d blended = current.multiply(1.0 - ELYTRA_VELOCITY_BLEND).add(target.multiply(ELYTRA_VELOCITY_BLEND));
-        if (Math.abs(forwardIntent) < 0.01 && Math.abs(strafeIntent) < 0.01) {
-            blended = new Vec3d(0.0, blended.y, 0.0);
-        }
-        if (Math.abs(verticalIntent) < 0.01) {
-            blended = new Vec3d(blended.x, 0.0, blended.z);
-        }
 
         client.player.setVelocity(blended);
         client.player.velocityModified = true;
@@ -265,5 +271,16 @@ public final class SingleLaneSweepDebugRunner {
         if (key != null) {
             key.setPressed(pressed);
         }
+    }
+
+    private void deactivate(MinecraftClient client) {
+        if (client != null) {
+            clearFlightControls(client);
+        }
+        activeController = null;
+        activeSession = null;
+        activeLane = null;
+        activeEnvelope = null;
+        activeLaneCorridor = null;
     }
 }
