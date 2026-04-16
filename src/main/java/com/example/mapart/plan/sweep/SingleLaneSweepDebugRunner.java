@@ -104,10 +104,8 @@ public final class SingleLaneSweepDebugRunner {
         }
 
         if (isTerminal(activeController.state())) {
-            if (lastResult == null) {
-                lastResult = activeController.result();
-            }
-            clearFlightControls(client);
+            lastResult = activeController.result();
+            deactivate(client);
             return;
         }
 
@@ -130,7 +128,7 @@ public final class SingleLaneSweepDebugRunner {
 
         if (isTerminal(activeController.state())) {
             lastResult = activeController.result();
-            clearFlightControls(client);
+            deactivate(client);
         }
     }
 
@@ -143,11 +141,7 @@ public final class SingleLaneSweepDebugRunner {
         }
         lastResult = activeController.result();
         MinecraftClient client = MinecraftClient.getInstance();
-        if (client != null) {
-            clearFlightControls(client);
-        }
-        activeEnvelope = null;
-        activeLaneCorridor = null;
+        deactivate(client);
         return Optional.empty();
     }
 
@@ -277,5 +271,16 @@ public final class SingleLaneSweepDebugRunner {
         if (key != null) {
             key.setPressed(pressed);
         }
+    }
+
+    private void deactivate(MinecraftClient client) {
+        if (client != null) {
+            clearFlightControls(client);
+        }
+        activeController = null;
+        activeSession = null;
+        activeLane = null;
+        activeEnvelope = null;
+        activeLaneCorridor = null;
     }
 }
