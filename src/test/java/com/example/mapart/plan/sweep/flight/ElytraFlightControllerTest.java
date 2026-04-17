@@ -55,10 +55,11 @@ class ElytraFlightControllerTest {
         BuildLane lane = lane(2, LaneDirection.FORWARD, 6, 0, 8);
         LaneEntryPlanner planner = new LaneEntryPlanner();
 
-        LaneEntryPlanner.LaneEntryPlan aligned = planner.plan(lane, new Vec3d(2.0, 71.0, 6.55), 0.75);
-        LaneEntryPlanner.LaneEntryPlan misaligned = planner.plan(lane, new Vec3d(2.0, 71.0, 7.40), 0.75);
+        LaneEntryPlanner.LaneEntryPlan aligned = planner.plan(lane, new Vec3d(0.4, 71.0, 6.55), 0.75, 1.0);
+        LaneEntryPlanner.LaneEntryPlan misaligned = planner.plan(lane, new Vec3d(2.0, 71.0, 7.40), 0.75, 1.0);
 
         assertTrue(aligned.aligned());
+        assertTrue(aligned.startAligned());
         assertFalse(misaligned.aligned());
         assertTrue(Math.abs(misaligned.lateralOffset()) > misaligned.centerTolerance());
     }
@@ -67,10 +68,10 @@ class ElytraFlightControllerTest {
     void altitudeBandClassificationUsesConfiguredBand() {
         ElytraFlightController controller = controller(lane(0, LaneDirection.FORWARD, 4, 0, 8), settings(0));
 
-        assertEquals(ElytraFlightController.AltitudeBand.BELOW, controller.classifyAltitude(64.9));
-        assertEquals(ElytraFlightController.AltitudeBand.IN_BAND, controller.classifyAltitude(65.0));
-        assertEquals(ElytraFlightController.AltitudeBand.IN_BAND, controller.classifyAltitude(80.0));
-        assertEquals(ElytraFlightController.AltitudeBand.ABOVE, controller.classifyAltitude(80.1));
+        assertEquals(ElytraFlightController.AltitudeBand.BELOW, controller.classifyAltitude(71.5));
+        assertEquals(ElytraFlightController.AltitudeBand.IN_BAND, controller.classifyAltitude(72.0));
+        assertEquals(ElytraFlightController.AltitudeBand.IN_BAND, controller.classifyAltitude(72.4));
+        assertEquals(ElytraFlightController.AltitudeBand.ABOVE, controller.classifyAltitude(72.6));
     }
 
     @Test

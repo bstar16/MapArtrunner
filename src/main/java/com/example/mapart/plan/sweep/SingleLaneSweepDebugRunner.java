@@ -27,11 +27,11 @@ import java.util.Optional;
 public final class SingleLaneSweepDebugRunner {
     private static final LanePlannerSettings LANE_SETTINGS = new LanePlannerSettings(2, 2, 1.0);
     private static final double ELYTRA_HORIZONTAL_SPEED = 1.20;
-    private static final double ELYTRA_VERTICAL_SPEED = 0.40;
-    private static final double ELYTRA_VELOCITY_BLEND = 0.25;
-    private static final double ENVELOPE_MARGIN = 2.0;
-    private static final double LANE_LATERAL_PADDING = 2.5;
-    private static final double LANE_PROGRESS_PADDING = 3.0;
+    private static final double ELYTRA_VERTICAL_SPEED = 0.45;
+    private static final double ELYTRA_VELOCITY_BLEND = 1.0;
+    private static final double ENVELOPE_MARGIN = 0.5;
+    private static final double LANE_LATERAL_PADDING = 0.6;
+    private static final double LANE_PROGRESS_PADDING = 0.0;
 
     private final AirPlacementEngine airPlacementEngine = new AirPlacementEngine();
     private final LanePlanner lanePlanner = new LanePlanner();
@@ -42,6 +42,8 @@ public final class SingleLaneSweepDebugRunner {
     private SweepPassResult lastResult;
     private SweepEnvelope activeEnvelope;
     private SweepEnvelope.LaneCorridor activeLaneCorridor;
+    private Vec3d activeLaneStartWorld;
+    private Vec3d activeLaneEndWorld;
 
     public Optional<String> start(BuildSession session, int laneIndex) {
         Objects.requireNonNull(session, "session");
@@ -93,6 +95,8 @@ public final class SingleLaneSweepDebugRunner {
         activeLane = selectedLane;
         activeEnvelope = SweepEnvelope.fromPlan(plan, session.getOrigin());
         activeLaneCorridor = activeEnvelope.activeLaneCorridor(selectedLane, LANE_LATERAL_PADDING, LANE_PROGRESS_PADDING);
+        activeLaneStartWorld = Vec3d.ofCenter(selectedLane.entryPoint()).add(session.getOrigin().getX(), session.getOrigin().getY(), session.getOrigin().getZ());
+        activeLaneEndWorld = Vec3d.ofCenter(selectedLane.endPoint()).add(session.getOrigin().getX(), session.getOrigin().getY(), session.getOrigin().getZ());
         lastResult = null;
         return Optional.empty();
     }
@@ -211,18 +215,18 @@ public final class SingleLaneSweepDebugRunner {
     }
 
     private Vec3d laneCenterlineTarget(Vec3d worldPlayerPos) {
-        if (activeSession == null || activeLane == null || activeLaneCorridor == null) {
+        if (activeSession == null || activeLane == null || activeLaneCorridor == null || activeLaneEndWorld == null) {
             return worldPlayerPos;
         }
         BlockPos origin = activeSession.getOrigin();
         double centerX;
         double centerZ;
         if (activeLane.axis() == LaneAxis.X) {
-            centerX = clamp(worldPlayerPos.x, origin.getX() + activeLane.minProgress() + 0.5, origin.getX() + activeLane.maxProgress() + 0.5);
+            centerX = clamp(activeLaneEndWorld.x, origin.getX() + activeLane.minProgress() + 0.5, origin.getX() + activeLane.maxProgress() + 0.5);
             centerZ = origin.getZ() + activeLane.fixedCoordinate() + 0.5;
         } else {
             centerX = origin.getX() + activeLane.fixedCoordinate() + 0.5;
-            centerZ = clamp(worldPlayerPos.z, origin.getZ() + activeLane.minProgress() + 0.5, origin.getZ() + activeLane.maxProgress() + 0.5);
+            centerZ = clamp(activeLaneEndWorld.z, origin.getZ() + activeLane.minProgress() + 0.5, origin.getZ() + activeLane.maxProgress() + 0.5);
         }
         return activeLaneCorridor.clampCenterlineTarget(new Vec3d(centerX, worldPlayerPos.y, centerZ));
     }
@@ -303,5 +307,7 @@ public final class SingleLaneSweepDebugRunner {
         activeLane = null;
         activeEnvelope = null;
         activeLaneCorridor = null;
+        activeLaneStartWorld = null;
+        activeLaneEndWorld = null;
     }
 }

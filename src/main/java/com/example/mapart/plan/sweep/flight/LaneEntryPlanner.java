@@ -7,7 +7,7 @@ import net.minecraft.util.math.Vec3d;
 import java.util.Objects;
 
 public final class LaneEntryPlanner {
-    public LaneEntryPlan plan(BuildLane lane, Vec3d playerPosition, double centerTolerance) {
+    public LaneEntryPlan plan(BuildLane lane, Vec3d playerPosition, double centerTolerance, double startTolerance) {
         Objects.requireNonNull(lane, "lane");
         Objects.requireNonNull(playerPosition, "playerPosition");
 
@@ -15,11 +15,25 @@ public final class LaneEntryPlanner {
         double lateralOffset = lane.axis() == LaneAxis.X
                 ? playerPosition.z - laneCenter
                 : playerPosition.x - laneCenter;
-        boolean aligned = Math.abs(lateralOffset) <= centerTolerance;
+        double entryProgress = lane.axis() == LaneAxis.X
+                ? lane.entryPoint().getX() + 0.5
+                : lane.entryPoint().getZ() + 0.5;
+        double playerProgress = lane.axis() == LaneAxis.X
+                ? playerPosition.x
+                : playerPosition.z;
+        double progressOffsetFromEntry = playerProgress - entryProgress;
 
-        return new LaneEntryPlan(lateralOffset, centerTolerance, aligned);
+        boolean aligned = Math.abs(lateralOffset) <= centerTolerance;
+        boolean startAligned = Math.abs(progressOffsetFromEntry) <= startTolerance;
+
+        return new LaneEntryPlan(lateralOffset, centerTolerance, progressOffsetFromEntry, startTolerance, aligned, startAligned);
     }
 
-    public record LaneEntryPlan(double lateralOffset, double centerTolerance, boolean aligned) {
+    public record LaneEntryPlan(double lateralOffset,
+                                double centerTolerance,
+                                double progressOffsetFromEntry,
+                                double startTolerance,
+                                boolean aligned,
+                                boolean startAligned) {
     }
 }
