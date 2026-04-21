@@ -8,24 +8,24 @@ import com.example.mapart.plan.compare.PlacementStatusSnapshot;
 import com.example.mapart.plan.state.BuildSession;
 import com.example.mapart.runtime.MapArtRuntime;
 import com.example.mapart.settings.MapartSettings;
-import net.fabricmc.fabric.api.client.rendering.v1.WorldRenderContext;
-import net.fabricmc.fabric.api.client.rendering.v1.WorldRenderEvents;
+import net.fabricmc.fabric.api.client.rendering.v1.world.WorldRenderContext;
+import net.fabricmc.fabric.api.client.rendering.v1.world.WorldRenderEvents;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.network.ClientPlayerEntity;
-import net.minecraft.client.render.RenderLayer;
+import net.minecraft.client.render.RenderLayers;
 import net.minecraft.client.render.VertexConsumer;
-import net.minecraft.client.render.VertexConsumerProvider;
 import net.minecraft.client.render.VertexRendering;
 import net.minecraft.client.util.math.MatrixStack;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Vec3d;
+import net.minecraft.util.shape.VoxelShapes;
 
 import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 
-public class SchematicOverlayRenderer implements WorldRenderEvents.AfterTranslucent {
+public class SchematicOverlayRenderer implements WorldRenderEvents.BeforeTranslucent {
     private final PlacementStatusResolver statusResolver;
 
     public SchematicOverlayRenderer(PlacementStatusResolver statusResolver) {
@@ -33,7 +33,7 @@ public class SchematicOverlayRenderer implements WorldRenderEvents.AfterTransluc
     }
 
     @Override
-    public void afterTranslucent(WorldRenderContext context) {
+    public void beforeTranslucent(WorldRenderContext context) {
         if (MapArtRuntime.buildPlanService() == null || MapArtRuntime.settingsStore() == null) {
             return;
         }
@@ -74,25 +74,23 @@ public class SchematicOverlayRenderer implements WorldRenderEvents.AfterTransluc
             return true;
         });
 
-        MatrixStack matrices = context.matrixStack();
-        VertexConsumerProvider.Immediate consumers = client.getBufferBuilders().getEntityVertexConsumers();
-        VertexConsumer lines = consumers.getBuffer(RenderLayer.getLines());
-        Vec3d camera = context.camera().getPos();
+        MatrixStack matrices = context.matrices();
+        VertexConsumer lines = context.consumers().getBuffer(RenderLayers.lines());
+        Vec3d camera = client.gameRenderer.getCamera().getCameraPos();
 
         for (PlacementStatusSnapshot snapshot : snapshots) {
-            int color = pickColor(snapshot);
-            float r = ((color >> 16) & 0xFF) / 255.0f;
-            float g = ((color >> 8) & 0xFF) / 255.0f;
-            float b = (color & 0xFF) / 255.0f;
+            int baseColor = pickColor(snapshot);
+            float r = ((baseColor >> 16) & 0xFF) / 255.0f;
+            float g = ((baseColor >> 8) & 0xFF) / 255.0f;
+            float b = (baseColor & 0xFF) / 255.0f;
 
             BlockPos pos = snapshot.absolutePos();
             double minX = pos.getX() - camera.x;
             double minY = pos.getY() - camera.y;
             double minZ = pos.getZ() - camera.z;
-            VertexRendering.drawBox(matrices, lines, minX, minY, minZ, minX + 1, minY + 1, minZ + 1, r, g, b, 0.85f);
+            int argbColor = (0xD9 << 24) | (((int) (r * 255.0f)) << 16) | (((int) (g * 255.0f)) << 8) | ((int) (b * 255.0f));
+            VertexRendering.drawOutline(matrices, lines, VoxelShapes.fullCube(), minX, minY, minZ, argbColor, 1.5f);
         }
-
-        consumers.draw();
     }
 
     private static int pickColor(PlacementStatusSnapshot snapshot) {

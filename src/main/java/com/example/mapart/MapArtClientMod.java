@@ -24,14 +24,14 @@ import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.rendering.v1.HudRenderCallback;
-import net.fabricmc.fabric.api.client.rendering.v1.WorldRenderEvents;
+import net.fabricmc.fabric.api.client.rendering.v1.world.WorldRenderEvents;
 import net.minecraft.client.option.KeyBinding;
 import net.minecraft.client.util.InputUtil;
 import net.minecraft.text.Text;
+import net.minecraft.util.Identifier;
 import org.lwjgl.glfw.GLFW;
 
 public class MapArtClientMod implements ClientModInitializer {
-    private static final String KEY_CATEGORY = "key.categories.mapart";
     private static final String PANIC_KEY_TRANSLATION = "key.mapart.panic";
 
     @Override
@@ -55,7 +55,7 @@ public class MapArtClientMod implements ClientModInitializer {
                 PANIC_KEY_TRANSLATION,
                 InputUtil.Type.KEYSYM,
                 GLFW.GLFW_KEY_UNKNOWN,
-                KEY_CATEGORY
+                KeyBinding.Category.create(Identifier.of("mapart", "general"))
         ));
 
         ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) -> {
@@ -93,7 +93,7 @@ public class MapArtClientMod implements ClientModInitializer {
 
         PlacementStatusResolver resolver = new PlacementStatusResolver();
         HudRenderCallback.EVENT.register(new HudRenderer(resolver));
-        WorldRenderEvents.AFTER_TRANSLUCENT.register(new SchematicOverlayRenderer(resolver));
+        WorldRenderEvents.BEFORE_TRANSLUCENT.register(new SchematicOverlayRenderer(resolver));
 
         debugReporter.logToFile("Debug log file: " + debugReporter.logPath().toAbsolutePath());
         MapArtMod.LOGGER.info("Initialized mapart client command pipeline with /mapart, /maprunner, and /mapartrunner");

@@ -109,25 +109,25 @@ public class PlacementExecutor {
     private InventorySelection ensureSelectedItem(MinecraftClient client, ClientPlayerEntity player, Item expectedItem) {
         PlayerInventory inventory = player.getInventory();
         if (player.getMainHandStack().isOf(expectedItem)) {
-            return InventorySelection.selected(inventory.selectedSlot, false);
+            return InventorySelection.selected(inventory.getSelectedSlot(), false);
         }
 
         for (int hotbarSlot = 0; hotbarSlot < PlayerInventory.getHotbarSize(); hotbarSlot++) {
             if (inventory.getStack(hotbarSlot).isOf(expectedItem)) {
-                inventory.selectedSlot = hotbarSlot;
+                inventory.setSelectedSlot(hotbarSlot);
                 syncSelectedSlotWithServer(player, hotbarSlot);
                 return InventorySelection.selected(hotbarSlot, false);
             }
         }
 
-        int swapHotbarSlot = inventory.selectedSlot;
+        int swapHotbarSlot = inventory.getSelectedSlot();
         for (int slot = PlayerInventory.getHotbarSize(); slot < PlayerInventory.MAIN_SIZE; slot++) {
             if (!inventory.getStack(slot).isOf(expectedItem)) {
                 continue;
             }
             client.interactionManager.clickSlot(player.playerScreenHandler.syncId, slot, swapHotbarSlot, SlotActionType.SWAP, player);
             if (inventory.getStack(swapHotbarSlot).isOf(expectedItem)) {
-                inventory.selectedSlot = swapHotbarSlot;
+                inventory.setSelectedSlot(swapHotbarSlot);
                 syncSelectedSlotWithServer(player, swapHotbarSlot);
                 return InventorySelection.selected(swapHotbarSlot, true);
             }
