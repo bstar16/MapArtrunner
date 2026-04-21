@@ -29,9 +29,6 @@ public final class SingleLaneSweepDebugRunner {
     private static final double ELYTRA_HORIZONTAL_SPEED = 1.20;
     private static final double ELYTRA_VERTICAL_SPEED = 0.40;
     private static final double ELYTRA_VELOCITY_BLEND = 0.25;
-    private static final double ENVELOPE_MARGIN = 2.0;
-    private static final double LANE_LATERAL_PADDING = 2.5;
-    private static final double LANE_PROGRESS_PADDING = 3.0;
 
     private final AirPlacementEngine airPlacementEngine = new AirPlacementEngine();
     private final LanePlanner lanePlanner = new LanePlanner();
@@ -40,8 +37,6 @@ public final class SingleLaneSweepDebugRunner {
     private BuildSession activeSession;
     private BuildLane activeLane;
     private SweepPassResult lastResult;
-    private SweepEnvelope activeEnvelope;
-    private SweepEnvelope.LaneCorridor activeLaneCorridor;
 
     public Optional<String> start(BuildSession session, int laneIndex) {
         Objects.requireNonNull(session, "session");
@@ -91,15 +86,12 @@ public final class SingleLaneSweepDebugRunner {
         );
         activeSession = session;
         activeLane = selectedLane;
-        activeEnvelope = SweepEnvelope.fromPlan(plan, session.getOrigin());
-        activeLaneCorridor = activeEnvelope.activeLaneCorridor(selectedLane, LANE_LATERAL_PADDING, LANE_PROGRESS_PADDING);
         lastResult = null;
         return Optional.empty();
     }
 
     public void tick(MinecraftClient client) {
-        if (client == null || client.player == null || activeController == null || activeSession == null || activeLane == null
-                || activeEnvelope == null || activeLaneCorridor == null) {
+        if (client == null || client.player == null || activeController == null || activeSession == null || activeLane == null) {
             return;
         }
 
@@ -109,20 +101,13 @@ public final class SingleLaneSweepDebugRunner {
             return;
         }
 
-        Vec3d worldPlayerPos = client.player.getPos();
+        Vec3d worldPlayerPos = client.player.getEntityPos();
         Vec3d relativePlayerPos = toRelative(worldPlayerPos, activeSession.getOrigin());
-        boolean inBounds = activeEnvelope.inSchematicBounds(worldPlayerPos, ENVELOPE_MARGIN);
-        boolean inCorridor = activeLaneCorridor.contains(worldPlayerPos);
-        Optional<Vec3d> corridorTarget = Optional.of(activeLaneCorridor.clampCenterlineTarget(worldPlayerPos));
 
         activeController.tick(SweepPassController.PassTickInput.withWorldAndRelative(
                 worldPlayerPos,
                 relativePlayerPos,
-                client.player.isGliding(),
-                client.player.isOnGround(),
-                inBounds,
-                inCorridor,
-                corridorTarget
+                client.player.isGliding()
         ));
         applyFlightControls(client);
 
@@ -251,7 +236,7 @@ public final class SingleLaneSweepDebugRunner {
         Vec3d blended = current.multiply(1.0 - ELYTRA_VELOCITY_BLEND).add(target.multiply(ELYTRA_VELOCITY_BLEND));
 
         client.player.setVelocity(blended);
-        client.player.velocityModified = true;
+        client.player.velocityDirty = true;
     }
 
     private static void clearFlightControls(MinecraftClient client) {
@@ -280,7 +265,5 @@ public final class SingleLaneSweepDebugRunner {
         activeController = null;
         activeSession = null;
         activeLane = null;
-        activeEnvelope = null;
-        activeLaneCorridor = null;
     }
 }

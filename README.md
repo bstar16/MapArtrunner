@@ -1,6 +1,6 @@
-# MapArt - Fabric 1.21.4 Mod
+# MapArt - Fabric 1.21.11 Mod
 
-A Minecraft Fabric mod for Minecraft 1.21.4
+A Minecraft Fabric mod for Minecraft 1.21.11
 
 ## Development Setup
 
@@ -116,7 +116,7 @@ If `/mapart` is unknown in game:
 
 MapArtRunner integrates with Baritone through `baritone-api-fabric` at runtime.
 
-- Install a Baritone jar that exposes the `baritone-api-fabric` API for your exact Minecraft version (1.21.4 in this project).
+- Install a Baritone jar that exposes the `baritone-api-fabric` API for your exact Minecraft version (1.21.11 in this project).
 - If Baritone is missing or the API is mismatched, `/mapart start` now reports a friendly in-game error and assisted movement is disabled until a compatible Baritone jar is installed.
 
 ## Troubleshooting
@@ -147,9 +147,9 @@ If the standard commands fail even when typed correctly, check the items below.
 
 ## Mod Details
 
-- **Minecraft Version:** 1.21.4
-- **Fabric Loader:** 0.16.5
-- **Fabric API:** 0.104.0+1.21.1
+- **Minecraft Version:** 1.21.11
+- **Fabric Loader:** 0.19.2
+- **Fabric API:** 0.141.1+1.21.11
 - **Java Version:** 21
 
 ## License

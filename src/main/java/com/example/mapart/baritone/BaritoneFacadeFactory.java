@@ -13,7 +13,7 @@ public final class BaritoneFacadeFactory {
         } catch (ClassNotFoundException exception) {
             return new NoOpBaritoneFacade("Baritone was not found. Install baritone-api-fabric to enable assisted movement.");
         } catch (LinkageError error) {
-            return new NoOpBaritoneFacade("Baritone API mismatch detected. Ensure your baritone-api-fabric jar matches Minecraft 1.21.4.");
+            return new NoOpBaritoneFacade("Baritone API mismatch detected. Ensure your baritone-api-fabric jar matches Minecraft 1.21.11.");
         }
     }
 }
