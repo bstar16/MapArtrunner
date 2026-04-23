@@ -14,11 +14,9 @@ import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.network.ClientPlayerEntity;
 import net.minecraft.client.render.RenderLayers;
 import net.minecraft.client.render.VertexConsumer;
-import net.minecraft.client.render.VertexRendering;
 import net.minecraft.client.util.math.MatrixStack;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Vec3d;
-import net.minecraft.util.shape.VoxelShapes;
 
 import java.util.HashSet;
 import java.util.List;
@@ -89,8 +87,41 @@ public class SchematicOverlayRenderer implements WorldRenderEvents.BeforeTranslu
             double minY = pos.getY() - camera.y;
             double minZ = pos.getZ() - camera.z;
             int argbColor = (0xD9 << 24) | (((int) (r * 255.0f)) << 16) | (((int) (g * 255.0f)) << 8) | ((int) (b * 255.0f));
-            VertexRendering.drawOutline(matrices, lines, VoxelShapes.fullCube(), minX, minY, minZ, argbColor, 1.5f);
+            drawBlockOutline(matrices, lines, minX, minY, minZ, argbColor, 1.5f);
         }
+    }
+
+    private static void drawBlockOutline(MatrixStack matrices, VertexConsumer lines, double minX, double minY, double minZ, int argbColor, float lineWidth) {
+        double maxX = minX + 1.0d;
+        double maxY = minY + 1.0d;
+        double maxZ = minZ + 1.0d;
+        MatrixStack.Entry entry = matrices.peek();
+
+        addLine(lines, entry, minX, minY, minZ, maxX, minY, minZ, argbColor, lineWidth, 1.0f, 0.0f, 0.0f);
+        addLine(lines, entry, minX, minY, maxZ, maxX, minY, maxZ, argbColor, lineWidth, 1.0f, 0.0f, 0.0f);
+        addLine(lines, entry, minX, maxY, minZ, maxX, maxY, minZ, argbColor, lineWidth, 1.0f, 0.0f, 0.0f);
+        addLine(lines, entry, minX, maxY, maxZ, maxX, maxY, maxZ, argbColor, lineWidth, 1.0f, 0.0f, 0.0f);
+
+        addLine(lines, entry, minX, minY, minZ, minX, minY, maxZ, argbColor, lineWidth, 0.0f, 0.0f, 1.0f);
+        addLine(lines, entry, maxX, minY, minZ, maxX, minY, maxZ, argbColor, lineWidth, 0.0f, 0.0f, 1.0f);
+        addLine(lines, entry, minX, maxY, minZ, minX, maxY, maxZ, argbColor, lineWidth, 0.0f, 0.0f, 1.0f);
+        addLine(lines, entry, maxX, maxY, minZ, maxX, maxY, maxZ, argbColor, lineWidth, 0.0f, 0.0f, 1.0f);
+
+        addLine(lines, entry, minX, minY, minZ, minX, maxY, minZ, argbColor, lineWidth, 0.0f, 1.0f, 0.0f);
+        addLine(lines, entry, maxX, minY, minZ, maxX, maxY, minZ, argbColor, lineWidth, 0.0f, 1.0f, 0.0f);
+        addLine(lines, entry, minX, minY, maxZ, minX, maxY, maxZ, argbColor, lineWidth, 0.0f, 1.0f, 0.0f);
+        addLine(lines, entry, maxX, minY, maxZ, maxX, maxY, maxZ, argbColor, lineWidth, 0.0f, 1.0f, 0.0f);
+    }
+
+    private static void addLine(VertexConsumer lines, MatrixStack.Entry entry, double startX, double startY, double startZ, double endX, double endY, double endZ, int argbColor, float lineWidth, float normalX, float normalY, float normalZ) {
+        lines.vertex(entry, (float) startX, (float) startY, (float) startZ)
+                .color(argbColor)
+                .normal(entry, normalX, normalY, normalZ)
+                .lineWidth(lineWidth);
+        lines.vertex(entry, (float) endX, (float) endY, (float) endZ)
+                .color(argbColor)
+                .normal(entry, normalX, normalY, normalZ)
+                .lineWidth(lineWidth);
     }
 
     private static int pickColor(PlacementStatusSnapshot snapshot) {
