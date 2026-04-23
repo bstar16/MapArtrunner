@@ -26,6 +26,11 @@ import java.util.Optional;
 import java.util.Set;
 
 public class SchematicOverlayRenderer implements WorldRenderEvents.BeforeTranslucent {
+    private static final double OUTLINE_EXPANSION = 0.002D;
+    private static final net.minecraft.util.shape.VoxelShape OUTLINE_SHAPE = VoxelShapes.cuboid(
+            -OUTLINE_EXPANSION, -OUTLINE_EXPANSION, -OUTLINE_EXPANSION,
+            1.0D + OUTLINE_EXPANSION, 1.0D + OUTLINE_EXPANSION, 1.0D + OUTLINE_EXPANSION
+    );
     private final PlacementStatusResolver statusResolver;
 
     public SchematicOverlayRenderer(PlacementStatusResolver statusResolver) {
@@ -75,7 +80,7 @@ public class SchematicOverlayRenderer implements WorldRenderEvents.BeforeTranslu
         });
 
         MatrixStack matrices = context.matrices();
-        VertexConsumer lines = context.consumers().getBuffer(RenderLayers.lines());
+        VertexConsumer lines = context.consumers().getBuffer(RenderLayers.secondaryBlockOutline());
         Vec3d camera = client.gameRenderer.getCamera().getCameraPos();
 
         for (PlacementStatusSnapshot snapshot : snapshots) {
@@ -89,7 +94,7 @@ public class SchematicOverlayRenderer implements WorldRenderEvents.BeforeTranslu
             double minY = pos.getY() - camera.y;
             double minZ = pos.getZ() - camera.z;
             int argbColor = (0xD9 << 24) | (((int) (r * 255.0f)) << 16) | (((int) (g * 255.0f)) << 8) | ((int) (b * 255.0f));
-            VertexRendering.drawOutline(matrices, lines, VoxelShapes.fullCube(), minX, minY, minZ, argbColor, 1.5f);
+            VertexRendering.drawOutline(matrices, lines, OUTLINE_SHAPE, minX, minY, minZ, argbColor, 1.5f);
         }
     }
 
