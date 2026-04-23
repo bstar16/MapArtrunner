@@ -81,7 +81,7 @@ public class HudRenderer implements HudRenderCallback {
         int height = lines.size() * lineHeight + 6;
         drawContext.fill(x - 4, y - 4, x + width + 4, y + height, 0x66000000);
         for (int i = 0; i < lines.size(); i++) {
-            drawContext.drawText(client.textRenderer, Text.literal(lines.get(i)), x, y + (i * lineHeight), 0xFFFFFF, false);
+            drawContext.drawText(client.textRenderer, Text.literal(lines.get(i)), x, y + (i * lineHeight), 0xFFFFFFFF, false);
         }
     }
 }
