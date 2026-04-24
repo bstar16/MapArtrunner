@@ -23,10 +23,12 @@ class SettingsAndSupplyStoreTest {
         MapartSettingsStore store = new MapartSettingsStore(settingsPath);
         assertTrue(store.set("showHud", "false").isEmpty());
         assertTrue(store.set("hudX", "42").isEmpty());
+        assertTrue(store.set("preferLongerAxis", "true").isEmpty());
 
         MapartSettingsStore restored = new MapartSettingsStore(settingsPath);
         assertFalse(restored.current().showHud());
         assertEquals(42, restored.current().hudX());
+        assertTrue(restored.current().preferLongerAxis());
     }
 
     @Test
