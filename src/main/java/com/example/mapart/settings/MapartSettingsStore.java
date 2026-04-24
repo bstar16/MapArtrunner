@@ -35,25 +35,70 @@ public class MapartSettingsStore {
 
     public Optional<String> set(String key, String value) {
         String normalized = key.toLowerCase(Locale.ROOT);
+        MapartSettings current = settings;
 
         try {
             switch (normalized) {
-                case "showhud" -> settings = new MapartSettings(parseBoolean(value), settings.showSchematicOverlay(), settings.overlayCurrentRegionOnly(),
-                        settings.overlayShowOnlyIncorrect(), settings.hudCompact(), settings.clientTimerSpeed(), settings.hudX(), settings.hudY());
-                case "showschematicoverlay" -> settings = new MapartSettings(settings.showHud(), parseBoolean(value), settings.overlayCurrentRegionOnly(),
-                        settings.overlayShowOnlyIncorrect(), settings.hudCompact(), settings.clientTimerSpeed(), settings.hudX(), settings.hudY());
-                case "overlaycurrentregiononly" -> settings = new MapartSettings(settings.showHud(), settings.showSchematicOverlay(), parseBoolean(value),
-                        settings.overlayShowOnlyIncorrect(), settings.hudCompact(), settings.clientTimerSpeed(), settings.hudX(), settings.hudY());
-                case "overlayshowonlyincorrect" -> settings = new MapartSettings(settings.showHud(), settings.showSchematicOverlay(), settings.overlayCurrentRegionOnly(),
-                        parseBoolean(value), settings.hudCompact(), settings.clientTimerSpeed(), settings.hudX(), settings.hudY());
-                case "hudcompact" -> settings = new MapartSettings(settings.showHud(), settings.showSchematicOverlay(), settings.overlayCurrentRegionOnly(),
-                        settings.overlayShowOnlyIncorrect(), parseBoolean(value), settings.clientTimerSpeed(), settings.hudX(), settings.hudY());
-                case "clienttimerspeed" -> settings = new MapartSettings(settings.showHud(), settings.showSchematicOverlay(), settings.overlayCurrentRegionOnly(),
-                        settings.overlayShowOnlyIncorrect(), settings.hudCompact(), parseClientTimerSpeed(value), settings.hudX(), settings.hudY());
-                case "hudx" -> settings = new MapartSettings(settings.showHud(), settings.showSchematicOverlay(), settings.overlayCurrentRegionOnly(),
-                        settings.overlayShowOnlyIncorrect(), settings.hudCompact(), settings.clientTimerSpeed(), parseInt(value), settings.hudY());
-                case "hudy" -> settings = new MapartSettings(settings.showHud(), settings.showSchematicOverlay(), settings.overlayCurrentRegionOnly(),
-                        settings.overlayShowOnlyIncorrect(), settings.hudCompact(), settings.clientTimerSpeed(), settings.hudX(), parseInt(value));
+                case "showhud" -> settings = copyWith(current, parseBoolean(value), current.showSchematicOverlay(), current.overlayCurrentRegionOnly(),
+                        current.overlayShowOnlyIncorrect(), current.hudCompact(), current.clientTimerSpeed(), current.hudX(), current.hudY(),
+                        current.preferLongerAxis(), current.sweepHalfWidth(), current.sweepTotalWidth(), current.laneStride(),
+                        current.forwardLookaheadSteps(), current.trivialBehindCleanupSteps(), current.groundedSweepConstantSprint());
+                case "showschematicoverlay" -> settings = copyWith(current, current.showHud(), parseBoolean(value), current.overlayCurrentRegionOnly(),
+                        current.overlayShowOnlyIncorrect(), current.hudCompact(), current.clientTimerSpeed(), current.hudX(), current.hudY(),
+                        current.preferLongerAxis(), current.sweepHalfWidth(), current.sweepTotalWidth(), current.laneStride(),
+                        current.forwardLookaheadSteps(), current.trivialBehindCleanupSteps(), current.groundedSweepConstantSprint());
+                case "overlaycurrentregiononly" -> settings = copyWith(current, current.showHud(), current.showSchematicOverlay(), parseBoolean(value),
+                        current.overlayShowOnlyIncorrect(), current.hudCompact(), current.clientTimerSpeed(), current.hudX(), current.hudY(),
+                        current.preferLongerAxis(), current.sweepHalfWidth(), current.sweepTotalWidth(), current.laneStride(),
+                        current.forwardLookaheadSteps(), current.trivialBehindCleanupSteps(), current.groundedSweepConstantSprint());
+                case "overlayshowonlyincorrect" -> settings = copyWith(current, current.showHud(), current.showSchematicOverlay(), current.overlayCurrentRegionOnly(),
+                        parseBoolean(value), current.hudCompact(), current.clientTimerSpeed(), current.hudX(), current.hudY(),
+                        current.preferLongerAxis(), current.sweepHalfWidth(), current.sweepTotalWidth(), current.laneStride(),
+                        current.forwardLookaheadSteps(), current.trivialBehindCleanupSteps(), current.groundedSweepConstantSprint());
+                case "hudcompact" -> settings = copyWith(current, current.showHud(), current.showSchematicOverlay(), current.overlayCurrentRegionOnly(),
+                        current.overlayShowOnlyIncorrect(), parseBoolean(value), current.clientTimerSpeed(), current.hudX(), current.hudY(),
+                        current.preferLongerAxis(), current.sweepHalfWidth(), current.sweepTotalWidth(), current.laneStride(),
+                        current.forwardLookaheadSteps(), current.trivialBehindCleanupSteps(), current.groundedSweepConstantSprint());
+                case "clienttimerspeed" -> settings = copyWith(current, current.showHud(), current.showSchematicOverlay(), current.overlayCurrentRegionOnly(),
+                        current.overlayShowOnlyIncorrect(), current.hudCompact(), parseClientTimerSpeed(value), current.hudX(), current.hudY(),
+                        current.preferLongerAxis(), current.sweepHalfWidth(), current.sweepTotalWidth(), current.laneStride(),
+                        current.forwardLookaheadSteps(), current.trivialBehindCleanupSteps(), current.groundedSweepConstantSprint());
+                case "hudx" -> settings = copyWith(current, current.showHud(), current.showSchematicOverlay(), current.overlayCurrentRegionOnly(),
+                        current.overlayShowOnlyIncorrect(), current.hudCompact(), current.clientTimerSpeed(), parseInt(value), current.hudY(),
+                        current.preferLongerAxis(), current.sweepHalfWidth(), current.sweepTotalWidth(), current.laneStride(),
+                        current.forwardLookaheadSteps(), current.trivialBehindCleanupSteps(), current.groundedSweepConstantSprint());
+                case "hudy" -> settings = copyWith(current, current.showHud(), current.showSchematicOverlay(), current.overlayCurrentRegionOnly(),
+                        current.overlayShowOnlyIncorrect(), current.hudCompact(), current.clientTimerSpeed(), current.hudX(), parseInt(value),
+                        current.preferLongerAxis(), current.sweepHalfWidth(), current.sweepTotalWidth(), current.laneStride(),
+                        current.forwardLookaheadSteps(), current.trivialBehindCleanupSteps(), current.groundedSweepConstantSprint());
+                case "preferlongeraxis" -> settings = copyWith(current, current.showHud(), current.showSchematicOverlay(), current.overlayCurrentRegionOnly(),
+                        current.overlayShowOnlyIncorrect(), current.hudCompact(), current.clientTimerSpeed(), current.hudX(), current.hudY(),
+                        parseBoolean(value), current.sweepHalfWidth(), current.sweepTotalWidth(), current.laneStride(),
+                        current.forwardLookaheadSteps(), current.trivialBehindCleanupSteps(), current.groundedSweepConstantSprint());
+                case "sweephalfwidth" -> settings = copyWith(current, current.showHud(), current.showSchematicOverlay(), current.overlayCurrentRegionOnly(),
+                        current.overlayShowOnlyIncorrect(), current.hudCompact(), current.clientTimerSpeed(), current.hudX(), current.hudY(),
+                        current.preferLongerAxis(), parseInt(value), current.sweepTotalWidth(), current.laneStride(),
+                        current.forwardLookaheadSteps(), current.trivialBehindCleanupSteps(), current.groundedSweepConstantSprint());
+                case "sweeptotalwidth" -> settings = copyWith(current, current.showHud(), current.showSchematicOverlay(), current.overlayCurrentRegionOnly(),
+                        current.overlayShowOnlyIncorrect(), current.hudCompact(), current.clientTimerSpeed(), current.hudX(), current.hudY(),
+                        current.preferLongerAxis(), current.sweepHalfWidth(), parseInt(value), current.laneStride(),
+                        current.forwardLookaheadSteps(), current.trivialBehindCleanupSteps(), current.groundedSweepConstantSprint());
+                case "lanestride" -> settings = copyWith(current, current.showHud(), current.showSchematicOverlay(), current.overlayCurrentRegionOnly(),
+                        current.overlayShowOnlyIncorrect(), current.hudCompact(), current.clientTimerSpeed(), current.hudX(), current.hudY(),
+                        current.preferLongerAxis(), current.sweepHalfWidth(), current.sweepTotalWidth(), parseInt(value),
+                        current.forwardLookaheadSteps(), current.trivialBehindCleanupSteps(), current.groundedSweepConstantSprint());
+                case "forwardlookaheadsteps" -> settings = copyWith(current, current.showHud(), current.showSchematicOverlay(), current.overlayCurrentRegionOnly(),
+                        current.overlayShowOnlyIncorrect(), current.hudCompact(), current.clientTimerSpeed(), current.hudX(), current.hudY(),
+                        current.preferLongerAxis(), current.sweepHalfWidth(), current.sweepTotalWidth(), current.laneStride(),
+                        parseInt(value), current.trivialBehindCleanupSteps(), current.groundedSweepConstantSprint());
+                case "trivialbehindcleanupsteps" -> settings = copyWith(current, current.showHud(), current.showSchematicOverlay(), current.overlayCurrentRegionOnly(),
+                        current.overlayShowOnlyIncorrect(), current.hudCompact(), current.clientTimerSpeed(), current.hudX(), current.hudY(),
+                        current.preferLongerAxis(), current.sweepHalfWidth(), current.sweepTotalWidth(), current.laneStride(),
+                        current.forwardLookaheadSteps(), parseInt(value), current.groundedSweepConstantSprint());
+                case "groundedsweepconstantsprint" -> settings = copyWith(current, current.showHud(), current.showSchematicOverlay(), current.overlayCurrentRegionOnly(),
+                        current.overlayShowOnlyIncorrect(), current.hudCompact(), current.clientTimerSpeed(), current.hudX(), current.hudY(),
+                        current.preferLongerAxis(), current.sweepHalfWidth(), current.sweepTotalWidth(), current.laneStride(),
+                        current.forwardLookaheadSteps(), current.trivialBehindCleanupSteps(), parseBoolean(value));
                 default -> {
                     return Optional.of("Unknown settings key: " + key);
                 }
@@ -104,7 +149,7 @@ public class MapartSettingsStore {
             }
 
             MapartSettings defaults = MapartSettings.defaults();
-            settings = new MapartSettings(
+            settings = copyWith(defaults,
                     stored.showHud == null ? defaults.showHud() : stored.showHud,
                     stored.showSchematicOverlay == null ? defaults.showSchematicOverlay() : stored.showSchematicOverlay,
                     stored.overlayCurrentRegionOnly == null ? defaults.overlayCurrentRegionOnly() : stored.overlayCurrentRegionOnly,
@@ -112,7 +157,16 @@ public class MapartSettingsStore {
                     stored.hudCompact == null ? defaults.hudCompact() : stored.hudCompact,
                     stored.clientTimerSpeed == null ? defaults.clientTimerSpeed() : parseClientTimerSpeed(Integer.toString(stored.clientTimerSpeed)),
                     stored.hudX == null ? defaults.hudX() : stored.hudX,
-                    stored.hudY == null ? defaults.hudY() : stored.hudY
+                    stored.hudY == null ? defaults.hudY() : stored.hudY,
+                    stored.preferLongerAxis == null ? defaults.preferLongerAxis() : stored.preferLongerAxis,
+                    stored.sweepHalfWidth == null ? defaults.sweepHalfWidth() : stored.sweepHalfWidth,
+                    stored.sweepTotalWidth == null ? defaults.sweepTotalWidth() : stored.sweepTotalWidth,
+                    stored.laneStride == null ? defaults.laneStride() : stored.laneStride,
+                    stored.forwardLookaheadSteps == null ? defaults.forwardLookaheadSteps() : stored.forwardLookaheadSteps,
+                    stored.trivialBehindCleanupSteps == null ? defaults.trivialBehindCleanupSteps() : stored.trivialBehindCleanupSteps,
+                    stored.groundedSweepConstantSprint == null
+                            ? defaults.groundedSweepConstantSprint()
+                            : stored.groundedSweepConstantSprint
             );
         } catch (RuntimeException exception) {
             MapArtMod.LOGGER.warn("Settings file {} is malformed; using defaults.", storagePath, exception);
@@ -158,6 +212,13 @@ public class MapartSettingsStore {
         Integer clientTimerSpeed;
         Integer hudX;
         Integer hudY;
+        Boolean preferLongerAxis;
+        Integer sweepHalfWidth;
+        Integer sweepTotalWidth;
+        Integer laneStride;
+        Integer forwardLookaheadSteps;
+        Integer trivialBehindCleanupSteps;
+        Boolean groundedSweepConstantSprint;
 
         StoredSettings() {
         }
@@ -171,6 +232,34 @@ public class MapartSettingsStore {
             this.clientTimerSpeed = settings.clientTimerSpeed();
             this.hudX = settings.hudX();
             this.hudY = settings.hudY();
+            this.preferLongerAxis = settings.preferLongerAxis();
+            this.sweepHalfWidth = settings.sweepHalfWidth();
+            this.sweepTotalWidth = settings.sweepTotalWidth();
+            this.laneStride = settings.laneStride();
+            this.forwardLookaheadSteps = settings.forwardLookaheadSteps();
+            this.trivialBehindCleanupSteps = settings.trivialBehindCleanupSteps();
+            this.groundedSweepConstantSprint = settings.groundedSweepConstantSprint();
         }
+    }
+
+    private static MapartSettings copyWith(MapartSettings current,
+                                           boolean showHud,
+                                           boolean showSchematicOverlay,
+                                           boolean overlayCurrentRegionOnly,
+                                           boolean overlayShowOnlyIncorrect,
+                                           boolean hudCompact,
+                                           int clientTimerSpeed,
+                                           int hudX,
+                                           int hudY,
+                                           boolean preferLongerAxis,
+                                           int sweepHalfWidth,
+                                           int sweepTotalWidth,
+                                           int laneStride,
+                                           int forwardLookaheadSteps,
+                                           int trivialBehindCleanupSteps,
+                                           boolean groundedSweepConstantSprint) {
+        return new MapartSettings(showHud, showSchematicOverlay, overlayCurrentRegionOnly, overlayShowOnlyIncorrect, hudCompact,
+                clientTimerSpeed, hudX, hudY, preferLongerAxis, sweepHalfWidth, sweepTotalWidth, laneStride,
+                forwardLookaheadSteps, trivialBehindCleanupSteps, groundedSweepConstantSprint);
     }
 }
