@@ -542,6 +542,13 @@ public final class MapArtCommand {
         source.sendFeedback(Text.literal("clientTimerSpeed=" + settings.clientTimerSpeed()));
         source.sendFeedback(Text.literal("hudX=" + settings.hudX()));
         source.sendFeedback(Text.literal("hudY=" + settings.hudY()));
+        source.sendFeedback(Text.literal("preferLongerAxis=" + settings.preferLongerAxis()));
+        source.sendFeedback(Text.literal("sweepHalfWidth=" + settings.sweepHalfWidth()));
+        source.sendFeedback(Text.literal("sweepTotalWidth=" + settings.sweepTotalWidth()));
+        source.sendFeedback(Text.literal("laneStride=" + settings.laneStride()));
+        source.sendFeedback(Text.literal("forwardLookaheadSteps=" + settings.forwardLookaheadSteps()));
+        source.sendFeedback(Text.literal("trivialBehindCleanupSteps=" + settings.trivialBehindCleanupSteps()));
+        source.sendFeedback(Text.literal("groundedSweepConstantSprint=" + settings.groundedSweepConstantSprint()));
         source.sendFeedback(Text.literal("clientTimerSpeed=" + ClientTimerController.getMultiplier()));
         return 1;
     }
