@@ -114,12 +114,10 @@ public final class GroundedSingleLaneDebugRunner {
     }
 
     private void tickStartApproach(MinecraftClient client, boolean constantSprint) {
-        if (!startApproachIssued) {
-            baritoneFacade.goTo(activeLane.startPoint());
-            startApproachIssued = true;
-        }
+        issueStartApproachIfNeeded();
 
-        if (!isNearLaneStart(client.player.getEntityPos(), activeLane)) {
+        BlockPos standingStart = approachTargetForLaneStart(activeLane, activeBounds);
+        if (!isNearLaneStart(client.player.getEntityPos(), standingStart)) {
             return;
         }
 
@@ -128,6 +126,13 @@ public final class GroundedSingleLaneDebugRunner {
         awaitingStartApproach = false;
         lastStatus = new DebugStatus(true, activeLane.laneIndex(), GroundedLaneWalker.GroundedLaneWalkState.ACTIVE, false, Optional.empty());
         applyLaneControls(client);
+    }
+
+    void issueStartApproachIfNeeded() {
+        if (!startApproachIssued && activeLane != null && activeBounds != null) {
+            baritoneFacade.goTo(approachTargetForLaneStart(activeLane, activeBounds));
+            startApproachIssued = true;
+        }
     }
 
     void finalizeTerminalStateForTests(GroundedLaneWalker.GroundedLaneWalkState terminalState, Optional<String> failureReason) {
@@ -173,9 +178,14 @@ public final class GroundedSingleLaneDebugRunner {
         client.player.setSprinting(command.sprinting());
     }
 
-    private static boolean isNearLaneStart(Vec3d playerPosition, GroundedSweepLane lane) {
-        Vec3d startCenter = new Vec3d(lane.startPoint().getX() + 0.5, playerPosition.y, lane.startPoint().getZ() + 0.5);
-        return playerPosition.squaredDistanceTo(startCenter) <= 2.25;
+    static BlockPos approachTargetForLaneStart(GroundedSweepLane lane, GroundedSchematicBounds bounds) {
+        return new BlockPos(lane.startPoint().getX(), bounds.minY() + 1, lane.startPoint().getZ());
+    }
+
+    static boolean isNearLaneStart(Vec3d playerPosition, BlockPos standingStartTarget) {
+        Vec3d standingCenter = new Vec3d(standingStartTarget.getX() + 0.5, standingStartTarget.getY(), standingStartTarget.getZ() + 0.5);
+        Vec3d playerFlat = new Vec3d(playerPosition.x, standingCenter.y, playerPosition.z);
+        return playerFlat.squaredDistanceTo(standingCenter) <= 2.25;
     }
 
     private static void clearControls(MinecraftClient client) {
