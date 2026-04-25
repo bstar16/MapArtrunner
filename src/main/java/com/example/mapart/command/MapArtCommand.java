@@ -450,15 +450,19 @@ public final class MapArtCommand {
         }
 
         GroundedSingleLaneDebugRunner.DebugStatus status = runner.status();
-        if (!status.active()) {
-            source.sendFeedback(Text.literal("No grounded single-lane debug run is active."));
-            return 0;
-        }
-
         source.sendFeedback(Text.literal("Grounded lane=" + status.laneIndex()
                 + ", state=" + status.walkState()
+                + ", active=" + status.active()
                 + ", awaitingStartApproach=" + status.awaitingStartApproach()));
+        source.sendFeedback(Text.literal("Placement results: success=" + status.successCount()
+                + ", missed=" + status.missedCount()
+                + ", failed=" + status.failedCount()
+                + ", leftovers=" + status.leftovers().size()));
         status.failureReason().ifPresent(reason -> source.sendFeedback(Text.literal("Failure reason: " + reason)));
+        if (!status.leftovers().isEmpty()) {
+            var record = status.leftovers().getFirst();
+            source.sendFeedback(Text.literal("Example leftover #" + record.placementIndex() + " reasons=" + record.reasons()));
+        }
         return 1;
     }
 

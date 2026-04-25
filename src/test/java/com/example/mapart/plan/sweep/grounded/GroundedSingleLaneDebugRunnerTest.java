@@ -114,6 +114,51 @@ class GroundedSingleLaneDebugRunnerTest {
         assertFalse(GroundedSingleLaneDebugRunner.isNearLaneStart(new Vec3d(13.0, 64.0, 12.5), standingStart));
     }
 
+    @Test
+    void laneTargetsAreFilteredToGroundedFiveWideStripe() {
+        Placement inStripe = new Placement(new BlockPos(0, 0, 0), null);
+        Placement edgeOfStripe = new Placement(new BlockPos(0, 0, 2), null);
+        Placement outsideStripe = new Placement(new BlockPos(0, 0, 3), null);
+        GroundedSweepLane lane = new GroundedSweepLane(
+                0,
+                12,
+                GroundedLaneDirection.EAST,
+                new BlockPos(10, 64, 12),
+                new BlockPos(14, 64, 12),
+                new GroundedLaneCorridorBounds(10, 14, 10, 14),
+                1.0
+        );
+
+        List<GroundedSweepPlacementExecutor.PlacementTarget> targets = GroundedSingleLaneDebugRunner.laneTargetsFor(
+                List.of(inStripe, edgeOfStripe, outsideStripe),
+                new BlockPos(10, 64, 12),
+                lane,
+                2
+        );
+
+        assertEquals(List.of(0, 1), targets.stream()
+                .map(GroundedSweepPlacementExecutor.PlacementTarget::placementIndex)
+                .toList());
+    }
+
+    @Test
+    void completionStatusRetainsPlacementAndLeftoverCounters() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        BuildSession session = sessionWithOrigin();
+        assertTrue(runner.start(session, 0, GroundedSweepSettings.defaults()).isEmpty());
+
+        runner.finalizeTerminalStateForTests(
+                GroundedLaneWalkState.COMPLETE,
+                Optional.empty()
+        );
+
+        GroundedSingleLaneDebugRunner.DebugStatus status = runner.status();
+        assertEquals(0, status.successCount());
+        assertEquals(0, status.missedCount());
+        assertEquals(0, status.failedCount());
+        assertTrue(status.leftovers().isEmpty());
+    }
+
     private static BuildSession sessionWithOrigin() {
         Placement placement = new Placement(new BlockPos(0, 0, 0), null);
         BuildPlan plan = new BuildPlan(
