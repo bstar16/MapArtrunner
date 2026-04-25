@@ -150,17 +150,23 @@ class GroundedSingleLaneDebugRunnerTest {
     }
 
     @Test
-    void failedPlacementIsRemovedFromPendingToPreventPerTickHammering() {
+    void hardFailedPlacementBecomesFinalFailedLeftoverAndIsRemovedFromPending() {
         GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
         assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
 
         runner.seedLanePlacementsForTests(List.of(new GroundedSweepPlacementExecutor.PlacementTarget(3, new BlockPos(11, 64, 12))));
         assertEquals(List.of(3), runner.rankedPlacementIndicesForTests(11, 10));
 
-        runner.recordPlacementOutcomeForTests(3, GroundedSweepPlacementExecutor.PlacementResult.FAILED, 10);
+        runner.recordFinalFailureForTests(3);
+        runner.tickPlacementSelectionForTests(11, 11);
 
         assertTrue(runner.pendingPlacementIndicesForTests().isEmpty());
         assertTrue(runner.rankedPlacementIndicesForTests(11, 11).isEmpty());
+        GroundedSweepLeftoverTracker.GroundedLeftoverRecord record = runner.status().leftovers().stream()
+                .filter(leftover -> leftover.placementIndex() == 3)
+                .findFirst()
+                .orElseThrow();
+        assertEquals(List.of(GroundedSweepLeftoverTracker.GroundedLeftoverReason.FAILED), record.reasons());
     }
 
     @Test

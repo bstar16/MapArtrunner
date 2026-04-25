@@ -247,6 +247,13 @@ public final class GroundedSingleLaneDebugRunner {
         onPlacementResult(placementIndex, result, tick);
     }
 
+    void recordFinalFailureForTests(int placementIndex) {
+        if (placementSelector == null) {
+            return;
+        }
+        onFinalFailure(placementIndex);
+    }
+
     static boolean shouldAttemptPlacementAfterWalkerTick(GroundedLaneWalker.GroundedLaneWalkState state) {
         return state == GroundedLaneWalker.GroundedLaneWalkState.ACTIVE;
     }
@@ -311,14 +318,16 @@ public final class GroundedSingleLaneDebugRunner {
             }
             Placement placement = lanePlacementsByIndex.get(candidate.placementIndex());
             if (placement == null || placement.block() == null) {
-                failedPlacements++;
-                placementSelector.recordPlacementResult(candidate.placementIndex(), GroundedSweepPlacementExecutor.PlacementResult.FAILED, laneTicksElapsed);
+                onFinalFailure(candidate.placementIndex());
                 continue;
             }
 
             PlacementResult result = placementExecutor.execute(client, activeSession, placement, candidate.worldPos());
-            GroundedSweepPlacementExecutor.PlacementResult groundedResult = toGroundedResult(result.status());
-            onPlacementResult(candidate.placementIndex(), groundedResult, laneTicksElapsed);
+            switch (result.status()) {
+                case PLACED, ALREADY_CORRECT -> onPlacementResult(candidate.placementIndex(), GroundedSweepPlacementExecutor.PlacementResult.SUCCESS, laneTicksElapsed);
+                case RETRY, MOVE_REQUIRED -> onPlacementResult(candidate.placementIndex(), GroundedSweepPlacementExecutor.PlacementResult.MISSED, laneTicksElapsed);
+                case MISSING_ITEM, ERROR -> onFinalFailure(candidate.placementIndex());
+            }
             attempts++;
         }
 
@@ -341,12 +350,10 @@ public final class GroundedSingleLaneDebugRunner {
         removePendingPlacement(placementIndex);
     }
 
-    private static GroundedSweepPlacementExecutor.PlacementResult toGroundedResult(PlacementResult.Status status) {
-        return switch (status) {
-            case PLACED, ALREADY_CORRECT -> GroundedSweepPlacementExecutor.PlacementResult.SUCCESS;
-            case RETRY, MOVE_REQUIRED -> GroundedSweepPlacementExecutor.PlacementResult.MISSED;
-            case MISSING_ITEM, ERROR -> GroundedSweepPlacementExecutor.PlacementResult.FAILED;
-        };
+    private void onFinalFailure(int placementIndex) {
+        failedPlacements++;
+        placementSelector.recordFinalFailure(placementIndex);
+        removePendingPlacement(placementIndex);
     }
 
     private void removePendingPlacement(int placementIndex) {
