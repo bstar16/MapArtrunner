@@ -10,6 +10,7 @@ import com.example.mapart.plan.sweep.LeftoverTracker;
 import com.example.mapart.plan.sweep.SingleLaneSweepDebugRunner;
 import com.example.mapart.plan.sweep.SweepPassResult;
 import com.example.mapart.plan.sweep.grounded.GroundedSingleLaneDebugRunner;
+import com.example.mapart.plan.sweep.grounded.GroundedSweepLeftoverTracker;
 import com.example.mapart.plan.sweep.grounded.GroundedSweepSettings;
 import com.example.mapart.runtime.ClientTimerController;
 import com.example.mapart.runtime.MapArtRuntime;
@@ -451,14 +452,30 @@ public final class MapArtCommand {
 
         GroundedSingleLaneDebugRunner.DebugStatus status = runner.status();
         if (!status.active()) {
-            source.sendFeedback(Text.literal("No grounded single-lane debug run is active."));
+            source.sendFeedback(Text.literal("No grounded single-lane debug run is active. "
+                    + "Last state=" + status.walkState()
+                    + ", ticks=" + status.ticksElapsed()
+                    + ", success=" + status.successfulPlacements()
+                    + ", missed=" + status.missedPlacements()
+                    + ", failed=" + status.failedPlacements()
+                    + ", leftovers=" + status.leftovers().size()));
+            status.failureReason().ifPresent(reason -> source.sendFeedback(Text.literal("Failure reason: " + reason)));
             return 0;
         }
 
         source.sendFeedback(Text.literal("Grounded lane=" + status.laneIndex()
                 + ", state=" + status.walkState()
-                + ", awaitingStartApproach=" + status.awaitingStartApproach()));
+                + ", awaitingStartApproach=" + status.awaitingStartApproach()
+                + ", ticks=" + status.ticksElapsed()
+                + ", success=" + status.successfulPlacements()
+                + ", missed=" + status.missedPlacements()
+                + ", failed=" + status.failedPlacements()
+                + ", leftovers=" + status.leftovers().size()));
         status.failureReason().ifPresent(reason -> source.sendFeedback(Text.literal("Failure reason: " + reason)));
+        if (!status.leftovers().isEmpty()) {
+            GroundedSweepLeftoverTracker.GroundedLeftoverRecord record = status.leftovers().getFirst();
+            source.sendFeedback(Text.literal("Example leftover #" + record.placementIndex() + " reasons=" + record.reasons()));
+        }
         return 1;
     }
 

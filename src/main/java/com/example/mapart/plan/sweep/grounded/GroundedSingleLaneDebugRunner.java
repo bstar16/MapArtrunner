@@ -2,28 +2,56 @@ package com.example.mapart.plan.sweep.grounded;
 
 import com.example.mapart.baritone.BaritoneFacade;
 import com.example.mapart.plan.BuildPlan;
+import com.example.mapart.plan.Placement;
 import com.example.mapart.plan.state.BuildSession;
+import com.example.mapart.plan.state.PlacementExecutor;
+import com.example.mapart.plan.state.PlacementResult;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.option.KeyBinding;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Vec3d;
 
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 
 public final class GroundedSingleLaneDebugRunner {
+    private static final int MAX_PLACEMENT_ATTEMPTS_PER_TICK = 2;
+
     private final GroundedSweepLanePlanner lanePlanner = new GroundedSweepLanePlanner();
     private final GroundedLaneWalker laneWalker = new GroundedLaneWalker();
     private final GroundedDisplacementAlert displacementAlert = new GroundedDisplacementAlert();
+    private final PlacementExecutor placementExecutor = new PlacementExecutor();
     private final BaritoneFacade baritoneFacade;
 
     private BuildSession activeSession;
     private GroundedSchematicBounds activeBounds;
     private GroundedSweepLane activeLane;
+    private GroundedSweepPlacementExecutor placementSelector;
+    private Map<Integer, Placement> lanePlacementsByIndex = Map.of();
+    private List<GroundedSweepPlacementExecutor.PlacementTarget> pendingPlacementTargets = List.of();
+    private List<GroundedSweepLeftoverTracker.GroundedLeftoverRecord> currentLeftovers = List.of();
+    private int successfulPlacements;
+    private int failedPlacements;
+    private int missedPlacements;
+    private long laneTicksElapsed;
     private boolean awaitingStartApproach;
     private boolean startApproachIssued;
-    private DebugStatus lastStatus = new DebugStatus(false, null, GroundedLaneWalker.GroundedLaneWalkState.IDLE, false, Optional.empty());
+    private DebugStatus lastStatus = new DebugStatus(
+            false,
+            null,
+            GroundedLaneWalker.GroundedLaneWalkState.IDLE,
+            false,
+            Optional.empty(),
+            0,
+            0,
+            0,
+            0,
+            List.of()
+    );
 
     public GroundedSingleLaneDebugRunner(BaritoneFacade baritoneFacade) {
         this.baritoneFacade = Objects.requireNonNull(baritoneFacade, "baritoneFacade");
@@ -53,10 +81,18 @@ public final class GroundedSingleLaneDebugRunner {
         activeSession = session;
         activeBounds = bounds;
         activeLane = lanes.get(laneIndex);
+        placementSelector = new GroundedSweepPlacementExecutor(GroundedSweepPlacementExecutorSettings.fromGroundedSweepSettings(settings));
+        lanePlacementsByIndex = new HashMap<>();
+        pendingPlacementTargets = buildLanePlacementTargets(session.getPlan(), session.getOrigin(), activeBounds, activeLane, lanePlacementsByIndex);
+        currentLeftovers = List.of();
+        successfulPlacements = 0;
+        failedPlacements = 0;
+        missedPlacements = 0;
+        laneTicksElapsed = 0;
         awaitingStartApproach = true;
         startApproachIssued = false;
         displacementAlert.reset();
-        lastStatus = new DebugStatus(true, activeLane.laneIndex(), GroundedLaneWalker.GroundedLaneWalkState.IDLE, true, Optional.empty());
+        lastStatus = new DebugStatus(true, activeLane.laneIndex(), GroundedLaneWalker.GroundedLaneWalkState.IDLE, true, Optional.empty(), 0, 0, 0, 0, List.of());
         return Optional.empty();
     }
 
@@ -76,6 +112,8 @@ public final class GroundedSingleLaneDebugRunner {
         }
 
         laneWalker.tick(client.player.getEntityPos());
+        laneTicksElapsed++;
+        tickPlacementExecutor(client);
         applyLaneControls(client);
         displacementAlert.tick(client, true, client.player.getY() < activeBounds.minY());
 
@@ -107,7 +145,12 @@ public final class GroundedSingleLaneDebugRunner {
                     activeLane.laneIndex(),
                     laneWalker.state(),
                     awaitingStartApproach,
-                    laneWalker.failureReason()
+                    laneWalker.failureReason(),
+                    laneTicksElapsed,
+                    successfulPlacements,
+                    missedPlacements,
+                    failedPlacements,
+                    currentLeftovers
             );
         }
         return lastStatus;
@@ -124,7 +167,18 @@ public final class GroundedSingleLaneDebugRunner {
         baritoneFacade.cancel();
         laneWalker.start(activeLane, activeBounds, constantSprint);
         awaitingStartApproach = false;
-        lastStatus = new DebugStatus(true, activeLane.laneIndex(), GroundedLaneWalker.GroundedLaneWalkState.ACTIVE, false, Optional.empty());
+        lastStatus = new DebugStatus(
+                true,
+                activeLane.laneIndex(),
+                GroundedLaneWalker.GroundedLaneWalkState.ACTIVE,
+                false,
+                Optional.empty(),
+                laneTicksElapsed,
+                successfulPlacements,
+                missedPlacements,
+                failedPlacements,
+                currentLeftovers
+        );
         applyLaneControls(client);
     }
 
@@ -140,6 +194,25 @@ public final class GroundedSingleLaneDebugRunner {
         clearActiveRunState();
     }
 
+    void seedLanePlacementsForTests(List<GroundedSweepPlacementExecutor.PlacementTarget> pendingPlacements) {
+        pendingPlacementTargets = List.copyOf(pendingPlacements);
+        currentLeftovers = List.of();
+    }
+
+    void tickPlacementSelectionForTests(int currentProgressCoordinate, long tick) {
+        if (activeLane == null || activeBounds == null || placementSelector == null) {
+            return;
+        }
+        GroundedSweepPlacementExecutor.SweepSelection selection = placementSelector.select(
+                activeLane,
+                activeBounds,
+                currentProgressCoordinate,
+                tick,
+                pendingPlacementTargets
+        );
+        currentLeftovers = selection.leftovers();
+    }
+
     private void handleTerminalState(MinecraftClient client) {
         captureLastStatus(laneWalker.state(), laneWalker.failureReason());
         if (client != null) {
@@ -150,16 +223,124 @@ public final class GroundedSingleLaneDebugRunner {
 
     private void captureLastStatus(GroundedLaneWalker.GroundedLaneWalkState state, Optional<String> failureReason) {
         Integer laneIndex = activeLane == null ? null : activeLane.laneIndex();
-        lastStatus = new DebugStatus(false, laneIndex, state, false, failureReason == null ? Optional.empty() : failureReason);
+        lastStatus = new DebugStatus(
+                false,
+                laneIndex,
+                state,
+                false,
+                failureReason == null ? Optional.empty() : failureReason,
+                laneTicksElapsed,
+                successfulPlacements,
+                missedPlacements,
+                failedPlacements,
+                currentLeftovers
+        );
     }
 
     private void clearActiveRunState() {
         activeSession = null;
         activeBounds = null;
         activeLane = null;
+        placementSelector = null;
+        lanePlacementsByIndex = Map.of();
+        pendingPlacementTargets = List.of();
+        currentLeftovers = List.of();
         awaitingStartApproach = false;
         startApproachIssued = false;
         displacementAlert.reset();
+    }
+
+    private void tickPlacementExecutor(MinecraftClient client) {
+        if (activeLane == null || activeBounds == null || activeSession == null || placementSelector == null || pendingPlacementTargets.isEmpty()) {
+            return;
+        }
+
+        BlockPos playerPos = client.player.getBlockPos();
+        int currentProgress = activeLane.direction().alongX() ? playerPos.getX() : playerPos.getZ();
+        GroundedSweepPlacementExecutor.SweepSelection selection = placementSelector.select(
+                activeLane,
+                activeBounds,
+                currentProgress,
+                laneTicksElapsed,
+                pendingPlacementTargets
+        );
+        currentLeftovers = selection.leftovers();
+
+        int attempts = 0;
+        for (GroundedSweepPlacementExecutor.SweepCandidate candidate : selection.rankedCandidates()) {
+            if (attempts >= MAX_PLACEMENT_ATTEMPTS_PER_TICK) {
+                break;
+            }
+            Placement placement = lanePlacementsByIndex.get(candidate.placementIndex());
+            if (placement == null || placement.block() == null) {
+                failedPlacements++;
+                placementSelector.recordPlacementResult(candidate.placementIndex(), GroundedSweepPlacementExecutor.PlacementResult.FAILED, laneTicksElapsed);
+                continue;
+            }
+
+            PlacementResult result = placementExecutor.execute(client, activeSession, placement, candidate.worldPos());
+            GroundedSweepPlacementExecutor.PlacementResult groundedResult = toGroundedResult(result.status());
+            placementSelector.recordPlacementResult(candidate.placementIndex(), groundedResult, laneTicksElapsed);
+            if (groundedResult == GroundedSweepPlacementExecutor.PlacementResult.SUCCESS) {
+                successfulPlacements++;
+                removePendingPlacement(candidate.placementIndex());
+            } else if (groundedResult == GroundedSweepPlacementExecutor.PlacementResult.MISSED) {
+                missedPlacements++;
+            } else {
+                failedPlacements++;
+            }
+            attempts++;
+        }
+
+        currentLeftovers = placementSelector.select(activeLane, activeBounds, currentProgress, laneTicksElapsed, pendingPlacementTargets).leftovers();
+    }
+
+    private static GroundedSweepPlacementExecutor.PlacementResult toGroundedResult(PlacementResult.Status status) {
+        return switch (status) {
+            case PLACED, ALREADY_CORRECT -> GroundedSweepPlacementExecutor.PlacementResult.SUCCESS;
+            case RETRY, MOVE_REQUIRED -> GroundedSweepPlacementExecutor.PlacementResult.MISSED;
+            case MISSING_ITEM, ERROR -> GroundedSweepPlacementExecutor.PlacementResult.FAILED;
+        };
+    }
+
+    private void removePendingPlacement(int placementIndex) {
+        if (pendingPlacementTargets.isEmpty()) {
+            return;
+        }
+        List<GroundedSweepPlacementExecutor.PlacementTarget> retained = new ArrayList<>(pendingPlacementTargets.size());
+        for (GroundedSweepPlacementExecutor.PlacementTarget target : pendingPlacementTargets) {
+            if (target.placementIndex() != placementIndex) {
+                retained.add(target);
+            }
+        }
+        pendingPlacementTargets = List.copyOf(retained);
+    }
+
+    private static List<GroundedSweepPlacementExecutor.PlacementTarget> buildLanePlacementTargets(
+            BuildPlan plan,
+            BlockPos origin,
+            GroundedSchematicBounds bounds,
+            GroundedSweepLane lane,
+            Map<Integer, Placement> lanePlacementsByIndex
+    ) {
+        List<GroundedSweepPlacementExecutor.PlacementTarget> targets = new ArrayList<>();
+        GroundedLaneCorridorBounds corridor = lane.corridorBounds();
+        for (int i = 0; i < plan.placements().size(); i++) {
+            Placement placement = plan.placements().get(i);
+            BlockPos worldPos = origin.add(placement.relativePos());
+            if (worldPos.getX() < bounds.minX() || worldPos.getX() > bounds.maxX()
+                    || worldPos.getY() < bounds.minY() || worldPos.getY() > bounds.maxY()
+                    || worldPos.getZ() < bounds.minZ() || worldPos.getZ() > bounds.maxZ()) {
+                continue;
+            }
+            if (worldPos.getX() < corridor.minX() || worldPos.getX() > corridor.maxX()
+                    || worldPos.getZ() < corridor.minZ() || worldPos.getZ() > corridor.maxZ()) {
+                continue;
+            }
+            lanePlacementsByIndex.put(i, placement);
+            targets.add(new GroundedSweepPlacementExecutor.PlacementTarget(i, worldPos));
+        }
+        return List.copyOf(targets);
     }
 
     private void applyLaneControls(MinecraftClient client) {
@@ -216,7 +397,16 @@ public final class GroundedSingleLaneDebugRunner {
             Integer laneIndex,
             GroundedLaneWalker.GroundedLaneWalkState walkState,
             boolean awaitingStartApproach,
-            Optional<String> failureReason
+            Optional<String> failureReason,
+            long ticksElapsed,
+            int successfulPlacements,
+            int missedPlacements,
+            int failedPlacements,
+            List<GroundedSweepLeftoverTracker.GroundedLeftoverRecord> leftovers
     ) {
+        public DebugStatus {
+            failureReason = failureReason == null ? Optional.empty() : failureReason;
+            leftovers = leftovers == null ? List.of() : List.copyOf(leftovers);
+        }
     }
 }
