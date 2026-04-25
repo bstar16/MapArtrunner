@@ -135,20 +135,103 @@ class GroundedSingleLaneDebugRunnerTest {
         assertFalse(GroundedSingleLaneDebugRunner.isNearLaneStart(new Vec3d(13.0, 64.0, 12.5), standingStart));
     }
 
-    private static BuildSession sessionWithOrigin() {
-        Placement placement = new Placement(new BlockPos(0, 0, 0), null);
-        BuildPlan plan = new BuildPlan(
-                "test",
-                Path.of("plan.schem"),
-                new Vec3i(5, 1, 5),
-                List.of(placement),
-                Map.of(),
-                List.of()
+    @Test
+    void missedPlacementIsRemovedFromPendingAfterRecording() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
+
+        runner.seedLanePlacementsForTests(List.of(new GroundedSweepPlacementExecutor.PlacementTarget(1, new BlockPos(11, 64, 12))));
+        assertEquals(List.of(1), runner.rankedPlacementIndicesForTests(11, 1));
+
+        runner.recordPlacementOutcomeForTests(1, GroundedSweepPlacementExecutor.PlacementResult.MISSED, 1);
+
+        assertTrue(runner.pendingPlacementIndicesForTests().isEmpty());
+        assertTrue(runner.rankedPlacementIndicesForTests(11, 2).isEmpty());
+    }
+
+    @Test
+    void failedPlacementIsRemovedFromPendingToPreventPerTickHammering() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
+
+        runner.seedLanePlacementsForTests(List.of(new GroundedSweepPlacementExecutor.PlacementTarget(3, new BlockPos(11, 64, 12))));
+        assertEquals(List.of(3), runner.rankedPlacementIndicesForTests(11, 10));
+
+        runner.recordPlacementOutcomeForTests(3, GroundedSweepPlacementExecutor.PlacementResult.FAILED, 10);
+
+        assertTrue(runner.pendingPlacementIndicesForTests().isEmpty());
+        assertTrue(runner.rankedPlacementIndicesForTests(11, 11).isEmpty());
+    }
+
+    @Test
+    void successfulPlacementStillRemovesPendingTarget() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
+
+        runner.seedLanePlacementsForTests(List.of(new GroundedSweepPlacementExecutor.PlacementTarget(2, new BlockPos(11, 64, 12))));
+        assertEquals(List.of(2), runner.rankedPlacementIndicesForTests(11, 1));
+
+        runner.recordPlacementOutcomeForTests(2, GroundedSweepPlacementExecutor.PlacementResult.SUCCESS, 1);
+
+        assertTrue(runner.pendingPlacementIndicesForTests().isEmpty());
+    }
+
+    @Test
+    void targetFilteringRequiresCorridorAndConfiguredSweepHalfWidth() {
+        BuildPlan plan = buildPlan(List.of(
+                new Placement(new BlockPos(1, 0, 2), null), // centerline
+                new Placement(new BlockPos(1, 0, 3), null), // within corridor, outside half-width=0
+                new Placement(new BlockPos(1, 0, 5), null)  // outside corridor
+        ));
+        BlockPos origin = new BlockPos(10, 64, 10);
+        GroundedSchematicBounds bounds = GroundedSchematicBounds.fromPlan(plan, origin);
+        GroundedSweepLane lane = new GroundedSweepLane(
+                0,
+                12,
+                GroundedLaneDirection.EAST,
+                new BlockPos(10, 64, 12),
+                new BlockPos(14, 64, 12),
+                new GroundedLaneCorridorBounds(10, 14, 10, 14),
+                1.0
         );
+
+        Map<Integer, Placement> byIndex = new java.util.HashMap<>();
+        List<GroundedSweepPlacementExecutor.PlacementTarget> targets = GroundedSingleLaneDebugRunner.buildLanePlacementTargetsForTests(
+                plan,
+                origin,
+                bounds,
+                lane,
+                0,
+                byIndex
+        );
+
+        assertEquals(List.of(0), targets.stream().map(GroundedSweepPlacementExecutor.PlacementTarget::placementIndex).toList());
+    }
+
+    @Test
+    void placementAttemptsAreGatedOnWalkerActiveState() {
+        assertTrue(GroundedSingleLaneDebugRunner.shouldAttemptPlacementAfterWalkerTick(GroundedLaneWalkState.ACTIVE));
+        assertFalse(GroundedSingleLaneDebugRunner.shouldAttemptPlacementAfterWalkerTick(GroundedLaneWalkState.FAILED));
+        assertFalse(GroundedSingleLaneDebugRunner.shouldAttemptPlacementAfterWalkerTick(GroundedLaneWalkState.COMPLETE));
+    }
+
+    private static BuildSession sessionWithOrigin() {
+        BuildPlan plan = buildPlan(List.of(new Placement(new BlockPos(0, 0, 0), null)));
 
         BuildSession session = new BuildSession(plan);
         session.setOrigin(new BlockPos(10, 64, 10));
         return session;
+    }
+
+    private static BuildPlan buildPlan(List<Placement> placements) {
+        return new BuildPlan(
+                "test",
+                Path.of("plan.schem"),
+                new Vec3i(5, 1, 5),
+                placements,
+                Map.of(),
+                List.of()
+        );
     }
 
     private static final class RecordingBaritoneFacade implements BaritoneFacade {
