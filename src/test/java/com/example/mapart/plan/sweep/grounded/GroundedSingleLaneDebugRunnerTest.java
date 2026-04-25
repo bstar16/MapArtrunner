@@ -18,6 +18,7 @@ import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class GroundedSingleLaneDebugRunnerTest {
@@ -112,6 +113,60 @@ class GroundedSingleLaneDebugRunnerTest {
         BlockPos standingStart = new BlockPos(10, 65, 12);
         assertTrue(GroundedSingleLaneDebugRunner.isNearLaneStart(new Vec3d(10.5, 64.0, 12.5), standingStart));
         assertFalse(GroundedSingleLaneDebugRunner.isNearLaneStart(new Vec3d(13.0, 64.0, 12.5), standingStart));
+    }
+
+    @Test
+    void collectLanePlacementTargetsIncludesOnlyCorridorAndBoundsPlacements() {
+        BuildSession session = new BuildSession(new BuildPlan(
+                "test",
+                Path.of("plan.schem"),
+                new Vec3i(7, 1, 7),
+                List.of(
+                        new Placement(new BlockPos(0, 0, 2), null), // x=10 z=12, inside corridor
+                        new Placement(new BlockPos(2, 0, 5), null), // x=12 z=15, outside +/-2 corridor
+                        new Placement(new BlockPos(6, 0, 2), null)  // x=16 z=12, out of lane progress span
+                ),
+                Map.of(),
+                List.of()
+        ));
+        session.setOrigin(new BlockPos(10, 64, 10));
+        GroundedSchematicBounds bounds = new GroundedSchematicBounds(
+                new BlockPos(10, 64, 10),
+                new BlockPos(10, 64, 10),
+                new BlockPos(14, 64, 14)
+        );
+        GroundedSweepLane lane = new GroundedSweepLane(
+                0,
+                12,
+                GroundedLaneDirection.EAST,
+                new BlockPos(10, 64, 12),
+                new BlockPos(14, 64, 12),
+                new GroundedLaneCorridorBounds(10, 14, 10, 14),
+                1.0
+        );
+
+        List<GroundedSweepPlacementExecutor.PlacementTarget> targets =
+                GroundedSingleLaneDebugRunner.collectLanePlacementTargets(session, bounds, lane);
+
+        assertEquals(1, targets.size());
+        assertEquals(0, targets.getFirst().placementIndex());
+    }
+
+    @Test
+    void terminalStatusRetainsLeftoversSnapshot() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        BuildSession session = sessionWithOrigin();
+
+        assertTrue(runner.start(session, 0, GroundedSweepSettings.defaults()).isEmpty());
+        runner.finalizeTerminalStateForTests(
+                GroundedLaneWalker.GroundedLaneWalkState.COMPLETE,
+                Optional.empty()
+        );
+
+        GroundedSingleLaneDebugRunner.DebugStatus status = runner.status();
+        assertFalse(status.active());
+        assertNotNull(status.leftovers());
+        assertEquals(0, status.leftovers().size());
     }
 
     private static BuildSession sessionWithOrigin() {

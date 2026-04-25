@@ -10,6 +10,7 @@ import com.example.mapart.plan.sweep.LeftoverTracker;
 import com.example.mapart.plan.sweep.SingleLaneSweepDebugRunner;
 import com.example.mapart.plan.sweep.SweepPassResult;
 import com.example.mapart.plan.sweep.grounded.GroundedSingleLaneDebugRunner;
+import com.example.mapart.plan.sweep.grounded.GroundedSweepLeftoverTracker;
 import com.example.mapart.plan.sweep.grounded.GroundedSweepSettings;
 import com.example.mapart.runtime.ClientTimerController;
 import com.example.mapart.runtime.MapArtRuntime;
@@ -450,15 +451,19 @@ public final class MapArtCommand {
         }
 
         GroundedSingleLaneDebugRunner.DebugStatus status = runner.status();
+        source.sendFeedback(Text.literal((status.active() ? "Grounded (active)" : "Grounded (last)") + " lane=" + status.laneIndex()
+                + ", state=" + status.walkState()
+                + ", awaitingStartApproach=" + status.awaitingStartApproach()
+                + ", ticks=" + status.ticksElapsed()
+                + ", leftovers=" + status.leftovers().size()));
+        status.failureReason().ifPresent(reason -> source.sendFeedback(Text.literal("Failure reason: " + reason)));
+        if (!status.leftovers().isEmpty()) {
+            GroundedSweepLeftoverTracker.GroundedLeftoverRecord leftover = status.leftovers().getFirst();
+            source.sendFeedback(Text.literal("Example leftover #" + leftover.placementIndex() + " reasons=" + leftover.reasons()));
+        }
         if (!status.active()) {
-            source.sendFeedback(Text.literal("No grounded single-lane debug run is active."));
             return 0;
         }
-
-        source.sendFeedback(Text.literal("Grounded lane=" + status.laneIndex()
-                + ", state=" + status.walkState()
-                + ", awaitingStartApproach=" + status.awaitingStartApproach()));
-        status.failureReason().ifPresent(reason -> source.sendFeedback(Text.literal("Failure reason: " + reason)));
         return 1;
     }
 
