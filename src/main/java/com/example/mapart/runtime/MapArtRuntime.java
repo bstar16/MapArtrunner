@@ -3,6 +3,7 @@ package com.example.mapart.runtime;
 import com.example.mapart.persistence.ConfigStore;
 import com.example.mapart.persistence.ProgressStore;
 import com.example.mapart.plan.sweep.SingleLaneSweepDebugRunner;
+import com.example.mapart.plan.sweep.grounded.GroundedSingleLaneDebugRunner;
 import com.example.mapart.plan.state.BuildPlanService;
 import com.example.mapart.baritone.BaritoneFacade;
 import com.example.mapart.settings.MapartSettingsStore;
@@ -17,6 +18,7 @@ public final class MapArtRuntime {
     private static BaritoneFacade baritoneFacade;
     private static DebugReporter debugReporter;
     private static SingleLaneSweepDebugRunner singleLaneSweepDebugRunner;
+    private static GroundedSingleLaneDebugRunner groundedSingleLaneDebugRunner;
 
     private MapArtRuntime() {
     }
@@ -29,7 +31,8 @@ public final class MapArtRuntime {
             SupplyStore supplies,
             BaritoneFacade facade,
             DebugReporter reporter,
-            SingleLaneSweepDebugRunner singleLaneRunner
+            SingleLaneSweepDebugRunner singleLaneRunner,
+            GroundedSingleLaneDebugRunner groundedSingleLaneRunner
     ) {
         buildPlanService = planService;
         configStore = config;
@@ -39,6 +42,7 @@ public final class MapArtRuntime {
         baritoneFacade = facade;
         debugReporter = reporter;
         singleLaneSweepDebugRunner = singleLaneRunner;
+        groundedSingleLaneDebugRunner = groundedSingleLaneRunner;
     }
 
     public static BuildPlanService buildPlanService() {
@@ -63,5 +67,9 @@ public final class MapArtRuntime {
 
     public static SingleLaneSweepDebugRunner singleLaneSweepDebugRunner() {
         return singleLaneSweepDebugRunner;
+    }
+
+    public static GroundedSingleLaneDebugRunner groundedSingleLaneDebugRunner() {
+        return groundedSingleLaneDebugRunner;
     }
 }

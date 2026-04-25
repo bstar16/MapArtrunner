@@ -9,6 +9,7 @@ import com.example.mapart.plan.PlanLoaderRegistry;
 import com.example.mapart.plan.compare.PlacementStatusResolver;
 import com.example.mapart.plan.loaders.SchemNbtLoader;
 import com.example.mapart.plan.sweep.SingleLaneSweepDebugRunner;
+import com.example.mapart.plan.sweep.grounded.GroundedSingleLaneDebugRunner;
 import com.example.mapart.plan.state.BuildCoordinator;
 import com.example.mapart.plan.state.BuildPlanService;
 import com.example.mapart.plan.state.WorldPlacementResolver;
@@ -50,7 +51,8 @@ public class MapArtClientMod implements ClientModInitializer {
         BuildCoordinator buildCoordinator = new BuildCoordinator(new WorldPlacementResolver(), configStore, progressStore, supplyStore, baritoneFacade);
         BuildPlanService buildPlanService = new BuildPlanService(loaderRegistry, buildCoordinator);
         SingleLaneSweepDebugRunner singleLaneSweepDebugRunner = new SingleLaneSweepDebugRunner();
-        MapArtRuntime.initialize(buildPlanService, configStore, progressStore, settingsStore, supplyStore, baritoneFacade, debugReporter, singleLaneSweepDebugRunner);
+        GroundedSingleLaneDebugRunner groundedSingleLaneDebugRunner = new GroundedSingleLaneDebugRunner();
+        MapArtRuntime.initialize(buildPlanService, configStore, progressStore, settingsStore, supplyStore, baritoneFacade, debugReporter, singleLaneSweepDebugRunner, groundedSingleLaneDebugRunner);
         KeyBinding panicKeyBinding = KeyBindingHelper.registerKeyBinding(new KeyBinding(
                 PANIC_KEY_TRANSLATION,
                 InputUtil.Type.KEYSYM,
@@ -76,6 +78,7 @@ public class MapArtClientMod implements ClientModInitializer {
             int clientTimerSpeed = settingsStore.current().clientTimerSpeed();
             for (int iteration = 0; iteration < clientTimerSpeed; iteration++) {
                 singleLaneSweepDebugRunner.tick(client);
+                groundedSingleLaneDebugRunner.tick(client);
                 BuildCoordinator.AssistedStepResult assistedStep = buildCoordinator.tickAssisted(client);
                 if (!assistedStep.didWork()) {
                     break;

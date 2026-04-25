@@ -9,6 +9,8 @@ import com.example.mapart.plan.state.BuildSession;
 import com.example.mapart.plan.sweep.LeftoverTracker;
 import com.example.mapart.plan.sweep.SingleLaneSweepDebugRunner;
 import com.example.mapart.plan.sweep.SweepPassResult;
+import com.example.mapart.plan.sweep.grounded.GroundedLaneWalkResult;
+import com.example.mapart.plan.sweep.grounded.GroundedSingleLaneDebugRunner;
 import com.example.mapart.runtime.ClientTimerController;
 import com.example.mapart.runtime.MapArtRuntime;
 import com.example.mapart.settings.MapartSettings;
@@ -245,6 +247,18 @@ public final class MapArtCommand {
                                         .executes(context -> debugSweepSingleLaneStatus(context.getSource())))
                                 .then(ClientCommandManager.literal("stop")
                                         .executes(context -> debugSweepSingleLaneStop(context.getSource()))))
+                        .then(ClientCommandManager.literal("grounded-single-lane")
+                                .then(ClientCommandManager.literal("start")
+                                        .then(ClientCommandManager.argument("lane", IntegerArgumentType.integer(0))
+                                                .executes(context -> debugGroundedSingleLaneStart(
+                                                        context.getSource(),
+                                                        planService,
+                                                        IntegerArgumentType.getInteger(context, "lane")
+                                                ))))
+                                .then(ClientCommandManager.literal("status")
+                                        .executes(context -> debugGroundedSingleLaneStatus(context.getSource())))
+                                .then(ClientCommandManager.literal("stop")
+                                        .executes(context -> debugGroundedSingleLaneStop(context.getSource()))))
                 );
     }
 
@@ -385,6 +399,72 @@ public final class MapArtCommand {
             return 0;
         }
         source.sendFeedback(Text.literal("Stopped debug single-lane elytra sweep."));
+        return 1;
+    }
+
+    private static int debugGroundedSingleLaneStart(FabricClientCommandSource source, BuildPlanService planService, int laneIndex) {
+        GroundedSingleLaneDebugRunner runner = MapArtRuntime.groundedSingleLaneDebugRunner();
+        if (runner == null) {
+            source.sendError(Text.literal("Grounded sweep debug runner is unavailable."));
+            return 0;
+        }
+        Optional<BuildSession> session = planService.currentSession();
+        if (session.isEmpty()) {
+            source.sendError(Text.literal("No build plan loaded."));
+            return 0;
+        }
+
+        boolean constantSprint = MapArtRuntime.settingsStore() != null
+                && MapArtRuntime.settingsStore().current().groundedSweepConstantSprint();
+        Optional<String> error = runner.start(session.get(), laneIndex, constantSprint);
+        if (error.isPresent()) {
+            source.sendError(Text.literal(error.get()));
+            return 0;
+        }
+        source.sendFeedback(Text.literal("Started debug grounded single-lane walk on lane " + laneIndex + "."));
+        return 1;
+    }
+
+    private static int debugGroundedSingleLaneStatus(FabricClientCommandSource source) {
+        GroundedSingleLaneDebugRunner runner = MapArtRuntime.groundedSingleLaneDebugRunner();
+        if (runner == null) {
+            source.sendError(Text.literal("Grounded sweep debug runner is unavailable."));
+            return 0;
+        }
+
+        Optional<GroundedLaneWalkResult> result = runner.activeResult();
+        if (result.isEmpty()) {
+            result = runner.lastResult();
+        }
+        if (result.isEmpty()) {
+            source.sendFeedback(Text.literal("No grounded single-lane debug walk has been started yet."));
+            return 0;
+        }
+
+        GroundedLaneWalkResult walk = result.get();
+        String laneInfo = runner.activeLane().map(lane -> " lane=" + lane.laneIndex()).orElse("");
+        source.sendFeedback(Text.literal("Grounded single-lane walk state=" + walk.state()
+                + ", ticks=" + walk.ticksElapsed()
+                + laneInfo));
+        if (!walk.failureReason().isBlank()) {
+            source.sendFeedback(Text.literal("Failure reason: " + walk.failureReason()));
+        }
+        return 1;
+    }
+
+    private static int debugGroundedSingleLaneStop(FabricClientCommandSource source) {
+        GroundedSingleLaneDebugRunner runner = MapArtRuntime.groundedSingleLaneDebugRunner();
+        if (runner == null) {
+            source.sendError(Text.literal("Grounded sweep debug runner is unavailable."));
+            return 0;
+        }
+
+        Optional<String> error = runner.stop();
+        if (error.isPresent()) {
+            source.sendError(Text.literal(error.get()));
+            return 0;
+        }
+        source.sendFeedback(Text.literal("Stopped debug grounded single-lane walk."));
         return 1;
     }
 
