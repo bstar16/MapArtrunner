@@ -116,8 +116,8 @@ class GroundedSweepPlacementExecutorTest {
                 List.of(target(7, 14, 64, 15))
         );
 
-        assertTrue(afterGrace.leftovers().getFirst().reasons().contains(
-                GroundedSweepLeftoverTracker.GroundedLeftoverReason.FAILED));
+        assertEquals(List.of(GroundedSweepLeftoverTracker.GroundedLeftoverReason.FAILED),
+                afterGrace.leftovers().getFirst().reasons());
     }
 
     @Test
@@ -148,8 +148,58 @@ class GroundedSweepPlacementExecutorTest {
         assertTrue(leftovers.stream().anyMatch(record -> record.placementIndex() == 3
                 && record.reasons().contains(GroundedSweepLeftoverTracker.GroundedLeftoverReason.MISSED)));
         assertTrue(leftovers.stream().anyMatch(record -> record.placementIndex() == 4
-                && record.reasons().contains(GroundedSweepLeftoverTracker.GroundedLeftoverReason.FAILED)
-                && record.reasons().contains(GroundedSweepLeftoverTracker.GroundedLeftoverReason.RETRY_DELAYED)));
+                && record.reasons().equals(List.of(GroundedSweepLeftoverTracker.GroundedLeftoverReason.FAILED))));
+    }
+
+    @Test
+    void successfulPlacementClearsLeftoverReasonsAndGraceTracking() {
+        GroundedSweepPlacementExecutor executor = new GroundedSweepPlacementExecutor(settings());
+
+        executor.recordPlacementResult(9, GroundedSweepPlacementExecutor.PlacementResult.FAILED, 100);
+        assertEquals(List.of(GroundedSweepLeftoverTracker.GroundedLeftoverReason.RETRY_DELAYED),
+                executor.select(
+                        lane(GroundedLaneDirection.EAST, 15),
+                        bounds(),
+                        14,
+                        101,
+                        List.of(target(9, 14, 64, 15))
+                ).leftovers().getFirst().reasons());
+
+        executor.recordPlacementResult(9, GroundedSweepPlacementExecutor.PlacementResult.SUCCESS, 102);
+        GroundedSweepPlacementExecutor.SweepSelection afterSuccess = executor.select(
+                lane(GroundedLaneDirection.EAST, 15),
+                bounds(),
+                14,
+                103,
+                List.of(target(9, 14, 64, 15))
+        );
+
+        assertTrue(afterSuccess.leftovers().stream().noneMatch(record -> record.placementIndex() == 9));
+        assertEquals(List.of(9), afterSuccess.rankedCandidates().stream()
+                .map(GroundedSweepPlacementExecutor.SweepCandidate::placementIndex)
+                .toList());
+    }
+
+    @Test
+    void mapsExecutorSettingsFromGroundedSweepSettings() {
+        GroundedSweepSettings groundedSettings = new GroundedSweepSettings(
+                false,
+                3,
+                7,
+                5,
+                2,
+                4,
+                true,
+                1.0
+        );
+
+        GroundedSweepPlacementExecutorSettings executorSettings =
+                GroundedSweepPlacementExecutorSettings.fromGroundedSweepSettings(groundedSettings);
+
+        assertEquals(3, executorSettings.corridorHalfWidth());
+        assertEquals(2, executorSettings.forwardLookaheadSteps());
+        assertEquals(4, executorSettings.trivialBehindCleanupSteps());
+        assertEquals(4, executorSettings.placementFailureGraceTicks());
     }
 
     private static GroundedSweepPlacementExecutorSettings settings() {

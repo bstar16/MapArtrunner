@@ -77,16 +77,19 @@ public final class GroundedSweepPlacementExecutor {
                 Long graceExpiryTick = graceExpiryTickByPlacement.get(placementIndex);
                 if (graceExpiryTick == null) {
                     graceExpiryTickByPlacement.put(placementIndex, tick + settings.placementFailureGraceTicks());
+                    leftoverTracker.clearReason(placementIndex, GroundedSweepLeftoverTracker.GroundedLeftoverReason.FAILED);
                     leftoverTracker.mark(placementIndex, GroundedSweepLeftoverTracker.GroundedLeftoverReason.RETRY_DELAYED);
                     return;
                 }
 
                 if (tick <= graceExpiryTick) {
+                    leftoverTracker.clearReason(placementIndex, GroundedSweepLeftoverTracker.GroundedLeftoverReason.FAILED);
                     leftoverTracker.mark(placementIndex, GroundedSweepLeftoverTracker.GroundedLeftoverReason.RETRY_DELAYED);
                     return;
                 }
 
                 graceExpiryTickByPlacement.remove(placementIndex);
+                leftoverTracker.clearReason(placementIndex, GroundedSweepLeftoverTracker.GroundedLeftoverReason.RETRY_DELAYED);
                 leftoverTracker.mark(placementIndex, GroundedSweepLeftoverTracker.GroundedLeftoverReason.FAILED);
             }
         }
