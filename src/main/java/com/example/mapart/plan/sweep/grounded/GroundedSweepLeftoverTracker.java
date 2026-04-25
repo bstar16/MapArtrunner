@@ -18,6 +18,17 @@ public final class GroundedSweepLeftoverTracker {
         reasonsByPlacement.remove(placementIndex);
     }
 
+    public void clearReason(int placementIndex, GroundedLeftoverReason reason) {
+        EnumSet<GroundedLeftoverReason> reasons = reasonsByPlacement.get(placementIndex);
+        if (reasons == null) {
+            return;
+        }
+        reasons.remove(reason);
+        if (reasons.isEmpty()) {
+            reasonsByPlacement.remove(placementIndex);
+        }
+    }
+
     public List<GroundedLeftoverRecord> snapshot() {
         List<GroundedLeftoverRecord> records = new ArrayList<>();
         for (Map.Entry<Integer, EnumSet<GroundedLeftoverReason>> entry : reasonsByPlacement.entrySet()) {
