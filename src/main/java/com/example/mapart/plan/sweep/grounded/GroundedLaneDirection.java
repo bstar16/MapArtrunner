@@ -1,8 +1,8 @@
 package com.example.mapart.plan.sweep.grounded;
 
 public enum GroundedLaneDirection {
-    EAST(90.0f, true, 1),
-    WEST(-90.0f, true, -1),
+    EAST(-90.0f, true, 1),
+    WEST(90.0f, true, -1),
     SOUTH(0.0f, false, 1),
     NORTH(180.0f, false, -1);
 

@@ -34,7 +34,7 @@ class GroundedLaneWalkerTest {
         walker.start(eastLane, bounds(), true);
 
         float eastYaw = walker.currentCommand().orElseThrow().yaw();
-        assertEquals(90.0f, eastYaw);
+        assertEquals(-90.0f, eastYaw);
 
         GroundedSweepLane northLane = new GroundedSweepLane(
                 1,

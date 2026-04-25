@@ -23,6 +23,7 @@ public final class GroundedSingleLaneDebugRunner {
     private GroundedSweepLane activeLane;
     private boolean awaitingStartApproach;
     private boolean startApproachIssued;
+    private DebugStatus lastStatus = new DebugStatus(false, null, GroundedLaneWalker.GroundedLaneWalkState.IDLE, false, Optional.empty());
 
     public GroundedSingleLaneDebugRunner(BaritoneFacade baritoneFacade) {
         this.baritoneFacade = Objects.requireNonNull(baritoneFacade, "baritoneFacade");
@@ -55,6 +56,7 @@ public final class GroundedSingleLaneDebugRunner {
         awaitingStartApproach = true;
         startApproachIssued = false;
         displacementAlert.reset();
+        lastStatus = new DebugStatus(true, activeLane.laneIndex(), GroundedLaneWalker.GroundedLaneWalkState.IDLE, true, Optional.empty());
         return Optional.empty();
     }
 
@@ -69,7 +71,7 @@ public final class GroundedSingleLaneDebugRunner {
         }
 
         if (laneWalker.state() != GroundedLaneWalker.GroundedLaneWalkState.ACTIVE) {
-            clearControls(client);
+            handleTerminalState(client);
             return;
         }
 
@@ -78,42 +80,37 @@ public final class GroundedSingleLaneDebugRunner {
         displacementAlert.tick(client, true, client.player.getY() < activeBounds.minY());
 
         if (laneWalker.state() != GroundedLaneWalker.GroundedLaneWalkState.ACTIVE) {
-            clearControls(client);
+            handleTerminalState(client);
         }
     }
 
     public Optional<String> stop() {
         if (!isActive()) {
-            return Optional.of("Grounded single-lane debug run is not active.");
+            MinecraftClient client = MinecraftClient.getInstance();
+            if (client != null) {
+                clearControls(client);
+            }
+            return Optional.empty();
         }
 
         awaitingStartApproach = false;
         laneWalker.interrupt();
         baritoneFacade.cancel();
-        activeSession = null;
-        activeBounds = null;
-        activeLane = null;
-        startApproachIssued = false;
-        displacementAlert.reset();
-        MinecraftClient client = MinecraftClient.getInstance();
-        if (client != null) {
-            clearControls(client);
-        }
+        handleTerminalState(MinecraftClient.getInstance());
         return Optional.empty();
     }
 
     public DebugStatus status() {
-        if (!isActive()) {
-            return new DebugStatus(false, null, GroundedLaneWalker.GroundedLaneWalkState.IDLE, false, Optional.empty());
+        if (isActive()) {
+            return new DebugStatus(
+                    true,
+                    activeLane.laneIndex(),
+                    laneWalker.state(),
+                    awaitingStartApproach,
+                    laneWalker.failureReason()
+            );
         }
-
-        return new DebugStatus(
-                true,
-                activeLane.laneIndex(),
-                laneWalker.state(),
-                awaitingStartApproach,
-                laneWalker.failureReason()
-        );
+        return lastStatus;
     }
 
     private void tickStartApproach(MinecraftClient client, boolean constantSprint) {
@@ -129,7 +126,35 @@ public final class GroundedSingleLaneDebugRunner {
         baritoneFacade.cancel();
         laneWalker.start(activeLane, activeBounds, constantSprint);
         awaitingStartApproach = false;
+        lastStatus = new DebugStatus(true, activeLane.laneIndex(), GroundedLaneWalker.GroundedLaneWalkState.ACTIVE, false, Optional.empty());
         applyLaneControls(client);
+    }
+
+    void finalizeTerminalStateForTests(GroundedLaneWalker.GroundedLaneWalkState terminalState, Optional<String> failureReason) {
+        captureLastStatus(terminalState, failureReason);
+        clearActiveRunState();
+    }
+
+    private void handleTerminalState(MinecraftClient client) {
+        captureLastStatus(laneWalker.state(), laneWalker.failureReason());
+        if (client != null) {
+            clearControls(client);
+        }
+        clearActiveRunState();
+    }
+
+    private void captureLastStatus(GroundedLaneWalker.GroundedLaneWalkState state, Optional<String> failureReason) {
+        Integer laneIndex = activeLane == null ? null : activeLane.laneIndex();
+        lastStatus = new DebugStatus(false, laneIndex, state, false, failureReason == null ? Optional.empty() : failureReason);
+    }
+
+    private void clearActiveRunState() {
+        activeSession = null;
+        activeBounds = null;
+        activeLane = null;
+        awaitingStartApproach = false;
+        startApproachIssued = false;
+        displacementAlert.reset();
     }
 
     private void applyLaneControls(MinecraftClient client) {
