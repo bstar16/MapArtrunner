@@ -73,6 +73,27 @@ class GroundedSingleLaneDebugRunnerTest {
     }
 
     @Test
+    void placementSelectionTracksDeferredLeftoversWithoutEndingLane() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        BuildSession session = sessionWithOrigin();
+        assertTrue(runner.start(session, 0, GroundedSweepSettings.defaults()).isEmpty());
+
+        runner.seedLanePlacementsForTests(List.of(
+                new GroundedSweepPlacementExecutor.PlacementTarget(1, new BlockPos(11, 64, 12)),
+                new GroundedSweepPlacementExecutor.PlacementTarget(2, new BlockPos(14, 64, 12))
+        ));
+        runner.tickPlacementSelectionForTests(10, 1);
+
+        GroundedSingleLaneDebugRunner.DebugStatus status = runner.status();
+        assertTrue(status.active());
+        assertEquals(GroundedLaneWalkState.IDLE, status.walkState());
+        assertEquals(1, status.leftovers().size());
+        GroundedSweepLeftoverTracker.GroundedLeftoverRecord record = status.leftovers().getFirst();
+        assertEquals(2, record.placementIndex());
+        assertEquals(List.of(GroundedSweepLeftoverTracker.GroundedLeftoverReason.DEFERRED), record.reasons());
+    }
+
+    @Test
     void startApproachTargetsStandingPositionOneBlockAboveBuildPlane() {
         RecordingBaritoneFacade baritone = new RecordingBaritoneFacade();
         GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(baritone);
