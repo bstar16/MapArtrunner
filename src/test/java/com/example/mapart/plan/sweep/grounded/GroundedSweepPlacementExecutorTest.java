@@ -181,6 +181,36 @@ class GroundedSweepPlacementExecutorTest {
     }
 
     @Test
+    void finalFailureBypassesGraceAndMarksFailedImmediately() {
+        GroundedSweepPlacementExecutor executor = new GroundedSweepPlacementExecutor(settings());
+
+        executor.recordPlacementResult(11, GroundedSweepPlacementExecutor.PlacementResult.FAILED, 100);
+        assertEquals(List.of(GroundedSweepLeftoverTracker.GroundedLeftoverReason.RETRY_DELAYED),
+                executor.select(
+                        lane(GroundedLaneDirection.EAST, 15),
+                        bounds(),
+                        14,
+                        101,
+                        List.of(target(11, 14, 64, 15))
+                ).leftovers().getFirst().reasons());
+
+        executor.recordFinalFailure(11);
+        GroundedSweepPlacementExecutor.SweepSelection finalized = executor.select(
+                lane(GroundedLaneDirection.EAST, 15),
+                bounds(),
+                14,
+                102,
+                List.of(target(11, 14, 64, 15))
+        );
+
+        assertEquals(List.of(GroundedSweepLeftoverTracker.GroundedLeftoverReason.FAILED),
+                finalized.leftovers().getFirst().reasons());
+        assertEquals(List.of(11), finalized.rankedCandidates().stream()
+                .map(GroundedSweepPlacementExecutor.SweepCandidate::placementIndex)
+                .toList());
+    }
+
+    @Test
     void mapsExecutorSettingsFromGroundedSweepSettings() {
         GroundedSweepSettings groundedSettings = new GroundedSweepSettings(
                 false,

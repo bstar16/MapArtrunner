@@ -95,6 +95,12 @@ public final class GroundedSweepPlacementExecutor {
         }
     }
 
+    public void recordFinalFailure(int placementIndex) {
+        graceExpiryTickByPlacement.remove(placementIndex);
+        leftoverTracker.clearReason(placementIndex, GroundedSweepLeftoverTracker.GroundedLeftoverReason.RETRY_DELAYED);
+        leftoverTracker.mark(placementIndex, GroundedSweepLeftoverTracker.GroundedLeftoverReason.FAILED);
+    }
+
     static LaneRelativeBand laneRelativeBand(GroundedSweepLane lane, BlockPos worldPos) {
         int lateralDelta = lateralDeltaFromCenterline(lane.direction(), lane.centerlineCoordinate(), worldPos);
         if (lateralDelta == 0) {

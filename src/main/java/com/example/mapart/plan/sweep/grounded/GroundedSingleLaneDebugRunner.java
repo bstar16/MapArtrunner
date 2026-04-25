@@ -83,7 +83,14 @@ public final class GroundedSingleLaneDebugRunner {
         activeLane = lanes.get(laneIndex);
         placementSelector = new GroundedSweepPlacementExecutor(GroundedSweepPlacementExecutorSettings.fromGroundedSweepSettings(settings));
         lanePlacementsByIndex = new HashMap<>();
-        pendingPlacementTargets = buildLanePlacementTargets(session.getPlan(), session.getOrigin(), activeBounds, activeLane, lanePlacementsByIndex);
+        pendingPlacementTargets = buildLanePlacementTargets(
+                session.getPlan(),
+                session.getOrigin(),
+                activeBounds,
+                activeLane,
+                settings.sweepHalfWidth(),
+                lanePlacementsByIndex
+        );
         currentLeftovers = List.of();
         successfulPlacements = 0;
         failedPlacements = 0;
@@ -113,11 +120,14 @@ public final class GroundedSingleLaneDebugRunner {
 
         laneWalker.tick(client.player.getEntityPos());
         laneTicksElapsed++;
-        tickPlacementExecutor(client);
+        boolean walkerActiveAfterTick = shouldAttemptPlacementAfterWalkerTick(laneWalker.state());
+        if (walkerActiveAfterTick) {
+            tickPlacementExecutor(client);
+        }
         applyLaneControls(client);
         displacementAlert.tick(client, true, client.player.getY() < activeBounds.minY());
 
-        if (laneWalker.state() != GroundedLaneWalker.GroundedLaneWalkState.ACTIVE) {
+        if (!walkerActiveAfterTick) {
             handleTerminalState(client);
         }
     }
@@ -213,6 +223,41 @@ public final class GroundedSingleLaneDebugRunner {
         currentLeftovers = selection.leftovers();
     }
 
+    List<Integer> pendingPlacementIndicesForTests() {
+        return pendingPlacementTargets.stream()
+                .map(GroundedSweepPlacementExecutor.PlacementTarget::placementIndex)
+                .toList();
+    }
+
+    List<Integer> rankedPlacementIndicesForTests(int currentProgressCoordinate, long tick) {
+        if (activeLane == null || activeBounds == null || placementSelector == null) {
+            return List.of();
+        }
+        return placementSelector.select(activeLane, activeBounds, currentProgressCoordinate, tick, pendingPlacementTargets)
+                .rankedCandidates()
+                .stream()
+                .map(GroundedSweepPlacementExecutor.SweepCandidate::placementIndex)
+                .toList();
+    }
+
+    void recordPlacementOutcomeForTests(int placementIndex, GroundedSweepPlacementExecutor.PlacementResult result, long tick) {
+        if (placementSelector == null) {
+            return;
+        }
+        onPlacementResult(placementIndex, result, tick);
+    }
+
+    void recordFinalFailureForTests(int placementIndex) {
+        if (placementSelector == null) {
+            return;
+        }
+        onFinalFailure(placementIndex);
+    }
+
+    static boolean shouldAttemptPlacementAfterWalkerTick(GroundedLaneWalker.GroundedLaneWalkState state) {
+        return state == GroundedLaneWalker.GroundedLaneWalkState.ACTIVE;
+    }
+
     private void handleTerminalState(MinecraftClient client) {
         captureLastStatus(laneWalker.state(), laneWalker.failureReason());
         if (client != null) {
@@ -273,21 +318,15 @@ public final class GroundedSingleLaneDebugRunner {
             }
             Placement placement = lanePlacementsByIndex.get(candidate.placementIndex());
             if (placement == null || placement.block() == null) {
-                failedPlacements++;
-                placementSelector.recordPlacementResult(candidate.placementIndex(), GroundedSweepPlacementExecutor.PlacementResult.FAILED, laneTicksElapsed);
+                onFinalFailure(candidate.placementIndex());
                 continue;
             }
 
             PlacementResult result = placementExecutor.execute(client, activeSession, placement, candidate.worldPos());
-            GroundedSweepPlacementExecutor.PlacementResult groundedResult = toGroundedResult(result.status());
-            placementSelector.recordPlacementResult(candidate.placementIndex(), groundedResult, laneTicksElapsed);
-            if (groundedResult == GroundedSweepPlacementExecutor.PlacementResult.SUCCESS) {
-                successfulPlacements++;
-                removePendingPlacement(candidate.placementIndex());
-            } else if (groundedResult == GroundedSweepPlacementExecutor.PlacementResult.MISSED) {
-                missedPlacements++;
-            } else {
-                failedPlacements++;
+            switch (result.status()) {
+                case PLACED, ALREADY_CORRECT -> onPlacementResult(candidate.placementIndex(), GroundedSweepPlacementExecutor.PlacementResult.SUCCESS, laneTicksElapsed);
+                case RETRY, MOVE_REQUIRED -> onPlacementResult(candidate.placementIndex(), GroundedSweepPlacementExecutor.PlacementResult.MISSED, laneTicksElapsed);
+                case MISSING_ITEM, ERROR -> onFinalFailure(candidate.placementIndex());
             }
             attempts++;
         }
@@ -295,12 +334,26 @@ public final class GroundedSingleLaneDebugRunner {
         currentLeftovers = placementSelector.select(activeLane, activeBounds, currentProgress, laneTicksElapsed, pendingPlacementTargets).leftovers();
     }
 
-    private static GroundedSweepPlacementExecutor.PlacementResult toGroundedResult(PlacementResult.Status status) {
-        return switch (status) {
-            case PLACED, ALREADY_CORRECT -> GroundedSweepPlacementExecutor.PlacementResult.SUCCESS;
-            case RETRY, MOVE_REQUIRED -> GroundedSweepPlacementExecutor.PlacementResult.MISSED;
-            case MISSING_ITEM, ERROR -> GroundedSweepPlacementExecutor.PlacementResult.FAILED;
-        };
+    private void onPlacementResult(int placementIndex, GroundedSweepPlacementExecutor.PlacementResult groundedResult, long tick) {
+        placementSelector.recordPlacementResult(placementIndex, groundedResult, tick);
+        if (groundedResult == GroundedSweepPlacementExecutor.PlacementResult.SUCCESS) {
+            successfulPlacements++;
+            removePendingPlacement(placementIndex);
+            return;
+        }
+        if (groundedResult == GroundedSweepPlacementExecutor.PlacementResult.MISSED) {
+            missedPlacements++;
+            removePendingPlacement(placementIndex);
+            return;
+        }
+        failedPlacements++;
+        removePendingPlacement(placementIndex);
+    }
+
+    private void onFinalFailure(int placementIndex) {
+        failedPlacements++;
+        placementSelector.recordFinalFailure(placementIndex);
+        removePendingPlacement(placementIndex);
     }
 
     private void removePendingPlacement(int placementIndex) {
@@ -321,6 +374,7 @@ public final class GroundedSingleLaneDebugRunner {
             BlockPos origin,
             GroundedSchematicBounds bounds,
             GroundedSweepLane lane,
+            int sweepHalfWidth,
             Map<Integer, Placement> lanePlacementsByIndex
     ) {
         List<GroundedSweepPlacementExecutor.PlacementTarget> targets = new ArrayList<>();
@@ -337,10 +391,18 @@ public final class GroundedSingleLaneDebugRunner {
                     || worldPos.getZ() < corridor.minZ() || worldPos.getZ() > corridor.maxZ()) {
                 continue;
             }
+            if (Math.abs(lateralDeltaFromCenterline(lane.direction(), lane.centerlineCoordinate(), worldPos)) > sweepHalfWidth) {
+                continue;
+            }
             lanePlacementsByIndex.put(i, placement);
             targets.add(new GroundedSweepPlacementExecutor.PlacementTarget(i, worldPos));
         }
         return List.copyOf(targets);
+    }
+
+    private static int lateralDeltaFromCenterline(GroundedLaneDirection direction, int centerlineCoordinate, BlockPos worldPos) {
+        int lateralCoordinate = direction.alongX() ? worldPos.getZ() : worldPos.getX();
+        return lateralCoordinate - centerlineCoordinate;
     }
 
     private void applyLaneControls(MinecraftClient client) {
@@ -367,6 +429,17 @@ public final class GroundedSingleLaneDebugRunner {
         Vec3d standingCenter = new Vec3d(standingStartTarget.getX() + 0.5, standingStartTarget.getY(), standingStartTarget.getZ() + 0.5);
         Vec3d playerFlat = new Vec3d(playerPosition.x, standingCenter.y, playerPosition.z);
         return playerFlat.squaredDistanceTo(standingCenter) <= 2.25;
+    }
+
+    static List<GroundedSweepPlacementExecutor.PlacementTarget> buildLanePlacementTargetsForTests(
+            BuildPlan plan,
+            BlockPos origin,
+            GroundedSchematicBounds bounds,
+            GroundedSweepLane lane,
+            int sweepHalfWidth,
+            Map<Integer, Placement> lanePlacementsByIndex
+    ) {
+        return buildLanePlacementTargets(plan, origin, bounds, lane, sweepHalfWidth, lanePlacementsByIndex);
     }
 
     private static void clearControls(MinecraftClient client) {
