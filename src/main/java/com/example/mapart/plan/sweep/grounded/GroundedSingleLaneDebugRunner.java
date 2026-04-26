@@ -37,6 +37,7 @@ public final class GroundedSingleLaneDebugRunner {
     private final GroundedLaneWalker laneWalker = new GroundedLaneWalker();
     private final GroundedDisplacementAlert displacementAlert = new GroundedDisplacementAlert();
     private final PlacementExecutor placementExecutor = new PlacementExecutor();
+    private final GroundedSweepResumeScanner resumeScanner = new GroundedSweepResumeScanner();
     private final BaritoneFacade baritoneFacade;
 
     private BuildSession activeSession;
@@ -69,6 +70,7 @@ public final class GroundedSingleLaneDebugRunner {
     private List<GroundedSweepLane> reverseLanes = List.of();
     private int laneCursor;
     private SweepPassPhase sweepPassPhase = SweepPassPhase.FORWARD;
+    private GroundedSweepResumePoint plannedResumePoint;
     private final Set<Integer> forwardLeftoverPlacements = new LinkedHashSet<>();
     private final Set<Integer> reversePlacementFilter = new LinkedHashSet<>();
 
@@ -123,8 +125,30 @@ public final class GroundedSingleLaneDebugRunner {
 
         List<GroundedSweepLane> reverse = buildReverseSweepLanes(lanes);
         initializeRunState(session, bounds, settings, SweepRunMode.FULL_SWEEP, lanes, reverse, SweepPassPhase.FORWARD);
-        laneCursor = 0;
-        activateLane(forwardLanes.getFirst(), Set.of());
+        GroundedSweepResumeSelection resumeSelection = resolveResumeSelection(session, bounds, lanes, settings);
+        if (resumeSelection.resumePoint().isEmpty()) {
+            clearActiveRunState();
+            lastStatus = new DebugStatus(
+                    false,
+                    null,
+                    GroundedLaneWalker.GroundedLaneWalkState.COMPLETE,
+                    false,
+                    false,
+                    Optional.of("No unfinished placements found in grounded sweep scan."),
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    List.of(),
+                    SweepPassPhase.COMPLETE
+            );
+            return Optional.of("No unfinished placements found; grounded sweep is already complete.");
+        }
+
+        plannedResumePoint = resumeSelection.resumePoint().get();
+        laneCursor = plannedResumePoint.laneIndex();
+        activateLane(forwardLanes.get(laneCursor), Set.of());
         return Optional.empty();
     }
 
@@ -370,6 +394,10 @@ public final class GroundedSingleLaneDebugRunner {
         clearActiveRunState();
     }
 
+    Optional<GroundedSweepResumePoint> plannedResumePointForTests() {
+        return Optional.ofNullable(plannedResumePoint);
+    }
+
     void seedLanePlacementsForTests(List<GroundedSweepPlacementExecutor.PlacementTarget> pendingPlacements) {
         pendingPlacementTargets = List.copyOf(pendingPlacements);
         currentLeftovers = List.of();
@@ -566,6 +594,7 @@ public final class GroundedSingleLaneDebugRunner {
         reverseLanes = List.of();
         laneCursor = 0;
         sweepPassPhase = SweepPassPhase.FORWARD;
+        plannedResumePoint = null;
         forwardLeftoverPlacements.clear();
         reversePlacementFilter.clear();
     }
@@ -1025,6 +1054,23 @@ public final class GroundedSingleLaneDebugRunner {
 
     public boolean isActive() {
         return activeLane != null;
+    }
+
+    private GroundedSweepResumeSelection resolveResumeSelection(
+            BuildSession session,
+            GroundedSchematicBounds bounds,
+            List<GroundedSweepLane> lanes,
+            GroundedSweepSettings settings
+    ) {
+        MinecraftClient client = MinecraftClient.getInstance();
+        Vec3d playerPosition = (client != null && client.player != null)
+                ? client.player.getEntityPos()
+                : new Vec3d(session.getOrigin().getX() + 0.5, session.getOrigin().getY() + 0.5, session.getOrigin().getZ() + 0.5);
+        WorldBlockLookup lookup = (worldPos, expectedBlock) -> client != null
+                && client.world != null
+                && client.world.isChunkLoaded(worldPos.getX() >> 4, worldPos.getZ() >> 4)
+                && client.world.getBlockState(worldPos).isOf(expectedBlock);
+        return resumeScanner.scan(session, bounds, lanes, playerPosition, settings.sweepHalfWidth(), lookup);
     }
 
     private Optional<String> validateStart(BuildSession session, GroundedSweepSettings settings) {
