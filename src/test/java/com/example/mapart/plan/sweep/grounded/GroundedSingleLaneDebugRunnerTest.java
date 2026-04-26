@@ -302,6 +302,37 @@ class GroundedSingleLaneDebugRunnerTest {
         assertFalse(GroundedSingleLaneDebugRunner.shouldAttemptPlacementAfterWalkerTick(GroundedLaneWalkState.COMPLETE));
     }
 
+    @Test
+    void movesAcrossForwardLanesThenCanEnterReverseSweep() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        BuildSession session = sessionWithOriginAndPlacements(new Vec3i(5, 1, 15), List.of(
+                new Placement(new BlockPos(0, 0, 0), null),
+                new Placement(new BlockPos(0, 0, 6), null),
+                new Placement(new BlockPos(0, 0, 10), null)
+        ));
+
+        assertTrue(runner.start(session, 0, GroundedSweepSettings.defaults()).isEmpty());
+        assertEquals("FORWARD", runner.sweepPhaseForTests());
+        assertEquals(0, runner.activeLaneCursorForTests());
+        assertTrue(runner.plannedLaneCountForTests() >= 2);
+        int expectedCursor = 0;
+        while (runner.moveToNextLaneForTests()) {
+            expectedCursor++;
+            assertEquals(expectedCursor, runner.activeLaneCursorForTests());
+        }
+        assertEquals(runner.plannedLaneCountForTests() - 1, runner.activeLaneCursorForTests());
+
+        runner.armReverseSweepForTests(List.of(
+                new GroundedSweepLeftoverTracker.GroundedLeftoverRecord(
+                        99,
+                        List.of(GroundedSweepLeftoverTracker.GroundedLeftoverReason.MISSED)
+                )
+        ));
+        assertEquals("REVERSE", runner.sweepPhaseForTests());
+        assertTrue(runner.moveToNextLaneForTests());
+        assertEquals(runner.plannedLaneCountForTests() - 2, runner.activeLaneCursorForTests());
+    }
+
     private static BuildSession sessionWithOrigin() {
         BuildPlan plan = buildPlan(List.of(new Placement(new BlockPos(0, 0, 0), null)));
 
@@ -310,11 +341,21 @@ class GroundedSingleLaneDebugRunnerTest {
         return session;
     }
 
+    private static BuildSession sessionWithOriginAndPlacements(Vec3i dimensions, List<Placement> placements) {
+        BuildSession session = new BuildSession(buildPlan(dimensions, placements));
+        session.setOrigin(new BlockPos(10, 64, 10));
+        return session;
+    }
+
     private static BuildPlan buildPlan(List<Placement> placements) {
+        return buildPlan(new Vec3i(5, 1, 5), placements);
+    }
+
+    private static BuildPlan buildPlan(Vec3i dimensions, List<Placement> placements) {
         return new BuildPlan(
                 "test",
                 Path.of("plan.schem"),
-                new Vec3i(5, 1, 5),
+                dimensions,
                 placements,
                 Map.of(),
                 List.of()
