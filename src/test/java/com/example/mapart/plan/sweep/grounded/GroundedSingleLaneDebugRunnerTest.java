@@ -381,6 +381,65 @@ class GroundedSingleLaneDebugRunnerTest {
     }
 
     @Test
+    void groundedTraceIsDisabledByDefault() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        assertFalse(runner.groundedTraceEnabled());
+    }
+
+    @Test
+    void enablingTraceDoesNotChangeRunnerState() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        assertFalse(runner.isActive());
+
+        runner.setGroundedTraceEnabled(true);
+
+        assertTrue(runner.groundedTraceEnabled());
+        assertFalse(runner.isActive());
+    }
+
+    @Test
+    void diagnosticsYawReadersHandleNullAndMissingFieldsSafely() {
+        assertEquals("unavailable", GroundedSingleLaneDebugRunner.readHeadYawForDiagnostics(null));
+        assertEquals("unavailable", GroundedSingleLaneDebugRunner.readBodyYawForDiagnostics(new Object()));
+    }
+
+    @Test
+    void smartResumeSelectionIsRecordedWhenTraceEnabled() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        runner.setGroundedTraceEnabled(true);
+        BuildSession session = rectangularSessionWithOrigin(new Vec3i(5, 1, 11));
+
+        Optional<String> error = runner.startFullSweepSmart(
+                session,
+                GroundedSweepSettings.defaults(),
+                new Vec3d(10.5, 65, 10.5),
+                (worldPos, expected) -> false
+        );
+
+        assertTrue(error.isEmpty());
+        assertTrue(runner.groundedTraceEventsForTests().stream().anyMatch(event -> event.contains("smart resume selected")));
+    }
+
+    @Test
+    void laneStartAndTransitionChangesAreRecorded() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        runner.setGroundedTraceEnabled(true);
+        GroundedSweepLane lane = new GroundedSweepLane(
+                0,
+                12,
+                GroundedLaneDirection.EAST,
+                new BlockPos(10, 64, 12),
+                new BlockPos(14, 64, 12),
+                new GroundedLaneCorridorBounds(10, 14, 10, 14),
+                1.0
+        );
+
+        GroundedSingleLaneDebugRunner.TestYawState yawState = new GroundedSingleLaneDebugRunner.TestYawState();
+        assertTrue(runner.queueLaneStartForTests(yawState, lane));
+        assertTrue(runner.groundedTraceEventsForTests().stream().anyMatch(event -> event.contains("lane yaw lock started")));
+    }
+
+    @Test
     void smartResumePartialLaneSkipsTargetsBehindResumeProgress() {
         GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
         BuildSession session = rectangularSessionWithOrigin(new Vec3i(11, 1, 5));
