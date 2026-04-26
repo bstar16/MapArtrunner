@@ -37,6 +37,7 @@ public final class GroundedSingleLaneDebugRunner {
     private final GroundedLaneWalker laneWalker = new GroundedLaneWalker();
     private final GroundedDisplacementAlert displacementAlert = new GroundedDisplacementAlert();
     private final PlacementExecutor placementExecutor = new PlacementExecutor();
+    private final GroundedSweepResumeScanner resumeScanner = new GroundedSweepResumeScanner();
     private final BaritoneFacade baritoneFacade;
 
     private BuildSession activeSession;
@@ -123,9 +124,28 @@ public final class GroundedSingleLaneDebugRunner {
 
         List<GroundedSweepLane> reverse = buildReverseSweepLanes(lanes);
         initializeRunState(session, bounds, settings, SweepRunMode.FULL_SWEEP, lanes, reverse, SweepPassPhase.FORWARD);
-        laneCursor = 0;
-        activateLane(forwardLanes.getFirst(), Set.of());
+        laneCursor = selectInitialForwardLaneCursor(session, bounds, forwardLanes).orElse(0);
+        activateLane(forwardLanes.get(laneCursor), Set.of());
         return Optional.empty();
+    }
+
+    private Optional<Integer> selectInitialForwardLaneCursor(BuildSession session, GroundedSchematicBounds bounds, List<GroundedSweepLane> lanes) {
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client == null || client.player == null || client.world == null) {
+            return Optional.empty();
+        }
+
+        GroundedSweepResumeScanner.ResumeSelection selection = resumeScanner.selectResumePoint(
+                session,
+                bounds,
+                lanes,
+                client.player.getEntityPos(),
+                GroundedSweepResumeScanner.PlacementCompletionLookup.blockEquality(pos -> client.world.getBlockState(pos).getBlock())
+        );
+        if (selection.complete()) {
+            return Optional.empty();
+        }
+        return selection.resumePoint().map(GroundedSweepResumePoint::laneIndex);
     }
 
     public void tick(MinecraftClient client, boolean constantSprint) {
