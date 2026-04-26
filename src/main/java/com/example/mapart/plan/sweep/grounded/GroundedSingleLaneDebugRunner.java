@@ -37,6 +37,11 @@ public final class GroundedSingleLaneDebugRunner {
     private static final int MAX_LANE_YAW_LOCK_TICKS = 10;
     private static final float LANE_YAW_LOCK_TOLERANCE_DEGREES = 1.5f;
     private static final int GROUNDED_TRACE_SNAPSHOT_INTERVAL_TICKS = 20;
+    private static final double START_APPROACH_NEAR_DISTANCE_SQ = 1.5 * 1.5;
+    private static final double START_APPROACH_CENTERLINE_TOLERANCE = 0.8;
+    private static final double START_APPROACH_PROGRESS_TOLERANCE = 1.0;
+    private static final int MAX_START_APPROACH_TICKS = 200;
+    private static final int MAX_START_APPROACH_STALL_TICKS = 60;
 
     private final GroundedSweepLanePlanner lanePlanner = new GroundedSweepLanePlanner();
     private final GroundedLaneWalker laneWalker = new GroundedLaneWalker();
@@ -60,6 +65,9 @@ public final class GroundedSingleLaneDebugRunner {
     private long laneTicksElapsed;
     private boolean awaitingStartApproach;
     private boolean startApproachIssued;
+    private int startApproachTicks;
+    private int startApproachStallTicks;
+    private double bestStartApproachDistanceSq = Double.POSITIVE_INFINITY;
     private boolean awaitingLaneShift;
     private BlockPos laneShiftTarget;
     private GroundedSweepLane pendingShiftLane;
@@ -230,6 +238,9 @@ public final class GroundedSingleLaneDebugRunner {
         activateLaneData(forwardLanes.get(selectedLaneIndex), Set.of(), minimumProgress);
         awaitingStartApproach = true;
         startApproachIssued = false;
+        startApproachTicks = 0;
+        startApproachStallTicks = 0;
+        bestStartApproachDistanceSq = Double.POSITIVE_INFINITY;
         awaitingLaneShift = false;
         laneShiftTarget = null;
         laneShiftPlan = null;
@@ -363,8 +374,39 @@ public final class GroundedSingleLaneDebugRunner {
     private void tickStartApproach(MinecraftClient client, boolean constantSprint) {
         issueStartApproachIfNeeded();
 
+        startApproachTicks++;
+        if (startApproachTicks > MAX_START_APPROACH_TICKS) {
+            failLaneStart(client, "Unable to reach valid lane start staging position");
+            return;
+        }
+
         BlockPos standingStart = activeStartApproachTarget();
-        if (!isNearLaneStart(client.player.getEntityPos(), standingStart)) {
+        Vec3d playerPos = client.player.getEntityPos();
+        double flatDistanceSq = squaredFlatDistanceToStandingTarget(playerPos, standingStart);
+        if (flatDistanceSq + 1.0E-4 < bestStartApproachDistanceSq) {
+            bestStartApproachDistanceSq = flatDistanceSq;
+            startApproachStallTicks = 0;
+        } else {
+            startApproachStallTicks++;
+        }
+        if (startApproachStallTicks > MAX_START_APPROACH_STALL_TICKS) {
+            failLaneStart(client, "Unable to reach valid lane start staging position");
+            return;
+        }
+
+        if (!isNearLaneStart(playerPos, standingStart)) {
+            return;
+        }
+
+        LaneStartReadiness readiness = evaluateLaneStartReadiness(playerPos, activeLane, standingStart, activeBounds);
+        if (!readiness.ready()) {
+            traceGroundedEvent("approach near but not staged: playerPos=" + playerPos
+                    + ", standingTarget=" + standingStart.toShortString()
+                    + ", laneDirection=" + activeLane.direction()
+                    + ", centerlineDelta=" + readiness.centerlineDelta()
+                    + ", forwardDelta=" + readiness.forwardDelta()
+                    + ", insideCorridor=" + readiness.insideCorridor()
+                    + ", reason=" + readiness.reason());
             return;
         }
 
@@ -532,6 +574,10 @@ public final class GroundedSingleLaneDebugRunner {
 
     void forceLaneTransitionTimeoutForTests(String reason) {
         failLaneTransition(null, reason);
+    }
+
+    void forceStartApproachTimeoutForTests() {
+        failLaneStart(null, "Unable to reach valid lane start staging position");
     }
 
     Optional<BlockPos> laneShiftTargetForTests() {
@@ -748,6 +794,9 @@ public final class GroundedSingleLaneDebugRunner {
         currentLeftovers = List.of();
         awaitingStartApproach = false;
         startApproachIssued = false;
+        startApproachTicks = 0;
+        startApproachStallTicks = 0;
+        bestStartApproachDistanceSq = Double.POSITIVE_INFINITY;
         awaitingLaneShift = false;
         laneShiftTarget = null;
         pendingShiftLane = null;
@@ -1219,9 +1268,61 @@ public final class GroundedSingleLaneDebugRunner {
     }
 
     static boolean isNearLaneStart(Vec3d playerPosition, BlockPos standingStartTarget) {
+        return squaredFlatDistanceToStandingTarget(playerPosition, standingStartTarget) <= START_APPROACH_NEAR_DISTANCE_SQ;
+    }
+
+    static boolean isReadyForLaneStart(
+            Vec3d playerPosition,
+            GroundedSweepLane lane,
+            BlockPos standingStartTarget,
+            GroundedSchematicBounds bounds
+    ) {
+        return evaluateLaneStartReadiness(playerPosition, lane, standingStartTarget, bounds).ready();
+    }
+
+    private static LaneStartReadiness evaluateLaneStartReadiness(
+            Vec3d playerPosition,
+            GroundedSweepLane lane,
+            BlockPos standingStartTarget,
+            GroundedSchematicBounds bounds
+    ) {
+        if (playerPosition == null || lane == null || standingStartTarget == null || bounds == null) {
+            return LaneStartReadiness.notReady("missing_state", 0.0, 0.0, false);
+        }
+        GroundedLaneCorridorBounds corridor = lane.corridorBounds();
+        double playerProgress = lane.direction().progressCoordinate(playerPosition.x, playerPosition.z);
+        double startProgress = lane.direction().alongX() ? lane.startPoint().getX() + 0.5 : lane.startPoint().getZ() + 0.5;
+        double playerLateral = lane.direction().lateralCoordinate(playerPosition.x, playerPosition.z);
+        double centerlineDelta = playerLateral - (lane.centerlineCoordinate() + 0.5);
+        double forwardDelta = (playerProgress - startProgress) * lane.direction().forwardSign();
+        boolean insideCorridor = playerPosition.x >= corridor.minX() && playerPosition.x <= corridor.maxX() + 1.0
+                && playerPosition.z >= corridor.minZ() && playerPosition.z <= corridor.maxZ() + 1.0;
+
+        if (squaredFlatDistanceToStandingTarget(playerPosition, standingStartTarget) > START_APPROACH_NEAR_DISTANCE_SQ) {
+            return LaneStartReadiness.notReady("far_from_standing_target", centerlineDelta, forwardDelta, insideCorridor);
+        }
+        if (!insideCorridor) {
+            return LaneStartReadiness.notReady("outside_lane_corridor", centerlineDelta, forwardDelta, false);
+        }
+        if (Math.abs(centerlineDelta) > START_APPROACH_CENTERLINE_TOLERANCE) {
+            return LaneStartReadiness.notReady("off_lane_centerline", centerlineDelta, forwardDelta, true);
+        }
+        if (forwardDelta < -START_APPROACH_PROGRESS_TOLERANCE) {
+            return LaneStartReadiness.notReady("before_lane_start_edge", centerlineDelta, forwardDelta, true);
+        }
+        if (Math.abs(playerProgress - startProgress) > START_APPROACH_PROGRESS_TOLERANCE) {
+            return LaneStartReadiness.notReady("not_at_lane_start_progress", centerlineDelta, forwardDelta, true);
+        }
+        if (standingStartTarget.getY() != bounds.minY() + 1) {
+            return LaneStartReadiness.notReady("standing_target_y_mismatch", centerlineDelta, forwardDelta, true);
+        }
+        return LaneStartReadiness.ready(centerlineDelta, forwardDelta, true);
+    }
+
+    private static double squaredFlatDistanceToStandingTarget(Vec3d playerPosition, BlockPos standingStartTarget) {
         Vec3d standingCenter = new Vec3d(standingStartTarget.getX() + 0.5, standingStartTarget.getY(), standingStartTarget.getZ() + 0.5);
         Vec3d playerFlat = new Vec3d(playerPosition.x, standingCenter.y, playerPosition.z);
-        return playerFlat.squaredDistanceTo(standingCenter) <= 2.25;
+        return playerFlat.squaredDistanceTo(standingCenter);
     }
 
     static boolean isNearLaneShiftTarget(Vec3d playerPosition, BlockPos shiftTarget) {
@@ -1510,6 +1611,9 @@ public final class GroundedSingleLaneDebugRunner {
         currentLeftovers = List.of();
         awaitingStartApproach = false;
         startApproachIssued = false;
+        startApproachTicks = 0;
+        startApproachStallTicks = 0;
+        bestStartApproachDistanceSq = Double.POSITIVE_INFINITY;
         awaitingLaneShift = false;
         laneShiftTarget = null;
         pendingShiftLane = null;
@@ -1536,6 +1640,9 @@ public final class GroundedSingleLaneDebugRunner {
         awaitingStartApproach = true;
         traceGroundedEvent("awaitingStartApproach=true");
         startApproachIssued = false;
+        startApproachTicks = 0;
+        startApproachStallTicks = 0;
+        bestStartApproachDistanceSq = Double.POSITIVE_INFINITY;
         awaitingLaneShift = false;
         laneShiftTarget = null;
         laneShiftPlan = null;
@@ -1567,6 +1674,9 @@ public final class GroundedSingleLaneDebugRunner {
         activateLaneData(lane, placementFilter, Optional.empty());
         awaitingStartApproach = false;
         startApproachIssued = false;
+        startApproachTicks = 0;
+        startApproachStallTicks = 0;
+        bestStartApproachDistanceSq = Double.POSITIVE_INFINITY;
         awaitingLaneShift = true;
         traceGroundedEvent("awaitingLaneShift=true");
         laneShiftPlan = buildLaneShiftPlan(fromLane, lane, activeBounds);
@@ -1734,6 +1844,22 @@ public final class GroundedSingleLaneDebugRunner {
         NONE,
         LOCK_LANE_YAW,
         START_WALKER
+    }
+
+    private record LaneStartReadiness(
+            boolean ready,
+            String reason,
+            double centerlineDelta,
+            double forwardDelta,
+            boolean insideCorridor
+    ) {
+        private static LaneStartReadiness ready(double centerlineDelta, double forwardDelta, boolean insideCorridor) {
+            return new LaneStartReadiness(true, "ready", centerlineDelta, forwardDelta, insideCorridor);
+        }
+
+        private static LaneStartReadiness notReady(String reason, double centerlineDelta, double forwardDelta, boolean insideCorridor) {
+            return new LaneStartReadiness(false, reason, centerlineDelta, forwardDelta, insideCorridor);
+        }
     }
 
     private enum SweepRunMode {
