@@ -6,6 +6,7 @@ import com.example.mapart.plan.BuildPlan;
 import com.example.mapart.plan.Placement;
 import com.example.mapart.plan.sweep.grounded.GroundedLaneWalker.GroundedLaneWalkState;
 import com.example.mapart.plan.state.BuildSession;
+import net.minecraft.block.Block;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.util.math.Vec3i;
@@ -21,6 +22,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class GroundedSingleLaneDebugRunnerTest {
+    private static final Block TEST_BLOCK = allocateBlock();
 
     @Test
     void terminalCompletionClearsActiveStateAndAllowsRestart() {
@@ -180,6 +182,68 @@ class GroundedSingleLaneDebugRunnerTest {
         runner.recordPlacementOutcomeForTests(2, GroundedSweepPlacementExecutor.PlacementResult.SUCCESS, 1);
 
         assertTrue(runner.pendingPlacementIndicesForTests().isEmpty());
+        assertEquals(1, runner.status().successfulPlacements());
+    }
+
+    @Test
+    void placedResultAddsPendingVerificationAndExcludesTargetFromReselection() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
+        runner.seedLanePlacementsForTests(List.of(new GroundedSweepPlacementExecutor.PlacementTarget(0, new BlockPos(10, 64, 10))));
+
+        runner.addPendingVerificationAndResolveTargetForTests(0, new BlockPos(10, 64, 10), TEST_BLOCK, 4);
+
+        assertTrue(runner.pendingPlacementIndicesForTests().isEmpty());
+        assertEquals(1, runner.pendingVerificationCountForTests());
+        assertTrue(runner.rankedPlacementIndicesForTests(11, 2).isEmpty());
+    }
+
+    @Test
+    void dueVerificationMatchRecordsSingleSuccessAndClearsPendingVerification() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
+        runner.addPendingVerificationForTests(0, new BlockPos(10, 64, 10), TEST_BLOCK, 3);
+
+        runner.processPendingVerificationsForTests(3, Map.of(0, true), false);
+
+        GroundedSingleLaneDebugRunner.DebugStatus status = runner.status();
+        assertEquals(1, status.successfulPlacements());
+        assertEquals(0, status.pendingVerificationPlacements());
+        assertEquals(0, status.leftovers().size());
+        assertTrue(runner.pendingPlacementIndicesForTests().isEmpty());
+    }
+
+    @Test
+    void dueVerificationMismatchBecomesMissedLeftoverAndLaneStaysActive() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
+        runner.addPendingVerificationForTests(0, new BlockPos(10, 64, 10), TEST_BLOCK, 2);
+
+        runner.processPendingVerificationsForTests(2, Map.of(0, false), false);
+        runner.tickPlacementSelectionForTests(11, 2);
+
+        GroundedSingleLaneDebugRunner.DebugStatus status = runner.status();
+        assertTrue(status.active());
+        assertEquals(1, status.missedPlacements());
+        assertEquals(0, status.pendingVerificationPlacements());
+        GroundedSweepLeftoverTracker.GroundedLeftoverRecord record = status.leftovers().stream()
+                .filter(leftover -> leftover.placementIndex() == 0)
+                .findFirst()
+                .orElseThrow();
+        assertEquals(List.of(GroundedSweepLeftoverTracker.GroundedLeftoverReason.MISSED), record.reasons());
+    }
+
+    @Test
+    void terminalStatusRetainsOutstandingPendingVerificationCount() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
+        runner.addPendingVerificationForTests(0, new BlockPos(10, 64, 10), TEST_BLOCK, 50);
+
+        runner.finalizeTerminalStateForTests(GroundedLaneWalkState.COMPLETE, Optional.empty());
+
+        GroundedSingleLaneDebugRunner.DebugStatus status = runner.status();
+        assertFalse(status.active());
+        assertEquals(1, status.pendingVerificationPlacements());
     }
 
     @Test
@@ -222,7 +286,7 @@ class GroundedSingleLaneDebugRunnerTest {
     }
 
     private static BuildSession sessionWithOrigin() {
-        BuildPlan plan = buildPlan(List.of(new Placement(new BlockPos(0, 0, 0), null)));
+        BuildPlan plan = buildPlan(List.of(new Placement(new BlockPos(0, 0, 0), TEST_BLOCK)));
 
         BuildSession session = new BuildSession(plan);
         session.setOrigin(new BlockPos(10, 64, 10));
@@ -238,6 +302,17 @@ class GroundedSingleLaneDebugRunnerTest {
                 Map.of(),
                 List.of()
         );
+    }
+
+    private static Block allocateBlock() {
+        try {
+            java.lang.reflect.Field unsafeField = sun.misc.Unsafe.class.getDeclaredField("theUnsafe");
+            unsafeField.setAccessible(true);
+            sun.misc.Unsafe unsafe = (sun.misc.Unsafe) unsafeField.get(null);
+            return (Block) unsafe.allocateInstance(Block.class);
+        } catch (ReflectiveOperationException exception) {
+            throw new IllegalStateException("Failed to allocate block", exception);
+        }
     }
 
     private static final class RecordingBaritoneFacade implements BaritoneFacade {
