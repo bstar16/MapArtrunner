@@ -39,6 +39,7 @@ public final class GroundedSingleLaneDebugRunner {
     private final GroundedLaneWalker laneWalker = new GroundedLaneWalker();
     private final GroundedDisplacementAlert displacementAlert = new GroundedDisplacementAlert();
     private final PlacementExecutor placementExecutor = new PlacementExecutor();
+    private final GroundedSweepResumeScanner resumeScanner = new GroundedSweepResumeScanner();
     private final BaritoneFacade baritoneFacade;
 
     private BuildSession activeSession;
@@ -71,6 +72,10 @@ public final class GroundedSingleLaneDebugRunner {
     private List<GroundedSweepLane> reverseLanes = List.of();
     private int laneCursor;
     private SweepPassPhase sweepPassPhase = SweepPassPhase.FORWARD;
+    private boolean smartResumeUsed;
+    private GroundedSweepResumePoint selectedResumePoint;
+    private int skippedCompletedForwardLanes;
+    private BlockPos startApproachTargetOverride;
     private final Set<Integer> forwardLeftoverPlacements = new LinkedHashSet<>();
     private final Set<Integer> reversePlacementFilter = new LinkedHashSet<>();
 
@@ -87,7 +92,10 @@ public final class GroundedSingleLaneDebugRunner {
             0,
             0,
             List.of(),
-            SweepPassPhase.FORWARD
+            SweepPassPhase.FORWARD,
+            false,
+            Optional.empty(),
+            0
     );
 
     public GroundedSingleLaneDebugRunner(BaritoneFacade baritoneFacade) {
@@ -123,11 +131,112 @@ public final class GroundedSingleLaneDebugRunner {
             return Optional.of("Grounded sweep did not produce any lanes for this schematic footprint.");
         }
 
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client != null && client.player != null && client.world != null) {
+            PlacementCompletionLookup lookup = (worldPos, expectedBlock) -> expectedBlock != null && client.world.getBlockState(worldPos).isOf(expectedBlock);
+            return startFullSweepFromSelection(session, settings, bounds, lanes, lookup, client.player.getEntityPos(), true);
+        }
+
         List<GroundedSweepLane> reverse = buildReverseSweepLanes(lanes);
         initializeRunState(session, bounds, settings, SweepRunMode.FULL_SWEEP, lanes, reverse, SweepPassPhase.FORWARD);
         laneCursor = 0;
+        smartResumeUsed = false;
+        selectedResumePoint = null;
+        skippedCompletedForwardLanes = 0;
         activateLane(forwardLanes.getFirst(), Set.of());
         return Optional.empty();
+    }
+
+    public Optional<String> startFullSweepSmart(
+            BuildSession session,
+            GroundedSweepSettings settings,
+            Vec3d playerPosition,
+            PlacementCompletionLookup completionLookup
+    ) {
+        Optional<String> validation = validateStart(session, settings);
+        if (validation.isPresent()) {
+            return validation;
+        }
+
+        GroundedSchematicBounds bounds = GroundedSchematicBounds.fromPlan(session.getPlan(), session.getOrigin());
+        List<GroundedSweepLane> lanes = lanePlanner.planLanes(bounds, settings);
+        if (lanes.isEmpty()) {
+            return Optional.of("Grounded sweep did not produce any lanes for this schematic footprint.");
+        }
+
+        return startFullSweepFromSelection(session, settings, bounds, lanes, completionLookup, playerPosition, true);
+    }
+
+    private Optional<String> startFullSweepFromSelection(
+            BuildSession session,
+            GroundedSweepSettings settings,
+            GroundedSchematicBounds bounds,
+            List<GroundedSweepLane> lanes,
+            PlacementCompletionLookup completionLookup,
+            Vec3d playerPosition,
+            boolean useSmartResume
+    ) {
+        GroundedSweepResumeSelection selection = resumeScanner.scan(
+                session,
+                bounds,
+                lanes,
+                settings.sweepHalfWidth(),
+                playerPosition,
+                completionLookup
+        );
+        if (selection.buildComplete()) {
+            return Optional.of("Grounded full sweep smart resume found no unfinished placements. Build appears complete.");
+        }
+
+        GroundedSweepResumePoint resumePoint = selection.resumePoint().orElseThrow();
+        List<GroundedSweepLane> reverse = buildReverseSweepLanes(lanes);
+        initializeRunState(session, bounds, settings, SweepRunMode.FULL_SWEEP, lanes, reverse, SweepPassPhase.FORWARD);
+
+        int selectedLaneIndex = Math.max(0, Math.min(resumePoint.laneIndex(), forwardLanes.size() - 1));
+        laneCursor = selectedLaneIndex;
+        smartResumeUsed = useSmartResume;
+        selectedResumePoint = resumePoint;
+        skippedCompletedForwardLanes = selectedLaneIndex;
+        startApproachTargetOverride = resumePoint.standingPosition();
+
+        Optional<Integer> minimumProgress = resumePoint.reason() == GroundedSweepResumePoint.ResumeReason.PARTIAL_LANE
+                ? Optional.of(resumePoint.progressCoordinate())
+                : Optional.empty();
+        activateLaneData(forwardLanes.get(selectedLaneIndex), Set.of(), minimumProgress);
+        awaitingStartApproach = true;
+        startApproachIssued = false;
+        awaitingLaneShift = false;
+        laneShiftTarget = null;
+        laneShiftPlan = null;
+        laneTransitionStage = LaneTransitionStage.ALIGN_FORWARD_AXIS;
+        laneTransitionTicks = 0;
+        lastStatus = new DebugStatus(
+                true,
+                activeLane.laneIndex(),
+                GroundedLaneWalker.GroundedLaneWalkState.IDLE,
+                true,
+                false,
+                Optional.empty(),
+                laneTicksElapsed,
+                successfulPlacements,
+                missedPlacements,
+                failedPlacements,
+                0,
+                currentLeftovers,
+                sweepPassPhase,
+                smartResumeUsed,
+                Optional.ofNullable(selectedResumePoint),
+                skippedCompletedForwardLanes
+        );
+        return Optional.empty();
+    }
+
+    private BlockPos activeStartApproachTarget() {
+        if (startApproachTargetOverride != null && selectedResumePoint != null && activeLane != null
+                && selectedResumePoint.laneIndex() == activeLane.laneIndex()) {
+            return startApproachTargetOverride;
+        }
+        return approachTargetForLaneStart(activeLane, activeBounds);
     }
 
     public void tick(MinecraftClient client, boolean constantSprint) {
@@ -203,7 +312,10 @@ public final class GroundedSingleLaneDebugRunner {
                     failedPlacements,
                     pendingVerificationsByPlacement.size(),
                     currentLeftovers,
-                    sweepPassPhase
+                    sweepPassPhase,
+                    smartResumeUsed,
+                    Optional.ofNullable(selectedResumePoint),
+                    skippedCompletedForwardLanes
             );
         }
         return lastStatus;
@@ -212,13 +324,14 @@ public final class GroundedSingleLaneDebugRunner {
     private void tickStartApproach(MinecraftClient client, boolean constantSprint) {
         issueStartApproachIfNeeded();
 
-        BlockPos standingStart = approachTargetForLaneStart(activeLane, activeBounds);
+        BlockPos standingStart = activeStartApproachTarget();
         if (!isNearLaneStart(client.player.getEntityPos(), standingStart)) {
             return;
         }
 
         baritoneFacade.cancel();
         awaitingStartApproach = false;
+        startApproachTargetOverride = null;
         if (!queueLaneStart(client, activeLane)) {
             failLaneStart(client, "Unable to lock lane yaw before starting lane walk.");
             return;
@@ -270,7 +383,10 @@ public final class GroundedSingleLaneDebugRunner {
                     failedPlacements,
                     pendingVerificationsByPlacement.size(),
                     currentLeftovers,
-                    sweepPassPhase
+                    sweepPassPhase,
+                    smartResumeUsed,
+                    Optional.ofNullable(selectedResumePoint),
+                    skippedCompletedForwardLanes
             );
             applyLaneControls(client);
         }
@@ -316,13 +432,16 @@ public final class GroundedSingleLaneDebugRunner {
                 failedPlacements,
                 pendingVerificationsByPlacement.size(),
                 currentLeftovers,
-                sweepPassPhase
+                sweepPassPhase,
+                smartResumeUsed,
+                Optional.ofNullable(selectedResumePoint),
+                skippedCompletedForwardLanes
         );
     }
 
     void issueStartApproachIfNeeded() {
         if (awaitingStartApproach && !startApproachIssued && activeLane != null && activeBounds != null) {
-            baritoneFacade.goTo(approachTargetForLaneStart(activeLane, activeBounds));
+            baritoneFacade.goTo(activeStartApproachTarget());
             startApproachIssued = true;
         }
     }
@@ -403,6 +522,12 @@ public final class GroundedSingleLaneDebugRunner {
     List<Integer> pendingPlacementIndicesForTests() {
         return pendingPlacementTargets.stream()
                 .map(GroundedSweepPlacementExecutor.PlacementTarget::placementIndex)
+                .toList();
+    }
+
+    List<BlockPos> pendingPlacementWorldPositionsForTests() {
+        return pendingPlacementTargets.stream()
+                .map(GroundedSweepPlacementExecutor.PlacementTarget::worldPos)
                 .toList();
     }
 
@@ -545,7 +670,10 @@ public final class GroundedSingleLaneDebugRunner {
                 failedPlacements,
                 pendingVerificationsByPlacement.size(),
                 currentLeftovers,
-                sweepPassPhase
+                sweepPassPhase,
+                smartResumeUsed,
+                Optional.ofNullable(selectedResumePoint),
+                skippedCompletedForwardLanes
         );
     }
 
@@ -577,6 +705,10 @@ public final class GroundedSingleLaneDebugRunner {
         reverseLanes = List.of();
         laneCursor = 0;
         sweepPassPhase = SweepPassPhase.FORWARD;
+        smartResumeUsed = false;
+        selectedResumePoint = null;
+        skippedCompletedForwardLanes = 0;
+        startApproachTargetOverride = null;
         forwardLeftoverPlacements.clear();
         reversePlacementFilter.clear();
     }
@@ -778,7 +910,8 @@ public final class GroundedSingleLaneDebugRunner {
             GroundedSweepLane lane,
             int sweepHalfWidth,
             Map<Integer, Placement> lanePlacementsByIndex,
-            Set<Integer> placementFilter
+            Set<Integer> placementFilter,
+            Optional<Integer> minimumForwardProgressCoordinate
     ) {
         List<GroundedSweepPlacementExecutor.PlacementTarget> targets = new ArrayList<>();
         GroundedLaneCorridorBounds corridor = lane.corridorBounds();
@@ -801,6 +934,14 @@ public final class GroundedSingleLaneDebugRunner {
             }
             if (Math.abs(lateralDeltaFromCenterline(lane.direction(), lane.centerlineCoordinate(), worldPos)) > sweepHalfWidth) {
                 continue;
+            }
+            if (minimumForwardProgressCoordinate.isPresent()) {
+                int laneProgress = lane.direction().alongX() ? worldPos.getX() : worldPos.getZ();
+                int resumeProgress = minimumForwardProgressCoordinate.get();
+                int signedDelta = (laneProgress - resumeProgress) * lane.direction().forwardSign();
+                if (signedDelta < 0) {
+                    continue;
+                }
             }
             lanePlacementsByIndex.put(i, placement);
             targets.add(new GroundedSweepPlacementExecutor.PlacementTarget(i, worldPos));
@@ -888,7 +1029,10 @@ public final class GroundedSingleLaneDebugRunner {
                 failedPlacements,
                 pendingVerificationsByPlacement.size(),
                 currentLeftovers,
-                sweepPassPhase
+                sweepPassPhase,
+                smartResumeUsed,
+                Optional.ofNullable(selectedResumePoint),
+                skippedCompletedForwardLanes
         );
     }
 
@@ -1069,7 +1213,7 @@ public final class GroundedSingleLaneDebugRunner {
             int sweepHalfWidth,
             Map<Integer, Placement> lanePlacementsByIndex
     ) {
-        return buildLanePlacementTargets(plan, origin, bounds, lane, sweepHalfWidth, lanePlacementsByIndex, Set.of());
+        return buildLanePlacementTargets(plan, origin, bounds, lane, sweepHalfWidth, lanePlacementsByIndex, Set.of(), Optional.empty());
     }
 
     private static void clearControls(MinecraftClient client) {
@@ -1149,25 +1293,16 @@ public final class GroundedSingleLaneDebugRunner {
         laneStartStage = LaneStartStage.NONE;
         pendingLaneStart = null;
         pendingLaneStartTicks = 0;
+        smartResumeUsed = false;
+        selectedResumePoint = null;
+        skippedCompletedForwardLanes = 0;
+        startApproachTargetOverride = null;
         displacementAlert.reset();
     }
 
     private void activateLane(GroundedSweepLane lane, Set<Integer> placementFilter) {
-        activeLane = lane;
+        activateLaneData(lane, placementFilter, Optional.empty());
         pendingShiftLane = null;
-        placementSelector = new GroundedSweepPlacementExecutor(GroundedSweepPlacementExecutorSettings.fromGroundedSweepSettings(activeSettings));
-        lanePlacementsByIndex = new HashMap<>();
-        pendingPlacementTargets = buildLanePlacementTargets(
-                activeSession.getPlan(),
-                activeSession.getOrigin(),
-                activeBounds,
-                activeLane,
-                activeSettings.sweepHalfWidth(),
-                lanePlacementsByIndex,
-                placementFilter
-        );
-        pendingVerificationsByPlacement = new LinkedHashMap<>();
-        currentLeftovers = List.of();
 
         awaitingStartApproach = true;
         startApproachIssued = false;
@@ -1190,13 +1325,16 @@ public final class GroundedSingleLaneDebugRunner {
                 failedPlacements,
                 0,
                 currentLeftovers,
-                sweepPassPhase
+                sweepPassPhase,
+                smartResumeUsed,
+                Optional.ofNullable(selectedResumePoint),
+                skippedCompletedForwardLanes
         );
     }
 
     private void activateLaneForNativeShift(GroundedSweepLane lane, Set<Integer> placementFilter) {
         GroundedSweepLane fromLane = activeLane;
-        activateLaneData(lane, placementFilter);
+        activateLaneData(lane, placementFilter, Optional.empty());
         awaitingStartApproach = false;
         startApproachIssued = false;
         awaitingLaneShift = true;
@@ -1218,11 +1356,14 @@ public final class GroundedSingleLaneDebugRunner {
                 failedPlacements,
                 0,
                 currentLeftovers,
-                sweepPassPhase
+                sweepPassPhase,
+                smartResumeUsed,
+                Optional.ofNullable(selectedResumePoint),
+                skippedCompletedForwardLanes
         );
     }
 
-    private void activateLaneData(GroundedSweepLane lane, Set<Integer> placementFilter) {
+    private void activateLaneData(GroundedSweepLane lane, Set<Integer> placementFilter, Optional<Integer> minimumForwardProgressCoordinate) {
         activeLane = lane;
         placementSelector = new GroundedSweepPlacementExecutor(GroundedSweepPlacementExecutorSettings.fromGroundedSweepSettings(activeSettings));
         lanePlacementsByIndex = new HashMap<>();
@@ -1233,7 +1374,8 @@ public final class GroundedSingleLaneDebugRunner {
                 activeLane,
                 activeSettings.sweepHalfWidth(),
                 lanePlacementsByIndex,
-                placementFilter
+                placementFilter,
+                minimumForwardProgressCoordinate
         );
         pendingVerificationsByPlacement = new LinkedHashMap<>();
         currentLeftovers = List.of();
@@ -1320,12 +1462,16 @@ public final class GroundedSingleLaneDebugRunner {
             int failedPlacements,
             int pendingVerification,
             List<GroundedSweepLeftoverTracker.GroundedLeftoverRecord> leftovers,
-            SweepPassPhase phase
+            SweepPassPhase phase,
+            boolean smartResumeUsed,
+            Optional<GroundedSweepResumePoint> resumePoint,
+            int skippedCompletedForwardLanes
     ) {
         public DebugStatus {
             failureReason = failureReason == null ? Optional.empty() : failureReason;
             leftovers = leftovers == null ? List.of() : List.copyOf(leftovers);
             phase = phase == null ? SweepPassPhase.FORWARD : phase;
+            resumePoint = resumePoint == null ? Optional.empty() : resumePoint;
         }
     }
 
