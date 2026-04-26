@@ -6,6 +6,7 @@ import com.example.mapart.plan.Placement;
 import com.example.mapart.plan.state.BuildSession;
 import com.example.mapart.plan.state.PlacementExecutor;
 import com.example.mapart.plan.state.PlacementResult;
+import net.minecraft.block.BlockState;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.option.KeyBinding;
 import net.minecraft.util.math.BlockPos;
@@ -13,13 +14,17 @@ import net.minecraft.util.math.Vec3d;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.function.Predicate;
 
 public final class GroundedSingleLaneDebugRunner {
     private static final int MAX_PLACEMENT_ATTEMPTS_PER_TICK = 2;
+    private static final int PLACEMENT_VERIFICATION_DELAY_TICKS = 3;
 
     private final GroundedSweepLanePlanner lanePlanner = new GroundedSweepLanePlanner();
     private final GroundedLaneWalker laneWalker = new GroundedLaneWalker();
@@ -33,6 +38,7 @@ public final class GroundedSingleLaneDebugRunner {
     private GroundedSweepPlacementExecutor placementSelector;
     private Map<Integer, Placement> lanePlacementsByIndex = Map.of();
     private List<GroundedSweepPlacementExecutor.PlacementTarget> pendingPlacementTargets = List.of();
+    private Map<Integer, PendingPlacementVerification> pendingVerificationsByPlacement = Map.of();
     private List<GroundedSweepLeftoverTracker.GroundedLeftoverRecord> currentLeftovers = List.of();
     private int successfulPlacements;
     private int failedPlacements;
@@ -46,6 +52,7 @@ public final class GroundedSingleLaneDebugRunner {
             GroundedLaneWalker.GroundedLaneWalkState.IDLE,
             false,
             Optional.empty(),
+            0,
             0,
             0,
             0,
@@ -91,6 +98,7 @@ public final class GroundedSingleLaneDebugRunner {
                 settings.sweepHalfWidth(),
                 lanePlacementsByIndex
         );
+        pendingVerificationsByPlacement = new LinkedHashMap<>();
         currentLeftovers = List.of();
         successfulPlacements = 0;
         failedPlacements = 0;
@@ -99,7 +107,7 @@ public final class GroundedSingleLaneDebugRunner {
         awaitingStartApproach = true;
         startApproachIssued = false;
         displacementAlert.reset();
-        lastStatus = new DebugStatus(true, activeLane.laneIndex(), GroundedLaneWalker.GroundedLaneWalkState.IDLE, true, Optional.empty(), 0, 0, 0, 0, List.of());
+        lastStatus = new DebugStatus(true, activeLane.laneIndex(), GroundedLaneWalker.GroundedLaneWalkState.IDLE, true, Optional.empty(), 0, 0, 0, 0, 0, List.of());
         return Optional.empty();
     }
 
@@ -120,6 +128,7 @@ public final class GroundedSingleLaneDebugRunner {
 
         laneWalker.tick(client.player.getEntityPos());
         laneTicksElapsed++;
+        processDuePlacementVerifications(client, laneTicksElapsed, false);
         boolean walkerActiveAfterTick = shouldAttemptPlacementAfterWalkerTick(laneWalker.state());
         if (walkerActiveAfterTick) {
             tickPlacementExecutor(client);
@@ -160,6 +169,7 @@ public final class GroundedSingleLaneDebugRunner {
                     successfulPlacements,
                     missedPlacements,
                     failedPlacements,
+                    pendingVerificationsByPlacement.size(),
                     currentLeftovers
             );
         }
@@ -187,6 +197,7 @@ public final class GroundedSingleLaneDebugRunner {
                 successfulPlacements,
                 missedPlacements,
                 failedPlacements,
+                pendingVerificationsByPlacement.size(),
                 currentLeftovers
         );
         applyLaneControls(client);
@@ -247,6 +258,31 @@ public final class GroundedSingleLaneDebugRunner {
         onPlacementResult(placementIndex, result, tick);
     }
 
+    void recordPlacementPlacedForTests(int placementIndex, BlockPos worldPos, long tick) {
+        pendingVerificationsByPlacement = mutablePendingVerifications();
+        pendingVerificationsByPlacement.put(
+                placementIndex,
+                new PendingPlacementVerification(placementIndex, worldPos, null, tick + PLACEMENT_VERIFICATION_DELAY_TICKS)
+        );
+        removePendingPlacement(placementIndex);
+    }
+
+    int pendingVerificationCountForTests() {
+        return pendingVerificationsByPlacement.size();
+    }
+
+    boolean hasPendingVerificationForTests(int placementIndex) {
+        return pendingVerificationsByPlacement.containsKey(placementIndex);
+    }
+
+    void processPendingVerificationsForTests(Map<Integer, Boolean> matchesByPlacementIndex, long tick) {
+        processDuePlacementVerifications(tick, false, pending -> matchesByPlacementIndex.getOrDefault(pending.placementIndex(), false));
+    }
+
+    void processAllPendingVerificationsForTests(Map<Integer, Boolean> matchesByPlacementIndex, long tick) {
+        processDuePlacementVerifications(tick, true, pending -> matchesByPlacementIndex.getOrDefault(pending.placementIndex(), false));
+    }
+
     void recordFinalFailureForTests(int placementIndex) {
         if (placementSelector == null) {
             return;
@@ -259,6 +295,7 @@ public final class GroundedSingleLaneDebugRunner {
     }
 
     private void handleTerminalState(MinecraftClient client) {
+        processTerminalPendingVerifications(client);
         captureLastStatus(laneWalker.state(), laneWalker.failureReason());
         if (client != null) {
             clearControls(client);
@@ -278,6 +315,7 @@ public final class GroundedSingleLaneDebugRunner {
                 successfulPlacements,
                 missedPlacements,
                 failedPlacements,
+                pendingVerificationsByPlacement.size(),
                 currentLeftovers
         );
     }
@@ -289,6 +327,7 @@ public final class GroundedSingleLaneDebugRunner {
         placementSelector = null;
         lanePlacementsByIndex = Map.of();
         pendingPlacementTargets = List.of();
+        pendingVerificationsByPlacement = Map.of();
         currentLeftovers = List.of();
         awaitingStartApproach = false;
         startApproachIssued = false;
@@ -324,7 +363,8 @@ public final class GroundedSingleLaneDebugRunner {
 
             PlacementResult result = placementExecutor.execute(client, activeSession, placement, candidate.worldPos());
             switch (result.status()) {
-                case PLACED, ALREADY_CORRECT -> onPlacementResult(candidate.placementIndex(), GroundedSweepPlacementExecutor.PlacementResult.SUCCESS, laneTicksElapsed);
+                case PLACED -> onPlacementPlaced(candidate.placementIndex(), placement, candidate.worldPos(), laneTicksElapsed);
+                case ALREADY_CORRECT -> onPlacementResult(candidate.placementIndex(), GroundedSweepPlacementExecutor.PlacementResult.SUCCESS, laneTicksElapsed);
                 case RETRY, MOVE_REQUIRED -> onPlacementResult(candidate.placementIndex(), GroundedSweepPlacementExecutor.PlacementResult.MISSED, laneTicksElapsed);
                 case MISSING_ITEM, ERROR -> onFinalFailure(candidate.placementIndex());
             }
@@ -332,6 +372,20 @@ public final class GroundedSingleLaneDebugRunner {
         }
 
         currentLeftovers = placementSelector.select(activeLane, activeBounds, currentProgress, laneTicksElapsed, pendingPlacementTargets).leftovers();
+    }
+
+    private void onPlacementPlaced(int placementIndex, Placement placement, BlockPos worldPos, long tick) {
+        if (placement == null || placement.block() == null) {
+            onFinalFailure(placementIndex);
+            return;
+        }
+
+        pendingVerificationsByPlacement = mutablePendingVerifications();
+        pendingVerificationsByPlacement.put(
+                placementIndex,
+                new PendingPlacementVerification(placementIndex, worldPos, placement.block(), tick + PLACEMENT_VERIFICATION_DELAY_TICKS)
+        );
+        removePendingPlacement(placementIndex);
     }
 
     private void onPlacementResult(int placementIndex, GroundedSweepPlacementExecutor.PlacementResult groundedResult, long tick) {
@@ -353,6 +407,7 @@ public final class GroundedSingleLaneDebugRunner {
     private void onFinalFailure(int placementIndex) {
         failedPlacements++;
         placementSelector.recordFinalFailure(placementIndex);
+        removePendingVerification(placementIndex);
         removePendingPlacement(placementIndex);
     }
 
@@ -367,6 +422,105 @@ public final class GroundedSingleLaneDebugRunner {
             }
         }
         pendingPlacementTargets = List.copyOf(retained);
+    }
+
+    private void removePendingVerification(int placementIndex) {
+        if (pendingVerificationsByPlacement.isEmpty()) {
+            return;
+        }
+        pendingVerificationsByPlacement = mutablePendingVerifications();
+        pendingVerificationsByPlacement.remove(placementIndex);
+        if (pendingVerificationsByPlacement.isEmpty()) {
+            pendingVerificationsByPlacement = Map.of();
+        }
+    }
+
+    private Map<Integer, PendingPlacementVerification> mutablePendingVerifications() {
+        if (pendingVerificationsByPlacement instanceof LinkedHashMap<Integer, PendingPlacementVerification> linkedHashMap) {
+            return linkedHashMap;
+        }
+        return new LinkedHashMap<>(pendingVerificationsByPlacement);
+    }
+
+    private void processTerminalPendingVerifications(MinecraftClient client) {
+        if (pendingVerificationsByPlacement.isEmpty()) {
+            return;
+        }
+        if (client == null || client.world == null) {
+            processDuePlacementVerifications(laneTicksElapsed, true, pending -> false);
+            return;
+        }
+        processDuePlacementVerifications(client, laneTicksElapsed, true);
+    }
+
+    private void processDuePlacementVerifications(MinecraftClient client, long tick, boolean forceAll) {
+        processDuePlacementVerifications(tick, forceAll, pending -> verifyExpectedBlock(client, pending));
+    }
+
+    private void processDuePlacementVerifications(long tick, boolean forceAll, Predicate<PendingPlacementVerification> verifier) {
+        if (placementSelector == null || pendingVerificationsByPlacement.isEmpty()) {
+            return;
+        }
+
+        pendingVerificationsByPlacement = mutablePendingVerifications();
+        boolean changed = false;
+        Iterator<Map.Entry<Integer, PendingPlacementVerification>> iterator = pendingVerificationsByPlacement.entrySet().iterator();
+        while (iterator.hasNext()) {
+            PendingPlacementVerification pending = iterator.next().getValue();
+            if (!forceAll && tick < pending.verifyDueTick()) {
+                continue;
+            }
+
+            if (verifier.test(pending)) {
+                onPlacementResult(pending.placementIndex(), GroundedSweepPlacementExecutor.PlacementResult.SUCCESS, tick);
+            } else {
+                onPlacementResult(pending.placementIndex(), GroundedSweepPlacementExecutor.PlacementResult.MISSED, tick);
+            }
+            iterator.remove();
+            changed = true;
+        }
+
+        if (pendingVerificationsByPlacement.isEmpty()) {
+            pendingVerificationsByPlacement = Map.of();
+        }
+        if (changed) {
+            refreshCurrentLeftovers();
+        }
+    }
+
+    private boolean verifyExpectedBlock(MinecraftClient client, PendingPlacementVerification pending) {
+        if (client == null || client.world == null || pending.expectedBlock() == null) {
+            return false;
+        }
+        BlockState worldState = client.world.getBlockState(pending.worldPos());
+        return worldState.isOf(pending.expectedBlock());
+    }
+
+    private void refreshCurrentLeftovers() {
+        if (activeLane == null || activeBounds == null || placementSelector == null) {
+            return;
+        }
+        currentLeftovers = placementSelector.select(
+                activeLane,
+                activeBounds,
+                currentLaneProgressCoordinate(),
+                laneTicksElapsed,
+                pendingPlacementTargets
+        ).leftovers();
+    }
+
+    private int currentLaneProgressCoordinate() {
+        if (activeLane == null) {
+            return 0;
+        }
+
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client == null || client.player == null) {
+            return activeLane.direction().alongX() ? activeLane.startPoint().getX() : activeLane.startPoint().getZ();
+        }
+
+        BlockPos playerPos = client.player.getBlockPos();
+        return activeLane.direction().alongX() ? playerPos.getX() : playerPos.getZ();
     }
 
     private static List<GroundedSweepPlacementExecutor.PlacementTarget> buildLanePlacementTargets(
@@ -475,11 +629,23 @@ public final class GroundedSingleLaneDebugRunner {
             int successfulPlacements,
             int missedPlacements,
             int failedPlacements,
+            int pendingVerification,
             List<GroundedSweepLeftoverTracker.GroundedLeftoverRecord> leftovers
     ) {
         public DebugStatus {
             failureReason = failureReason == null ? Optional.empty() : failureReason;
             leftovers = leftovers == null ? List.of() : List.copyOf(leftovers);
+        }
+    }
+
+    private record PendingPlacementVerification(
+            int placementIndex,
+            BlockPos worldPos,
+            net.minecraft.block.Block expectedBlock,
+            long verifyDueTick
+    ) {
+        private PendingPlacementVerification {
+            Objects.requireNonNull(worldPos, "worldPos");
         }
     }
 }
