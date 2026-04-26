@@ -33,6 +33,13 @@ public final class GroundedSingleLaneDebugRunner {
     private static final double LANE_SHIFT_REACH_DISTANCE_SQ = 1.5 * 1.5;
     private static final double LANE_TRANSITION_AXIS_TOLERANCE = 0.6;
     private static final int MAX_LANE_TRANSITION_TICKS = 120;
+    private static final int MAX_START_APPROACH_TICKS = 240;
+    private static final int MAX_START_APPROACH_NO_PROGRESS_TICKS = 80;
+    private static final double START_APPROACH_PROGRESS_EPSILON_SQ = 0.05 * 0.05;
+    private static final double LANE_START_TARGET_DISTANCE_TOLERANCE = 0.9;
+    private static final double LANE_START_CENTERLINE_TOLERANCE = 0.8;
+    private static final double LANE_START_FORWARD_TOLERANCE = 1.0;
+    private static final double LANE_START_CORRIDOR_MARGIN = 0.2;
     private static final int MIN_LANE_YAW_LOCK_TICKS = 2;
     private static final int MAX_LANE_YAW_LOCK_TICKS = 10;
     private static final float LANE_YAW_LOCK_TOLERANCE_DEGREES = 1.5f;
@@ -79,6 +86,9 @@ public final class GroundedSingleLaneDebugRunner {
     private GroundedSweepResumePoint selectedResumePoint;
     private int skippedCompletedForwardLanes;
     private BlockPos startApproachTargetOverride;
+    private int startApproachTicks;
+    private long startApproachLastProgressTick;
+    private double bestStartApproachDistanceSq = Double.POSITIVE_INFINITY;
     private final Set<Integer> forwardLeftoverPlacements = new LinkedHashSet<>();
     private final Set<Integer> reversePlacementFilter = new LinkedHashSet<>();
     private final List<String> groundedTraceEvents = new ArrayList<>();
@@ -362,9 +372,38 @@ public final class GroundedSingleLaneDebugRunner {
 
     private void tickStartApproach(MinecraftClient client, boolean constantSprint) {
         issueStartApproachIfNeeded();
+        startApproachTicks++;
 
         BlockPos standingStart = activeStartApproachTarget();
-        if (!isNearLaneStart(client.player.getEntityPos(), standingStart)) {
+        Vec3d playerPos = client.player.getEntityPos();
+        double flatDistanceSq = flatSquaredDistanceToStandingTarget(playerPos, standingStart);
+        if (flatDistanceSq + START_APPROACH_PROGRESS_EPSILON_SQ < bestStartApproachDistanceSq) {
+            bestStartApproachDistanceSq = flatDistanceSq;
+            startApproachLastProgressTick = startApproachTicks;
+        }
+
+        if (startApproachTicks > MAX_START_APPROACH_TICKS
+                || startApproachTicks - startApproachLastProgressTick > MAX_START_APPROACH_NO_PROGRESS_TICKS) {
+            traceGroundedEvent("start approach timeout/no-progress: playerPos=" + playerPos
+                    + ", standingTarget=" + standingStart.toShortString()
+                    + ", bestFlatDistanceSq=" + bestStartApproachDistanceSq
+                    + ", ticks=" + startApproachTicks);
+            failLaneStart(client, "Unable to reach valid lane start staging position");
+            return;
+        }
+
+        if (!isNearLaneStart(playerPos, standingStart)) {
+            return;
+        }
+        LaneStartStagingAssessment staging = assessLaneStartReadiness(playerPos, activeLane, standingStart, activeBounds);
+        if (!staging.ready()) {
+            traceGroundedEvent("approach near but not staged: playerPos=" + playerPos
+                    + ", standingTarget=" + standingStart.toShortString()
+                    + ", laneDirection=" + activeLane.direction()
+                    + ", centerlineDelta=" + staging.centerlineDelta()
+                    + ", forwardDelta=" + staging.forwardDelta()
+                    + ", insideCorridor=" + staging.insideCorridor()
+                    + ", reason=" + staging.failureReason());
             return;
         }
 
@@ -771,6 +810,9 @@ public final class GroundedSingleLaneDebugRunner {
         selectedResumePoint = null;
         skippedCompletedForwardLanes = 0;
         startApproachTargetOverride = null;
+        startApproachTicks = 0;
+        startApproachLastProgressTick = 0;
+        bestStartApproachDistanceSq = Double.POSITIVE_INFINITY;
         forwardLeftoverPlacements.clear();
         reversePlacementFilter.clear();
     }
@@ -1219,9 +1261,68 @@ public final class GroundedSingleLaneDebugRunner {
     }
 
     static boolean isNearLaneStart(Vec3d playerPosition, BlockPos standingStartTarget) {
+        return flatSquaredDistanceToStandingTarget(playerPosition, standingStartTarget) <= 2.25;
+    }
+
+    private static double flatSquaredDistanceToStandingTarget(Vec3d playerPosition, BlockPos standingStartTarget) {
         Vec3d standingCenter = new Vec3d(standingStartTarget.getX() + 0.5, standingStartTarget.getY(), standingStartTarget.getZ() + 0.5);
         Vec3d playerFlat = new Vec3d(playerPosition.x, standingCenter.y, playerPosition.z);
-        return playerFlat.squaredDistanceTo(standingCenter) <= 2.25;
+        return playerFlat.squaredDistanceTo(standingCenter);
+    }
+
+    static boolean isReadyForLaneStart(
+            Vec3d playerPosition,
+            GroundedSweepLane lane,
+            BlockPos standingStartTarget,
+            GroundedSchematicBounds bounds
+    ) {
+        return assessLaneStartReadiness(playerPosition, lane, standingStartTarget, bounds).ready();
+    }
+
+    private static LaneStartStagingAssessment assessLaneStartReadiness(
+            Vec3d playerPosition,
+            GroundedSweepLane lane,
+            BlockPos standingStartTarget,
+            GroundedSchematicBounds bounds
+    ) {
+        if (playerPosition == null || lane == null || standingStartTarget == null || bounds == null) {
+            return new LaneStartStagingAssessment(false, 0.0, 0.0, false, "invalid staging inputs");
+        }
+
+        double flatDistanceSq = flatSquaredDistanceToStandingTarget(playerPosition, standingStartTarget);
+        if (flatDistanceSq > LANE_START_TARGET_DISTANCE_TOLERANCE * LANE_START_TARGET_DISTANCE_TOLERANCE) {
+            return new LaneStartStagingAssessment(false, 0.0, 0.0, false, "too far from standing target");
+        }
+
+        double centerlineDelta = lane.direction().alongX()
+                ? playerPosition.z - (lane.centerlineCoordinate() + 0.5)
+                : playerPosition.x - (lane.centerlineCoordinate() + 0.5);
+        if (Math.abs(centerlineDelta) > LANE_START_CENTERLINE_TOLERANCE) {
+            return new LaneStartStagingAssessment(false, centerlineDelta, 0.0, false, "outside centerline tolerance");
+        }
+
+        GroundedLaneCorridorBounds corridor = lane.corridorBounds();
+        boolean insideCorridor = playerPosition.x >= corridor.minX() - LANE_START_CORRIDOR_MARGIN
+                && playerPosition.x <= corridor.maxX() + 1.0 + LANE_START_CORRIDOR_MARGIN
+                && playerPosition.z >= corridor.minZ() - LANE_START_CORRIDOR_MARGIN
+                && playerPosition.z <= corridor.maxZ() + 1.0 + LANE_START_CORRIDOR_MARGIN;
+        if (!insideCorridor) {
+            return new LaneStartStagingAssessment(false, centerlineDelta, 0.0, false, "outside lane corridor");
+        }
+
+        double targetForward = lane.direction().alongX()
+                ? standingStartTarget.getX() + 0.5
+                : standingStartTarget.getZ() + 0.5;
+        double playerForward = lane.direction().alongX() ? playerPosition.x : playerPosition.z;
+        double signedForwardDelta = (playerForward - targetForward) * lane.direction().forwardSign();
+        if (signedForwardDelta < -LANE_START_FORWARD_TOLERANCE) {
+            return new LaneStartStagingAssessment(false, centerlineDelta, signedForwardDelta, true, "behind lane start/progress edge");
+        }
+        if (Math.abs(signedForwardDelta) > LANE_START_FORWARD_TOLERANCE) {
+            return new LaneStartStagingAssessment(false, centerlineDelta, signedForwardDelta, true, "outside forward start/progress tolerance");
+        }
+
+        return new LaneStartStagingAssessment(true, centerlineDelta, signedForwardDelta, true, "");
     }
 
     static boolean isNearLaneShiftTarget(Vec3d playerPosition, BlockPos shiftTarget) {
@@ -1523,6 +1624,9 @@ public final class GroundedSingleLaneDebugRunner {
         selectedResumePoint = null;
         skippedCompletedForwardLanes = 0;
         startApproachTargetOverride = null;
+        startApproachTicks = 0;
+        startApproachLastProgressTick = 0;
+        bestStartApproachDistanceSq = Double.POSITIVE_INFINITY;
         displacementAlert.reset();
         corridorWarningActive = false;
         lastGroundedSnapshotTick = -1;
@@ -1536,6 +1640,9 @@ public final class GroundedSingleLaneDebugRunner {
         awaitingStartApproach = true;
         traceGroundedEvent("awaitingStartApproach=true");
         startApproachIssued = false;
+        startApproachTicks = 0;
+        startApproachLastProgressTick = 0;
+        bestStartApproachDistanceSq = Double.POSITIVE_INFINITY;
         awaitingLaneShift = false;
         laneShiftTarget = null;
         laneShiftPlan = null;
@@ -1635,6 +1742,10 @@ public final class GroundedSingleLaneDebugRunner {
         return buildReverseSweepLanes(forwardLanes);
     }
 
+    void forceStartApproachTimeoutForTests() {
+        failLaneStart(null, "Unable to reach valid lane start staging position");
+    }
+
     LaneStartStage laneStartStageForTests() {
         return laneStartStage;
     }
@@ -1721,6 +1832,15 @@ public final class GroundedSingleLaneDebugRunner {
             BlockPos shiftTarget,
             GroundedSweepLane fromLane,
             GroundedSweepLane toLane
+    ) {
+    }
+
+    private record LaneStartStagingAssessment(
+            boolean ready,
+            double centerlineDelta,
+            double forwardDelta,
+            boolean insideCorridor,
+            String failureReason
     ) {
     }
 
