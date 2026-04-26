@@ -468,6 +468,9 @@ public final class MapArtCommand {
         source.sendFeedback(Text.literal("Grounded lane=" + status.laneIndex()
                 + ", phase=" + status.phase()
                 + ", state=" + status.walkState()
+                + ", smartResumeUsed=" + status.smartResumeUsed()
+                + ", resumeReason=" + status.resumeReason()
+                + ", skippedCompletedLanes=" + status.skippedCompletedLaneCount()
                 + ", awaitingStartApproach=" + status.awaitingStartApproach()
                 + ", awaitingLaneShift=" + status.awaitingLaneShift()
                 + ", ticks=" + status.ticksElapsed()
@@ -523,7 +526,11 @@ public final class MapArtCommand {
             return 0;
         }
 
-        source.sendFeedback(Text.literal("Started debug grounded full serpentine sweep (forward + reverse leftovers)."));
+        GroundedSingleLaneDebugRunner.DebugStatus status = runner.status();
+        source.sendFeedback(Text.literal("Started debug grounded full serpentine sweep (forward + reverse leftovers)"
+                + " with smart resume: lane=" + status.laneIndex()
+                + ", reason=" + status.resumeReason()
+                + ", skippedCompletedLanes=" + status.skippedCompletedLaneCount() + "."));
         return 1;
     }
 

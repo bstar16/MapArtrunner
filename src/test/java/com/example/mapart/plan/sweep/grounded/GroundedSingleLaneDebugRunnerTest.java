@@ -724,6 +724,86 @@ class GroundedSingleLaneDebugRunnerTest {
         assertEquals(GroundedLaneDirection.WEST, reverse.get(1).direction());
     }
 
+    @Test
+    void smartResumeCanStartFullSweepFromLaterLane() {
+        RecordingBaritoneFacade baritone = new RecordingBaritoneFacade();
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(baritone);
+        BuildSession session = sessionWithOrigin(new Vec3i(5, 1, 11));
+
+        GroundedSweepResumePoint resumePoint = new GroundedSweepResumePoint(
+                1,
+                GroundedSweepResumePoint.SweepPhase.FORWARD,
+                GroundedLaneDirection.WEST,
+                13,
+                14,
+                new BlockPos(14, 65, 13),
+                GroundedLaneDirection.WEST.yawDegrees(),
+                GroundedSweepResumePoint.ResumeReason.FIRST_UNFINISHED,
+                10,
+                10
+        );
+        assertTrue(runner.startFullSweepFromResumeForTests(
+                session,
+                GroundedSweepSettings.defaults(),
+                GroundedSweepResumeSelection.resumeAt(resumePoint)
+        ).isEmpty());
+
+        GroundedSingleLaneDebugRunner.DebugStatus status = runner.status();
+        assertEquals(1, status.laneIndex());
+        assertEquals(GroundedSingleLaneDebugRunner.SweepPassPhase.FORWARD, status.phase());
+        assertTrue(status.smartResumeUsed());
+        assertEquals(GroundedSweepResumePoint.ResumeReason.FIRST_UNFINISHED, status.resumeReason());
+        assertEquals(1, status.skippedCompletedLaneCount());
+        runner.issueStartApproachIfNeeded();
+        assertEquals(new BlockPos(14, 65, 13), baritone.lastGoToTarget);
+    }
+
+    @Test
+    void smartResumePartialLaneSkipsPlacementsBehindResumeCoordinate() {
+        RecordingBaritoneFacade baritone = new RecordingBaritoneFacade();
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(baritone);
+        BuildSession session = sessionWithOrigin(new Vec3i(12, 1, 5));
+
+        List<Placement> placements = new java.util.ArrayList<>();
+        for (int x = 0; x < 12; x++) {
+            placements.add(new Placement(new BlockPos(x, 0, 2), null));
+        }
+        BuildSession denseSession = new BuildSession(buildPlan(new Vec3i(12, 1, 5), placements));
+        denseSession.setOrigin(new BlockPos(10, 64, 10));
+
+        GroundedSweepResumePoint resumePoint = new GroundedSweepResumePoint(
+                0,
+                GroundedSweepResumePoint.SweepPhase.FORWARD,
+                GroundedLaneDirection.EAST,
+                12,
+                15,
+                new BlockPos(15, 65, 12),
+                GroundedLaneDirection.EAST.yawDegrees(),
+                GroundedSweepResumePoint.ResumeReason.PARTIAL_LANE,
+                6,
+                6
+        );
+        assertTrue(runner.startFullSweepFromResumeForTests(
+                denseSession,
+                GroundedSweepSettings.defaults(),
+                GroundedSweepResumeSelection.resumeAt(resumePoint)
+        ).isEmpty());
+
+        assertEquals(List.of(5, 6, 7, 8, 9, 10, 11), runner.pendingPlacementIndicesForTests());
+    }
+
+    @Test
+    void smartResumeCompleteSelectionDoesNotStartRunner() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        Optional<String> error = runner.startFullSweepFromResumeForTests(
+                sessionWithOrigin(),
+                GroundedSweepSettings.defaults(),
+                GroundedSweepResumeSelection.complete()
+        );
+        assertTrue(error.isPresent());
+        assertFalse(runner.isActive());
+    }
+
     private static BuildSession sessionWithOrigin() {
         return sessionWithOrigin(new Vec3i(5, 1, 5));
     }
