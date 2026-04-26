@@ -137,6 +137,77 @@ class GroundedSingleLaneDebugRunnerTest {
     }
 
     @Test
+    void readyForLaneStartRequiresInsideCorridorEvenWhenNearTarget() {
+        GroundedSweepLane lane = eastLane();
+        GroundedSchematicBounds bounds = eastLaneBounds();
+        BlockPos standing = new BlockPos(10, 65, 12);
+
+        assertTrue(GroundedSingleLaneDebugRunner.isNearLaneStart(new Vec3d(10.55, 64.0, 13.55), standing));
+        assertFalse(GroundedSingleLaneDebugRunner.isReadyForLaneStart(
+                new Vec3d(10.55, 64.0, 13.55),
+                lane,
+                standing,
+                bounds
+        ));
+    }
+
+    @Test
+    void westLaneReadinessRejectsPlayerOutsideStartEdge() {
+        GroundedSweepLane lane = new GroundedSweepLane(
+                1,
+                -59,
+                GroundedLaneDirection.WEST,
+                new BlockPos(-65, 64, -59),
+                new BlockPos(-192, 64, -59),
+                new GroundedLaneCorridorBounds(-192, -65, -61, -57),
+                1.0
+        );
+        GroundedSchematicBounds bounds = new GroundedSchematicBounds(
+                new BlockPos(-192, 64, -61),
+                new BlockPos(-192, 64, -61),
+                new BlockPos(-65, 64, -57)
+        );
+        BlockPos standing = new BlockPos(-65, 65, -58);
+
+        assertFalse(GroundedSingleLaneDebugRunner.isReadyForLaneStart(
+                new Vec3d(-63.56, 64.0, -58.5),
+                lane,
+                standing,
+                bounds
+        ));
+    }
+
+    @Test
+    void playerOnCenterlineAndStartCoordinateIsReady() {
+        assertTrue(GroundedSingleLaneDebugRunner.isReadyForLaneStart(
+                new Vec3d(10.5, 64.0, 12.5),
+                eastLane(),
+                new BlockPos(10, 65, 12),
+                eastLaneBounds()
+        ));
+    }
+
+    @Test
+    void partialLaneResumeStandingTargetUsesSameStagingRule() {
+        GroundedSweepLane lane = eastLane();
+        GroundedSchematicBounds bounds = eastLaneBounds();
+        BlockPos resumeStanding = new BlockPos(12, 65, 12);
+
+        assertFalse(GroundedSingleLaneDebugRunner.isReadyForLaneStart(
+                new Vec3d(12.5, 64.0, 13.6),
+                lane,
+                resumeStanding,
+                bounds
+        ));
+        assertTrue(GroundedSingleLaneDebugRunner.isReadyForLaneStart(
+                new Vec3d(12.5, 64.0, 12.5),
+                lane,
+                resumeStanding,
+                bounds
+        ));
+    }
+
+    @Test
     void missedPlacementIsRemovedFromPendingAfterRecording() {
         GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
         assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
@@ -815,6 +886,19 @@ class GroundedSingleLaneDebugRunnerTest {
     }
 
     @Test
+    void startApproachTimeoutFailsWithClearReason() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
+
+        runner.forceStartApproachTimeoutForTests();
+
+        GroundedSingleLaneDebugRunner.DebugStatus status = runner.status();
+        assertFalse(status.active());
+        assertEquals(GroundedLaneWalkState.FAILED, status.walkState());
+        assertEquals("Unable to reach valid lane start staging position", status.failureReason().orElseThrow());
+    }
+
+    @Test
     void stopDuringLaneTransitionClearsShiftState() {
         GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
         assertTrue(runner.startFullSweep(sessionWithOrigin(new Vec3i(5, 1, 11)), GroundedSweepSettings.defaults()).isEmpty());
@@ -903,6 +987,26 @@ class GroundedSingleLaneDebugRunnerTest {
 
     private static BuildSession sessionWithOrigin() {
         return sessionWithOrigin(new Vec3i(5, 1, 5));
+    }
+
+    private static GroundedSweepLane eastLane() {
+        return new GroundedSweepLane(
+                0,
+                12,
+                GroundedLaneDirection.EAST,
+                new BlockPos(10, 64, 12),
+                new BlockPos(14, 64, 12),
+                new GroundedLaneCorridorBounds(10, 14, 10, 14),
+                1.0
+        );
+    }
+
+    private static GroundedSchematicBounds eastLaneBounds() {
+        return new GroundedSchematicBounds(
+                new BlockPos(10, 64, 10),
+                new BlockPos(10, 64, 10),
+                new BlockPos(14, 64, 14)
+        );
     }
 
     private static void markLaneComplete(BuildPlan plan, BlockPos origin, int sweepHalfWidth, GroundedSweepLane lane, java.util.Set<BlockPos> world) {
