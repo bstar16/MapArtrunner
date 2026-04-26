@@ -440,6 +440,15 @@ class GroundedSingleLaneDebugRunnerTest {
     }
 
     @Test
+    void snapshotRateLimitUsesDedicatedDiagnosticsTickCounterCadence() {
+        assertFalse(GroundedSingleLaneDebugRunner.shouldEmitGroundedSnapshotForTick(1));
+        assertFalse(GroundedSingleLaneDebugRunner.shouldEmitGroundedSnapshotForTick(19));
+        assertTrue(GroundedSingleLaneDebugRunner.shouldEmitGroundedSnapshotForTick(20));
+        assertFalse(GroundedSingleLaneDebugRunner.shouldEmitGroundedSnapshotForTick(21));
+        assertTrue(GroundedSingleLaneDebugRunner.shouldEmitGroundedSnapshotForTick(40));
+    }
+
+    @Test
     void smartResumePartialLaneSkipsTargetsBehindResumeProgress() {
         GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
         BuildSession session = rectangularSessionWithOrigin(new Vec3i(11, 1, 5));

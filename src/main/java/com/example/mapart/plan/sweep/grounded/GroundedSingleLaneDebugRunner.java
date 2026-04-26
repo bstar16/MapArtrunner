@@ -85,6 +85,7 @@ public final class GroundedSingleLaneDebugRunner {
 
     private boolean groundedTraceEnabled;
     private long lastGroundedSnapshotTick = -1;
+    private long groundedTraceTickCounter;
     private boolean corridorWarningActive;
 
     private DebugStatus lastStatus = new DebugStatus(
@@ -264,6 +265,7 @@ public final class GroundedSingleLaneDebugRunner {
     }
 
     public void tick(MinecraftClient client, boolean constantSprint) {
+        groundedTraceTickCounter++;
         if (client == null || client.player == null || activeLane == null || activeBounds == null || activeSession == null) {
             return;
         }
@@ -758,6 +760,7 @@ public final class GroundedSingleLaneDebugRunner {
         displacementAlert.reset();
         corridorWarningActive = false;
         lastGroundedSnapshotTick = -1;
+        groundedTraceTickCounter = 0;
 
         runMode = SweepRunMode.SINGLE_LANE;
         forwardLanes = List.of();
@@ -1326,11 +1329,19 @@ public final class GroundedSingleLaneDebugRunner {
         if (!groundedTraceEnabled) {
             return;
         }
-        if (laneTicksElapsed > 0 && (laneTicksElapsed - lastGroundedSnapshotTick) < GROUNDED_TRACE_SNAPSHOT_INTERVAL_TICKS) {
+        if (!shouldEmitGroundedSnapshotForTick(groundedTraceTickCounter)) {
             return;
         }
-        lastGroundedSnapshotTick = laneTicksElapsed;
+        if (lastGroundedSnapshotTick == groundedTraceTickCounter) {
+            return;
+        }
+        lastGroundedSnapshotTick = groundedTraceTickCounter;
         MapArtMod.LOGGER.info("[grounded-trace:snapshot] {}", groundedSnapshot(client));
+    }
+
+    static boolean shouldEmitGroundedSnapshotForTick(long diagnosticsTickCounter) {
+        return diagnosticsTickCounter > 0
+                && diagnosticsTickCounter % GROUNDED_TRACE_SNAPSHOT_INTERVAL_TICKS == 0;
     }
 
     private String groundedSnapshot(MinecraftClient client) {
@@ -1515,6 +1526,7 @@ public final class GroundedSingleLaneDebugRunner {
         displacementAlert.reset();
         corridorWarningActive = false;
         lastGroundedSnapshotTick = -1;
+        groundedTraceTickCounter = 0;
     }
 
     private void activateLane(GroundedSweepLane lane, Set<Integer> placementFilter) {
