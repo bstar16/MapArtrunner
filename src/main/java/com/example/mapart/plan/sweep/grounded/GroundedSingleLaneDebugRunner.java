@@ -29,6 +29,8 @@ public final class GroundedSingleLaneDebugRunner {
     private static final int PLACEMENT_VERIFICATION_DELAY_TICKS = 3;
     private static final double LANE_SHIFT_REACH_DISTANCE_SQ = 1.5 * 1.5;
     private static final double LANE_SHIFT_CENTERLINE_TOLERANCE = 0.5;
+    private static final double LANE_SHIFT_START_BACK_TOLERANCE = 0.7;
+    private static final double LANE_SHIFT_START_FORWARD_TOLERANCE = 0.2;
 
     private final GroundedSweepLanePlanner lanePlanner = new GroundedSweepLanePlanner();
     private final GroundedLaneWalker laneWalker = new GroundedLaneWalker();
@@ -241,7 +243,7 @@ public final class GroundedSingleLaneDebugRunner {
             return;
         }
         if (isLaneShiftComplete(playerPosition, laneShiftPlan, pendingShiftLane)) {
-            beginShiftedLane(constantSprint);
+            beginShiftedLane(null, constantSprint);
         }
     }
 
@@ -251,6 +253,10 @@ public final class GroundedSingleLaneDebugRunner {
 
     Optional<LaneShiftPlan> laneShiftPlanForTests() {
         return Optional.ofNullable(laneShiftPlan);
+    }
+
+    Optional<GroundedLaneWalker.GroundedLaneWalkCommand> laneWalkCommandForTests() {
+        return laneWalker.currentCommand();
     }
 
     void finalizeTerminalStateForTests(GroundedLaneWalker.GroundedLaneWalkState terminalState, Optional<String> failureReason) {
@@ -706,14 +712,14 @@ public final class GroundedSingleLaneDebugRunner {
             return;
         }
         if (isLaneShiftComplete(client.player.getEntityPos(), laneShiftPlan, pendingShiftLane)) {
-            beginShiftedLane(constantSprint);
-            applyLaneControls(client);
+            beginShiftedLane(client, constantSprint);
             return;
         }
         applyShiftControls(client, laneShiftPlan.shiftDirection(), constantSprint);
     }
 
-    private void beginShiftedLane(boolean constantSprint) {
+    private void beginShiftedLane(MinecraftClient client, boolean constantSprint) {
+        prepareNextLaneStart(client, pendingShiftLane);
         awaitingLaneShift = false;
         laneShiftTarget = null;
         laneShiftPlan = null;
@@ -735,6 +741,16 @@ public final class GroundedSingleLaneDebugRunner {
                 currentLeftovers,
                 sweepPassPhase
         );
+    }
+
+    private static void prepareNextLaneStart(MinecraftClient client, GroundedSweepLane lane) {
+        if (client == null || lane == null) {
+            return;
+        }
+        clearControls(client);
+        if (client.player != null) {
+            client.player.setYaw(lane.direction().yawDegrees());
+        }
     }
 
     private static void applyShiftControls(MinecraftClient client, GroundedLaneDirection shiftDirection, boolean constantSprint) {
@@ -773,12 +789,29 @@ public final class GroundedSingleLaneDebugRunner {
         if (centerlineDelta > LANE_SHIFT_CENTERLINE_TOLERANCE) {
             return false;
         }
-        double playerForward = nextLane.direction().progressCoordinate(playerPosition.x, playerPosition.z);
-        double laneStartForward = nextLane.direction().progressCoordinate(
-                nextLane.startPoint().getX() + 0.5,
-                nextLane.startPoint().getZ() + 0.5
+        if (!isInsideLaneCorridor(playerPosition, nextLane)) {
+            return false;
+        }
+        double signedForwardOffset = signedForwardOffsetFromLaneStart(playerPosition, nextLane);
+        return signedForwardOffset >= -LANE_SHIFT_START_BACK_TOLERANCE
+                && signedForwardOffset <= LANE_SHIFT_START_FORWARD_TOLERANCE;
+    }
+
+    private static boolean isInsideLaneCorridor(Vec3d playerPosition, GroundedSweepLane lane) {
+        GroundedLaneCorridorBounds corridor = lane.corridorBounds();
+        return playerPosition.x >= corridor.minX() - 0.5
+                && playerPosition.x <= corridor.maxX() + 1.5
+                && playerPosition.z >= corridor.minZ() - 0.5
+                && playerPosition.z <= corridor.maxZ() + 1.5;
+    }
+
+    private static double signedForwardOffsetFromLaneStart(Vec3d playerPosition, GroundedSweepLane lane) {
+        double playerForward = lane.direction().progressCoordinate(playerPosition.x, playerPosition.z);
+        double laneStartForward = lane.direction().progressCoordinate(
+                lane.startPoint().getX() + 0.5,
+                lane.startPoint().getZ() + 0.5
         );
-        return Math.abs(playerForward - laneStartForward) <= nextLane.endpointTolerance();
+        return (playerForward - laneStartForward) * lane.direction().forwardSign();
     }
 
     static LaneShiftPlan buildLaneShiftPlan(GroundedSweepLane fromLane, GroundedSweepLane toLane, GroundedSchematicBounds bounds) {
