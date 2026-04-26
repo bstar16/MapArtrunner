@@ -338,6 +338,20 @@ class GroundedSingleLaneDebugRunnerTest {
     }
 
     @Test
+    void laneZeroToLaneOneTransitionRemainsForwardPhaseAndAwaitsShift() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        assertTrue(runner.startFullSweep(sessionWithOrigin(new Vec3i(5, 1, 11)), GroundedSweepSettings.defaults()).isEmpty());
+
+        runner.advanceSweepToNextLaneForTests();
+
+        GroundedSingleLaneDebugRunner.DebugStatus status = runner.status();
+        assertEquals(GroundedSingleLaneDebugRunner.SweepPassPhase.FORWARD, status.phase());
+        assertEquals(1, status.laneIndex());
+        assertTrue(status.awaitingLaneShift());
+        assertFalse(status.awaitingStartApproach());
+    }
+
+    @Test
     void laneShiftCompletionDoesNotCallBaritoneAgain() {
         RecordingBaritoneFacade baritone = new RecordingBaritoneFacade();
         GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(baritone);
@@ -357,6 +371,7 @@ class GroundedSingleLaneDebugRunnerTest {
         GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
         assertTrue(runner.startFullSweep(sessionWithOrigin(new Vec3i(5, 1, 11)), GroundedSweepSettings.defaults()).isEmpty());
         runner.advanceSweepToNextLaneForTests();
+        GroundedSingleLaneDebugRunner.LaneShiftPlan plan = runner.laneShiftPlanForTests().orElseThrow();
 
         GroundedSingleLaneDebugRunner.DebugStatus shifting = runner.status();
         assertTrue(shifting.awaitingLaneShift());
@@ -368,6 +383,7 @@ class GroundedSingleLaneDebugRunnerTest {
         GroundedSingleLaneDebugRunner.DebugStatus shifted = runner.status();
         assertFalse(shifted.awaitingLaneShift());
         assertEquals(GroundedLaneWalkState.ACTIVE, shifted.walkState());
+        assertEquals(plan.toLane().direction().yawDegrees(), runner.laneWalkCommandForTests().orElseThrow().yaw());
     }
 
     @Test
@@ -497,6 +513,57 @@ class GroundedSingleLaneDebugRunnerTest {
         GroundedSingleLaneDebugRunner.DebugStatus shifted = runner.status();
         assertFalse(shifted.awaitingLaneShift());
         assertEquals(GroundedLaneWalkState.ACTIVE, shifted.walkState());
+    }
+
+    @Test
+    void laneShiftDoesNotCompleteWhenPlayerIsOutsideNextLaneCorridor() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        assertTrue(runner.startFullSweep(sessionWithOrigin(new Vec3i(5, 1, 11)), GroundedSweepSettings.defaults()).isEmpty());
+        runner.advanceSweepToNextLaneForTests();
+        GroundedSingleLaneDebugRunner.LaneShiftPlan plan = runner.laneShiftPlanForTests().orElseThrow();
+        BlockPos shiftTarget = runner.laneShiftTargetForTests().orElseThrow();
+
+        runner.completeLaneShiftIfNearForTests(new Vec3d(-20.0, 64.0, plan.targetCenterlineCoordinate() + 0.5), false);
+        GroundedSingleLaneDebugRunner.DebugStatus stillShifting = runner.status();
+        assertTrue(stillShifting.awaitingLaneShift());
+        assertEquals(GroundedLaneWalkState.IDLE, stillShifting.walkState());
+
+        runner.completeLaneShiftIfNearForTests(new Vec3d(shiftTarget.getX() + 0.5, 64.0, shiftTarget.getZ() + 0.5), false);
+        GroundedSingleLaneDebugRunner.DebugStatus shifted = runner.status();
+        assertFalse(shifted.awaitingLaneShift());
+        assertEquals(GroundedLaneWalkState.ACTIVE, shifted.walkState());
+    }
+
+    @Test
+    void laneShiftDoesNotCompleteWhenPlayerIsBeyondNextLaneStart() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        assertTrue(runner.startFullSweep(sessionWithOrigin(new Vec3i(5, 1, 11)), GroundedSweepSettings.defaults()).isEmpty());
+        runner.advanceSweepToNextLaneForTests();
+        GroundedSingleLaneDebugRunner.LaneShiftPlan plan = runner.laneShiftPlanForTests().orElseThrow();
+        BlockPos shiftTarget = runner.laneShiftTargetForTests().orElseThrow();
+
+        runner.completeLaneShiftIfNearForTests(new Vec3d(shiftTarget.getX() - 1.0, 64.0, plan.targetCenterlineCoordinate() + 0.5), false);
+        GroundedSingleLaneDebugRunner.DebugStatus stillShifting = runner.status();
+        assertTrue(stillShifting.awaitingLaneShift());
+        assertEquals(GroundedLaneWalkState.IDLE, stillShifting.walkState());
+
+        runner.completeLaneShiftIfNearForTests(new Vec3d(shiftTarget.getX() + 0.5, 64.0, shiftTarget.getZ() + 0.5), false);
+        GroundedSingleLaneDebugRunner.DebugStatus shifted = runner.status();
+        assertFalse(shifted.awaitingLaneShift());
+        assertEquals(GroundedLaneWalkState.ACTIVE, shifted.walkState());
+    }
+
+    @Test
+    void reversePhaseDoesNotStartAfterFirstForwardLane() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        assertTrue(runner.startFullSweep(sessionWithOrigin(new Vec3i(5, 1, 11)), GroundedSweepSettings.defaults()).isEmpty());
+
+        runner.advanceSweepToNextLaneForTests();
+
+        GroundedSingleLaneDebugRunner.DebugStatus status = runner.status();
+        assertEquals(GroundedSingleLaneDebugRunner.SweepPassPhase.FORWARD, status.phase());
+        assertTrue(status.awaitingLaneShift());
+        assertEquals(1, status.laneIndex());
     }
 
     @Test
