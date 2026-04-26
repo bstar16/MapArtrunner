@@ -304,15 +304,82 @@ class GroundedSingleLaneDebugRunnerTest {
 
     @Test
     void fullSweepStartsInForwardPhaseOnNorthWestAnchoredLane() {
-        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        RecordingBaritoneFacade baritone = new RecordingBaritoneFacade();
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(baritone);
         BuildSession session = sessionWithOrigin();
 
         assertTrue(runner.startFullSweep(session, GroundedSweepSettings.defaults()).isEmpty());
+        runner.issueStartApproachIfNeeded();
 
         GroundedSingleLaneDebugRunner.DebugStatus status = runner.status();
         assertTrue(status.active());
         assertEquals(GroundedSingleLaneDebugRunner.SweepPassPhase.FORWARD, status.phase());
         assertEquals(0, status.laneIndex());
+        assertTrue(status.awaitingStartApproach());
+        assertFalse(status.awaitingLaneShift());
+        assertEquals(1, baritone.goToCalls);
+    }
+
+    @Test
+    void fullSweepLaneAdvanceUsesNativeLaneShiftInsteadOfStartApproach() {
+        RecordingBaritoneFacade baritone = new RecordingBaritoneFacade();
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(baritone);
+        assertTrue(runner.startFullSweep(sessionWithOrigin(new Vec3i(5, 1, 11)), GroundedSweepSettings.defaults()).isEmpty());
+        runner.issueStartApproachIfNeeded();
+        assertEquals(1, baritone.goToCalls);
+
+        runner.advanceSweepToNextLaneForTests();
+        GroundedSingleLaneDebugRunner.DebugStatus status = runner.status();
+        assertTrue(status.awaitingLaneShift());
+        assertFalse(status.awaitingStartApproach());
+
+        runner.issueStartApproachIfNeeded();
+        assertEquals(1, baritone.goToCalls);
+    }
+
+    @Test
+    void laneShiftCompletionStartsNextLaneWalker() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        assertTrue(runner.startFullSweep(sessionWithOrigin(new Vec3i(5, 1, 11)), GroundedSweepSettings.defaults()).isEmpty());
+        runner.advanceSweepToNextLaneForTests();
+
+        GroundedSingleLaneDebugRunner.DebugStatus shifting = runner.status();
+        assertTrue(shifting.awaitingLaneShift());
+        assertEquals(GroundedLaneWalkState.IDLE, shifting.walkState());
+
+        BlockPos shiftTarget = runner.laneShiftTargetForTests().orElseThrow();
+        runner.completeLaneShiftIfNearForTests(new Vec3d(shiftTarget.getX() + 0.5, 64.0, shiftTarget.getZ() + 0.5), false);
+
+        GroundedSingleLaneDebugRunner.DebugStatus shifted = runner.status();
+        assertFalse(shifted.awaitingLaneShift());
+        assertEquals(GroundedLaneWalkState.ACTIVE, shifted.walkState());
+    }
+
+    @Test
+    void reverseSweepTransitionsAlsoUseNativeLaneShift() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        assertTrue(runner.startFullSweep(sessionWithOrigin(), GroundedSweepSettings.defaults()).isEmpty());
+
+        runner.seedLanePlacementsForTests(List.of(new GroundedSweepPlacementExecutor.PlacementTarget(42, new BlockPos(11, 64, 10))));
+        runner.advanceSweepToNextLaneForTests(); // complete forward lane and move to reverse lane
+
+        GroundedSingleLaneDebugRunner.DebugStatus status = runner.status();
+        assertEquals(GroundedSingleLaneDebugRunner.SweepPassPhase.REVERSE, status.phase());
+        assertTrue(status.awaitingLaneShift());
+        assertFalse(status.awaitingStartApproach());
+    }
+
+    @Test
+    void singleLaneStartStillUsesStartApproachBehavior() {
+        RecordingBaritoneFacade baritone = new RecordingBaritoneFacade();
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(baritone);
+        assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
+
+        GroundedSingleLaneDebugRunner.DebugStatus status = runner.status();
+        assertTrue(status.awaitingStartApproach());
+        assertFalse(status.awaitingLaneShift());
+        runner.issueStartApproachIfNeeded();
+        assertEquals(1, baritone.goToCalls);
     }
 
     @Test
@@ -348,7 +415,11 @@ class GroundedSingleLaneDebugRunnerTest {
     }
 
     private static BuildSession sessionWithOrigin() {
-        BuildPlan plan = buildPlan(List.of(new Placement(new BlockPos(0, 0, 0), null)));
+        return sessionWithOrigin(new Vec3i(5, 1, 5));
+    }
+
+    private static BuildSession sessionWithOrigin(Vec3i dimensions) {
+        BuildPlan plan = buildPlan(dimensions, List.of(new Placement(new BlockPos(0, 0, 0), null)));
 
         BuildSession session = new BuildSession(plan);
         session.setOrigin(new BlockPos(10, 64, 10));
@@ -356,10 +427,14 @@ class GroundedSingleLaneDebugRunnerTest {
     }
 
     private static BuildPlan buildPlan(List<Placement> placements) {
+        return buildPlan(new Vec3i(5, 1, 5), placements);
+    }
+
+    private static BuildPlan buildPlan(Vec3i dimensions, List<Placement> placements) {
         return new BuildPlan(
                 "test",
                 Path.of("plan.schem"),
-                new Vec3i(5, 1, 5),
+                dimensions,
                 placements,
                 Map.of(),
                 List.of()
@@ -368,10 +443,12 @@ class GroundedSingleLaneDebugRunnerTest {
 
     private static final class RecordingBaritoneFacade implements BaritoneFacade {
         private BlockPos lastGoToTarget;
+        private int goToCalls;
 
         @Override
         public CommandResult goTo(BlockPos target) {
             lastGoToTarget = target;
+            goToCalls++;
             return CommandResult.success("ok");
         }
 

@@ -469,6 +469,7 @@ public final class MapArtCommand {
                 + ", phase=" + status.phase()
                 + ", state=" + status.walkState()
                 + ", awaitingStartApproach=" + status.awaitingStartApproach()
+                + ", awaitingLaneShift=" + status.awaitingLaneShift()
                 + ", ticks=" + status.ticksElapsed()
                 + ", success=" + status.successfulPlacements()
                 + ", missed=" + status.missedPlacements()
