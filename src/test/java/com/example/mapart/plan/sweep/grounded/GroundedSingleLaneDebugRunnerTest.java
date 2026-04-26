@@ -322,6 +322,88 @@ class GroundedSingleLaneDebugRunnerTest {
     }
 
     @Test
+    void smartResumeFreshWorldStartsAtLaneZero() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        BuildSession session = rectangularSession(11, 11);
+
+        Optional<String> error = runner.startFullSweep(
+                session,
+                GroundedSweepSettings.defaults(),
+                new Vec3d(10.5, 65.0, 10.5),
+                (worldPos, expectedBlock) -> false
+        );
+
+        assertTrue(error.isEmpty());
+        GroundedSingleLaneDebugRunner.DebugStatus status = runner.status();
+        assertEquals(0, status.laneIndex());
+        assertEquals(GroundedSingleLaneDebugRunner.SweepPassPhase.FORWARD, status.phase());
+    }
+
+    @Test
+    void smartResumeSkipsCompletedLeadingLane() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        BuildSession session = rectangularSession(11, 11);
+        GroundedSweepSettings settings = GroundedSweepSettings.defaults();
+        GroundedSchematicBounds bounds = GroundedSchematicBounds.fromPlan(session.getPlan(), session.getOrigin());
+        List<GroundedSweepLane> lanes = new GroundedSweepLanePlanner().planLanes(bounds, settings);
+        GroundedSweepLane lane0 = lanes.getFirst();
+
+        Optional<String> error = runner.startFullSweep(
+                session,
+                settings,
+                new Vec3d(16.5, 65.0, 16.5),
+                (worldPos, expectedBlock) -> worldPos.getX() >= lane0.corridorBounds().minX()
+                        && worldPos.getX() <= lane0.corridorBounds().maxX()
+                        && worldPos.getZ() >= lane0.corridorBounds().minZ()
+                        && worldPos.getZ() <= lane0.corridorBounds().maxZ()
+        );
+
+        assertTrue(error.isEmpty());
+        GroundedSingleLaneDebugRunner.DebugStatus status = runner.status();
+        assertTrue(status.laneIndex() >= 1);
+        assertTrue(status.smartResumeUsed());
+    }
+
+    @Test
+    void smartResumeCompleteWorldDoesNotStartRunner() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        BuildSession session = rectangularSession(6, 6);
+
+        Optional<String> error = runner.startFullSweep(
+                session,
+                GroundedSweepSettings.defaults(),
+                new Vec3d(10.5, 65.0, 10.5),
+                (worldPos, expectedBlock) -> true
+        );
+
+        assertTrue(error.isPresent());
+        assertFalse(runner.isActive());
+        assertEquals(GroundedLaneWalkState.COMPLETE, runner.status().walkState());
+    }
+
+    @Test
+    void smartResumePartialLaneFiltersPlacementsBehindResumeProgress() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        BuildSession session = rectangularSession(11, 11);
+        GroundedSweepSettings settings = GroundedSweepSettings.defaults();
+        GroundedSchematicBounds bounds = GroundedSchematicBounds.fromPlan(session.getPlan(), session.getOrigin());
+        GroundedSweepLane lane0 = new GroundedSweepLanePlanner().planLanes(bounds, settings).getFirst();
+        int resumeAtX = lane0.startPoint().getX() + 3;
+
+        Optional<String> error = runner.startFullSweep(
+                session,
+                settings,
+                new Vec3d(resumeAtX + 0.5, 65.0, lane0.centerlineCoordinate() + 0.5),
+                (worldPos, expectedBlock) -> worldPos.getX() < resumeAtX
+        );
+
+        assertTrue(error.isEmpty());
+        assertTrue(runner.pendingPlacementIndicesForTests().stream()
+                .map(idx -> session.getOrigin().add(session.getPlan().placements().get(idx).relativePos()).getX())
+                .allMatch(x -> x >= resumeAtX));
+    }
+
+    @Test
     void fullSweepLaneAdvanceUsesNativeLaneShiftInsteadOfStartApproach() {
         RecordingBaritoneFacade baritone = new RecordingBaritoneFacade();
         GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(baritone);
@@ -726,6 +808,18 @@ class GroundedSingleLaneDebugRunnerTest {
 
     private static BuildSession sessionWithOrigin() {
         return sessionWithOrigin(new Vec3i(5, 1, 5));
+    }
+
+    private static BuildSession rectangularSession(int x, int z) {
+        List<Placement> placements = new java.util.ArrayList<>();
+        for (int zz = 0; zz < z; zz++) {
+            for (int xx = 0; xx < x; xx++) {
+                placements.add(new Placement(new BlockPos(xx, 0, zz), null));
+            }
+        }
+        BuildSession session = new BuildSession(buildPlan(new Vec3i(x, 1, z), placements));
+        session.setOrigin(new BlockPos(10, 64, 10));
+        return session;
     }
 
     private static BuildSession sessionWithOrigin(Vec3i dimensions) {

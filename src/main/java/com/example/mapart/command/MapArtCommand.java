@@ -31,6 +31,7 @@ import net.minecraft.item.Item;
 import net.minecraft.registry.Registries;
 import net.minecraft.text.Text;
 import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Vec3d;
 
 import java.nio.file.Path;
 import java.util.Comparator;
@@ -470,6 +471,10 @@ public final class MapArtCommand {
                 + ", state=" + status.walkState()
                 + ", awaitingStartApproach=" + status.awaitingStartApproach()
                 + ", awaitingLaneShift=" + status.awaitingLaneShift()
+                + ", smartResumeUsed=" + status.smartResumeUsed()
+                + ", resumeReason=" + status.resumeReason()
+                + ", resumeLane=" + status.resumeLaneIndex()
+                + ", skippedCompletedLanes=" + status.skippedCompletedLaneCount()
                 + ", ticks=" + status.ticksElapsed()
                 + ", success=" + status.successfulPlacements()
                 + ", missed=" + status.missedPlacements()
@@ -517,13 +522,24 @@ public final class MapArtCommand {
         }
 
         GroundedSweepSettings groundedSettings = groundedSettings(settingsStore.current());
-        Optional<String> error = runner.startFullSweep(session.get(), groundedSettings);
+        Vec3d playerPosition = source.getPlayer() == null ? source.getPosition() : source.getPlayer().getEntityPos();
+        Optional<String> error = runner.startFullSweep(
+                session.get(),
+                groundedSettings,
+                playerPosition,
+                (worldPos, expectedBlock) -> source.getWorld().getBlockState(worldPos).isOf(expectedBlock)
+        );
         if (error.isPresent()) {
             source.sendError(Text.literal(error.get()));
             return 0;
         }
 
-        source.sendFeedback(Text.literal("Started debug grounded full serpentine sweep (forward + reverse leftovers)."));
+        GroundedSingleLaneDebugRunner.DebugStatus status = runner.status();
+        source.sendFeedback(Text.literal("Started debug grounded full serpentine sweep (forward + reverse leftovers). "
+                + "smartResumeUsed=" + status.smartResumeUsed()
+                + ", reason=" + status.resumeReason()
+                + ", lane=" + status.resumeLaneIndex()
+                + ", skippedCompletedLanes=" + status.skippedCompletedLaneCount()));
         return 1;
     }
 
