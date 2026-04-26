@@ -6,6 +6,7 @@ import com.example.mapart.plan.BuildPlan;
 import com.example.mapart.plan.Placement;
 import com.example.mapart.plan.sweep.grounded.GroundedLaneWalker.GroundedLaneWalkState;
 import com.example.mapart.plan.state.BuildSession;
+import com.example.mapart.plan.state.PlacementResult;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.util.math.Vec3i;
@@ -180,6 +181,114 @@ class GroundedSingleLaneDebugRunnerTest {
         runner.recordPlacementOutcomeForTests(2, GroundedSweepPlacementExecutor.PlacementResult.SUCCESS, 1);
 
         assertTrue(runner.pendingPlacementIndicesForTests().isEmpty());
+    }
+
+    @Test
+    void placedAttemptQueuesPendingVerificationInsteadOfImmediateSuccess() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
+        Placement placement = new Placement(new BlockPos(1, 0, 2), null);
+        runner.seedPlacementDefinitionForTests(7, placement);
+        runner.seedLanePlacementsForTests(List.of(new GroundedSweepPlacementExecutor.PlacementTarget(7, new BlockPos(11, 64, 12))));
+
+        runner.recordPlacementAttemptStatusForTests(7, PlacementResult.Status.PLACED, 100);
+
+        GroundedSingleLaneDebugRunner.DebugStatus status = runner.status();
+        assertEquals(0, status.successfulPlacements());
+        assertEquals(1, status.pendingVerification());
+        assertEquals(List.of(7), runner.pendingPlacementIndicesForTests());
+        assertTrue(runner.rankedPlacementIndicesForTests(11, 101).isEmpty());
+    }
+
+    @Test
+    void dueVerificationMatchConfirmsSuccessAndClearsPendingVerification() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
+        Placement placement = new Placement(new BlockPos(1, 0, 2), null);
+        runner.seedLanePlacementsForTests(List.of(new GroundedSweepPlacementExecutor.PlacementTarget(8, new BlockPos(11, 64, 12))));
+        runner.queuePendingVerificationForTests(8, placement, new BlockPos(11, 64, 12), 10);
+
+        runner.processPendingVerificationsForTests(10, index -> index == 8, false);
+        runner.tickPlacementSelectionForTests(11, 11);
+
+        GroundedSingleLaneDebugRunner.DebugStatus status = runner.status();
+        assertEquals(1, status.successfulPlacements());
+        assertEquals(0, status.pendingVerification());
+        assertTrue(runner.pendingPlacementIndicesForTests().isEmpty());
+        assertTrue(status.leftovers().stream().noneMatch(leftover -> leftover.placementIndex() == 8));
+    }
+
+    @Test
+    void dueVerificationMismatchBecomesMissedLeftoverWithoutStoppingLane() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
+        Placement placement = new Placement(new BlockPos(1, 0, 2), null);
+        runner.seedLanePlacementsForTests(List.of(new GroundedSweepPlacementExecutor.PlacementTarget(9, new BlockPos(11, 64, 12))));
+        runner.queuePendingVerificationForTests(9, placement, new BlockPos(11, 64, 12), 10);
+
+        runner.processPendingVerificationsForTests(10, index -> false, false);
+        runner.tickPlacementSelectionForTests(11, 11);
+
+        GroundedSingleLaneDebugRunner.DebugStatus status = runner.status();
+        assertEquals(1, status.missedPlacements());
+        assertEquals(0, status.pendingVerification());
+        assertTrue(status.active());
+        assertTrue(runner.pendingPlacementIndicesForTests().isEmpty());
+        GroundedSweepLeftoverTracker.GroundedLeftoverRecord record = status.leftovers().stream()
+                .filter(leftover -> leftover.placementIndex() == 9)
+                .findFirst()
+                .orElseThrow();
+        assertEquals(List.of(GroundedSweepLeftoverTracker.GroundedLeftoverReason.MISSED), record.reasons());
+    }
+
+    @Test
+    void alreadyCorrectRemainsImmediateSuccess() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
+        runner.seedLanePlacementsForTests(List.of(new GroundedSweepPlacementExecutor.PlacementTarget(10, new BlockPos(11, 64, 12))));
+
+        runner.recordPlacementAttemptStatusForTests(10, PlacementResult.Status.ALREADY_CORRECT, 5);
+
+        GroundedSingleLaneDebugRunner.DebugStatus status = runner.status();
+        assertEquals(1, status.successfulPlacements());
+        assertEquals(0, status.pendingVerification());
+        assertTrue(runner.pendingPlacementIndicesForTests().isEmpty());
+    }
+
+    @Test
+    void missingItemAndErrorRemainFinalFailures() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
+        runner.seedLanePlacementsForTests(List.of(
+                new GroundedSweepPlacementExecutor.PlacementTarget(11, new BlockPos(11, 64, 12)),
+                new GroundedSweepPlacementExecutor.PlacementTarget(12, new BlockPos(12, 64, 12))
+        ));
+
+        runner.recordPlacementAttemptStatusForTests(11, PlacementResult.Status.MISSING_ITEM, 3);
+        runner.recordPlacementAttemptStatusForTests(12, PlacementResult.Status.ERROR, 3);
+        runner.tickPlacementSelectionForTests(11, 4);
+
+        GroundedSingleLaneDebugRunner.DebugStatus status = runner.status();
+        assertEquals(2, status.failedPlacements());
+        assertTrue(runner.pendingPlacementIndicesForTests().isEmpty());
+        assertTrue(status.leftovers().stream().anyMatch(leftover -> leftover.placementIndex() == 11
+                && leftover.reasons().contains(GroundedSweepLeftoverTracker.GroundedLeftoverReason.FAILED)));
+        assertTrue(status.leftovers().stream().anyMatch(leftover -> leftover.placementIndex() == 12
+                && leftover.reasons().contains(GroundedSweepLeftoverTracker.GroundedLeftoverReason.FAILED)));
+    }
+
+    @Test
+    void terminalStatusReflectsPendingVerificationState() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
+        Placement placement = new Placement(new BlockPos(1, 0, 2), null);
+        runner.queuePendingVerificationForTests(13, placement, new BlockPos(11, 64, 12), 100);
+
+        runner.finalizeTerminalStateForTests(GroundedLaneWalkState.COMPLETE, Optional.empty());
+
+        GroundedSingleLaneDebugRunner.DebugStatus status = runner.status();
+        assertFalse(status.active());
+        assertEquals(1, status.pendingVerification());
     }
 
     @Test

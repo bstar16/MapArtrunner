@@ -458,7 +458,8 @@ public final class MapArtCommand {
                     + ", success=" + status.successfulPlacements()
                     + ", missed=" + status.missedPlacements()
                     + ", failed=" + status.failedPlacements()
-                    + ", leftovers=" + status.leftovers().size()));
+                    + ", leftovers=" + status.leftovers().size()
+                    + ", pendingVerification=" + status.pendingVerification()));
             status.failureReason().ifPresent(reason -> source.sendFeedback(Text.literal("Failure reason: " + reason)));
             return 0;
         }
@@ -470,7 +471,8 @@ public final class MapArtCommand {
                 + ", success=" + status.successfulPlacements()
                 + ", missed=" + status.missedPlacements()
                 + ", failed=" + status.failedPlacements()
-                + ", leftovers=" + status.leftovers().size()));
+                + ", leftovers=" + status.leftovers().size()
+                + ", pendingVerification=" + status.pendingVerification()));
         status.failureReason().ifPresent(reason -> source.sendFeedback(Text.literal("Failure reason: " + reason)));
         if (!status.leftovers().isEmpty()) {
             GroundedSweepLeftoverTracker.GroundedLeftoverRecord record = status.leftovers().getFirst();
