@@ -24,11 +24,21 @@ class SettingsAndSupplyStoreTest {
         assertTrue(store.set("showHud", "false").isEmpty());
         assertTrue(store.set("hudX", "42").isEmpty());
         assertTrue(store.set("preferLongerAxis", "true").isEmpty());
+        assertTrue(store.set("groundedDebugTrace", "true").isEmpty());
 
         MapartSettingsStore restored = new MapartSettingsStore(settingsPath);
         assertFalse(restored.current().showHud());
         assertEquals(42, restored.current().hudX());
         assertTrue(restored.current().preferLongerAxis());
+        assertTrue(restored.current().groundedDebugTrace());
+    }
+
+    @Test
+    void groundedTraceDefaultsDisabled() {
+        Path settingsPath = tempDir.resolve("settings-defaults.json");
+        MapartSettingsStore store = new MapartSettingsStore(settingsPath);
+
+        assertFalse(store.current().groundedDebugTrace());
     }
 
     @Test

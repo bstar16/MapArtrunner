@@ -272,6 +272,13 @@ public final class MapArtCommand {
                                         .executes(context -> debugGroundedSingleLaneStatus(context.getSource())))
                                 .then(ClientCommandManager.literal("stop")
                                         .executes(context -> debugGroundedSingleLaneStop(context.getSource()))))
+                        .then(ClientCommandManager.literal("grounded-trace")
+                                .then(ClientCommandManager.literal("on")
+                                        .executes(context -> setGroundedTrace(context.getSource(), settingsStore, true)))
+                                .then(ClientCommandManager.literal("off")
+                                        .executes(context -> setGroundedTrace(context.getSource(), settingsStore, false)))
+                                .then(ClientCommandManager.literal("status")
+                                        .executes(context -> groundedTraceStatus(context.getSource(), settingsStore))))
                 );
     }
 
@@ -550,6 +557,7 @@ public final class MapArtCommand {
                 settings.forwardLookaheadSteps(),
                 settings.trivialBehindCleanupSteps(),
                 settings.groundedSweepConstantSprint(),
+                settings.groundedDebugTrace(),
                 1.0
         );
     }
@@ -708,7 +716,24 @@ public final class MapArtCommand {
         source.sendFeedback(Text.literal("clientTimerSpeed=" + settings.clientTimerSpeed()));
         source.sendFeedback(Text.literal("hudX=" + settings.hudX()));
         source.sendFeedback(Text.literal("hudY=" + settings.hudY()));
+        source.sendFeedback(Text.literal("groundedDebugTrace=" + settings.groundedDebugTrace()));
         source.sendFeedback(Text.literal("clientTimerSpeed=" + ClientTimerController.getMultiplier()));
+        return 1;
+    }
+
+    private static int setGroundedTrace(FabricClientCommandSource source, MapartSettingsStore settingsStore, boolean enabled) {
+        Optional<String> error = settingsStore.set("groundedDebugTrace", Boolean.toString(enabled));
+        if (error.isPresent()) {
+            source.sendError(Text.literal(error.get()));
+            return 0;
+        }
+        source.sendFeedback(Text.literal("Grounded diagnostics trace " + (enabled ? "enabled" : "disabled") + "."));
+        return 1;
+    }
+
+    private static int groundedTraceStatus(FabricClientCommandSource source, MapartSettingsStore settingsStore) {
+        source.sendFeedback(Text.literal("Grounded diagnostics trace is "
+                + (settingsStore.current().groundedDebugTrace() ? "ON" : "OFF") + "."));
         return 1;
     }
 

@@ -53,6 +53,7 @@ public class MapartSettingsStore {
                 case "forwardlookaheadsteps" -> settings = with(forwardLookaheadSteps(parseNonNegativeInt(value, "forwardLookaheadSteps")));
                 case "trivialbehindcleanupsteps" -> settings = with(trivialBehindCleanupSteps(parseNonNegativeInt(value, "trivialBehindCleanupSteps")));
                 case "groundedsweepconstantsprint" -> settings = with(groundedSweepConstantSprint(parseBoolean(value)));
+                case "groundeddebugtrace" -> settings = with(groundedDebugTrace(parseBoolean(value)));
                 default -> {
                     return Optional.of("Unknown settings key: " + key);
                 }
@@ -82,7 +83,8 @@ public class MapartSettingsStore {
                 mutator.laneStride != null ? mutator.laneStride : current.laneStride(),
                 mutator.forwardLookaheadSteps != null ? mutator.forwardLookaheadSteps : current.forwardLookaheadSteps(),
                 mutator.trivialBehindCleanupSteps != null ? mutator.trivialBehindCleanupSteps : current.trivialBehindCleanupSteps(),
-                mutator.groundedSweepConstantSprint != null ? mutator.groundedSweepConstantSprint : current.groundedSweepConstantSprint()
+                mutator.groundedSweepConstantSprint != null ? mutator.groundedSweepConstantSprint : current.groundedSweepConstantSprint(),
+                mutator.groundedDebugTrace != null ? mutator.groundedDebugTrace : current.groundedDebugTrace()
         );
 
         validateGroundedSweepWidths(updated.sweepHalfWidth(), updated.sweepTotalWidth());
@@ -104,6 +106,7 @@ public class MapartSettingsStore {
     private static SettingsMutator forwardLookaheadSteps(int value) { return new SettingsMutator().forwardLookaheadSteps(value); }
     private static SettingsMutator trivialBehindCleanupSteps(int value) { return new SettingsMutator().trivialBehindCleanupSteps(value); }
     private static SettingsMutator groundedSweepConstantSprint(boolean value) { return new SettingsMutator().groundedSweepConstantSprint(value); }
+    private static SettingsMutator groundedDebugTrace(boolean value) { return new SettingsMutator().groundedDebugTrace(value); }
 
     private static boolean parseBoolean(String value) {
         if ("true".equalsIgnoreCase(value) || "false".equalsIgnoreCase(value)) {
@@ -185,7 +188,8 @@ public class MapartSettingsStore {
                     stored.laneStride == null ? defaults.laneStride() : parsePositiveInt(Integer.toString(stored.laneStride), "laneStride"),
                     stored.forwardLookaheadSteps == null ? defaults.forwardLookaheadSteps() : parseNonNegativeInt(Integer.toString(stored.forwardLookaheadSteps), "forwardLookaheadSteps"),
                     stored.trivialBehindCleanupSteps == null ? defaults.trivialBehindCleanupSteps() : parseNonNegativeInt(Integer.toString(stored.trivialBehindCleanupSteps), "trivialBehindCleanupSteps"),
-                    stored.groundedSweepConstantSprint == null ? defaults.groundedSweepConstantSprint() : stored.groundedSweepConstantSprint
+                    stored.groundedSweepConstantSprint == null ? defaults.groundedSweepConstantSprint() : stored.groundedSweepConstantSprint,
+                    stored.groundedDebugTrace == null ? defaults.groundedDebugTrace() : stored.groundedDebugTrace
             );
         } catch (RuntimeException exception) {
             MapArtMod.LOGGER.warn("Settings file {} is malformed; using defaults.", storagePath, exception);
@@ -238,6 +242,7 @@ public class MapartSettingsStore {
         private Integer forwardLookaheadSteps;
         private Integer trivialBehindCleanupSteps;
         private Boolean groundedSweepConstantSprint;
+        private Boolean groundedDebugTrace;
 
         SettingsMutator showHud(boolean value) { this.showHud = value; return this; }
         SettingsMutator showSchematicOverlay(boolean value) { this.showSchematicOverlay = value; return this; }
@@ -254,6 +259,7 @@ public class MapartSettingsStore {
         SettingsMutator forwardLookaheadSteps(int value) { this.forwardLookaheadSteps = value; return this; }
         SettingsMutator trivialBehindCleanupSteps(int value) { this.trivialBehindCleanupSteps = value; return this; }
         SettingsMutator groundedSweepConstantSprint(boolean value) { this.groundedSweepConstantSprint = value; return this; }
+        SettingsMutator groundedDebugTrace(boolean value) { this.groundedDebugTrace = value; return this; }
     }
 
     private static final class StoredSettings {
@@ -272,6 +278,7 @@ public class MapartSettingsStore {
         Integer forwardLookaheadSteps;
         Integer trivialBehindCleanupSteps;
         Boolean groundedSweepConstantSprint;
+        Boolean groundedDebugTrace;
 
         StoredSettings() {
         }
@@ -292,6 +299,7 @@ public class MapartSettingsStore {
             this.forwardLookaheadSteps = settings.forwardLookaheadSteps();
             this.trivialBehindCleanupSteps = settings.trivialBehindCleanupSteps();
             this.groundedSweepConstantSprint = settings.groundedSweepConstantSprint();
+            this.groundedDebugTrace = settings.groundedDebugTrace();
         }
     }
 }

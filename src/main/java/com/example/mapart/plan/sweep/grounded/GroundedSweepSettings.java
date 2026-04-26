@@ -8,6 +8,7 @@ public record GroundedSweepSettings(
         int forwardLookaheadSteps,
         int trivialBehindCleanupSteps,
         boolean groundedSweepConstantSprint,
+        boolean groundedDebugTrace,
         double endpointTolerance
 ) {
     public GroundedSweepSettings {
@@ -43,6 +44,7 @@ public record GroundedSweepSettings(
                 1,
                 1,
                 true,
+                false,
                 1.0
         );
     }

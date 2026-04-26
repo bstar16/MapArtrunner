@@ -27,7 +27,7 @@ class GroundedSweepLanePlannerTest {
 
     @Test
     void usesEastFirstWhenPreferLongerAxisIsDisabled() {
-        GroundedSweepSettings settings = new GroundedSweepSettings(false, 2, 5, 5, 1, 1, true, 1.0);
+        GroundedSweepSettings settings = new GroundedSweepSettings(false, 2, 5, 5, 1, 1, true, false, 1.0);
         GroundedSchematicBounds bounds = new GroundedSchematicBounds(
                 new BlockPos(0, 64, 0),
                 new BlockPos(0, 64, 0),
@@ -43,7 +43,7 @@ class GroundedSweepLanePlannerTest {
 
     @Test
     void followsLongerAxisOrientationWhenEnabled() {
-        GroundedSweepSettings settings = new GroundedSweepSettings(true, 2, 5, 5, 1, 1, true, 1.0);
+        GroundedSweepSettings settings = new GroundedSweepSettings(true, 2, 5, 5, 1, 1, true, false, 1.0);
         GroundedSchematicBounds zLongerBounds = new GroundedSchematicBounds(
                 new BlockPos(10, 64, 10),
                 new BlockPos(10, 64, 10),

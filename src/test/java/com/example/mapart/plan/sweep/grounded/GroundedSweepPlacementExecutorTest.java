@@ -220,6 +220,7 @@ class GroundedSweepPlacementExecutorTest {
                 2,
                 4,
                 true,
+                false,
                 1.0
         );
 

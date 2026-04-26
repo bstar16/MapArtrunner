@@ -431,6 +431,58 @@ class GroundedSingleLaneDebugRunnerTest {
     }
 
     @Test
+    void diagnosticsHelpersHandleMissingYawFieldsSafely() {
+        Object noYawFields = new Object();
+
+        assertEquals("unavailable", GroundedSingleLaneDebugRunner.readHeadYawForDiagnostics(noYawFields));
+        assertEquals("unavailable", GroundedSingleLaneDebugRunner.readBodyYawForDiagnostics(noYawFields));
+        assertEquals("unavailable", GroundedSingleLaneDebugRunner.readHeadYawForDiagnostics(null));
+        assertEquals("unavailable", GroundedSingleLaneDebugRunner.readBodyYawForDiagnostics(null));
+    }
+
+    @Test
+    void enablingTraceDoesNotChangeRunnerStateAtStart() {
+        GroundedSingleLaneDebugRunner traceRunner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        GroundedSingleLaneDebugRunner noTraceRunner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        BuildSession session = sessionWithOrigin();
+        GroundedSweepSettings traceSettings = new GroundedSweepSettings(false, 2, 5, 5, 1, 1, true, true, 1.0);
+
+        assertTrue(traceRunner.start(session, 0, traceSettings).isEmpty());
+        assertTrue(noTraceRunner.start(session, 0, GroundedSweepSettings.defaults()).isEmpty());
+
+        assertEquals(noTraceRunner.status().laneIndex(), traceRunner.status().laneIndex());
+        assertEquals(noTraceRunner.status().walkState(), traceRunner.status().walkState());
+        assertEquals(noTraceRunner.status().awaitingStartApproach(), traceRunner.status().awaitingStartApproach());
+    }
+
+    @Test
+    void smartResumeSelectionEventRecordedWhenTraceEnabled() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        BuildSession session = rectangularSessionWithOrigin(new Vec3i(11, 1, 5));
+        GroundedSweepSettings traceSettings = new GroundedSweepSettings(false, 2, 5, 5, 1, 1, true, true, 1.0);
+
+        assertTrue(runner.startFullSweepSmart(
+                session,
+                traceSettings,
+                new Vec3d(10.5, 65, 10.5),
+                (worldPos, expected) -> false
+        ).isEmpty());
+
+        assertTrue(runner.traceEventsForTests().stream().anyMatch(event -> event.contains("smart resume selected")));
+    }
+
+    @Test
+    void laneStageTransitionsAreRecordedWhenTraceEnabled() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        GroundedSweepSettings traceSettings = new GroundedSweepSettings(false, 2, 5, 5, 1, 1, true, true, 1.0);
+        assertTrue(runner.startFullSweep(sessionWithOrigin(new Vec3i(5, 1, 11)), traceSettings).isEmpty());
+
+        runner.advanceSweepToNextLaneForTests();
+
+        assertTrue(runner.traceEventsForTests().stream().anyMatch(event -> event.contains("awaitingLaneShift -> true")));
+    }
+
+    @Test
     void fullSweepLaneAdvanceUsesNativeLaneShiftInsteadOfStartApproach() {
         RecordingBaritoneFacade baritone = new RecordingBaritoneFacade();
         GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(baritone);

@@ -15,7 +15,8 @@ public record MapartSettings(
         int laneStride,
         int forwardLookaheadSteps,
         int trivialBehindCleanupSteps,
-        boolean groundedSweepConstantSprint
+        boolean groundedSweepConstantSprint,
+        boolean groundedDebugTrace
 ) {
     public static MapartSettings defaults() {
         return new MapartSettings(
@@ -33,7 +34,8 @@ public record MapartSettings(
                 5,
                 1,
                 1,
-                true
+                true,
+                false
         );
     }
 }
