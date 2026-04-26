@@ -13,4 +13,12 @@ class GroundedLaneDirectionTest {
         assertEquals(0.0f, GroundedLaneDirection.SOUTH.yawDegrees());
         assertEquals(180.0f, GroundedLaneDirection.NORTH.yawDegrees());
     }
+
+    @Test
+    void exposesDeterministicOppositeDirection() {
+        assertEquals(GroundedLaneDirection.WEST, GroundedLaneDirection.EAST.opposite());
+        assertEquals(GroundedLaneDirection.EAST, GroundedLaneDirection.WEST.opposite());
+        assertEquals(GroundedLaneDirection.NORTH, GroundedLaneDirection.SOUTH.opposite());
+        assertEquals(GroundedLaneDirection.SOUTH, GroundedLaneDirection.NORTH.opposite());
+    }
 }

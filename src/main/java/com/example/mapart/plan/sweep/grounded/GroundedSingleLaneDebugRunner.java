@@ -20,6 +20,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.function.Predicate;
 
 public final class GroundedSingleLaneDebugRunner {
@@ -34,8 +35,16 @@ public final class GroundedSingleLaneDebugRunner {
 
     private BuildSession activeSession;
     private GroundedSchematicBounds activeBounds;
+    private List<GroundedSweepLane> activeLanes = List.of();
     private GroundedSweepLane activeLane;
+    private int activeLaneCursor = -1;
+    private boolean reverseSweep;
+    private boolean reverseSweepCompleted;
+    private boolean pendingLaneShift;
+    private BlockPos pendingLaneShiftTarget;
+    private java.util.Set<Integer> reverseSweepPlacementFilter = java.util.Set.of();
     private GroundedSweepPlacementExecutor placementSelector;
+    private int activeSweepHalfWidth;
     private Map<Integer, Placement> lanePlacementsByIndex = Map.of();
     private List<GroundedSweepPlacementExecutor.PlacementTarget> pendingPlacementTargets = List.of();
     private Map<Integer, PendingPlacementVerification> pendingVerificationsByPlacement = Map.of();
@@ -87,8 +96,16 @@ public final class GroundedSingleLaneDebugRunner {
 
         activeSession = session;
         activeBounds = bounds;
+        activeLanes = List.copyOf(lanes);
+        activeLaneCursor = laneIndex;
         activeLane = lanes.get(laneIndex);
+        reverseSweep = false;
+        reverseSweepCompleted = false;
+        pendingLaneShift = false;
+        pendingLaneShiftTarget = null;
+        reverseSweepPlacementFilter = Set.of();
         placementSelector = new GroundedSweepPlacementExecutor(GroundedSweepPlacementExecutorSettings.fromGroundedSweepSettings(settings));
+        activeSweepHalfWidth = settings.sweepHalfWidth();
         lanePlacementsByIndex = new HashMap<>();
         pendingPlacementTargets = buildLanePlacementTargets(
                 session.getPlan(),
@@ -96,7 +113,8 @@ public final class GroundedSingleLaneDebugRunner {
                 activeBounds,
                 activeLane,
                 settings.sweepHalfWidth(),
-                lanePlacementsByIndex
+                lanePlacementsByIndex,
+                Set.of()
         );
         pendingVerificationsByPlacement = new LinkedHashMap<>();
         currentLeftovers = List.of();
@@ -121,8 +139,13 @@ public final class GroundedSingleLaneDebugRunner {
             return;
         }
 
+        if (pendingLaneShift) {
+            tickLaneShift(client, constantSprint);
+            return;
+        }
+
         if (laneWalker.state() != GroundedLaneWalker.GroundedLaneWalkState.ACTIVE) {
-            handleTerminalState(client);
+            handleTerminalOrAdvance(client, constantSprint);
             return;
         }
 
@@ -137,7 +160,7 @@ public final class GroundedSingleLaneDebugRunner {
         displacementAlert.tick(client, true, client.player.getY() < activeBounds.minY());
 
         if (!walkerActiveAfterTick) {
-            handleTerminalState(client);
+            handleTerminalOrAdvance(client, constantSprint);
         }
     }
 
@@ -294,6 +317,121 @@ public final class GroundedSingleLaneDebugRunner {
         return state == GroundedLaneWalker.GroundedLaneWalkState.ACTIVE;
     }
 
+    private void handleTerminalOrAdvance(MinecraftClient client, boolean constantSprint) {
+        if (laneWalker.state() == GroundedLaneWalker.GroundedLaneWalkState.COMPLETE && tryAdvanceLane(client, constantSprint)) {
+            return;
+        }
+        handleTerminalState(client);
+    }
+
+    private boolean tryAdvanceLane(MinecraftClient client, boolean constantSprint) {
+        if (activeSession == null || activeBounds == null || activeLane == null || activeLanes.isEmpty()) {
+            return false;
+        }
+
+        markPendingTargetsDeferred();
+        processTerminalPendingVerifications(client);
+
+        int nextCursor = activeLaneCursor + 1;
+        if (nextCursor >= activeLanes.size()) {
+            if (!reverseSweep && !reverseSweepCompleted) {
+                initializeReverseSweep();
+                nextCursor = 0;
+            } else {
+                reverseSweepCompleted = true;
+                return false;
+            }
+        }
+
+        GroundedSweepLane nextLane = activeLanes.get(nextCursor);
+        activeLaneCursor = nextCursor;
+        activeLane = nextLane;
+        lanePlacementsByIndex = new HashMap<>();
+        pendingPlacementTargets = buildLanePlacementTargets(
+                activeSession.getPlan(),
+                activeSession.getOrigin(),
+                activeBounds,
+                activeLane,
+                activeSweepHalfWidth,
+                lanePlacementsByIndex,
+                reverseSweepPlacementFilter
+        );
+        pendingLaneShift = true;
+        pendingLaneShiftTarget = approachTargetForLaneStart(activeLane, activeBounds);
+        applyShiftControls(client, pendingLaneShiftTarget, constantSprint);
+        return true;
+    }
+
+    private void initializeReverseSweep() {
+        reverseSweep = true;
+        activeLanes = reverseLanesForSweep(activeLanes);
+        reverseSweepPlacementFilter = currentLeftovers.stream()
+                .map(GroundedSweepLeftoverTracker.GroundedLeftoverRecord::placementIndex)
+                .collect(java.util.stream.Collectors.toSet());
+        if (reverseSweepPlacementFilter.isEmpty()) {
+            reverseSweepCompleted = true;
+        }
+    }
+
+    static List<GroundedSweepLane> reverseLanesForSweep(List<GroundedSweepLane> lanes) {
+        List<GroundedSweepLane> reversed = new ArrayList<>(lanes.size());
+        for (int i = lanes.size() - 1; i >= 0; i--) {
+            GroundedSweepLane lane = lanes.get(i);
+            reversed.add(new GroundedSweepLane(
+                    lanes.size() - 1 - i,
+                    lane.centerlineCoordinate(),
+                    lane.direction().opposite(),
+                    lane.endPoint(),
+                    lane.startPoint(),
+                    lane.corridorBounds(),
+                    lane.endpointTolerance()
+            ));
+        }
+        return List.copyOf(reversed);
+    }
+
+    private void tickLaneShift(MinecraftClient client, boolean constantSprint) {
+        if (client == null || client.player == null || pendingLaneShiftTarget == null || activeLane == null || activeBounds == null) {
+            return;
+        }
+        if (isNearLaneStart(client.player.getEntityPos(), pendingLaneShiftTarget)) {
+            pendingLaneShift = false;
+            pendingLaneShiftTarget = null;
+            laneWalker.start(activeLane, activeBounds, constantSprint);
+            applyLaneControls(client);
+            return;
+        }
+        applyShiftControls(client, pendingLaneShiftTarget, constantSprint);
+    }
+
+    private void applyShiftControls(MinecraftClient client, BlockPos target, boolean constantSprint) {
+        if (client == null || client.player == null || client.options == null || target == null) {
+            return;
+        }
+        Vec3d position = client.player.getEntityPos();
+        double dx = target.getX() + 0.5 - position.x;
+        double dz = target.getZ() + 0.5 - position.z;
+        float yaw = (float) (Math.toDegrees(Math.atan2(dz, dx)) - 90.0);
+        client.player.setYaw(yaw);
+        setKey(client.options.forwardKey, true);
+        setKey(client.options.backKey, false);
+        setKey(client.options.leftKey, false);
+        setKey(client.options.rightKey, false);
+        setKey(client.options.jumpKey, false);
+        setKey(client.options.sneakKey, false);
+        client.player.setSprinting(constantSprint);
+    }
+
+    private void markPendingTargetsDeferred() {
+        if (placementSelector == null || pendingPlacementTargets.isEmpty()) {
+            return;
+        }
+        for (GroundedSweepPlacementExecutor.PlacementTarget target : pendingPlacementTargets) {
+            placementSelector.recordPlacementResult(target.placementIndex(), GroundedSweepPlacementExecutor.PlacementResult.MISSED, laneTicksElapsed);
+        }
+        refreshCurrentLeftovers();
+    }
+
     private void handleTerminalState(MinecraftClient client) {
         processTerminalPendingVerifications(client);
         captureLastStatus(laneWalker.state(), laneWalker.failureReason());
@@ -323,8 +461,16 @@ public final class GroundedSingleLaneDebugRunner {
     private void clearActiveRunState() {
         activeSession = null;
         activeBounds = null;
+        activeLanes = List.of();
         activeLane = null;
+        activeLaneCursor = -1;
+        reverseSweep = false;
+        reverseSweepCompleted = false;
+        pendingLaneShift = false;
+        pendingLaneShiftTarget = null;
+        reverseSweepPlacementFilter = Set.of();
         placementSelector = null;
+        activeSweepHalfWidth = 0;
         lanePlacementsByIndex = Map.of();
         pendingPlacementTargets = List.of();
         pendingVerificationsByPlacement = Map.of();
@@ -529,7 +675,8 @@ public final class GroundedSingleLaneDebugRunner {
             GroundedSchematicBounds bounds,
             GroundedSweepLane lane,
             int sweepHalfWidth,
-            Map<Integer, Placement> lanePlacementsByIndex
+            Map<Integer, Placement> lanePlacementsByIndex,
+            Set<Integer> placementFilter
     ) {
         List<GroundedSweepPlacementExecutor.PlacementTarget> targets = new ArrayList<>();
         GroundedLaneCorridorBounds corridor = lane.corridorBounds();
@@ -546,6 +693,9 @@ public final class GroundedSingleLaneDebugRunner {
                 continue;
             }
             if (Math.abs(lateralDeltaFromCenterline(lane.direction(), lane.centerlineCoordinate(), worldPos)) > sweepHalfWidth) {
+                continue;
+            }
+            if (!placementFilter.isEmpty() && !placementFilter.contains(i)) {
                 continue;
             }
             lanePlacementsByIndex.put(i, placement);
@@ -593,7 +743,7 @@ public final class GroundedSingleLaneDebugRunner {
             int sweepHalfWidth,
             Map<Integer, Placement> lanePlacementsByIndex
     ) {
-        return buildLanePlacementTargets(plan, origin, bounds, lane, sweepHalfWidth, lanePlacementsByIndex);
+        return buildLanePlacementTargets(plan, origin, bounds, lane, sweepHalfWidth, lanePlacementsByIndex, Set.of());
     }
 
     private static void clearControls(MinecraftClient client) {

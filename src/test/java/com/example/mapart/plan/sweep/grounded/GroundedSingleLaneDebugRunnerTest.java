@@ -296,6 +296,30 @@ class GroundedSingleLaneDebugRunnerTest {
     }
 
     @Test
+    void reverseSweepLanesRunInOppositeSerpentineOrder() {
+        GroundedSweepLane lane0 = new GroundedSweepLane(
+                0, 2, GroundedLaneDirection.EAST,
+                new BlockPos(10, 64, 12), new BlockPos(20, 64, 12),
+                new GroundedLaneCorridorBounds(10, 20, 10, 14), 1.0
+        );
+        GroundedSweepLane lane1 = new GroundedSweepLane(
+                1, 7, GroundedLaneDirection.WEST,
+                new BlockPos(20, 64, 17), new BlockPos(10, 64, 17),
+                new GroundedLaneCorridorBounds(10, 20, 15, 19), 1.0
+        );
+
+        List<GroundedSweepLane> reversed = GroundedSingleLaneDebugRunner.reverseLanesForSweep(List.of(lane0, lane1));
+
+        assertEquals(2, reversed.size());
+        assertEquals(GroundedLaneDirection.EAST, reversed.get(0).direction());
+        assertEquals(new BlockPos(10, 64, 17), reversed.get(0).startPoint());
+        assertEquals(new BlockPos(20, 64, 17), reversed.get(0).endPoint());
+        assertEquals(GroundedLaneDirection.WEST, reversed.get(1).direction());
+        assertEquals(new BlockPos(20, 64, 12), reversed.get(1).startPoint());
+        assertEquals(new BlockPos(10, 64, 12), reversed.get(1).endPoint());
+    }
+
+    @Test
     void placementAttemptsAreGatedOnWalkerActiveState() {
         assertTrue(GroundedSingleLaneDebugRunner.shouldAttemptPlacementAfterWalkerTick(GroundedLaneWalkState.ACTIVE));
         assertFalse(GroundedSingleLaneDebugRunner.shouldAttemptPlacementAfterWalkerTick(GroundedLaneWalkState.FAILED));
