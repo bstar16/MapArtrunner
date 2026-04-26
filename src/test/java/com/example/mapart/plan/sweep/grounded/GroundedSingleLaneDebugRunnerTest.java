@@ -356,6 +356,88 @@ class GroundedSingleLaneDebugRunnerTest {
     }
 
     @Test
+    void laneShiftDoesNotCompleteUntilPlayerIsCloseToNextCenterline() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        assertTrue(runner.startFullSweep(sessionWithOrigin(new Vec3i(5, 1, 11)), GroundedSweepSettings.defaults()).isEmpty());
+        runner.advanceSweepToNextLaneForTests();
+        BlockPos shiftTarget = runner.laneShiftTargetForTests().orElseThrow();
+
+        runner.completeLaneShiftIfNearForTests(new Vec3d(shiftTarget.getX() + 0.5, 64.0, shiftTarget.getZ() - 0.7), false);
+        GroundedSingleLaneDebugRunner.DebugStatus notShifted = runner.status();
+        assertTrue(notShifted.awaitingLaneShift());
+        assertEquals(GroundedLaneWalkState.IDLE, notShifted.walkState());
+
+        runner.completeLaneShiftIfNearForTests(new Vec3d(shiftTarget.getX() + 0.5, 64.0, shiftTarget.getZ() + 0.5), false);
+        GroundedSingleLaneDebugRunner.DebugStatus shifted = runner.status();
+        assertFalse(shifted.awaitingLaneShift());
+        assertEquals(GroundedLaneWalkState.ACTIVE, shifted.walkState());
+    }
+
+    @Test
+    void eastWestSerpentineShiftDirectionIsSouthForBothLaneParities() {
+        GroundedSchematicBounds bounds = new GroundedSchematicBounds(
+                new BlockPos(10, 64, 10),
+                new BlockPos(10, 64, 10),
+                new BlockPos(20, 64, 30)
+        );
+        GroundedSweepLane lane0East = new GroundedSweepLane(
+                0, 12, GroundedLaneDirection.EAST,
+                new BlockPos(10, 64, 12), new BlockPos(20, 64, 12),
+                new GroundedLaneCorridorBounds(10, 20, 10, 14), 1.0
+        );
+        GroundedSweepLane lane1West = new GroundedSweepLane(
+                1, 17, GroundedLaneDirection.WEST,
+                new BlockPos(20, 64, 17), new BlockPos(10, 64, 17),
+                new GroundedLaneCorridorBounds(10, 20, 15, 19), 1.0
+        );
+        GroundedSweepLane lane2East = new GroundedSweepLane(
+                2, 22, GroundedLaneDirection.EAST,
+                new BlockPos(10, 64, 22), new BlockPos(20, 64, 22),
+                new GroundedLaneCorridorBounds(10, 20, 20, 24), 1.0
+        );
+
+        GroundedSingleLaneDebugRunner.LaneShiftPlan eastToWest =
+                GroundedSingleLaneDebugRunner.buildLaneShiftPlanForTests(lane0East, lane1West, bounds);
+        GroundedSingleLaneDebugRunner.LaneShiftPlan westToEast =
+                GroundedSingleLaneDebugRunner.buildLaneShiftPlanForTests(lane1West, lane2East, bounds);
+
+        assertEquals(GroundedLaneDirection.SOUTH, eastToWest.shiftDirection());
+        assertEquals(GroundedLaneDirection.SOUTH, westToEast.shiftDirection());
+    }
+
+    @Test
+    void northSouthSerpentineShiftsAlongXAxis() {
+        GroundedSchematicBounds bounds = new GroundedSchematicBounds(
+                new BlockPos(10, 64, 10),
+                new BlockPos(10, 64, 10),
+                new BlockPos(30, 64, 20)
+        );
+        GroundedSweepLane lane0South = new GroundedSweepLane(
+                0, 12, GroundedLaneDirection.SOUTH,
+                new BlockPos(12, 64, 10), new BlockPos(12, 64, 20),
+                new GroundedLaneCorridorBounds(10, 14, 10, 20), 1.0
+        );
+        GroundedSweepLane lane1North = new GroundedSweepLane(
+                1, 17, GroundedLaneDirection.NORTH,
+                new BlockPos(17, 64, 20), new BlockPos(17, 64, 10),
+                new GroundedLaneCorridorBounds(15, 19, 10, 20), 1.0
+        );
+        GroundedSweepLane lane2South = new GroundedSweepLane(
+                2, 12, GroundedLaneDirection.SOUTH,
+                new BlockPos(12, 64, 10), new BlockPos(12, 64, 20),
+                new GroundedLaneCorridorBounds(10, 14, 10, 20), 1.0
+        );
+
+        GroundedSingleLaneDebugRunner.LaneShiftPlan southToNorth =
+                GroundedSingleLaneDebugRunner.buildLaneShiftPlanForTests(lane0South, lane1North, bounds);
+        GroundedSingleLaneDebugRunner.LaneShiftPlan northToSouth =
+                GroundedSingleLaneDebugRunner.buildLaneShiftPlanForTests(lane1North, lane2South, bounds);
+
+        assertEquals(GroundedLaneDirection.EAST, southToNorth.shiftDirection());
+        assertEquals(GroundedLaneDirection.WEST, northToSouth.shiftDirection());
+    }
+
+    @Test
     void reverseSweepTransitionsAlsoUseNativeLaneShift() {
         GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
         assertTrue(runner.startFullSweep(sessionWithOrigin(), GroundedSweepSettings.defaults()).isEmpty());
@@ -367,6 +449,7 @@ class GroundedSingleLaneDebugRunnerTest {
         assertEquals(GroundedSingleLaneDebugRunner.SweepPassPhase.REVERSE, status.phase());
         assertTrue(status.awaitingLaneShift());
         assertFalse(status.awaitingStartApproach());
+        assertTrue(runner.laneShiftDirectionForTests().isPresent());
     }
 
     @Test
