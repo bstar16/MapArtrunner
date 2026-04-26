@@ -361,12 +361,14 @@ class GroundedSingleLaneDebugRunnerTest {
         GroundedSingleLaneDebugRunner.LaneShiftPlan plan = runner.laneShiftPlanForTests().orElseThrow();
 
         MinecraftClientStub client = new MinecraftClientStub();
-        boolean queued = runner.queueLaneStartForTests(client.playerYawSetter(), plan.toLane());
+        boolean queued = runner.queueLaneStartForTests(client, plan.toLane());
 
         assertTrue(queued);
         assertEquals(GroundedSingleLaneDebugRunner.LaneStartStage.LOCK_LANE_YAW, runner.laneStartStageForTests());
         assertEquals(GroundedLaneDirection.WEST, plan.toLane().direction());
         assertEquals(plan.toLane().direction().yawDegrees(), client.yaw());
+        assertEquals(plan.toLane().direction().yawDegrees(), client.headYaw);
+        assertEquals(plan.toLane().direction().yawDegrees(), client.bodyYaw);
     }
 
     @Test
@@ -736,9 +738,11 @@ class GroundedSingleLaneDebugRunnerTest {
 
     private static final class MinecraftClientStub {
         private float yaw;
+        public float headYaw;
+        public float bodyYaw;
 
-        java.util.function.Consumer<Float> playerYawSetter() {
-            return value -> yaw = value;
+        public void setYaw(float value) {
+            yaw = value;
         }
 
         float yaw() {
