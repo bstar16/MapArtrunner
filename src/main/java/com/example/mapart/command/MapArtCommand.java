@@ -455,12 +455,18 @@ public final class MapArtCommand {
         if (!status.active()) {
             source.sendFeedback(Text.literal("No grounded single-lane debug run is active. "
                     + "Last state=" + status.walkState()
+                    + ", smartResumeUsed=" + status.smartResumeUsed()
                     + ", ticks=" + status.ticksElapsed()
                     + ", success=" + status.successfulPlacements()
                     + ", missed=" + status.missedPlacements()
                     + ", failed=" + status.failedPlacements()
                     + ", pendingVerification=" + status.pendingVerification()
                     + ", leftovers=" + status.leftovers().size()));
+            status.resumePoint().ifPresent(point -> source.sendFeedback(Text.literal(
+                    "Last resume lane=" + point.laneIndex()
+                            + ", reason=" + point.reason()
+                            + ", progress=" + point.progressCoordinate()
+            )));
             status.failureReason().ifPresent(reason -> source.sendFeedback(Text.literal("Failure reason: " + reason)));
             return 0;
         }
@@ -468,6 +474,8 @@ public final class MapArtCommand {
         source.sendFeedback(Text.literal("Grounded lane=" + status.laneIndex()
                 + ", phase=" + status.phase()
                 + ", state=" + status.walkState()
+                + ", smartResumeUsed=" + status.smartResumeUsed()
+                + ", skippedCompletedLanes=" + status.skippedCompletedForwardLanes()
                 + ", awaitingStartApproach=" + status.awaitingStartApproach()
                 + ", awaitingLaneShift=" + status.awaitingLaneShift()
                 + ", ticks=" + status.ticksElapsed()
@@ -476,6 +484,12 @@ public final class MapArtCommand {
                 + ", failed=" + status.failedPlacements()
                 + ", pendingVerification=" + status.pendingVerification()
                 + ", leftovers=" + status.leftovers().size()));
+        status.resumePoint().ifPresent(point -> source.sendFeedback(Text.literal(
+                "Resume lane=" + point.laneIndex()
+                        + ", reason=" + point.reason()
+                        + ", progress=" + point.progressCoordinate()
+                        + ", standing=" + point.standingPosition().toShortString()
+        )));
         status.failureReason().ifPresent(reason -> source.sendFeedback(Text.literal("Failure reason: " + reason)));
         if (!status.leftovers().isEmpty()) {
             GroundedSweepLeftoverTracker.GroundedLeftoverRecord record = status.leftovers().getFirst();
