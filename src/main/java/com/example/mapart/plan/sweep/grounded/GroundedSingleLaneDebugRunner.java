@@ -58,6 +58,7 @@ public final class GroundedSingleLaneDebugRunner {
     private LaneShiftPlan laneShiftPlan;
     private LaneTransitionStage laneTransitionStage = LaneTransitionStage.ALIGN_FORWARD_AXIS;
     private int laneTransitionTicks;
+    private boolean laneStartPrepared;
 
     private SweepRunMode runMode = SweepRunMode.SINGLE_LANE;
     private List<GroundedSweepLane> forwardLanes = List.of();
@@ -136,6 +137,12 @@ public final class GroundedSingleLaneDebugRunner {
             tickLaneShift(client, constantSprint);
             return;
         }
+        if (laneStartPrepared) {
+            if (!startPreparedLaneWalker(client, constantSprint)) {
+                failLaneTransition(client, "Failed to start grounded lane: unable to lock lane yaw.");
+            }
+            return;
+        }
 
         if (laneWalker.state() != GroundedLaneWalker.GroundedLaneWalkState.ACTIVE) {
             handleTerminalState(client);
@@ -207,12 +214,17 @@ public final class GroundedSingleLaneDebugRunner {
         }
 
         baritoneFacade.cancel();
-        laneWalker.start(activeLane, activeBounds, constantSprint);
+        Optional<String> preparationFailure = prepareLaneStart(client, activeLane);
+        if (preparationFailure.isPresent()) {
+            failLaneTransition(client, preparationFailure.get());
+            return;
+        }
         awaitingStartApproach = false;
+        laneStartPrepared = true;
         lastStatus = new DebugStatus(
                 true,
                 activeLane.laneIndex(),
-                GroundedLaneWalker.GroundedLaneWalkState.ACTIVE,
+                GroundedLaneWalker.GroundedLaneWalkState.IDLE,
                 false,
                 false,
                 Optional.empty(),
@@ -224,7 +236,6 @@ public final class GroundedSingleLaneDebugRunner {
                 currentLeftovers,
                 sweepPassPhase
         );
-        applyLaneControls(client);
     }
 
     void issueStartApproachIfNeeded() {
@@ -251,6 +262,7 @@ public final class GroundedSingleLaneDebugRunner {
         }
         if (laneTransitionStage == LaneTransitionStage.START_NEXT_LANE) {
             beginShiftedLane(null, constantSprint);
+            startPreparedLaneWalker(null, constantSprint);
         }
     }
 
@@ -474,6 +486,7 @@ public final class GroundedSingleLaneDebugRunner {
         laneShiftPlan = null;
         laneTransitionStage = LaneTransitionStage.ALIGN_FORWARD_AXIS;
         laneTransitionTicks = 0;
+        laneStartPrepared = false;
         displacementAlert.reset();
 
         runMode = SweepRunMode.SINGLE_LANE;
@@ -765,7 +778,11 @@ public final class GroundedSingleLaneDebugRunner {
     }
 
     private void beginShiftedLane(MinecraftClient client, boolean constantSprint) {
-        prepareNextLaneStart(client, pendingShiftLane);
+        Optional<String> preparationFailure = prepareLaneStart(client, pendingShiftLane);
+        if (preparationFailure.isPresent()) {
+            failLaneTransition(client, preparationFailure.get());
+            return;
+        }
         awaitingLaneShift = false;
         laneShiftTarget = null;
         laneShiftPlan = null;
@@ -773,11 +790,11 @@ public final class GroundedSingleLaneDebugRunner {
         laneTransitionTicks = 0;
         activeLane = pendingShiftLane;
         pendingShiftLane = null;
-        laneWalker.start(activeLane, activeBounds, constantSprint);
+        laneStartPrepared = true;
         lastStatus = new DebugStatus(
                 true,
                 activeLane.laneIndex(),
-                GroundedLaneWalker.GroundedLaneWalkState.ACTIVE,
+                GroundedLaneWalker.GroundedLaneWalkState.IDLE,
                 false,
                 false,
                 Optional.empty(),
@@ -798,6 +815,7 @@ public final class GroundedSingleLaneDebugRunner {
         pendingShiftLane = null;
         laneTransitionStage = LaneTransitionStage.ALIGN_FORWARD_AXIS;
         laneTransitionTicks = 0;
+        laneStartPrepared = false;
         laneWalker.interrupt();
         captureLastStatus(GroundedLaneWalker.GroundedLaneWalkState.FAILED, Optional.of(reason));
         if (client != null) {
@@ -806,14 +824,21 @@ public final class GroundedSingleLaneDebugRunner {
         clearActiveRunState();
     }
 
-    private static void prepareNextLaneStart(MinecraftClient client, GroundedSweepLane lane) {
-        if (client == null || lane == null) {
-            return;
+    private Optional<String> prepareLaneStart(MinecraftClient client, GroundedSweepLane lane) {
+        if (lane == null) {
+            return Optional.of("Failed to start grounded lane: lane is unavailable.");
+        }
+        if (client == null || client.player == null || client.options == null) {
+            return Optional.empty();
         }
         clearControls(client);
-        if (client.player != null) {
-            client.player.setYaw(lane.direction().yawDegrees());
+        float targetYaw = lane.direction().yawDegrees();
+        client.player.setYaw(targetYaw);
+        if (!isYawLocked(client.player.getYaw(), targetYaw)) {
+            clearControls(client);
+            return Optional.of("Failed to start grounded lane: unable to apply planned lane yaw.");
         }
+        return Optional.empty();
     }
 
     private static void applyShiftControls(MinecraftClient client, GroundedLaneDirection shiftDirection, boolean constantSprint) {
@@ -844,6 +869,39 @@ public final class GroundedSingleLaneDebugRunner {
         Vec3d standingCenter = new Vec3d(shiftTarget.getX() + 0.5, shiftTarget.getY(), shiftTarget.getZ() + 0.5);
         Vec3d playerFlat = new Vec3d(playerPosition.x, standingCenter.y, playerPosition.z);
         return playerFlat.squaredDistanceTo(standingCenter) <= LANE_SHIFT_REACH_DISTANCE_SQ;
+    }
+
+    private boolean startPreparedLaneWalker(MinecraftClient client, boolean constantSprint) {
+        if (!laneStartPrepared || activeLane == null || activeBounds == null) {
+            return false;
+        }
+        if (client != null && client.player != null) {
+            float targetYaw = activeLane.direction().yawDegrees();
+            client.player.setYaw(targetYaw);
+            if (!isYawLocked(client.player.getYaw(), targetYaw)) {
+                clearControls(client);
+                return false;
+            }
+            clearControls(client);
+        }
+        laneWalker.start(activeLane, activeBounds, constantSprint);
+        laneStartPrepared = false;
+        lastStatus = new DebugStatus(
+                true,
+                activeLane.laneIndex(),
+                GroundedLaneWalker.GroundedLaneWalkState.ACTIVE,
+                false,
+                false,
+                Optional.empty(),
+                laneTicksElapsed,
+                successfulPlacements,
+                missedPlacements,
+                failedPlacements,
+                pendingVerificationsByPlacement.size(),
+                currentLeftovers,
+                sweepPassPhase
+        );
+        return true;
     }
 
     private static boolean isForwardAxisAligned(Vec3d playerPosition, GroundedSweepLane nextLane) {
@@ -921,6 +979,20 @@ public final class GroundedSingleLaneDebugRunner {
         }
     }
 
+    private static boolean isYawLocked(float currentYaw, float expectedYaw) {
+        return Math.abs(normalizeYaw(currentYaw - expectedYaw)) <= 0.01f;
+    }
+
+    private static float normalizeYaw(float yaw) {
+        float wrapped = yaw % 360.0f;
+        if (wrapped > 180.0f) {
+            wrapped -= 360.0f;
+        } else if (wrapped <= -180.0f) {
+            wrapped += 360.0f;
+        }
+        return wrapped;
+    }
+
     public boolean isActive() {
         return activeLane != null;
     }
@@ -975,6 +1047,7 @@ public final class GroundedSingleLaneDebugRunner {
         laneShiftPlan = null;
         laneTransitionStage = LaneTransitionStage.ALIGN_FORWARD_AXIS;
         laneTransitionTicks = 0;
+        laneStartPrepared = false;
         displacementAlert.reset();
     }
 
@@ -1002,6 +1075,7 @@ public final class GroundedSingleLaneDebugRunner {
         laneShiftPlan = null;
         laneTransitionStage = LaneTransitionStage.ALIGN_FORWARD_AXIS;
         laneTransitionTicks = 0;
+        laneStartPrepared = false;
 
         lastStatus = new DebugStatus(
                 true,
@@ -1031,6 +1105,7 @@ public final class GroundedSingleLaneDebugRunner {
         pendingShiftLane = lane;
         laneTransitionStage = LaneTransitionStage.ALIGN_FORWARD_AXIS;
         laneTransitionTicks = 0;
+        laneStartPrepared = false;
         lastStatus = new DebugStatus(
                 true,
                 lane.laneIndex(),

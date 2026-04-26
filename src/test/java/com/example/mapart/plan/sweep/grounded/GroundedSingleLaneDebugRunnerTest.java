@@ -689,6 +689,21 @@ class GroundedSingleLaneDebugRunnerTest {
         assertEquals(GroundedLaneDirection.WEST, reverse.get(1).direction());
     }
 
+    @Test
+    void plannedSerpentineLaneDirectionsAlternateEastWest() {
+        GroundedSchematicBounds bounds = new GroundedSchematicBounds(
+                new BlockPos(0, 64, 0),
+                new BlockPos(0, 64, 0),
+                new BlockPos(20, 64, 14)
+        );
+        List<GroundedSweepLane> lanes = new GroundedSweepLanePlanner().planLanes(bounds, GroundedSweepSettings.defaults());
+
+        assertTrue(lanes.size() >= 3);
+        assertEquals(GroundedLaneDirection.EAST, lanes.get(0).direction());
+        assertEquals(GroundedLaneDirection.WEST, lanes.get(1).direction());
+        assertEquals(GroundedLaneDirection.EAST, lanes.get(2).direction());
+    }
+
     private static BuildSession sessionWithOrigin() {
         return sessionWithOrigin(new Vec3i(5, 1, 5));
     }

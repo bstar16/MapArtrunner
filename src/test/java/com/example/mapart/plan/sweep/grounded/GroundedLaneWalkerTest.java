@@ -50,6 +50,26 @@ class GroundedLaneWalkerTest {
     }
 
     @Test
+    void westboundLaneAlwaysForcesWestYawWhileActive() {
+        GroundedLaneWalker walker = new GroundedLaneWalker();
+        GroundedSweepLane westLane = new GroundedSweepLane(
+                1,
+                2,
+                GroundedLaneDirection.WEST,
+                new BlockPos(8, 64, 2),
+                new BlockPos(0, 64, 2),
+                new GroundedLaneCorridorBounds(0, 8, 0, 4),
+                0.5
+        );
+        walker.start(westLane, bounds(), true);
+
+        walker.tick(new Vec3d(7.6, 64.0, 2.5));
+        assertEquals(90.0f, walker.currentCommand().orElseThrow().yaw());
+        walker.tick(new Vec3d(4.2, 64.0, 2.4));
+        assertEquals(90.0f, walker.currentCommand().orElseThrow().yaw());
+    }
+
+    @Test
     void keepsSprintIntentConstantWhileWalking() {
         GroundedLaneWalker walker = new GroundedLaneWalker();
         walker.start(eastboundLane(), bounds(), true);
