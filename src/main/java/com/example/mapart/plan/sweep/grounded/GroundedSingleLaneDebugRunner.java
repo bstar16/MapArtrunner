@@ -23,7 +23,6 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
-import java.util.function.Consumer;
 import java.util.function.Predicate;
 
 public final class GroundedSingleLaneDebugRunner {
@@ -32,6 +31,9 @@ public final class GroundedSingleLaneDebugRunner {
     private static final double LANE_SHIFT_REACH_DISTANCE_SQ = 1.5 * 1.5;
     private static final double LANE_TRANSITION_AXIS_TOLERANCE = 0.6;
     private static final int MAX_LANE_TRANSITION_TICKS = 120;
+    private static final int MIN_LANE_YAW_LOCK_TICKS = 2;
+    private static final int MAX_LANE_YAW_LOCK_TICKS = 10;
+    private static final float LANE_YAW_LOCK_TOLERANCE_DEGREES = 1.5f;
 
     private final GroundedSweepLanePlanner lanePlanner = new GroundedSweepLanePlanner();
     private final GroundedLaneWalker laneWalker = new GroundedLaneWalker();
@@ -231,18 +233,26 @@ public final class GroundedSingleLaneDebugRunner {
             return;
         }
         if (laneStartStage == LaneStartStage.LOCK_LANE_YAW) {
-            if (!prepareLaneStart(client, pendingLaneStart)) {
-                failLaneStart(client, "Unable to lock lane yaw before starting lane walk.");
+            if (!forcePlayerLaneYaw(client, pendingLaneStart)) {
+                failLaneStart(client, "Unable to lock lane yaw/body/head before starting lane walk.");
                 return;
             }
-            if (pendingLaneStartTicks == 0) {
-                pendingLaneStartTicks = 1;
+            pendingLaneStartTicks++;
+            if (pendingLaneStartTicks > MAX_LANE_YAW_LOCK_TICKS) {
+                failLaneStart(client, "Lane yaw/body/head lock timed out before lane walk could begin.");
+                return;
+            }
+            if (pendingLaneStartTicks < MIN_LANE_YAW_LOCK_TICKS) {
                 return;
             }
             laneStartStage = LaneStartStage.START_WALKER;
         }
 
         if (laneStartStage == LaneStartStage.START_WALKER) {
+            if (!forcePlayerLaneYaw(client, pendingLaneStart)) {
+                failLaneStart(client, "Unable to confirm lane yaw/body/head lock before starting lane walk.");
+                return;
+            }
             laneWalker.start(activeLane, activeBounds, constantSprint);
             laneStartStage = LaneStartStage.NONE;
             pendingLaneStart = null;
@@ -270,7 +280,8 @@ public final class GroundedSingleLaneDebugRunner {
         if (lane == null) {
             return false;
         }
-        if (!prepareLaneStart(client, lane)) {
+        clearControls(client);
+        if (!forcePlayerLaneYaw(client, lane)) {
             return false;
         }
         pendingLaneStart = lane;
@@ -806,6 +817,10 @@ public final class GroundedSingleLaneDebugRunner {
         if (client.options == null || client.player == null) {
             return;
         }
+        if (activeLane != null && !forcePlayerLaneYaw(client, activeLane)) {
+            failLaneStart(client, "Lane yaw/body/head lock drifted during lane walk.");
+            return;
+        }
 
         GroundedLaneWalker.GroundedLaneWalkCommand command = laneWalker.currentCommand().orElse(GroundedLaneWalker.GroundedLaneWalkCommand.idle());
         float authoritativeYaw = activeLane == null ? command.yaw() : activeLane.direction().yawDegrees();
@@ -908,14 +923,68 @@ public final class GroundedSingleLaneDebugRunner {
         clearActiveRunState();
     }
 
-    private static boolean prepareLaneStart(MinecraftClient client, GroundedSweepLane lane) {
+    private static boolean forcePlayerLaneYaw(MinecraftClient client, GroundedSweepLane lane) {
         if (client == null || client.player == null || lane == null) {
             return false;
         }
-        clearControls(client);
         float targetYaw = lane.direction().yawDegrees();
         client.player.setYaw(targetYaw);
-        return Math.abs(MathHelper.wrapDegrees(client.player.getYaw() - targetYaw)) <= 0.001f;
+        applyFloatFieldIfPresent(client.player, "headYaw", targetYaw);
+        applyFloatFieldIfPresent(client.player, "bodyYaw", targetYaw);
+        applyFloatFieldIfPresent(client.player, "prevYaw", targetYaw);
+        applyFloatFieldIfPresent(client.player, "prevHeadYaw", targetYaw);
+        applyFloatFieldIfPresent(client.player, "prevBodyYaw", targetYaw);
+        return isLaneYawLocked(client, lane);
+    }
+
+    private static boolean isLaneYawLocked(MinecraftClient client, GroundedSweepLane lane) {
+        if (client == null || client.player == null || lane == null) {
+            return false;
+        }
+        float targetYaw = lane.direction().yawDegrees();
+        if (!yawWithinTolerance(client.player.getYaw(), targetYaw)) {
+            return false;
+        }
+        Optional<Float> headYaw = readFloatField(client.player, "headYaw");
+        if (headYaw.isPresent() && !yawWithinTolerance(headYaw.get(), targetYaw)) {
+            return false;
+        }
+        Optional<Float> bodyYaw = readFloatField(client.player, "bodyYaw");
+        return bodyYaw.isEmpty() || yawWithinTolerance(bodyYaw.get(), targetYaw);
+    }
+
+    private static boolean yawWithinTolerance(float actualYaw, float targetYaw) {
+        return Math.abs(MathHelper.wrapDegrees(actualYaw - targetYaw)) <= LANE_YAW_LOCK_TOLERANCE_DEGREES;
+    }
+
+    private static void applyFloatFieldIfPresent(Object instance, String fieldName, float value) {
+        readFloatField(instance, fieldName).ifPresent(ignored -> writeFloatField(instance, fieldName, value));
+    }
+
+    private static Optional<Float> readFloatField(Object instance, String fieldName) {
+        if (instance == null) {
+            return Optional.empty();
+        }
+        try {
+            java.lang.reflect.Field field = instance.getClass().getField(fieldName);
+            if (field.getType() != float.class && field.getType() != Float.class) {
+                return Optional.empty();
+            }
+            return Optional.of(field.getFloat(instance));
+        } catch (ReflectiveOperationException ignored) {
+            return Optional.empty();
+        }
+    }
+
+    private static void writeFloatField(Object instance, String fieldName, float value) {
+        try {
+            java.lang.reflect.Field field = instance.getClass().getField(fieldName);
+            if (field.getType() == float.class || field.getType() == Float.class) {
+                field.setFloat(instance, value);
+            }
+        } catch (ReflectiveOperationException ignored) {
+            // Best-effort lock for versions exposing these fields.
+        }
     }
 
     private static void applyShiftControls(MinecraftClient client, GroundedLaneDirection shiftDirection, boolean constantSprint) {
@@ -1196,15 +1265,45 @@ public final class GroundedSingleLaneDebugRunner {
     }
 
 
-    boolean queueLaneStartForTests(Consumer<Float> yawSetter, GroundedSweepLane lane) {
-        if (lane == null || yawSetter == null) {
+    boolean queueLaneStartForTests(TestYawState yawState, GroundedSweepLane lane) {
+        if (lane == null || yawState == null) {
             return false;
         }
-        yawSetter.accept(lane.direction().yawDegrees());
+        float targetYaw = lane.direction().yawDegrees();
+        yawState.setYaw(targetYaw);
+        yawState.headYaw = targetYaw;
+        yawState.bodyYaw = targetYaw;
         pendingLaneStart = lane;
         laneStartStage = LaneStartStage.LOCK_LANE_YAW;
         pendingLaneStartTicks = 0;
         return true;
+    }
+
+    static boolean forceLaneYawForTests(TestYawState yawState, GroundedSweepLane lane) {
+        if (yawState == null || lane == null) {
+            return false;
+        }
+        float targetYaw = lane.direction().yawDegrees();
+        yawState.setYaw(targetYaw);
+        yawState.headYaw = targetYaw;
+        yawState.bodyYaw = targetYaw;
+        return yawWithinTolerance(yawState.yaw(), targetYaw)
+                && yawWithinTolerance(yawState.headYaw, targetYaw)
+                && yawWithinTolerance(yawState.bodyYaw, targetYaw);
+    }
+
+    static final class TestYawState {
+        private float yaw;
+        float headYaw;
+        float bodyYaw;
+
+        void setYaw(float value) {
+            yaw = value;
+        }
+
+        float yaw() {
+            return yaw;
+        }
     }
 
 

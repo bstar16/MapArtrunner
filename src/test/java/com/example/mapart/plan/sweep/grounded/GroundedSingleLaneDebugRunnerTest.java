@@ -360,13 +360,31 @@ class GroundedSingleLaneDebugRunnerTest {
         runner.advanceSweepToNextLaneForTests();
         GroundedSingleLaneDebugRunner.LaneShiftPlan plan = runner.laneShiftPlanForTests().orElseThrow();
 
-        MinecraftClientStub client = new MinecraftClientStub();
-        boolean queued = runner.queueLaneStartForTests(client.playerYawSetter(), plan.toLane());
+        GroundedSingleLaneDebugRunner.TestYawState yawState = new GroundedSingleLaneDebugRunner.TestYawState();
+        boolean queued = runner.queueLaneStartForTests(yawState, plan.toLane());
 
         assertTrue(queued);
         assertEquals(GroundedSingleLaneDebugRunner.LaneStartStage.LOCK_LANE_YAW, runner.laneStartStageForTests());
         assertEquals(GroundedLaneDirection.WEST, plan.toLane().direction());
-        assertEquals(plan.toLane().direction().yawDegrees(), client.yaw());
+        assertEquals(plan.toLane().direction().yawDegrees(), yawState.yaw());
+        assertEquals(plan.toLane().direction().yawDegrees(), yawState.headYaw);
+        assertEquals(plan.toLane().direction().yawDegrees(), yawState.bodyYaw);
+    }
+
+    @Test
+    void laneOneWestYawLockAppliesPlayerHeadAndBodyYawInTestHook() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        assertTrue(runner.startFullSweep(sessionWithOrigin(new Vec3i(5, 1, 11)), GroundedSweepSettings.defaults()).isEmpty());
+        runner.advanceSweepToNextLaneForTests();
+        GroundedSweepLane westLane = runner.laneShiftPlanForTests().orElseThrow().toLane();
+        assertEquals(1, westLane.laneIndex());
+        assertEquals(GroundedLaneDirection.WEST, westLane.direction());
+
+        GroundedSingleLaneDebugRunner.TestYawState yawState = new GroundedSingleLaneDebugRunner.TestYawState();
+        assertTrue(GroundedSingleLaneDebugRunner.forceLaneYawForTests(yawState, westLane));
+        assertEquals(westLane.direction().yawDegrees(), yawState.yaw());
+        assertEquals(westLane.direction().yawDegrees(), yawState.headYaw);
+        assertEquals(westLane.direction().yawDegrees(), yawState.bodyYaw);
     }
 
     @Test
@@ -731,19 +749,6 @@ class GroundedSingleLaneDebugRunnerTest {
                 Map.of(),
                 List.of()
         );
-    }
-
-
-    private static final class MinecraftClientStub {
-        private float yaw;
-
-        java.util.function.Consumer<Float> playerYawSetter() {
-            return value -> yaw = value;
-        }
-
-        float yaw() {
-            return yaw;
-        }
     }
 
     private static final class RecordingBaritoneFacade implements BaritoneFacade {
