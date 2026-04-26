@@ -302,6 +302,51 @@ class GroundedSingleLaneDebugRunnerTest {
         assertFalse(GroundedSingleLaneDebugRunner.shouldAttemptPlacementAfterWalkerTick(GroundedLaneWalkState.COMPLETE));
     }
 
+    @Test
+    void fullSweepStartsInForwardPhaseOnNorthWestAnchoredLane() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        BuildSession session = sessionWithOrigin();
+
+        assertTrue(runner.startFullSweep(session, GroundedSweepSettings.defaults()).isEmpty());
+
+        GroundedSingleLaneDebugRunner.DebugStatus status = runner.status();
+        assertTrue(status.active());
+        assertEquals(GroundedSingleLaneDebugRunner.SweepPassPhase.FORWARD, status.phase());
+        assertEquals(0, status.laneIndex());
+    }
+
+    @Test
+    void reverseSweepLaneListFlipsOrderAndDirection() {
+        GroundedSweepLane lane0 = new GroundedSweepLane(
+                0,
+                12,
+                GroundedLaneDirection.EAST,
+                new BlockPos(10, 64, 12),
+                new BlockPos(20, 64, 12),
+                new GroundedLaneCorridorBounds(10, 20, 10, 14),
+                1.0
+        );
+        GroundedSweepLane lane1 = new GroundedSweepLane(
+                1,
+                17,
+                GroundedLaneDirection.WEST,
+                new BlockPos(20, 64, 17),
+                new BlockPos(10, 64, 17),
+                new GroundedLaneCorridorBounds(10, 20, 15, 19),
+                1.0
+        );
+
+        List<GroundedSweepLane> reverse = GroundedSingleLaneDebugRunner.buildReverseSweepLanesForTests(List.of(lane0, lane1));
+
+        assertEquals(2, reverse.size());
+        assertEquals(1, reverse.get(0).laneIndex());
+        assertEquals(GroundedLaneDirection.EAST, reverse.get(0).direction());
+        assertEquals(lane1.endPoint(), reverse.get(0).startPoint());
+        assertEquals(lane1.startPoint(), reverse.get(0).endPoint());
+        assertEquals(0, reverse.get(1).laneIndex());
+        assertEquals(GroundedLaneDirection.WEST, reverse.get(1).direction());
+    }
+
     private static BuildSession sessionWithOrigin() {
         BuildPlan plan = buildPlan(List.of(new Placement(new BlockPos(0, 0, 0), null)));
 

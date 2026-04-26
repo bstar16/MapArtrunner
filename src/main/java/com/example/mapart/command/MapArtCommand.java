@@ -261,6 +261,17 @@ public final class MapArtCommand {
                                         .executes(context -> debugGroundedSingleLaneStatus(context.getSource())))
                                 .then(ClientCommandManager.literal("stop")
                                         .executes(context -> debugGroundedSingleLaneStop(context.getSource()))))
+                        .then(ClientCommandManager.literal("grounded-sweep")
+                                .then(ClientCommandManager.literal("start")
+                                        .executes(context -> debugGroundedSweepStart(
+                                                context.getSource(),
+                                                planService,
+                                                settingsStore
+                                        )))
+                                .then(ClientCommandManager.literal("status")
+                                        .executes(context -> debugGroundedSingleLaneStatus(context.getSource())))
+                                .then(ClientCommandManager.literal("stop")
+                                        .executes(context -> debugGroundedSingleLaneStop(context.getSource()))))
                 );
     }
 
@@ -421,17 +432,7 @@ public final class MapArtCommand {
             return 0;
         }
 
-        MapartSettings settings = settingsStore.current();
-        GroundedSweepSettings groundedSettings = new GroundedSweepSettings(
-                settings.preferLongerAxis(),
-                settings.sweepHalfWidth(),
-                settings.sweepTotalWidth(),
-                settings.laneStride(),
-                settings.forwardLookaheadSteps(),
-                settings.trivialBehindCleanupSteps(),
-                settings.groundedSweepConstantSprint(),
-                1.0
-        );
+        GroundedSweepSettings groundedSettings = groundedSettings(settingsStore.current());
 
         Optional<String> error = runner.start(session.get(), laneIndex, groundedSettings);
         if (error.isPresent()) {
@@ -465,6 +466,7 @@ public final class MapArtCommand {
         }
 
         source.sendFeedback(Text.literal("Grounded lane=" + status.laneIndex()
+                + ", phase=" + status.phase()
                 + ", state=" + status.walkState()
                 + ", awaitingStartApproach=" + status.awaitingStartApproach()
                 + ", ticks=" + status.ticksElapsed()
@@ -496,6 +498,45 @@ public final class MapArtCommand {
 
         source.sendFeedback(Text.literal("Stopped debug grounded single-lane sweep."));
         return 1;
+    }
+
+    private static int debugGroundedSweepStart(FabricClientCommandSource source,
+                                               BuildPlanService planService,
+                                               MapartSettingsStore settingsStore) {
+        GroundedSingleLaneDebugRunner runner = MapArtRuntime.groundedSingleLaneDebugRunner();
+        if (runner == null) {
+            source.sendError(Text.literal("Grounded sweep debug runner is unavailable."));
+            return 0;
+        }
+
+        Optional<BuildSession> session = planService.currentSession();
+        if (session.isEmpty()) {
+            source.sendError(Text.literal("No build plan loaded."));
+            return 0;
+        }
+
+        GroundedSweepSettings groundedSettings = groundedSettings(settingsStore.current());
+        Optional<String> error = runner.startFullSweep(session.get(), groundedSettings);
+        if (error.isPresent()) {
+            source.sendError(Text.literal(error.get()));
+            return 0;
+        }
+
+        source.sendFeedback(Text.literal("Started debug grounded full serpentine sweep (forward + reverse leftovers)."));
+        return 1;
+    }
+
+    private static GroundedSweepSettings groundedSettings(MapartSettings settings) {
+        return new GroundedSweepSettings(
+                settings.preferLongerAxis(),
+                settings.sweepHalfWidth(),
+                settings.sweepTotalWidth(),
+                settings.laneStride(),
+                settings.forwardLookaheadSteps(),
+                settings.trivialBehindCleanupSteps(),
+                settings.groundedSweepConstantSprint(),
+                1.0
+        );
     }
 
     private static int setOrigin(
