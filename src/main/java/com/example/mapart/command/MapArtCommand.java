@@ -272,6 +272,13 @@ public final class MapArtCommand {
                                         .executes(context -> debugGroundedSingleLaneStatus(context.getSource())))
                                 .then(ClientCommandManager.literal("stop")
                                         .executes(context -> debugGroundedSingleLaneStop(context.getSource()))))
+                        .then(ClientCommandManager.literal("grounded-trace")
+                                .then(ClientCommandManager.literal("on")
+                                        .executes(context -> groundedTraceSet(context.getSource(), true)))
+                                .then(ClientCommandManager.literal("off")
+                                        .executes(context -> groundedTraceSet(context.getSource(), false)))
+                                .then(ClientCommandManager.literal("status")
+                                        .executes(context -> groundedTraceStatus(context.getSource()))))
                 );
     }
 
@@ -538,6 +545,27 @@ public final class MapArtCommand {
         }
 
         source.sendFeedback(Text.literal("Started debug grounded full serpentine sweep (forward + reverse leftovers)."));
+        return 1;
+    }
+
+    private static int groundedTraceSet(FabricClientCommandSource source, boolean enabled) {
+        GroundedSingleLaneDebugRunner runner = MapArtRuntime.groundedSingleLaneDebugRunner();
+        if (runner == null) {
+            source.sendError(Text.literal("Grounded sweep debug runner is unavailable."));
+            return 0;
+        }
+        runner.setGroundedTraceEnabled(enabled);
+        source.sendFeedback(Text.literal("Grounded trace " + (enabled ? "enabled" : "disabled") + "."));
+        return 1;
+    }
+
+    private static int groundedTraceStatus(FabricClientCommandSource source) {
+        GroundedSingleLaneDebugRunner runner = MapArtRuntime.groundedSingleLaneDebugRunner();
+        if (runner == null) {
+            source.sendError(Text.literal("Grounded sweep debug runner is unavailable."));
+            return 0;
+        }
+        source.sendFeedback(Text.literal("Grounded trace is " + (runner.groundedTraceEnabled() ? "on" : "off") + "."));
         return 1;
     }
 
