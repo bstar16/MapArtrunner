@@ -352,6 +352,23 @@ class GroundedSingleLaneDebugRunnerTest {
         assertFalse(status.awaitingStartApproach());
     }
 
+
+    @Test
+    void shiftedLaneCompletionQueuesYawLockBeforeWalkerStartsInRuntimeFlow() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        assertTrue(runner.startFullSweep(sessionWithOrigin(new Vec3i(5, 1, 11)), GroundedSweepSettings.defaults()).isEmpty());
+        runner.advanceSweepToNextLaneForTests();
+        GroundedSingleLaneDebugRunner.LaneShiftPlan plan = runner.laneShiftPlanForTests().orElseThrow();
+
+        MinecraftClientStub client = new MinecraftClientStub();
+        boolean queued = runner.queueLaneStartForTests(client.playerYawSetter(), plan.toLane());
+
+        assertTrue(queued);
+        assertEquals(GroundedSingleLaneDebugRunner.LaneStartStage.LOCK_LANE_YAW, runner.laneStartStageForTests());
+        assertEquals(GroundedLaneDirection.WEST, plan.toLane().direction());
+        assertEquals(plan.toLane().direction().yawDegrees(), client.yaw());
+    }
+
     @Test
     void laneShiftCompletionDoesNotCallBaritoneAgain() {
         RecordingBaritoneFacade baritone = new RecordingBaritoneFacade();
@@ -714,6 +731,19 @@ class GroundedSingleLaneDebugRunnerTest {
                 Map.of(),
                 List.of()
         );
+    }
+
+
+    private static final class MinecraftClientStub {
+        private float yaw;
+
+        java.util.function.Consumer<Float> playerYawSetter() {
+            return value -> yaw = value;
+        }
+
+        float yaw() {
+            return yaw;
+        }
     }
 
     private static final class RecordingBaritoneFacade implements BaritoneFacade {
