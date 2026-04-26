@@ -183,6 +183,87 @@ class GroundedSingleLaneDebugRunnerTest {
     }
 
     @Test
+    void placedResultCreatesPendingVerificationInsteadOfImmediateSuccess() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
+        runner.seedLanePlacementsForTests(List.of(new GroundedSweepPlacementExecutor.PlacementTarget(4, new BlockPos(11, 64, 12))));
+
+        runner.recordPlacementPlacedForTests(4, new BlockPos(11, 64, 12), 10);
+
+        GroundedSingleLaneDebugRunner.DebugStatus status = runner.status();
+        assertEquals(0, status.successfulPlacements());
+        assertEquals(1, status.pendingVerification());
+        assertTrue(runner.hasPendingVerificationForTests(4));
+        assertTrue(runner.pendingPlacementIndicesForTests().isEmpty());
+    }
+
+    @Test
+    void pendingVerificationPlacementIsNotReselectedDuringDelay() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
+        runner.seedLanePlacementsForTests(List.of(new GroundedSweepPlacementExecutor.PlacementTarget(5, new BlockPos(11, 64, 12))));
+        runner.recordPlacementPlacedForTests(5, new BlockPos(11, 64, 12), 20);
+
+        assertTrue(runner.rankedPlacementIndicesForTests(11, 21).isEmpty());
+        assertEquals(1, runner.pendingVerificationCountForTests());
+    }
+
+    @Test
+    void dueVerificationWithWorldMatchBecomesConfirmedSuccessOnce() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
+        runner.seedLanePlacementsForTests(List.of(new GroundedSweepPlacementExecutor.PlacementTarget(6, new BlockPos(11, 64, 12))));
+        runner.recordPlacementPlacedForTests(6, new BlockPos(11, 64, 12), 30);
+
+        runner.processPendingVerificationsForTests(Map.of(6, true), 32);
+        assertEquals(0, runner.status().successfulPlacements());
+        assertEquals(1, runner.pendingVerificationCountForTests());
+
+        runner.processPendingVerificationsForTests(Map.of(6, true), 33);
+        GroundedSingleLaneDebugRunner.DebugStatus status = runner.status();
+        assertEquals(1, status.successfulPlacements());
+        assertEquals(0, status.pendingVerification());
+        assertTrue(runner.pendingPlacementIndicesForTests().isEmpty());
+        assertTrue(status.leftovers().stream().noneMatch(record -> record.placementIndex() == 6));
+    }
+
+    @Test
+    void dueVerificationWithoutWorldMatchBecomesMissedLeftoverWithoutStoppingLane() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
+        runner.seedLanePlacementsForTests(List.of(new GroundedSweepPlacementExecutor.PlacementTarget(7, new BlockPos(11, 64, 12))));
+        runner.recordPlacementPlacedForTests(7, new BlockPos(11, 64, 12), 40);
+
+        runner.processPendingVerificationsForTests(Map.of(7, false), 43);
+
+        GroundedSingleLaneDebugRunner.DebugStatus status = runner.status();
+        assertTrue(status.active());
+        assertEquals(GroundedLaneWalkState.IDLE, status.walkState());
+        assertEquals(1, status.missedPlacements());
+        assertEquals(0, status.pendingVerification());
+        assertTrue(runner.pendingPlacementIndicesForTests().isEmpty());
+        GroundedSweepLeftoverTracker.GroundedLeftoverRecord record = status.leftovers().stream()
+                .filter(leftover -> leftover.placementIndex() == 7)
+                .findFirst()
+                .orElseThrow();
+        assertEquals(List.of(GroundedSweepLeftoverTracker.GroundedLeftoverReason.MISSED), record.reasons());
+    }
+
+    @Test
+    void terminalStatusCapturesOutstandingPendingVerificationCount() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
+        runner.seedLanePlacementsForTests(List.of(new GroundedSweepPlacementExecutor.PlacementTarget(8, new BlockPos(11, 64, 12))));
+        runner.recordPlacementPlacedForTests(8, new BlockPos(11, 64, 12), 50);
+
+        runner.finalizeTerminalStateForTests(GroundedLaneWalkState.COMPLETE, Optional.empty());
+
+        GroundedSingleLaneDebugRunner.DebugStatus status = runner.status();
+        assertFalse(status.active());
+        assertEquals(1, status.pendingVerification());
+    }
+
+    @Test
     void targetFilteringRequiresCorridorAndConfiguredSweepHalfWidth() {
         BuildPlan plan = buildPlan(List.of(
                 new Placement(new BlockPos(1, 0, 2), null), // centerline

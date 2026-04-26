@@ -458,6 +458,7 @@ public final class MapArtCommand {
                     + ", success=" + status.successfulPlacements()
                     + ", missed=" + status.missedPlacements()
                     + ", failed=" + status.failedPlacements()
+                    + ", pendingVerification=" + status.pendingVerification()
                     + ", leftovers=" + status.leftovers().size()));
             status.failureReason().ifPresent(reason -> source.sendFeedback(Text.literal("Failure reason: " + reason)));
             return 0;
@@ -470,6 +471,7 @@ public final class MapArtCommand {
                 + ", success=" + status.successfulPlacements()
                 + ", missed=" + status.missedPlacements()
                 + ", failed=" + status.failedPlacements()
+                + ", pendingVerification=" + status.pendingVerification()
                 + ", leftovers=" + status.leftovers().size()));
         status.failureReason().ifPresent(reason -> source.sendFeedback(Text.literal("Failure reason: " + reason)));
         if (!status.leftovers().isEmpty()) {
