@@ -35,4 +35,13 @@ public enum GroundedLaneDirection {
     public int forwardSign() {
         return forwardSign;
     }
+
+    public GroundedLaneDirection opposite() {
+        return switch (this) {
+            case EAST -> WEST;
+            case WEST -> EAST;
+            case SOUTH -> NORTH;
+            case NORTH -> SOUTH;
+        };
+    }
 }

@@ -16,10 +16,12 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.function.Predicate;
 
 public final class GroundedSingleLaneDebugRunner {
@@ -35,6 +37,7 @@ public final class GroundedSingleLaneDebugRunner {
     private BuildSession activeSession;
     private GroundedSchematicBounds activeBounds;
     private GroundedSweepLane activeLane;
+    private GroundedSweepSettings activeSettings;
     private GroundedSweepPlacementExecutor placementSelector;
     private Map<Integer, Placement> lanePlacementsByIndex = Map.of();
     private List<GroundedSweepPlacementExecutor.PlacementTarget> pendingPlacementTargets = List.of();
@@ -46,6 +49,15 @@ public final class GroundedSingleLaneDebugRunner {
     private long laneTicksElapsed;
     private boolean awaitingStartApproach;
     private boolean startApproachIssued;
+
+    private SweepRunMode runMode = SweepRunMode.SINGLE_LANE;
+    private List<GroundedSweepLane> forwardLanes = List.of();
+    private List<GroundedSweepLane> reverseLanes = List.of();
+    private int laneCursor;
+    private SweepPassPhase sweepPassPhase = SweepPassPhase.FORWARD;
+    private final Set<Integer> forwardLeftoverPlacements = new LinkedHashSet<>();
+    private final Set<Integer> reversePlacementFilter = new LinkedHashSet<>();
+
     private DebugStatus lastStatus = new DebugStatus(
             false,
             null,
@@ -57,7 +69,8 @@ public final class GroundedSingleLaneDebugRunner {
             0,
             0,
             0,
-            List.of()
+            List.of(),
+            SweepPassPhase.FORWARD
     );
 
     public GroundedSingleLaneDebugRunner(BaritoneFacade baritoneFacade) {
@@ -65,49 +78,38 @@ public final class GroundedSingleLaneDebugRunner {
     }
 
     public Optional<String> start(BuildSession session, int laneIndex, GroundedSweepSettings settings) {
-        Objects.requireNonNull(session, "session");
-        Objects.requireNonNull(settings, "settings");
-        if (session.getOrigin() == null) {
-            return Optional.of("Origin must be set before starting debug grounded sweep mode.");
-        }
-        if (activeLane != null || laneWalker.state() == GroundedLaneWalker.GroundedLaneWalkState.ACTIVE) {
-            return Optional.of("Grounded single-lane debug run is already active.");
+        Optional<String> validation = validateStart(session, settings);
+        if (validation.isPresent()) {
+            return validation;
         }
 
-        BuildPlan plan = session.getPlan();
-        if (plan.placements().isEmpty()) {
-            return Optional.of("Loaded plan has no placements.");
-        }
-
-        GroundedSchematicBounds bounds = GroundedSchematicBounds.fromPlan(plan, session.getOrigin());
+        GroundedSchematicBounds bounds = GroundedSchematicBounds.fromPlan(session.getPlan(), session.getOrigin());
         List<GroundedSweepLane> lanes = lanePlanner.planLanes(bounds, settings);
         if (laneIndex < 0 || laneIndex >= lanes.size()) {
             return Optional.of("Requested lane index " + laneIndex + " does not exist. Available range: 0-" + (lanes.size() - 1) + ".");
         }
 
-        activeSession = session;
-        activeBounds = bounds;
-        activeLane = lanes.get(laneIndex);
-        placementSelector = new GroundedSweepPlacementExecutor(GroundedSweepPlacementExecutorSettings.fromGroundedSweepSettings(settings));
-        lanePlacementsByIndex = new HashMap<>();
-        pendingPlacementTargets = buildLanePlacementTargets(
-                session.getPlan(),
-                session.getOrigin(),
-                activeBounds,
-                activeLane,
-                settings.sweepHalfWidth(),
-                lanePlacementsByIndex
-        );
-        pendingVerificationsByPlacement = new LinkedHashMap<>();
-        currentLeftovers = List.of();
-        successfulPlacements = 0;
-        failedPlacements = 0;
-        missedPlacements = 0;
-        laneTicksElapsed = 0;
-        awaitingStartApproach = true;
-        startApproachIssued = false;
-        displacementAlert.reset();
-        lastStatus = new DebugStatus(true, activeLane.laneIndex(), GroundedLaneWalker.GroundedLaneWalkState.IDLE, true, Optional.empty(), 0, 0, 0, 0, 0, List.of());
+        initializeRunState(session, bounds, settings, SweepRunMode.SINGLE_LANE, lanes, List.of(), SweepPassPhase.FORWARD);
+        activateLane(lanes.get(laneIndex), Set.of());
+        return Optional.empty();
+    }
+
+    public Optional<String> startFullSweep(BuildSession session, GroundedSweepSettings settings) {
+        Optional<String> validation = validateStart(session, settings);
+        if (validation.isPresent()) {
+            return validation;
+        }
+
+        GroundedSchematicBounds bounds = GroundedSchematicBounds.fromPlan(session.getPlan(), session.getOrigin());
+        List<GroundedSweepLane> lanes = lanePlanner.planLanes(bounds, settings);
+        if (lanes.isEmpty()) {
+            return Optional.of("Grounded sweep did not produce any lanes for this schematic footprint.");
+        }
+
+        List<GroundedSweepLane> reverse = buildReverseSweepLanes(lanes);
+        initializeRunState(session, bounds, settings, SweepRunMode.FULL_SWEEP, lanes, reverse, SweepPassPhase.FORWARD);
+        laneCursor = 0;
+        activateLane(forwardLanes.getFirst(), Set.of());
         return Optional.empty();
     }
 
@@ -170,7 +172,8 @@ public final class GroundedSingleLaneDebugRunner {
                     missedPlacements,
                     failedPlacements,
                     pendingVerificationsByPlacement.size(),
-                    currentLeftovers
+                    currentLeftovers,
+                    sweepPassPhase
             );
         }
         return lastStatus;
@@ -198,7 +201,8 @@ public final class GroundedSingleLaneDebugRunner {
                 missedPlacements,
                 failedPlacements,
                 pendingVerificationsByPlacement.size(),
-                currentLeftovers
+                currentLeftovers,
+                sweepPassPhase
         );
         applyLaneControls(client);
     }
@@ -296,11 +300,72 @@ public final class GroundedSingleLaneDebugRunner {
 
     private void handleTerminalState(MinecraftClient client) {
         processTerminalPendingVerifications(client);
-        captureLastStatus(laneWalker.state(), laneWalker.failureReason());
+
+        GroundedLaneWalker.GroundedLaneWalkState terminalState = laneWalker.state();
+        Optional<String> failureReason = laneWalker.failureReason();
+        captureLaneLeftoversForPass();
+
+        if (terminalState == GroundedLaneWalker.GroundedLaneWalkState.COMPLETE && runMode == SweepRunMode.FULL_SWEEP) {
+            if (tryAdvanceSweepToNextLane()) {
+                if (client != null) {
+                    clearControls(client);
+                }
+                return;
+            }
+        }
+
+        captureLastStatus(terminalState, failureReason);
         if (client != null) {
             clearControls(client);
         }
         clearActiveRunState();
+    }
+
+    private void captureLaneLeftoversForPass() {
+        if (placementSelector == null || activeLane == null || activeBounds == null) {
+            return;
+        }
+        refreshCurrentLeftovers();
+        if (sweepPassPhase == SweepPassPhase.FORWARD) {
+            for (GroundedSweepLeftoverTracker.GroundedLeftoverRecord leftover : currentLeftovers) {
+                forwardLeftoverPlacements.add(leftover.placementIndex());
+            }
+            for (GroundedSweepPlacementExecutor.PlacementTarget pendingPlacementTarget : pendingPlacementTargets) {
+                forwardLeftoverPlacements.add(pendingPlacementTarget.placementIndex());
+            }
+            for (PendingPlacementVerification pending : pendingVerificationsByPlacement.values()) {
+                forwardLeftoverPlacements.add(pending.placementIndex());
+            }
+        }
+    }
+
+    private boolean tryAdvanceSweepToNextLane() {
+        laneCursor++;
+        if (sweepPassPhase == SweepPassPhase.FORWARD && laneCursor < forwardLanes.size()) {
+            activateLane(forwardLanes.get(laneCursor), Set.of());
+            return true;
+        }
+
+        if (sweepPassPhase == SweepPassPhase.FORWARD) {
+            if (forwardLeftoverPlacements.isEmpty() || reverseLanes.isEmpty()) {
+                sweepPassPhase = SweepPassPhase.COMPLETE;
+                return false;
+            }
+            reversePlacementFilter.clear();
+            reversePlacementFilter.addAll(forwardLeftoverPlacements);
+            sweepPassPhase = SweepPassPhase.REVERSE;
+            laneCursor = 0;
+            activateLane(reverseLanes.getFirst(), reversePlacementFilter);
+            return true;
+        }
+
+        if (sweepPassPhase == SweepPassPhase.REVERSE && laneCursor < reverseLanes.size() && !reversePlacementFilter.isEmpty()) {
+            activateLane(reverseLanes.get(laneCursor), reversePlacementFilter);
+            return true;
+        }
+
+        sweepPassPhase = SweepPassPhase.COMPLETE;
+        return false;
     }
 
     private void captureLastStatus(GroundedLaneWalker.GroundedLaneWalkState state, Optional<String> failureReason) {
@@ -316,7 +381,8 @@ public final class GroundedSingleLaneDebugRunner {
                 missedPlacements,
                 failedPlacements,
                 pendingVerificationsByPlacement.size(),
-                currentLeftovers
+                currentLeftovers,
+                sweepPassPhase
         );
     }
 
@@ -324,6 +390,7 @@ public final class GroundedSingleLaneDebugRunner {
         activeSession = null;
         activeBounds = null;
         activeLane = null;
+        activeSettings = null;
         placementSelector = null;
         lanePlacementsByIndex = Map.of();
         pendingPlacementTargets = List.of();
@@ -332,6 +399,14 @@ public final class GroundedSingleLaneDebugRunner {
         awaitingStartApproach = false;
         startApproachIssued = false;
         displacementAlert.reset();
+
+        runMode = SweepRunMode.SINGLE_LANE;
+        forwardLanes = List.of();
+        reverseLanes = List.of();
+        laneCursor = 0;
+        sweepPassPhase = SweepPassPhase.FORWARD;
+        forwardLeftoverPlacements.clear();
+        reversePlacementFilter.clear();
     }
 
     private void tickPlacementExecutor(MinecraftClient client) {
@@ -392,6 +467,7 @@ public final class GroundedSingleLaneDebugRunner {
         placementSelector.recordPlacementResult(placementIndex, groundedResult, tick);
         if (groundedResult == GroundedSweepPlacementExecutor.PlacementResult.SUCCESS) {
             successfulPlacements++;
+            reversePlacementFilter.remove(placementIndex);
             removePendingPlacement(placementIndex);
             return;
         }
@@ -529,11 +605,17 @@ public final class GroundedSingleLaneDebugRunner {
             GroundedSchematicBounds bounds,
             GroundedSweepLane lane,
             int sweepHalfWidth,
-            Map<Integer, Placement> lanePlacementsByIndex
+            Map<Integer, Placement> lanePlacementsByIndex,
+            Set<Integer> placementFilter
     ) {
         List<GroundedSweepPlacementExecutor.PlacementTarget> targets = new ArrayList<>();
         GroundedLaneCorridorBounds corridor = lane.corridorBounds();
+        boolean hasFilter = placementFilter != null && !placementFilter.isEmpty();
+
         for (int i = 0; i < plan.placements().size(); i++) {
+            if (hasFilter && !placementFilter.contains(i)) {
+                continue;
+            }
             Placement placement = plan.placements().get(i);
             BlockPos worldPos = origin.add(placement.relativePos());
             if (worldPos.getX() < bounds.minX() || worldPos.getX() > bounds.maxX()
@@ -593,7 +675,7 @@ public final class GroundedSingleLaneDebugRunner {
             int sweepHalfWidth,
             Map<Integer, Placement> lanePlacementsByIndex
     ) {
-        return buildLanePlacementTargets(plan, origin, bounds, lane, sweepHalfWidth, lanePlacementsByIndex);
+        return buildLanePlacementTargets(plan, origin, bounds, lane, sweepHalfWidth, lanePlacementsByIndex, Set.of());
     }
 
     private static void clearControls(MinecraftClient client) {
@@ -619,6 +701,107 @@ public final class GroundedSingleLaneDebugRunner {
         return activeLane != null;
     }
 
+    private Optional<String> validateStart(BuildSession session, GroundedSweepSettings settings) {
+        Objects.requireNonNull(session, "session");
+        Objects.requireNonNull(settings, "settings");
+        if (session.getOrigin() == null) {
+            return Optional.of("Origin must be set before starting debug grounded sweep mode.");
+        }
+        if (activeLane != null || laneWalker.state() == GroundedLaneWalker.GroundedLaneWalkState.ACTIVE) {
+            return Optional.of("Grounded single-lane debug run is already active.");
+        }
+        if (session.getPlan().placements().isEmpty()) {
+            return Optional.of("Loaded plan has no placements.");
+        }
+        return Optional.empty();
+    }
+
+    private void initializeRunState(
+            BuildSession session,
+            GroundedSchematicBounds bounds,
+            GroundedSweepSettings settings,
+            SweepRunMode mode,
+            List<GroundedSweepLane> plannedForwardLanes,
+            List<GroundedSweepLane> plannedReverseLanes,
+            SweepPassPhase initialPhase
+    ) {
+        activeSession = session;
+        activeBounds = bounds;
+        activeSettings = settings;
+        runMode = mode;
+        forwardLanes = List.copyOf(plannedForwardLanes);
+        reverseLanes = List.copyOf(plannedReverseLanes);
+        laneCursor = 0;
+        sweepPassPhase = initialPhase;
+
+        successfulPlacements = 0;
+        failedPlacements = 0;
+        missedPlacements = 0;
+        laneTicksElapsed = 0;
+        forwardLeftoverPlacements.clear();
+        reversePlacementFilter.clear();
+
+        pendingVerificationsByPlacement = new LinkedHashMap<>();
+        currentLeftovers = List.of();
+        displacementAlert.reset();
+    }
+
+    private void activateLane(GroundedSweepLane lane, Set<Integer> placementFilter) {
+        activeLane = lane;
+        placementSelector = new GroundedSweepPlacementExecutor(GroundedSweepPlacementExecutorSettings.fromGroundedSweepSettings(activeSettings));
+        lanePlacementsByIndex = new HashMap<>();
+        pendingPlacementTargets = buildLanePlacementTargets(
+                activeSession.getPlan(),
+                activeSession.getOrigin(),
+                activeBounds,
+                activeLane,
+                activeSettings.sweepHalfWidth(),
+                lanePlacementsByIndex,
+                placementFilter
+        );
+        pendingVerificationsByPlacement = new LinkedHashMap<>();
+        currentLeftovers = List.of();
+
+        awaitingStartApproach = true;
+        startApproachIssued = false;
+
+        lastStatus = new DebugStatus(
+                true,
+                activeLane.laneIndex(),
+                GroundedLaneWalker.GroundedLaneWalkState.IDLE,
+                true,
+                Optional.empty(),
+                laneTicksElapsed,
+                successfulPlacements,
+                missedPlacements,
+                failedPlacements,
+                0,
+                currentLeftovers,
+                sweepPassPhase
+        );
+    }
+
+    private static List<GroundedSweepLane> buildReverseSweepLanes(List<GroundedSweepLane> forwardLanes) {
+        List<GroundedSweepLane> reversed = new ArrayList<>(forwardLanes.size());
+        for (int i = forwardLanes.size() - 1; i >= 0; i--) {
+            GroundedSweepLane lane = forwardLanes.get(i);
+            reversed.add(new GroundedSweepLane(
+                    lane.laneIndex(),
+                    lane.centerlineCoordinate(),
+                    lane.direction().opposite(),
+                    lane.endPoint(),
+                    lane.startPoint(),
+                    lane.corridorBounds(),
+                    lane.endpointTolerance()
+            ));
+        }
+        return List.copyOf(reversed);
+    }
+
+    static List<GroundedSweepLane> buildReverseSweepLanesForTests(List<GroundedSweepLane> forwardLanes) {
+        return buildReverseSweepLanes(forwardLanes);
+    }
+
     public record DebugStatus(
             boolean active,
             Integer laneIndex,
@@ -630,12 +813,25 @@ public final class GroundedSingleLaneDebugRunner {
             int missedPlacements,
             int failedPlacements,
             int pendingVerification,
-            List<GroundedSweepLeftoverTracker.GroundedLeftoverRecord> leftovers
+            List<GroundedSweepLeftoverTracker.GroundedLeftoverRecord> leftovers,
+            SweepPassPhase phase
     ) {
         public DebugStatus {
             failureReason = failureReason == null ? Optional.empty() : failureReason;
             leftovers = leftovers == null ? List.of() : List.copyOf(leftovers);
+            phase = phase == null ? SweepPassPhase.FORWARD : phase;
         }
+    }
+
+    public enum SweepPassPhase {
+        FORWARD,
+        REVERSE,
+        COMPLETE
+    }
+
+    private enum SweepRunMode {
+        SINGLE_LANE,
+        FULL_SWEEP
     }
 
     private record PendingPlacementVerification(
