@@ -604,6 +604,52 @@ public final class GroundedSingleLaneDebugRunner {
         return pendingTransitionSupportTargets.stream().map(GroundedSweepPlacementExecutor.PlacementTarget::worldPos).toList();
     }
 
+    List<GroundedSweepPlacementExecutor.PlacementTarget> transitionSupportTargetsForTests() {
+        return List.copyOf(pendingTransitionSupportTargets);
+    }
+
+    void keepOnlyTransitionSupportTargetForTests(int placementIndex) {
+        if (pendingTransitionSupportTargets.isEmpty()) {
+            return;
+        }
+        List<GroundedSweepPlacementExecutor.PlacementTarget> retained = new ArrayList<>();
+        for (GroundedSweepPlacementExecutor.PlacementTarget target : pendingTransitionSupportTargets) {
+            if (target.placementIndex() == placementIndex) {
+                retained.add(target);
+            }
+        }
+        pendingTransitionSupportTargets = List.copyOf(retained);
+        if (!transitionSupportPlacementsByIndex.isEmpty()) {
+            Placement placement = transitionSupportPlacementsByIndex.get(placementIndex);
+            transitionSupportPlacementsByIndex = placement == null ? Map.of() : Map.of(placementIndex, placement);
+        }
+    }
+
+    void recordTransitionSupportPlacedForTests(int placementIndex, BlockPos worldPos, long supportTick) {
+        pendingTransitionSupportVerifications = mutableTransitionSupportVerifications();
+        pendingTransitionSupportVerifications.put(
+                placementIndex,
+                new PendingPlacementVerification(placementIndex, worldPos, null, supportTick + PLACEMENT_VERIFICATION_DELAY_TICKS)
+        );
+        removePendingTransitionSupportTarget(placementIndex);
+    }
+
+    int pendingTransitionSupportVerificationCountForTests() {
+        return pendingTransitionSupportVerifications.size();
+    }
+
+    void processTransitionSupportVerificationsForTests(Map<Integer, Boolean> matchesByPlacementIndex, long supportTick) {
+        processTransitionSupportVerifications(
+                null,
+                supportTick,
+                false,
+                pending -> matchesByPlacementIndex.getOrDefault(pending.placementIndex(), false)
+        );
+        if (awaitingTransitionSupport && transitionSupportReady()) {
+            completeTransitionSupportPhase();
+        }
+    }
+
     void completeTransitionSupportForTests() {
         pendingTransitionSupportTargets = List.of();
         pendingTransitionSupportVerifications = Map.of();
@@ -1152,7 +1198,7 @@ public final class GroundedSingleLaneDebugRunner {
             return;
         }
         transitionSupportTicks++;
-        processTransitionSupportVerifications(client, laneTicksElapsed, false);
+        processTransitionSupportVerifications(client, transitionSupportTicks, false);
         if (transitionSupportReady()) {
             completeTransitionSupportPhase();
             return;
@@ -1180,7 +1226,7 @@ public final class GroundedSingleLaneDebugRunner {
                     pendingTransitionSupportVerifications = mutableTransitionSupportVerifications();
                     pendingTransitionSupportVerifications.put(
                             target.placementIndex(),
-                            new PendingPlacementVerification(target.placementIndex(), target.worldPos(), placement.block(), laneTicksElapsed + PLACEMENT_VERIFICATION_DELAY_TICKS)
+                            new PendingPlacementVerification(target.placementIndex(), target.worldPos(), placement.block(), transitionSupportTicks + PLACEMENT_VERIFICATION_DELAY_TICKS)
                     );
                     removePendingTransitionSupportTarget(target.placementIndex());
                 }
@@ -1199,7 +1245,7 @@ public final class GroundedSingleLaneDebugRunner {
             }
             attempts++;
         }
-        processTransitionSupportVerifications(client, laneTicksElapsed, false);
+        processTransitionSupportVerifications(client, transitionSupportTicks, false);
         if (transitionSupportReady()) {
             completeTransitionSupportPhase();
         }
@@ -1890,6 +1936,15 @@ public final class GroundedSingleLaneDebugRunner {
     }
 
     private void processTransitionSupportVerifications(MinecraftClient client, long tick, boolean forceAll) {
+        processTransitionSupportVerifications(client, tick, forceAll, pending -> verifyExpectedBlock(client, pending));
+    }
+
+    private void processTransitionSupportVerifications(
+            MinecraftClient client,
+            long tick,
+            boolean forceAll,
+            Predicate<PendingPlacementVerification> verifier
+    ) {
         if (pendingTransitionSupportVerifications.isEmpty()) {
             return;
         }
@@ -1900,7 +1955,7 @@ public final class GroundedSingleLaneDebugRunner {
             if (!forceAll && tick < pending.verifyDueTick()) {
                 continue;
             }
-            if (!verifyExpectedBlock(client, pending)) {
+            if (!verifier.test(pending)) {
                 transitionSupportFailedCount++;
                 failLaneTransition(client, "Unable to build safe transition support path");
                 return;

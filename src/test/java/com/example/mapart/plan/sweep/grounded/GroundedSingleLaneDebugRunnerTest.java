@@ -1075,6 +1075,32 @@ class GroundedSingleLaneDebugRunnerTest {
         assertEquals("Unable to build safe transition support path", status.failureReason().orElseThrow());
     }
 
+    @Test
+    void transitionSupportVerificationTimingUsesSupportTicksNotLaneTicks() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        assertTrue(runner.startFullSweep(sessionWithBridgeSupport(), GroundedSweepSettings.defaults()).isEmpty());
+        runner.advanceSweepToNextLaneForTests();
+        assertTrue(runner.awaitingTransitionSupportForTests());
+        assertEquals(0, runner.status().ticksElapsed());
+
+        GroundedSweepPlacementExecutor.PlacementTarget target = runner.transitionSupportTargetsForTests().getFirst();
+        runner.keepOnlyTransitionSupportTargetForTests(target.placementIndex());
+        runner.recordTransitionSupportPlacedForTests(target.placementIndex(), target.worldPos(), 0);
+        assertEquals(1, runner.pendingTransitionSupportVerificationCountForTests());
+
+        runner.processTransitionSupportVerificationsForTests(Map.of(target.placementIndex(), true), 2);
+        assertEquals(1, runner.pendingTransitionSupportVerificationCountForTests());
+        assertEquals(0, runner.status().ticksElapsed());
+        assertTrue(runner.awaitingTransitionSupportForTests());
+        assertFalse(runner.status().awaitingLaneShift());
+
+        runner.processTransitionSupportVerificationsForTests(Map.of(target.placementIndex(), true), 3);
+        assertEquals(0, runner.pendingTransitionSupportVerificationCountForTests());
+        assertFalse(runner.awaitingTransitionSupportForTests());
+        assertTrue(runner.status().awaitingLaneShift());
+        assertEquals(0, runner.status().ticksElapsed());
+    }
+
     private static BuildSession sessionWithOrigin() {
         return sessionWithOrigin(new Vec3i(5, 1, 5));
     }
