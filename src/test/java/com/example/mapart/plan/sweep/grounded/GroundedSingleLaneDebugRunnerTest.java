@@ -15,6 +15,7 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -985,6 +986,121 @@ class GroundedSingleLaneDebugRunnerTest {
         assertEquals(GroundedLaneDirection.WEST, reverse.get(1).direction());
     }
 
+    @Test
+    void transitionSupportTargetsBridgeBetweenEastWestLaneCenterlinesInsideBounds() {
+        BuildPlan plan = buildPlan(new Vec3i(5, 1, 5), List.of(
+                new Placement(new BlockPos(4, 0, 1), null),
+                new Placement(new BlockPos(4, 0, 2), null),
+                new Placement(new BlockPos(4, 0, 3), null),
+                new Placement(new BlockPos(0, 0, 4), null)
+        ));
+        BlockPos origin = new BlockPos(10, 64, 10);
+        GroundedSchematicBounds bounds = GroundedSchematicBounds.fromPlan(plan, origin);
+        GroundedSweepLane fromLane = new GroundedSweepLane(0, 11, GroundedLaneDirection.EAST,
+                new BlockPos(10, 64, 11), new BlockPos(14, 64, 11), new GroundedLaneCorridorBounds(10, 14, 10, 12), 1.0);
+        GroundedSweepLane toLane = new GroundedSweepLane(1, 13, GroundedLaneDirection.WEST,
+                new BlockPos(14, 64, 13), new BlockPos(10, 64, 13), new GroundedLaneCorridorBounds(10, 14, 12, 14), 1.0);
+
+        List<BlockPos> targets = GroundedSingleLaneDebugRunner.buildTransitionSupportTargetsForTests(
+                plan, origin, bounds, fromLane, toLane, new java.util.HashMap<>())
+                .stream()
+                .map(GroundedSweepPlacementExecutor.PlacementTarget::worldPos)
+                .toList();
+
+        assertTrue(targets.contains(new BlockPos(14, 64, 11)));
+        assertTrue(targets.contains(new BlockPos(14, 64, 12)));
+        assertTrue(targets.contains(new BlockPos(14, 64, 13)));
+        assertFalse(targets.contains(new BlockPos(10, 64, 14)));
+    }
+
+    @Test
+    void transitionSupportTargetsBuildXBridgeForNorthSouthLanes() {
+        BuildPlan plan = buildPlan(new Vec3i(5, 1, 5), List.of(
+                new Placement(new BlockPos(1, 0, 4), null),
+                new Placement(new BlockPos(2, 0, 4), null),
+                new Placement(new BlockPos(3, 0, 4), null)
+        ));
+        BlockPos origin = new BlockPos(10, 64, 10);
+        GroundedSchematicBounds bounds = GroundedSchematicBounds.fromPlan(plan, origin);
+        GroundedSweepLane fromLane = new GroundedSweepLane(0, 11, GroundedLaneDirection.SOUTH,
+                new BlockPos(11, 64, 10), new BlockPos(11, 64, 14), new GroundedLaneCorridorBounds(10, 12, 10, 14), 1.0);
+        GroundedSweepLane toLane = new GroundedSweepLane(1, 13, GroundedLaneDirection.NORTH,
+                new BlockPos(13, 64, 14), new BlockPos(13, 64, 10), new GroundedLaneCorridorBounds(12, 14, 10, 14), 1.0);
+
+        Set<BlockPos> targets = Set.copyOf(GroundedSingleLaneDebugRunner.buildTransitionSupportTargetsForTests(
+                        plan, origin, bounds, fromLane, toLane, new java.util.HashMap<>())
+                .stream().map(GroundedSweepPlacementExecutor.PlacementTarget::worldPos).toList());
+
+        assertTrue(targets.contains(new BlockPos(11, 64, 14)));
+        assertTrue(targets.contains(new BlockPos(12, 64, 14)));
+        assertTrue(targets.contains(new BlockPos(13, 64, 14)));
+    }
+
+    @Test
+    void laneShiftWaitsUntilTransitionSupportCompletes() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        assertTrue(runner.startFullSweep(sessionWithBridgeSupport(), GroundedSweepSettings.defaults()).isEmpty());
+        runner.advanceSweepToNextLaneForTests();
+
+        assertTrue(runner.awaitingTransitionSupportForTests());
+        assertFalse(runner.status().awaitingLaneShift());
+
+        GroundedSingleLaneDebugRunner.LaneShiftPlan plan = runner.laneShiftPlanForTests().orElseThrow();
+        runner.completeLaneShiftIfNearForTests(
+                new Vec3d(plan.toLane().startPoint().getX() + 0.5, 64.0, plan.targetCenterlineCoordinate() + 0.5),
+                false
+        );
+        assertEquals(GroundedLaneWalkState.IDLE, runner.status().walkState());
+        assertTrue(runner.awaitingTransitionSupportForTests());
+
+        runner.completeTransitionSupportForTests();
+        runner.completeLaneShiftIfNearForTests(
+                new Vec3d(plan.toLane().startPoint().getX() + 0.5, 64.0, plan.targetCenterlineCoordinate() + 0.5),
+                false
+        );
+        assertEquals(GroundedLaneWalkState.ACTIVE, runner.status().walkState());
+    }
+
+    @Test
+    void transitionSupportFailureProducesClearReason() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        assertTrue(runner.startFullSweep(sessionWithBridgeSupport(), GroundedSweepSettings.defaults()).isEmpty());
+        runner.advanceSweepToNextLaneForTests();
+        assertTrue(runner.awaitingTransitionSupportForTests());
+
+        runner.failTransitionSupportForTests();
+
+        GroundedSingleLaneDebugRunner.DebugStatus status = runner.status();
+        assertFalse(status.active());
+        assertEquals("Unable to build safe transition support path", status.failureReason().orElseThrow());
+    }
+
+    @Test
+    void transitionSupportVerificationTimingUsesSupportTicksNotLaneTicks() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        assertTrue(runner.startFullSweep(sessionWithBridgeSupport(), GroundedSweepSettings.defaults()).isEmpty());
+        runner.advanceSweepToNextLaneForTests();
+        assertTrue(runner.awaitingTransitionSupportForTests());
+        assertEquals(0, runner.status().ticksElapsed());
+
+        GroundedSweepPlacementExecutor.PlacementTarget target = runner.transitionSupportTargetsForTests().getFirst();
+        runner.keepOnlyTransitionSupportTargetForTests(target.placementIndex());
+        runner.recordTransitionSupportPlacedForTests(target.placementIndex(), target.worldPos(), 0);
+        assertEquals(1, runner.pendingTransitionSupportVerificationCountForTests());
+
+        runner.processTransitionSupportVerificationsForTests(Map.of(target.placementIndex(), true), 2);
+        assertEquals(1, runner.pendingTransitionSupportVerificationCountForTests());
+        assertEquals(0, runner.status().ticksElapsed());
+        assertTrue(runner.awaitingTransitionSupportForTests());
+        assertFalse(runner.status().awaitingLaneShift());
+
+        runner.processTransitionSupportVerificationsForTests(Map.of(target.placementIndex(), true), 3);
+        assertEquals(0, runner.pendingTransitionSupportVerificationCountForTests());
+        assertFalse(runner.awaitingTransitionSupportForTests());
+        assertTrue(runner.status().awaitingLaneShift());
+        assertEquals(0, runner.status().ticksElapsed());
+    }
+
     private static BuildSession sessionWithOrigin() {
         return sessionWithOrigin(new Vec3i(5, 1, 5));
     }
@@ -1028,6 +1144,18 @@ class GroundedSingleLaneDebugRunnerTest {
     private static BuildSession sessionWithOrigin(Vec3i dimensions) {
         BuildPlan plan = buildPlan(dimensions, List.of(new Placement(new BlockPos(0, 0, 0), null)));
 
+        BuildSession session = new BuildSession(plan);
+        session.setOrigin(new BlockPos(10, 64, 10));
+        return session;
+    }
+
+    private static BuildSession sessionWithBridgeSupport() {
+        BuildPlan plan = buildPlan(new Vec3i(5, 1, 5), List.of(
+                new Placement(new BlockPos(0, 0, 0), null),
+                new Placement(new BlockPos(4, 0, 1), null),
+                new Placement(new BlockPos(4, 0, 2), null),
+                new Placement(new BlockPos(4, 0, 3), null)
+        ));
         BuildSession session = new BuildSession(plan);
         session.setOrigin(new BlockPos(10, 64, 10));
         return session;
