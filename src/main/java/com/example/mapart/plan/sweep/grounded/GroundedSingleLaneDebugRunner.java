@@ -33,6 +33,7 @@ public final class GroundedSingleLaneDebugRunner {
     private static final double LANE_SHIFT_REACH_DISTANCE_SQ = 1.5 * 1.5;
     private static final double LANE_TRANSITION_AXIS_TOLERANCE = 0.6;
     private static final int MAX_LANE_TRANSITION_TICKS = 120;
+    private static final int MAX_TRANSITION_SUPPORT_TICKS = 80;
     private static final int MIN_LANE_YAW_LOCK_TICKS = 2;
     private static final int MAX_LANE_YAW_LOCK_TICKS = 10;
     private static final float LANE_YAW_LOCK_TOLERANCE_DEGREES = 1.5f;
@@ -50,6 +51,7 @@ public final class GroundedSingleLaneDebugRunner {
     private final GroundedDisplacementAlert displacementAlert = new GroundedDisplacementAlert();
     private final PlacementExecutor placementExecutor = new PlacementExecutor();
     private final GroundedSweepResumeScanner resumeScanner = new GroundedSweepResumeScanner();
+    private final GroundedLaneTransitionSupportPlanner transitionSupportPlanner = new GroundedLaneTransitionSupportPlanner();
     private final BaritoneFacade baritoneFacade;
 
     private BuildSession activeSession;
@@ -73,6 +75,9 @@ public final class GroundedSingleLaneDebugRunner {
     private LaneShiftPlan laneShiftPlan;
     private LaneTransitionStage laneTransitionStage = LaneTransitionStage.ALIGN_FORWARD_AXIS;
     private int laneTransitionTicks;
+    private List<GroundedLaneTransitionSupportPlanner.SupportTarget> pendingTransitionSupportTargets = List.of();
+    private Map<Integer, PendingPlacementVerification> pendingTransitionSupportVerifications = Map.of();
+    private int transitionSupportTicks;
     private LaneStartStage laneStartStage = LaneStartStage.NONE;
     private GroundedSweepLane pendingLaneStart;
     private int pendingLaneStartTicks;
@@ -539,6 +544,9 @@ public final class GroundedSingleLaneDebugRunner {
         if (!awaitingLaneShift || playerPosition == null || laneShiftPlan == null || pendingShiftLane == null) {
             return;
         }
+        if (!pendingTransitionSupportTargets.isEmpty() || !pendingTransitionSupportVerifications.isEmpty()) {
+            return;
+        }
         if (laneTransitionStage == LaneTransitionStage.ALIGN_FORWARD_AXIS && isForwardAxisAligned(playerPosition, pendingShiftLane)) {
             laneTransitionStage = LaneTransitionStage.SHIFT_TO_CENTERLINE;
             traceGroundedEvent("lane transition stage changed: " + laneTransitionStage);
@@ -579,6 +587,15 @@ public final class GroundedSingleLaneDebugRunner {
 
     Optional<LaneShiftPlan> laneShiftPlanForTests() {
         return Optional.ofNullable(laneShiftPlan);
+    }
+
+    int transitionSupportPendingCountForTests() {
+        return pendingTransitionSupportTargets.size() + pendingTransitionSupportVerifications.size();
+    }
+
+    void markTransitionSupportReadyForTests() {
+        pendingTransitionSupportTargets = List.of();
+        pendingTransitionSupportVerifications = Map.of();
     }
 
     Optional<GroundedLaneWalker.GroundedLaneWalkCommand> laneWalkCommandForTests() {
@@ -793,6 +810,9 @@ public final class GroundedSingleLaneDebugRunner {
         laneShiftPlan = null;
         laneTransitionStage = LaneTransitionStage.ALIGN_FORWARD_AXIS;
         laneTransitionTicks = 0;
+        pendingTransitionSupportTargets = List.of();
+        pendingTransitionSupportVerifications = Map.of();
+        transitionSupportTicks = 0;
         laneStartStage = LaneStartStage.NONE;
         pendingLaneStart = null;
         pendingLaneStartTicks = 0;
@@ -1080,6 +1100,9 @@ public final class GroundedSingleLaneDebugRunner {
         if (!awaitingLaneShift || pendingShiftLane == null || laneShiftPlan == null || client.player == null) {
             return;
         }
+        if (!tickTransitionSupportPlacement(client)) {
+            return;
+        }
         laneTransitionTicks++;
         if (laneTransitionTicks > MAX_LANE_TRANSITION_TICKS) {
             traceGroundedEvent("lane failed: transition timeout");
@@ -1117,6 +1140,9 @@ public final class GroundedSingleLaneDebugRunner {
         laneShiftPlan = null;
         laneTransitionStage = LaneTransitionStage.ALIGN_FORWARD_AXIS;
         laneTransitionTicks = 0;
+        pendingTransitionSupportTargets = List.of();
+        pendingTransitionSupportVerifications = Map.of();
+        transitionSupportTicks = 0;
         activeLane = pendingShiftLane;
         traceGroundedEvent("active lane changed: " + describeLane(activeLane));
         pendingShiftLane = null;
@@ -1149,6 +1175,9 @@ public final class GroundedSingleLaneDebugRunner {
         laneShiftPlan = null;
         laneTransitionStage = LaneTransitionStage.ALIGN_FORWARD_AXIS;
         laneTransitionTicks = 0;
+        pendingTransitionSupportTargets = List.of();
+        pendingTransitionSupportVerifications = Map.of();
+        transitionSupportTicks = 0;
         activeLane = nextLane;
         traceGroundedEvent("active lane changed: " + describeLane(activeLane));
         pendingShiftLane = null;
@@ -1167,6 +1196,9 @@ public final class GroundedSingleLaneDebugRunner {
         pendingShiftLane = null;
         laneTransitionStage = LaneTransitionStage.ALIGN_FORWARD_AXIS;
         laneTransitionTicks = 0;
+        pendingTransitionSupportTargets = List.of();
+        pendingTransitionSupportVerifications = Map.of();
+        transitionSupportTicks = 0;
         laneWalker.interrupt();
         captureLastStatus(GroundedLaneWalker.GroundedLaneWalkState.FAILED, Optional.of(reason));
         if (client != null) {
@@ -1374,6 +1406,16 @@ public final class GroundedSingleLaneDebugRunner {
 
     static LaneShiftPlan buildLaneShiftPlanForTests(GroundedSweepLane fromLane, GroundedSweepLane toLane, GroundedSchematicBounds bounds) {
         return buildLaneShiftPlan(fromLane, toLane, bounds);
+    }
+
+    static List<GroundedLaneTransitionSupportPlanner.SupportTarget> buildLaneTransitionSupportTargetsForTests(
+            BuildPlan plan,
+            BlockPos origin,
+            GroundedSchematicBounds bounds,
+            GroundedSweepLane fromLane,
+            GroundedSweepLane toLane
+    ) {
+        return new GroundedLaneTransitionSupportPlanner().buildSupportTargets(plan, origin, bounds, fromLane, toLane);
     }
 
     static List<GroundedSweepPlacementExecutor.PlacementTarget> buildLanePlacementTargetsForTests(
@@ -1621,6 +1663,9 @@ public final class GroundedSingleLaneDebugRunner {
         laneShiftPlan = null;
         laneTransitionStage = LaneTransitionStage.ALIGN_FORWARD_AXIS;
         laneTransitionTicks = 0;
+        pendingTransitionSupportTargets = List.of();
+        pendingTransitionSupportVerifications = Map.of();
+        transitionSupportTicks = 0;
         laneStartStage = LaneStartStage.NONE;
         pendingLaneStart = null;
         pendingLaneStartTicks = 0;
@@ -1681,6 +1726,7 @@ public final class GroundedSingleLaneDebugRunner {
         awaitingLaneShift = true;
         traceGroundedEvent("awaitingLaneShift=true");
         laneShiftPlan = buildLaneShiftPlan(fromLane, lane, activeBounds);
+        initializeTransitionSupport(fromLane, lane);
         laneShiftTarget = laneShiftPlan.shiftTarget();
         pendingShiftLane = lane;
         laneTransitionStage = LaneTransitionStage.ALIGN_FORWARD_AXIS;
@@ -1723,6 +1769,146 @@ public final class GroundedSingleLaneDebugRunner {
         );
         pendingVerificationsByPlacement = new LinkedHashMap<>();
         currentLeftovers = List.of();
+    }
+
+
+    private void initializeTransitionSupport(GroundedSweepLane fromLane, GroundedSweepLane toLane) {
+        if (activeSession == null || activeBounds == null || fromLane == null || toLane == null) {
+            pendingTransitionSupportTargets = List.of();
+            pendingTransitionSupportVerifications = Map.of();
+            transitionSupportTicks = 0;
+            return;
+        }
+        pendingTransitionSupportTargets = transitionSupportPlanner.buildSupportTargets(
+                activeSession.getPlan(),
+                activeSession.getOrigin(),
+                activeBounds,
+                fromLane,
+                toLane
+        );
+        pendingTransitionSupportVerifications = new LinkedHashMap<>();
+        transitionSupportTicks = 0;
+        traceGroundedEvent("transition support phase started: from=" + describeLane(fromLane)
+                + ", to=" + describeLane(toLane)
+                + ", supportTargets=" + pendingTransitionSupportTargets.size());
+        if (pendingTransitionSupportTargets.isEmpty()) {
+            traceGroundedEvent("transition support complete: no support targets required");
+        }
+    }
+
+    private boolean tickTransitionSupportPlacement(MinecraftClient client) {
+        if (pendingTransitionSupportTargets.isEmpty() && pendingTransitionSupportVerifications.isEmpty()) {
+            return true;
+        }
+        if (client.world == null || activeSession == null) {
+            failLaneTransition(client, "Unable to build safe transition support path");
+            return false;
+        }
+        transitionSupportTicks++;
+        if (transitionSupportTicks > MAX_TRANSITION_SUPPORT_TICKS) {
+            traceGroundedEvent("transition support placement failed reason: timeout");
+            failLaneTransition(client, "Unable to build safe transition support path");
+            return false;
+        }
+
+        processTransitionSupportVerifications(client, laneTicksElapsed);
+
+        int alreadyCorrectCount = 0;
+        List<GroundedLaneTransitionSupportPlanner.SupportTarget> retained = new ArrayList<>(pendingTransitionSupportTargets.size());
+        for (GroundedLaneTransitionSupportPlanner.SupportTarget target : pendingTransitionSupportTargets) {
+            if (target.placement().block() != null && client.world.getBlockState(target.worldPos()).isOf(target.placement().block())) {
+                alreadyCorrectCount++;
+                continue;
+            }
+            retained.add(target);
+        }
+        pendingTransitionSupportTargets = List.copyOf(retained);
+
+        int placedCount = 0;
+        int missingCount = 0;
+        List<GroundedLaneTransitionSupportPlanner.SupportTarget> afterAttempt = new ArrayList<>(pendingTransitionSupportTargets.size());
+        int attempts = 0;
+        for (GroundedLaneTransitionSupportPlanner.SupportTarget target : pendingTransitionSupportTargets) {
+            if (attempts >= MAX_PLACEMENT_ATTEMPTS_PER_TICK) {
+                afterAttempt.add(target);
+                continue;
+            }
+            if (target.placement() == null || target.placement().block() == null) {
+                missingCount++;
+                traceGroundedEvent("transition support placement failed reason: missing block at " + target.worldPos().toShortString());
+                failLaneTransition(client, "Unable to build safe transition support path");
+                return false;
+            }
+            PlacementResult result = placementExecutor.execute(client, activeSession, target.placement(), target.worldPos());
+            switch (result.status()) {
+                case PLACED -> {
+                    placedCount++;
+                    pendingTransitionSupportVerifications = mutableTransitionSupportVerifications();
+                    pendingTransitionSupportVerifications.put(
+                            target.placementIndex(),
+                            new PendingPlacementVerification(
+                                    target.placementIndex(),
+                                    target.worldPos(),
+                                    target.placement().block(),
+                                    laneTicksElapsed + PLACEMENT_VERIFICATION_DELAY_TICKS
+                            )
+                    );
+                }
+                case ALREADY_CORRECT -> alreadyCorrectCount++;
+                case RETRY, MOVE_REQUIRED -> afterAttempt.add(target);
+                case MISSING_ITEM, ERROR -> {
+                    missingCount++;
+                    traceGroundedEvent("transition support placement failed reason: placement error " + result.status());
+                    failLaneTransition(client, "Unable to build safe transition support path");
+                    return false;
+                }
+            }
+            attempts++;
+        }
+        pendingTransitionSupportTargets = List.copyOf(afterAttempt);
+
+        traceGroundedEvent("transition support tick: targetCount=" + pendingTransitionSupportTargets.size()
+                + ", alreadyCorrect=" + alreadyCorrectCount
+                + ", placed=" + placedCount
+                + ", pendingVerification=" + pendingTransitionSupportVerifications.size()
+                + ", failedMissing=" + missingCount);
+
+        if (pendingTransitionSupportTargets.isEmpty() && pendingTransitionSupportVerifications.isEmpty()) {
+            traceGroundedEvent("transition support complete");
+            return true;
+        }
+        return false;
+    }
+
+    private void processTransitionSupportVerifications(MinecraftClient client, long tick) {
+        if (pendingTransitionSupportVerifications.isEmpty() || client.world == null) {
+            return;
+        }
+        pendingTransitionSupportVerifications = mutableTransitionSupportVerifications();
+        Iterator<Map.Entry<Integer, PendingPlacementVerification>> iterator = pendingTransitionSupportVerifications.entrySet().iterator();
+        while (iterator.hasNext()) {
+            PendingPlacementVerification pending = iterator.next().getValue();
+            if (tick < pending.verifyDueTick()) {
+                continue;
+            }
+            if (pending.expectedBlock() == null || !client.world.getBlockState(pending.worldPos()).isOf(pending.expectedBlock())) {
+                traceGroundedEvent("transition support placement failed reason: verification mismatch at " + pending.worldPos().toShortString());
+                failLaneTransition(client, "Unable to build safe transition support path");
+                return;
+            }
+            iterator.remove();
+        }
+
+        if (pendingTransitionSupportVerifications.isEmpty()) {
+            pendingTransitionSupportVerifications = Map.of();
+        }
+    }
+
+    private Map<Integer, PendingPlacementVerification> mutableTransitionSupportVerifications() {
+        if (pendingTransitionSupportVerifications instanceof LinkedHashMap<Integer, PendingPlacementVerification> linkedHashMap) {
+            return linkedHashMap;
+        }
+        return new LinkedHashMap<>(pendingTransitionSupportVerifications);
     }
 
     private static List<GroundedSweepLane> buildReverseSweepLanes(List<GroundedSweepLane> forwardLanes) {

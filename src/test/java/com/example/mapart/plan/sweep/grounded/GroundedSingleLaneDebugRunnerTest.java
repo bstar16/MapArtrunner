@@ -658,6 +658,7 @@ class GroundedSingleLaneDebugRunnerTest {
         GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
         assertTrue(runner.startFullSweep(sessionWithOrigin(new Vec3i(5, 1, 11)), GroundedSweepSettings.defaults()).isEmpty());
         runner.advanceSweepToNextLaneForTests();
+        runner.markTransitionSupportReadyForTests();
         GroundedSingleLaneDebugRunner.LaneShiftPlan plan = runner.laneShiftPlanForTests().orElseThrow();
 
         GroundedSingleLaneDebugRunner.DebugStatus shifting = runner.status();
@@ -789,6 +790,7 @@ class GroundedSingleLaneDebugRunnerTest {
         GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
         assertTrue(runner.startFullSweep(sessionWithOrigin(new Vec3i(5, 1, 11)), GroundedSweepSettings.defaults()).isEmpty());
         runner.advanceSweepToNextLaneForTests();
+        runner.markTransitionSupportReadyForTests();
         GroundedSingleLaneDebugRunner.LaneShiftPlan plan = runner.laneShiftPlanForTests().orElseThrow();
 
         assertEquals(
@@ -810,6 +812,7 @@ class GroundedSingleLaneDebugRunnerTest {
         GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
         assertTrue(runner.startFullSweep(sessionWithOrigin(new Vec3i(5, 1, 11)), GroundedSweepSettings.defaults()).isEmpty());
         runner.advanceSweepToNextLaneForTests();
+        runner.markTransitionSupportReadyForTests();
         GroundedSingleLaneDebugRunner.LaneShiftPlan plan = runner.laneShiftPlanForTests().orElseThrow();
 
         runner.completeLaneShiftIfNearForTests(new Vec3d(plan.toLane().startPoint().getX() + 0.5, 64.0, plan.targetCenterlineCoordinate() - 1.0), false);
@@ -848,6 +851,7 @@ class GroundedSingleLaneDebugRunnerTest {
         GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
         assertTrue(runner.startFullSweep(sessionWithOrigin(new Vec3i(11, 1, 5)), GroundedSweepSettings.defaults()).isEmpty());
         runner.advanceSweepToNextLaneForTests();
+        runner.markTransitionSupportReadyForTests();
         GroundedSingleLaneDebugRunner.LaneShiftPlan plan = runner.laneShiftPlanForTests().orElseThrow();
 
         Vec3d forwardMisaligned;
@@ -883,6 +887,20 @@ class GroundedSingleLaneDebugRunnerTest {
         assertFalse(status.active());
         assertEquals(GroundedLaneWalkState.FAILED, status.walkState());
         assertEquals("Lane transition failed to reach next lane start", status.failureReason().orElseThrow());
+    }
+
+    @Test
+    void laneShiftWaitsUntilTransitionSupportIsReady() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        BuildSession session = rectangularSessionWithOrigin(new Vec3i(5, 1, 5));
+        assertTrue(runner.startFullSweep(session, GroundedSweepSettings.defaults()).isEmpty());
+        runner.advanceSweepToNextLaneForTests();
+        GroundedSingleLaneDebugRunner.LaneShiftPlan plan = runner.laneShiftPlanForTests().orElseThrow();
+        assertTrue(runner.transitionSupportPendingCountForTests() > 0);
+
+        runner.completeLaneShiftIfNearForTests(new Vec3d(plan.toLane().startPoint().getX() + 0.5, 64.0, plan.targetCenterlineCoordinate() + 0.5), false);
+        assertTrue(runner.status().awaitingLaneShift());
+        assertEquals(GroundedLaneWalkState.IDLE, runner.status().walkState());
     }
 
     @Test
