@@ -207,6 +207,24 @@ class GroundedSingleLaneDebugRunnerTest {
     }
 
     @Test
+    void outsideStagingPositionQueuesEntrySupportBeforeLaneYawLock() {
+        GroundedSweepLane lane = eastLane();
+        GroundedSchematicBounds bounds = eastLaneBounds();
+        GroundedSingleLaneDebugRunner.LaneStartStage stageOutside = GroundedSingleLaneDebugRunner.laneStartStageForCurrentPositionForTests(
+                new Vec3d(9.5, 64.0, 12.5),
+                lane,
+                bounds
+        );
+        GroundedSingleLaneDebugRunner.LaneStartStage stageInside = GroundedSingleLaneDebugRunner.laneStartStageForCurrentPositionForTests(
+                new Vec3d(10.5, 64.0, 12.5),
+                lane,
+                bounds
+        );
+        assertEquals(GroundedSingleLaneDebugRunner.LaneStartStage.AWAITING_LANE_ENTRY_SUPPORT, stageOutside);
+        assertEquals(GroundedSingleLaneDebugRunner.LaneStartStage.LOCK_LANE_YAW, stageInside);
+    }
+
+    @Test
     void partialLaneResumeStandingTargetUsesSameStagingRule() {
         GroundedSweepLane lane = eastLane();
         GroundedSchematicBounds bounds = eastLaneBounds();
@@ -564,7 +582,7 @@ class GroundedSingleLaneDebugRunnerTest {
     }
 
     @Test
-    void smartResumeApproachTargetsSelectedResumeStandingPosition() {
+    void smartResumeApproachTargetsOutsideStagingBeforeResumeStandingPosition() {
         RecordingBaritoneFacade baritone = new RecordingBaritoneFacade();
         GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(baritone);
         BuildSession session = rectangularSessionWithOrigin(new Vec3i(11, 1, 5));
@@ -584,8 +602,40 @@ class GroundedSingleLaneDebugRunnerTest {
         BlockPos selectedStanding = runner.status().resumePoint().orElseThrow().standingPosition();
         runner.issueStartApproachIfNeeded();
         assertEquals(1, baritone.goToCalls);
-        assertEquals(selectedStanding, baritone.lastGoToTarget);
+        GroundedSweepLane resumeLane = laneForIndex(session, GroundedSweepSettings.defaults(), runner.status().laneIndex());
+        BlockPos expectedStaging = switch (resumeLane.direction()) {
+            case EAST -> selectedStanding.add(-1, 0, 0);
+            case WEST -> selectedStanding.add(1, 0, 0);
+            case SOUTH -> selectedStanding.add(0, 0, -1);
+            case NORTH -> selectedStanding.add(0, 0, 1);
+        };
+        assertEquals(expectedStaging, baritone.lastGoToTarget);
         assertEquals(GroundedSingleLaneDebugRunner.SweepPassPhase.FORWARD, runner.status().phase());
+    }
+
+    @Test
+    void smartResumeEntryAnchorUsesResumeStandingAndProgressInsteadOfLaneStart() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        BuildSession session = rectangularSessionWithOrigin(new Vec3i(11, 1, 5));
+        BlockPos origin = session.getOrigin();
+        java.util.Set<BlockPos> complete = new java.util.HashSet<>();
+        for (int z = origin.getZ(); z < origin.getZ() + 5; z++) {
+            complete.add(new BlockPos(origin.getX(), origin.getY(), z));
+        }
+
+        assertTrue(runner.startFullSweepSmart(
+                session,
+                GroundedSweepSettings.defaults(),
+                new Vec3d(origin.getX() + 2.5, origin.getY() + 1, origin.getZ() + 2.5),
+                (worldPos, expected) -> complete.contains(worldPos)
+        ).isEmpty());
+
+        GroundedSweepResumePoint selectedResume = runner.status().resumePoint().orElseThrow();
+        GroundedSweepLane resumeLane = laneForIndex(session, GroundedSweepSettings.defaults(), selectedResume.laneIndex());
+        assertEquals(selectedResume.standingPosition(), runner.laneEntryStandingTargetForTests().orElseThrow());
+        assertEquals(selectedResume.progressCoordinate(), runner.laneEntryProgressCoordinateForTests().orElseThrow());
+        int laneStartProgress = resumeLane.direction().alongX() ? resumeLane.startPoint().getX() : resumeLane.startPoint().getZ();
+        assertFalse(selectedResume.progressCoordinate() == laneStartProgress);
     }
 
     @Test
@@ -1224,6 +1274,12 @@ class GroundedSingleLaneDebugRunnerTest {
         BuildSession session = new BuildSession(buildPlan(dimensions, placements));
         session.setOrigin(new BlockPos(10, 64, 10));
         return session;
+    }
+
+    private static GroundedSweepLane laneForIndex(BuildSession session, GroundedSweepSettings settings, int laneIndex) {
+        GroundedSchematicBounds bounds = GroundedSchematicBounds.fromPlan(session.getPlan(), session.getOrigin());
+        List<GroundedSweepLane> lanes = new GroundedSweepLanePlanner().planLanes(bounds, settings);
+        return lanes.get(laneIndex);
     }
 
     private static BuildPlan buildPlan(List<Placement> placements) {
