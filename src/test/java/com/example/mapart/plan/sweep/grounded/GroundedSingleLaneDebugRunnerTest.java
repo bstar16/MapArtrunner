@@ -206,6 +206,46 @@ class GroundedSingleLaneDebugRunnerTest {
         ));
     }
 
+
+    @Test
+    void laneWalkStartRequiresTightCenterlineNotJustCorridor() {
+        GroundedSweepLane lane = eastLane();
+        assertFalse(GroundedSingleLaneDebugRunner.isCenteredForLaneWalk(new Vec3d(10.5, 64.0, 12.95), lane));
+        assertTrue(GroundedSingleLaneDebugRunner.isCenteredForLaneWalk(new Vec3d(10.5, 64.0, 12.69), lane));
+    }
+
+    @Test
+    void entryCenterlineCorrectionDirectionMatchesLaneAxisRules() {
+        GroundedSweepLane east = new GroundedSweepLane(0, 12, GroundedLaneDirection.EAST, new BlockPos(10, 64, 12), new BlockPos(14, 64, 12), new GroundedLaneCorridorBounds(10, 14, 10, 14), 1.0);
+        assertEquals(GroundedLaneDirection.SOUTH, GroundedSingleLaneDebugRunner.entryCenterlineCorrectionDirection(new Vec3d(10.5, 64.0, 12.2), east));
+        assertEquals(GroundedLaneDirection.NORTH, GroundedSingleLaneDebugRunner.entryCenterlineCorrectionDirection(new Vec3d(10.5, 64.0, 12.9), east));
+
+        GroundedSweepLane south = new GroundedSweepLane(1, 12, GroundedLaneDirection.SOUTH, new BlockPos(12, 64, 10), new BlockPos(12, 64, 14), new GroundedLaneCorridorBounds(10, 14, 10, 14), 1.0);
+        assertEquals(GroundedLaneDirection.EAST, GroundedSingleLaneDebugRunner.entryCenterlineCorrectionDirection(new Vec3d(12.2, 64.0, 10.5), south));
+        assertEquals(GroundedLaneDirection.WEST, GroundedSingleLaneDebugRunner.entryCenterlineCorrectionDirection(new Vec3d(12.9, 64.0, 10.5), south));
+    }
+
+    @Test
+    void entryBurstTargetsIncludeCurrentAndForwardCrossSections() {
+        GroundedSweepLane lane = eastLane();
+        GroundedSchematicBounds bounds = eastLaneBounds();
+        List<GroundedSweepPlacementExecutor.PlacementTarget> targets = List.of(
+                new GroundedSweepPlacementExecutor.PlacementTarget(1, new BlockPos(10, 64, 12)),
+                new GroundedSweepPlacementExecutor.PlacementTarget(2, new BlockPos(10, 64, 13)),
+                new GroundedSweepPlacementExecutor.PlacementTarget(3, new BlockPos(11, 64, 11)),
+                new GroundedSweepPlacementExecutor.PlacementTarget(4, new BlockPos(12, 64, 12)),
+                new GroundedSweepPlacementExecutor.PlacementTarget(5, new BlockPos(13, 64, 12))
+        );
+        List<Integer> burst = GroundedSingleLaneDebugRunner.buildEntryBurstTargets(lane, bounds, 1, 10, targets)
+                .stream().map(GroundedSweepPlacementExecutor.PlacementTarget::placementIndex).toList();
+
+        assertTrue(burst.contains(1));
+        assertTrue(burst.contains(2));
+        assertTrue(burst.contains(3));
+        assertTrue(burst.contains(4));
+        assertFalse(burst.contains(5));
+    }
+
     @Test
     void outsideStagingPositionQueuesEntrySupportBeforeLaneYawLock() {
         GroundedSweepLane lane = eastLane();
@@ -220,7 +260,7 @@ class GroundedSingleLaneDebugRunnerTest {
                 lane,
                 bounds
         );
-        assertEquals(GroundedSingleLaneDebugRunner.LaneStartStage.AWAITING_LANE_ENTRY_SUPPORT, stageOutside);
+        assertEquals(GroundedSingleLaneDebugRunner.LaneStartStage.AWAITING_LANE_ENTRY_STEP, stageOutside);
         assertEquals(GroundedSingleLaneDebugRunner.LaneStartStage.LOCK_LANE_YAW, stageInside);
     }
 

@@ -46,10 +46,13 @@ public final class GroundedSingleLaneDebugRunner {
     private static final int MAX_START_APPROACH_TICKS = 200;
     private static final int MAX_START_APPROACH_NO_PROGRESS_TICKS = 80;
     private static final double START_APPROACH_PROGRESS_EPSILON_SQ = 0.01;
-    private static final int MAX_LANE_ENTRY_SUPPORT_TICKS = 60;
-    private static final int MAX_LANE_ENTRY_ATTEMPTS_PER_TICK = 2;
     private static final int MAX_LANE_ENTRY_STEP_TICKS = 40;
     private static final double LANE_ENTRY_STEP_REACH_DISTANCE_SQ = 0.35 * 0.35;
+    private static final double LANE_WALK_START_CENTERLINE_TOLERANCE = 0.25;
+    private static final int MAX_ENTRY_CENTERLINE_ALIGN_TICKS = 40;
+    private static final int ENTRY_BURST_DURATION_TICKS = 16;
+    private static final int ENTRY_BURST_ATTEMPTS_PER_TICK = 2;
+    private static final int MAX_ENTRY_BURST_ATTEMPTS_PER_TARGET = 2;
     private static final double TRANSITION_WALKING_DISABLE_SPRINT_DELTA = 1.5;
 
     private final GroundedSweepLanePlanner lanePlanner = new GroundedSweepLanePlanner();
@@ -89,6 +92,9 @@ public final class GroundedSingleLaneDebugRunner {
     private GroundedSweepLane pendingLaneStart;
     private int pendingLaneStartTicks;
     private int laneEntryStepTicks;
+    private int entryBurstTicks;
+    private final Map<Integer, Integer> entryAttemptsByPlacementIndex = new HashMap<>();
+    private boolean entrySupportEstablished;
     private int startApproachTicks;
     private double startApproachBestDistanceSq = Double.POSITIVE_INFINITY;
     private int startApproachNoProgressTicks;
@@ -422,7 +428,7 @@ public final class GroundedSingleLaneDebugRunner {
         traceGroundedEvent("Baritone approach reached/cancelled at " + stagingTarget.toShortString());
         awaitingStartApproach = false;
         clearControls(client);
-        if (!queueLaneStart(client, activeLane, LaneStartStage.AWAITING_LANE_ENTRY_SUPPORT)) {
+        if (!queueLaneStart(client, activeLane, LaneStartStage.AWAITING_LANE_ENTRY_STEP)) {
             failLaneStart(client, "Unable to prepare lane entry before starting lane walk.");
             return;
         }
@@ -435,20 +441,6 @@ public final class GroundedSingleLaneDebugRunner {
             failLaneStart(client, "Lane start preparation state is invalid.");
             return;
         }
-        if (laneStartStage == LaneStartStage.AWAITING_LANE_ENTRY_SUPPORT) {
-            pendingLaneStartTicks++;
-            if (pendingLaneStartTicks > MAX_LANE_ENTRY_SUPPORT_TICKS) {
-                failLaneStart(client, "Timed out building lane start entry support.");
-                return;
-            }
-            if (!attemptLaneEntrySupport(client, pendingLaneStart, activeBounds, laneEntryAnchorForActiveLane(pendingLaneStart, activeBounds))) {
-                return;
-            }
-            laneStartStage = LaneStartStage.AWAITING_LANE_ENTRY_STEP;
-            laneEntryStepTicks = 0;
-            pendingLaneStartTicks = 0;
-            traceGroundedEvent("lane entry support ready");
-        }
 
         if (laneStartStage == LaneStartStage.AWAITING_LANE_ENTRY_STEP) {
             laneEntryStepTicks++;
@@ -456,13 +448,44 @@ public final class GroundedSingleLaneDebugRunner {
                 failLaneStart(client, "Timed out stepping onto lane start.");
                 return;
             }
+            attemptLaneEntryBurst(client, pendingLaneStart, activeBounds, laneEntryAnchorForActiveLane(pendingLaneStart, activeBounds));
             if (!stepToLaneEntryTarget(client, pendingLaneStart, laneEntryAnchorForActiveLane(pendingLaneStart, activeBounds))) {
+                if (client.player.getY() < activeBounds.minY() && !entrySupportEstablished) {
+                    failLaneStart(client, "Unable to establish lane entry support; air-place may be unsupported or starter support is missing");
+                }
                 return;
             }
             clearControls(client);
-            laneStartStage = LaneStartStage.LOCK_LANE_YAW;
+            laneStartStage = LaneStartStage.ALIGN_ENTRY_CENTERLINE;
             pendingLaneStartTicks = 0;
             traceGroundedEvent("lane entry step complete");
+        }
+
+        if (laneStartStage == LaneStartStage.ALIGN_ENTRY_CENTERLINE) {
+            pendingLaneStartTicks++;
+            if (pendingLaneStartTicks > MAX_ENTRY_CENTERLINE_ALIGN_TICKS) {
+                failLaneStart(client, "Unable to center on lane entry before walking");
+                return;
+            }
+            Vec3d playerPos = client.player.getEntityPos();
+            double lateral = entryLateralCoordinate(playerPos, pendingLaneStart);
+            double target = entryCenterlineTargetCoordinate(pendingLaneStart);
+            double delta = target - lateral;
+            traceGroundedEvent("entry centerline target=" + target + ", currentLateral=" + lateral + ", delta=" + delta);
+            attemptLaneEntryBurst(client, pendingLaneStart, activeBounds, laneEntryAnchorForActiveLane(pendingLaneStart, activeBounds));
+            if (!isCenteredForLaneWalk(playerPos, pendingLaneStart)) {
+                GroundedLaneDirection correctionDirection = entryCenterlineCorrectionDirection(playerPos, pendingLaneStart);
+                traceGroundedEvent("entry centerline correction direction=" + correctionDirection);
+                applyCardinalControls(client, correctionDirection, false, false);
+                if (client.player.getY() < activeBounds.minY() && !entrySupportEstablished) {
+                    failLaneStart(client, "Unable to establish lane entry support; air-place may be unsupported or starter support is missing");
+                }
+                return;
+            }
+            clearControls(client);
+            traceGroundedEvent("entry centered");
+            laneStartStage = LaneStartStage.LOCK_LANE_YAW;
+            pendingLaneStartTicks = 0;
         }
 
         if (laneStartStage == LaneStartStage.LOCK_LANE_YAW) {
@@ -485,6 +508,10 @@ public final class GroundedSingleLaneDebugRunner {
         }
 
         if (laneStartStage == LaneStartStage.START_WALKER) {
+            if (!isCenteredForLaneWalk(client.player.getEntityPos(), pendingLaneStart)) {
+                failLaneStart(client, "Unable to center on lane entry before walking");
+                return;
+            }
             if (!forcePlayerLaneYaw(client, pendingLaneStart)) {
                 traceGroundedEvent("lane yaw lock failed before walker start");
                 failLaneStart(client, "Unable to confirm lane yaw/body/head lock before starting lane walk.");
@@ -526,21 +553,28 @@ public final class GroundedSingleLaneDebugRunner {
         laneEntryAnchor = laneEntryAnchorForActiveLane(lane, activeBounds);
         laneStartStage = initialStage == null ? LaneStartStage.LOCK_LANE_YAW : initialStage;
         traceGroundedEvent("lane start stage entered: " + laneStartStage);
+        traceGroundedEvent("entry anchor selected: " + laneEntryAnchor.source());
+        traceGroundedEvent("entry staging target: " + laneEntryAnchor.stagingTarget().toShortString());
+        traceGroundedEvent("entry target progress: " + laneEntryAnchor.progressCoordinate());
+        traceGroundedEvent("entry centerline target: " + entryCenterlineTargetCoordinate(lane));
         pendingLaneStartTicks = 0;
         laneEntryStepTicks = 0;
+        entryBurstTicks = 0;
+        entryAttemptsByPlacementIndex.clear();
+        entrySupportEstablished = false;
         return true;
     }
 
     private static LaneStartStage laneStartStageForCurrentPosition(Vec3d playerPosition, GroundedSweepLane lane, GroundedSchematicBounds bounds) {
         if (playerPosition == null || lane == null || bounds == null) {
-            return LaneStartStage.AWAITING_LANE_ENTRY_SUPPORT;
+            return LaneStartStage.AWAITING_LANE_ENTRY_STEP;
         }
         return insideCorridor(playerPosition, lane, bounds)
                 ? LaneStartStage.LOCK_LANE_YAW
-                : LaneStartStage.AWAITING_LANE_ENTRY_SUPPORT;
+                : LaneStartStage.AWAITING_LANE_ENTRY_STEP;
     }
 
-    private boolean attemptLaneEntrySupport(
+    private boolean attemptLaneEntryBurst(
             MinecraftClient client,
             GroundedSweepLane lane,
             GroundedSchematicBounds bounds,
@@ -549,52 +583,84 @@ public final class GroundedSingleLaneDebugRunner {
         if (activeSession == null || client == null || client.world == null || lane == null || bounds == null) {
             return false;
         }
-        int startProgress = entryAnchor.progressCoordinate();
+        if (entryBurstTicks >= ENTRY_BURST_DURATION_TICKS) {
+            return entrySupportEstablished;
+        }
+        entryBurstTicks++;
+        List<GroundedSweepPlacementExecutor.PlacementTarget> burstTargets = buildEntryBurstTargets(
+                lane,
+                bounds,
+                activeSettings.sweepHalfWidth(),
+                entryAnchor.progressCoordinate(),
+                pendingPlacementTargets
+        );
+        traceGroundedEvent("entry burst target count=" + burstTargets.size());
         int attempts = 0;
-        for (GroundedSweepPlacementExecutor.PlacementTarget target : pendingPlacementTargets) {
-            if (attempts >= MAX_LANE_ENTRY_ATTEMPTS_PER_TICK) {
+        for (GroundedSweepPlacementExecutor.PlacementTarget target : burstTargets) {
+            if (attempts >= ENTRY_BURST_ATTEMPTS_PER_TICK) {
                 break;
             }
-            BlockPos pos = target.worldPos();
-            int progress = lane.direction().alongX() ? pos.getX() : pos.getZ();
-            if (progress != startProgress) {
-                continue;
-            }
-            if (Math.abs(lateralDeltaFromCenterline(lane.direction(), lane.centerlineCoordinate(), pos)) > activeSettings.sweepHalfWidth()) {
+            int usedAttempts = entryAttemptsByPlacementIndex.getOrDefault(target.placementIndex(), 0);
+            if (usedAttempts >= MAX_ENTRY_BURST_ATTEMPTS_PER_TARGET) {
                 continue;
             }
             Placement placement = lanePlacementsByIndex.get(target.placementIndex());
             if (placement == null || placement.block() == null) {
                 continue;
             }
-            PlacementResult result = placementExecutor.execute(client, activeSession, placement, pos);
+            entryAttemptsByPlacementIndex.put(target.placementIndex(), usedAttempts + 1);
+            PlacementResult result = placementExecutor.execute(client, activeSession, placement, target.worldPos());
             switch (result.status()) {
-                case PLACED -> onPlacementPlaced(target.placementIndex(), placement, pos, laneTicksElapsed);
-                case ALREADY_CORRECT -> onPlacementResult(target.placementIndex(), GroundedSweepPlacementExecutor.PlacementResult.SUCCESS, laneTicksElapsed);
-                case RETRY, MOVE_REQUIRED -> {
-                    // Keep pending and retry during the next entry-support tick.
+                case PLACED -> {
+                    onPlacementPlaced(target.placementIndex(), placement, target.worldPos(), laneTicksElapsed);
+                    entrySupportEstablished = true;
+                    traceGroundedEvent("entry burst attempt placement=" + target.placementIndex() + " result=PLACED attempts=" + (usedAttempts + 1));
                 }
+                case ALREADY_CORRECT -> {
+                    onPlacementResult(target.placementIndex(), GroundedSweepPlacementExecutor.PlacementResult.SUCCESS, laneTicksElapsed);
+                    entrySupportEstablished = true;
+                    traceGroundedEvent("entry burst attempt placement=" + target.placementIndex() + " result=ALREADY_CORRECT attempts=" + (usedAttempts + 1));
+                }
+                case RETRY, MOVE_REQUIRED -> traceGroundedEvent("entry burst attempt placement=" + target.placementIndex()
+                        + " result=" + result.status() + " attempts=" + (usedAttempts + 1));
                 case MISSING_ITEM, ERROR -> onFinalFailure(target.placementIndex());
             }
             attempts++;
         }
         processDuePlacementVerifications(client, laneTicksElapsed, true);
-        return !hasPendingStartCrossSectionTargets(lane, entryAnchor.progressCoordinate());
+        return entrySupportEstablished;
     }
 
-    private boolean hasPendingStartCrossSectionTargets(GroundedSweepLane lane, int progressCoordinate) {
-        if (lane == null || pendingPlacementTargets.isEmpty()) {
-            return false;
+    static List<GroundedSweepPlacementExecutor.PlacementTarget> buildEntryBurstTargets(
+            GroundedSweepLane lane,
+            GroundedSchematicBounds bounds,
+            int sweepHalfWidth,
+            int startProgress,
+            List<GroundedSweepPlacementExecutor.PlacementTarget> pendingTargets
+    ) {
+        if (lane == null || bounds == null || pendingTargets == null || pendingTargets.isEmpty()) {
+            return List.of();
         }
-        for (GroundedSweepPlacementExecutor.PlacementTarget target : pendingPlacementTargets) {
+        Set<Integer> validProgress = new LinkedHashSet<>();
+        validProgress.add(startProgress);
+        validProgress.add(startProgress + lane.direction().forwardSign());
+        validProgress.add(startProgress + (2 * lane.direction().forwardSign()));
+        List<GroundedSweepPlacementExecutor.PlacementTarget> selected = new ArrayList<>();
+        for (GroundedSweepPlacementExecutor.PlacementTarget target : pendingTargets) {
             BlockPos pos = target.worldPos();
             int progress = lane.direction().alongX() ? pos.getX() : pos.getZ();
-            if (progress == progressCoordinate
-                    && Math.abs(lateralDeltaFromCenterline(lane.direction(), lane.centerlineCoordinate(), pos)) <= activeSettings.sweepHalfWidth()) {
-                return true;
+            if (!validProgress.contains(progress)) {
+                continue;
             }
+            if (Math.abs(lateralDeltaFromCenterline(lane.direction(), lane.centerlineCoordinate(), pos)) > sweepHalfWidth) {
+                continue;
+            }
+            if (pos.getX() < bounds.minX() || pos.getX() > bounds.maxX() || pos.getZ() < bounds.minZ() || pos.getZ() > bounds.maxZ()) {
+                continue;
+            }
+            selected.add(target);
         }
-        return false;
+        return List.copyOf(selected);
     }
 
     private boolean stepToLaneEntryTarget(MinecraftClient client, GroundedSweepLane lane, GroundedLaneEntryAnchor entryAnchor) {
@@ -1043,6 +1109,9 @@ public final class GroundedSingleLaneDebugRunner {
         pendingLaneStart = null;
         pendingLaneStartTicks = 0;
         laneEntryStepTicks = 0;
+        entryBurstTicks = 0;
+        entryAttemptsByPlacementIndex.clear();
+        entrySupportEstablished = false;
         displacementAlert.reset();
         corridorWarningActive = false;
         lastGroundedSnapshotTick = -1;
@@ -1588,11 +1657,15 @@ public final class GroundedSingleLaneDebugRunner {
     }
 
     private static void applyShiftControls(MinecraftClient client, GroundedLaneDirection shiftDirection, boolean sprintEnabled) {
+        applyCardinalControls(client, shiftDirection, true, sprintEnabled);
+    }
+
+    private static void applyCardinalControls(MinecraftClient client, GroundedLaneDirection moveDirection, boolean forward, boolean sprintEnabled) {
         if (client.options == null || client.player == null) {
             return;
         }
-        forcePlayerYaw(client, shiftDirection.yawDegrees());
-        setKey(client.options.forwardKey, true);
+        forcePlayerYaw(client, moveDirection.yawDegrees());
+        setKey(client.options.forwardKey, forward);
         setKey(client.options.backKey, false);
         setKey(client.options.leftKey, false);
         setKey(client.options.rightKey, false);
@@ -1683,6 +1756,29 @@ public final class GroundedSingleLaneDebugRunner {
             GroundedSchematicBounds bounds
     ) {
         return evaluateLaneStartReadiness(playerPosition, lane, standingStartTarget, bounds).ready();
+    }
+
+    static boolean isCenteredForLaneWalk(Vec3d playerPosition, GroundedSweepLane lane) {
+        if (playerPosition == null || lane == null) {
+            return false;
+        }
+        return Math.abs(entryCenterlineTargetCoordinate(lane) - entryLateralCoordinate(playerPosition, lane)) <= LANE_WALK_START_CENTERLINE_TOLERANCE;
+    }
+
+    static GroundedLaneDirection entryCenterlineCorrectionDirection(Vec3d playerPosition, GroundedSweepLane lane) {
+        double delta = entryCenterlineTargetCoordinate(lane) - entryLateralCoordinate(playerPosition, lane);
+        if (lane.direction().alongX()) {
+            return delta >= 0 ? GroundedLaneDirection.SOUTH : GroundedLaneDirection.NORTH;
+        }
+        return delta >= 0 ? GroundedLaneDirection.EAST : GroundedLaneDirection.WEST;
+    }
+
+    private static double entryCenterlineTargetCoordinate(GroundedSweepLane lane) {
+        return lane.centerlineCoordinate() + 0.5;
+    }
+
+    private static double entryLateralCoordinate(Vec3d playerPosition, GroundedSweepLane lane) {
+        return lane.direction().alongX() ? playerPosition.z : playerPosition.x;
     }
 
     private static LaneStartReadiness evaluateLaneStartReadiness(
@@ -2084,6 +2180,9 @@ public final class GroundedSingleLaneDebugRunner {
         pendingLaneStart = null;
         pendingLaneStartTicks = 0;
         laneEntryStepTicks = 0;
+        entryBurstTicks = 0;
+        entryAttemptsByPlacementIndex.clear();
+        entrySupportEstablished = false;
         smartResumeUsed = false;
         selectedResumePoint = null;
         skippedCompletedForwardLanes = 0;
@@ -2430,8 +2529,8 @@ public final class GroundedSingleLaneDebugRunner {
 
     enum LaneStartStage {
         NONE,
-        AWAITING_LANE_ENTRY_SUPPORT,
         AWAITING_LANE_ENTRY_STEP,
+        ALIGN_ENTRY_CENTERLINE,
         LOCK_LANE_YAW,
         START_WALKER
     }
