@@ -1235,6 +1235,29 @@ class GroundedSingleLaneDebugRunnerTest {
         GroundedSingleLaneDebugRunner.DebugStatus status = runner.status();
         assertFalse(status.active());
         assertEquals("Unable to build safe transition support path", status.failureReason().orElseThrow());
+        assertFalse(status.awaitingLaneShift());
+    }
+
+    @Test
+    void transitionSupportFailureAddsDetailedDiagnostics() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        runner.setGroundedTraceEnabled(true);
+        assertTrue(runner.startFullSweep(sessionWithBridgeSupport(), GroundedSweepSettings.defaults()).isEmpty());
+        runner.advanceSweepToNextLaneForTests();
+        assertTrue(runner.awaitingTransitionSupportForTests());
+
+        runner.failTransitionSupportForTests();
+
+        List<String> trace = runner.groundedTraceEventsForTests();
+        assertTrue(trace.stream().anyMatch(event -> event.contains("transition support failed diagnostics: supportTargets=")));
+        assertTrue(trace.stream().anyMatch(event -> event.contains("transition support failed: idx=")));
+    }
+
+    @Test
+    void centerlineHelpersHandleNullLaneSafely() {
+        Vec3d pos = new Vec3d(1.0, 64.0, 1.0);
+        assertNull(GroundedSingleLaneDebugRunner.centerlineAlignmentDirectionForTests(pos, null));
+        assertFalse(GroundedSingleLaneDebugRunner.isCenterlineAlignedForTests(pos, null));
     }
 
     @Test

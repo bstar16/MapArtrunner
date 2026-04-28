@@ -10,6 +10,9 @@ import com.example.mapart.plan.state.PlacementResult;
 import net.minecraft.block.BlockState;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.option.KeyBinding;
+import net.minecraft.entity.player.PlayerInventory;
+import net.minecraft.item.Item;
+import net.minecraft.registry.Registries;
 import net.minecraft.text.Text;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.MathHelper;
@@ -826,7 +829,10 @@ public final class GroundedSingleLaneDebugRunner {
     }
 
     void failTransitionSupportForTests() {
-        failLaneTransition(null, "Unable to build safe transition support path");
+        GroundedSweepPlacementExecutor.PlacementTarget failedTarget = pendingTransitionSupportTargets.isEmpty()
+                ? null
+                : pendingTransitionSupportTargets.getFirst();
+        failTransitionSupportWithDiagnostics(null, failedTarget, failedTarget == null ? null : transitionSupportPlacementsByIndex.get(failedTarget.placementIndex()), "ERROR");
     }
 
     Optional<GroundedLaneWalker.GroundedLaneWalkCommand> laneWalkCommandForTests() {
@@ -1447,7 +1453,7 @@ public final class GroundedSingleLaneDebugRunner {
     }
 
     private void tickLaneShift(MinecraftClient client, boolean constantSprint) {
-        if (!awaitingLaneShift || pendingShiftLane == null || laneShiftPlan == null || client.player == null) {
+        if (!hasActiveLaneTransitionState() || client.player == null) {
             return;
         }
         laneTransitionTicks++;
@@ -1477,9 +1483,15 @@ public final class GroundedSingleLaneDebugRunner {
             laneTransitionYawLockTicks = 0;
             traceGroundedEvent("turn to shift direction confirmed");
             traceGroundedEvent("lane transition stage changed: " + laneTransitionStage);
+            if (!hasActiveLaneTransitionState()) {
+                return;
+            }
         }
         if (laneTransitionStage == LaneTransitionStage.SHIFT_TO_NEXT_CENTERLINE) {
             tickTransitionSupport(client);
+            if (!hasActiveLaneTransitionState()) {
+                return;
+            }
             if (!transitionSupportReady()) {
                 clearControls(client);
                 return;
@@ -1492,6 +1504,13 @@ public final class GroundedSingleLaneDebugRunner {
                 traceGroundedEvent("lane transition stage changed: " + laneTransitionStage);
             } else {
                 GroundedLaneDirection correctionDirection = centerlineAlignmentDirection(playerPosition, pendingShiftLane);
+                if (correctionDirection == null) {
+                    failLaneTransition(client, "Lane transition lost target centerline alignment state");
+                    return;
+                }
+                if (!hasActiveLaneTransitionState()) {
+                    return;
+                }
                 boolean overshootCorrected = correctionDirection != laneShiftPlan.shiftDirection();
                 double delta = centerlineDelta(playerPosition, pendingShiftLane);
                 double lateral = pendingShiftLane.direction().alongX() ? playerPosition.z : playerPosition.x;
@@ -1507,6 +1526,9 @@ public final class GroundedSingleLaneDebugRunner {
                 recordTransitionDiagnostics(client, correctionDirection, false);
                 return;
             }
+        }
+        if (!hasActiveLaneTransitionState()) {
+            return;
         }
         if (laneTransitionStage == LaneTransitionStage.TURN_TO_NEXT_LANE) {
             clearControls(client);
@@ -1527,6 +1549,9 @@ public final class GroundedSingleLaneDebugRunner {
             laneTransitionYawLockTicks = 0;
             traceGroundedEvent("turn to next lane direction confirmed");
             traceGroundedEvent("lane transition stage changed: " + laneTransitionStage);
+            if (!hasActiveLaneTransitionState()) {
+                return;
+            }
         }
         if (laneTransitionStage == LaneTransitionStage.START_NEXT_LANE) {
             traceGroundedEvent("lane walker started on next lane");
@@ -1554,7 +1579,10 @@ public final class GroundedSingleLaneDebugRunner {
             return;
         }
         if (transitionSupportTicks > MAX_TRANSITION_SUPPORT_TICKS) {
-            failLaneTransition(client, "Unable to build safe transition support path");
+            GroundedSweepPlacementExecutor.PlacementTarget failedTarget = pendingTransitionSupportTargets.isEmpty()
+                    ? null
+                    : pendingTransitionSupportTargets.getFirst();
+            failTransitionSupportWithDiagnostics(client, failedTarget, null, "RETRY timeout");
             return;
         }
 
@@ -1566,7 +1594,7 @@ public final class GroundedSingleLaneDebugRunner {
             Placement placement = transitionSupportPlacementsByIndex.get(target.placementIndex());
             if (placement == null || placement.block() == null) {
                 transitionSupportFailedCount++;
-                failLaneTransition(client, "Unable to build safe transition support path");
+                failTransitionSupportWithDiagnostics(client, target, placement, "ERROR");
                 return;
             }
             PlacementResult result = placementExecutor.execute(client, activeSession, placement, target.worldPos());
@@ -1589,7 +1617,7 @@ public final class GroundedSingleLaneDebugRunner {
                 }
                 case MISSING_ITEM, ERROR -> {
                     transitionSupportFailedCount++;
-                    failLaneTransition(client, "Unable to build safe transition support path");
+                    failTransitionSupportWithDiagnostics(client, target, placement, result.status().name());
                     return;
                 }
             }
@@ -1669,6 +1697,79 @@ public final class GroundedSingleLaneDebugRunner {
             clearControls(client);
         }
         clearActiveRunState();
+    }
+
+    private boolean hasActiveLaneTransitionState() {
+        return activeSession != null
+                && activeBounds != null
+                && activeLane != null
+                && awaitingLaneShift
+                && pendingShiftLane != null
+                && laneShiftPlan != null;
+    }
+
+    private void failTransitionSupportWithDiagnostics(
+            MinecraftClient client,
+            GroundedSweepPlacementExecutor.PlacementTarget target,
+            Placement placement,
+            String resultStatus
+    ) {
+        String expectedBlock = placement == null || placement.block() == null
+                ? "null"
+                : Registries.BLOCK.getId(placement.block()).toString();
+        BlockPos worldPos = target == null ? null : target.worldPos();
+        String worldBlock = "unavailable";
+        boolean worldMatchesExpected = false;
+        if (worldPos != null && client != null && client.world != null) {
+            BlockState state = client.world.getBlockState(worldPos);
+            worldBlock = Registries.BLOCK.getId(state.getBlock()).toString();
+            worldMatchesExpected = placement != null && placement.block() != null && state.isOf(placement.block());
+        }
+        boolean creativeMode = client != null && client.player != null && client.player.getAbilities().creativeMode;
+        boolean hasItem = hasExpectedPlacementItem(client, placement);
+        traceGroundedEvent("transition support failed diagnostics: supportTargets="
+                + pendingTransitionSupportTargets.size()
+                + ", pendingVerification=" + pendingTransitionSupportVerifications.size()
+                + ", alreadyCorrect=" + transitionSupportAlreadyCorrectCount
+                + ", placed=" + transitionSupportPlacedCount
+                + ", failed=" + transitionSupportFailedCount
+                + ", idx=" + (target == null ? "none" : target.placementIndex())
+                + ", pos=" + (worldPos == null ? "none" : worldPos.toShortString())
+                + ", result=" + resultStatus
+                + ", expected=" + expectedBlock
+                + ", world=" + worldBlock
+                + ", worldMatchesExpected=" + worldMatchesExpected
+                + ", hasItem=" + hasItem
+                + ", creative=" + creativeMode);
+        traceGroundedEvent("transition support failed: idx="
+                + (target == null ? "none" : target.placementIndex())
+                + ", pos=" + (worldPos == null ? "none" : worldPos.toShortString())
+                + ", result=" + resultStatus
+                + ", expected=" + expectedBlock
+                + ", world=" + worldBlock
+                + ", targetsRemaining=" + pendingTransitionSupportTargets.size()
+                + ", pendingVerification=" + pendingTransitionSupportVerifications.size());
+        failLaneTransition(client, "Unable to build safe transition support path");
+    }
+
+    private static boolean hasExpectedPlacementItem(MinecraftClient client, Placement placement) {
+        if (client == null || client.player == null || placement == null || placement.block() == null) {
+            return false;
+        }
+        Item expectedItem = placement.block().asItem();
+        if (expectedItem == null) {
+            return false;
+        }
+        if (client.player.getMainHandStack().isOf(expectedItem)) {
+            return true;
+        }
+        PlayerInventory inventory = client.player.getInventory();
+        for (int slot = 0; slot < PlayerInventory.MAIN_SIZE; slot++) {
+            if (inventory.getStack(slot).isOf(expectedItem)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static boolean forcePlayerLaneYaw(MinecraftClient client, GroundedSweepLane lane) {
@@ -1930,7 +2031,11 @@ public final class GroundedSingleLaneDebugRunner {
     }
 
     private static boolean isCenterlineAligned(Vec3d playerPosition, GroundedSweepLane nextLane) {
-        return Math.abs(centerlineDelta(playerPosition, nextLane)) <= LANE_TRANSITION_AXIS_TOLERANCE;
+        double delta = centerlineDelta(playerPosition, nextLane);
+        if (Double.isNaN(delta)) {
+            return false;
+        }
+        return Math.abs(delta) <= LANE_TRANSITION_AXIS_TOLERANCE;
     }
 
     private static GroundedLaneDirection forwardAlignmentDirection(Vec3d playerPosition, GroundedSweepLane nextLane) {
@@ -1950,7 +2055,13 @@ public final class GroundedSingleLaneDebugRunner {
     }
 
     private static GroundedLaneDirection centerlineAlignmentDirection(Vec3d playerPosition, GroundedSweepLane targetLane) {
+        if (playerPosition == null || targetLane == null) {
+            return null;
+        }
         double delta = centerlineDelta(playerPosition, targetLane);
+        if (Double.isNaN(delta)) {
+            return null;
+        }
         if (targetLane.direction().alongX()) {
             return delta >= 0.0 ? GroundedLaneDirection.SOUTH : GroundedLaneDirection.NORTH;
         }
@@ -1958,6 +2069,9 @@ public final class GroundedSingleLaneDebugRunner {
     }
 
     private static double centerlineDelta(Vec3d playerPosition, GroundedSweepLane targetLane) {
+        if (playerPosition == null || targetLane == null) {
+            return Double.NaN;
+        }
         double targetCenterline = targetLane.centerlineCoordinate() + 0.5;
         double lateralCoordinate = targetLane.direction().alongX() ? playerPosition.z : playerPosition.x;
         return targetCenterline - lateralCoordinate;
@@ -2461,7 +2575,12 @@ public final class GroundedSingleLaneDebugRunner {
             }
             if (!verifier.test(pending)) {
                 transitionSupportFailedCount++;
-                failLaneTransition(client, "Unable to build safe transition support path");
+                failTransitionSupportWithDiagnostics(
+                        client,
+                        new GroundedSweepPlacementExecutor.PlacementTarget(pending.placementIndex(), pending.worldPos()),
+                        transitionSupportPlacementsByIndex.get(pending.placementIndex()),
+                        "verification mismatch"
+                );
                 return;
             }
             transitionSupportAlreadyCorrectCount++;
@@ -2533,6 +2652,10 @@ public final class GroundedSingleLaneDebugRunner {
 
     static GroundedLaneDirection centerlineAlignmentDirectionForTests(Vec3d playerPosition, GroundedSweepLane lane) {
         return centerlineAlignmentDirection(playerPosition, lane);
+    }
+
+    static boolean isCenterlineAlignedForTests(Vec3d playerPosition, GroundedSweepLane lane) {
+        return isCenterlineAligned(playerPosition, lane);
     }
 
     static boolean hasCrossedEntryProgressForTests(Vec3d playerPosition, GroundedSweepLane lane, GroundedSchematicBounds bounds) {
