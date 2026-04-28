@@ -104,11 +104,11 @@ class GroundedSingleLaneDebugRunnerTest {
         assertTrue(runner.start(session, 0, GroundedSweepSettings.defaults()).isEmpty());
         runner.issueStartApproachIfNeeded();
 
-        assertEquals(new BlockPos(10, 65, 12), baritone.lastGoToTarget);
+        assertEquals(new BlockPos(9, 65, 12), baritone.lastGoToTarget);
     }
 
     @Test
-    void standingApproachTargetDoesNotMutateLaneBuildPlaneStartPoint() {
+    void stagingApproachTargetDoesNotMutateLaneBuildPlaneStartPoint() {
         GroundedSchematicBounds bounds = new GroundedSchematicBounds(
                 new BlockPos(10, 64, 10),
                 new BlockPos(10, 64, 10),
@@ -124,10 +124,24 @@ class GroundedSingleLaneDebugRunnerTest {
                 1.0
         );
 
-        BlockPos approachTarget = GroundedSingleLaneDebugRunner.approachTargetForLaneStart(lane, bounds);
+        BlockPos approachTarget = GroundedSingleLaneDebugRunner.approachStagingTargetBeforeLaneStart(lane, bounds);
 
-        assertEquals(new BlockPos(10, 65, 12), approachTarget);
+        assertEquals(new BlockPos(9, 65, 12), approachTarget);
         assertEquals(new BlockPos(10, 64, 12), lane.startPoint());
+    }
+
+    @Test
+    void stagingApproachTargetOffsetsOutsideAllCardinalLaneStarts() {
+        GroundedSchematicBounds bounds = eastLaneBounds();
+        GroundedSweepLane eastLane = eastLane();
+        GroundedSweepLane westLane = new GroundedSweepLane(1, 12, GroundedLaneDirection.WEST, new BlockPos(14, 64, 12), new BlockPos(10, 64, 12), new GroundedLaneCorridorBounds(10, 14, 10, 14), 1.0);
+        GroundedSweepLane southLane = new GroundedSweepLane(2, 12, GroundedLaneDirection.SOUTH, new BlockPos(12, 64, 10), new BlockPos(12, 64, 14), new GroundedLaneCorridorBounds(10, 14, 10, 14), 1.0);
+        GroundedSweepLane northLane = new GroundedSweepLane(3, 12, GroundedLaneDirection.NORTH, new BlockPos(12, 64, 14), new BlockPos(12, 64, 10), new GroundedLaneCorridorBounds(10, 14, 10, 14), 1.0);
+
+        assertEquals(new BlockPos(9, 65, 12), GroundedSingleLaneDebugRunner.approachStagingTargetBeforeLaneStart(eastLane, bounds));
+        assertEquals(new BlockPos(15, 65, 12), GroundedSingleLaneDebugRunner.approachStagingTargetBeforeLaneStart(westLane, bounds));
+        assertEquals(new BlockPos(12, 65, 9), GroundedSingleLaneDebugRunner.approachStagingTargetBeforeLaneStart(southLane, bounds));
+        assertEquals(new BlockPos(12, 65, 15), GroundedSingleLaneDebugRunner.approachStagingTargetBeforeLaneStart(northLane, bounds));
     }
 
     @Test
@@ -665,8 +679,10 @@ class GroundedSingleLaneDebugRunnerTest {
         assertTrue(shifting.awaitingLaneShift());
         assertEquals(GroundedLaneWalkState.IDLE, shifting.walkState());
 
-        BlockPos shiftTarget = runner.laneShiftTargetForTests().orElseThrow();
-        runner.completeLaneShiftIfNearForTests(new Vec3d(shiftTarget.getX() + 0.5, 64.0, shiftTarget.getZ() + 0.5), false);
+        runner.completeLaneShiftIfNearForTests(
+                new Vec3d(plan.toLane().startPoint().getX() + 0.5, 64.0, plan.targetCenterlineCoordinate() + 0.5),
+                false
+        );
 
         GroundedSingleLaneDebugRunner.DebugStatus shifted = runner.status();
         assertFalse(shifted.awaitingLaneShift());
@@ -870,6 +886,53 @@ class GroundedSingleLaneDebugRunnerTest {
                 plan.shiftDirection(),
                 runner.laneShiftDirectionForTests(forwardAlignedCenterlineMisaligned)
         );
+    }
+
+    @Test
+    void centerlineTransitionDirectionReversesAfterOvershoot() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        assertTrue(runner.startFullSweep(sessionWithOrigin(new Vec3i(5, 1, 11)), GroundedSweepSettings.defaults()).isEmpty());
+        runner.advanceSweepToNextLaneForTests();
+        GroundedSingleLaneDebugRunner.LaneShiftPlan plan = runner.laneShiftPlanForTests().orElseThrow();
+        runner.completeLaneShiftIfNearForTests(new Vec3d(plan.toLane().startPoint().getX() + 0.5, 64.0, plan.targetCenterlineCoordinate() - 1.0), false);
+        assertEquals(GroundedLaneDirection.SOUTH, runner.laneShiftDirectionForTests(new Vec3d(plan.toLane().startPoint().getX() + 0.5, 64.0, plan.targetCenterlineCoordinate() - 0.6)));
+        assertEquals(GroundedLaneDirection.NORTH, runner.laneShiftDirectionForTests(new Vec3d(plan.toLane().startPoint().getX() + 0.5, 64.0, plan.targetCenterlineCoordinate() + 1.6)));
+    }
+
+    @Test
+    void entryCrossSectionTargetsIncludeFirstLaneBlockBand() {
+        GroundedSweepLane lane = eastLane();
+        List<GroundedSweepPlacementExecutor.PlacementTarget> targets = List.of(
+                new GroundedSweepPlacementExecutor.PlacementTarget(1, new BlockPos(10, 64, 11)),
+                new GroundedSweepPlacementExecutor.PlacementTarget(2, new BlockPos(10, 64, 12)),
+                new GroundedSweepPlacementExecutor.PlacementTarget(3, new BlockPos(11, 64, 12))
+        );
+        List<GroundedSweepPlacementExecutor.PlacementTarget> entry = GroundedSingleLaneDebugRunner.laneEntryCrossSectionTargetsForTests(lane, targets);
+        assertEquals(List.of(1, 2), entry.stream().map(GroundedSweepPlacementExecutor.PlacementTarget::placementIndex).toList());
+    }
+
+    @Test
+    void transitionYawLockForTestsUpdatesYawHeadBodyAndPrev() {
+        GroundedSingleLaneDebugRunner.TestYawState yaw = new GroundedSingleLaneDebugRunner.TestYawState();
+        GroundedSingleLaneDebugRunner.forcePlayerYawForTests(yaw, 90.0f);
+        assertEquals(90.0f, yaw.yaw());
+        assertEquals(90.0f, yaw.headYaw);
+        assertEquals(90.0f, yaw.bodyYaw);
+        assertEquals(90.0f, yaw.prevYaw);
+        assertEquals(90.0f, yaw.prevHeadYaw);
+        assertEquals(90.0f, yaw.prevBodyYaw);
+    }
+
+    @Test
+    void endpointCrossSectionTargetsIncludeFinalLaneBand() {
+        GroundedSweepLane lane = eastLane();
+        List<GroundedSweepPlacementExecutor.PlacementTarget> targets = List.of(
+                new GroundedSweepPlacementExecutor.PlacementTarget(1, new BlockPos(13, 64, 12)),
+                new GroundedSweepPlacementExecutor.PlacementTarget(2, new BlockPos(14, 64, 11)),
+                new GroundedSweepPlacementExecutor.PlacementTarget(3, new BlockPos(14, 64, 12))
+        );
+        List<GroundedSweepPlacementExecutor.PlacementTarget> endpoint = GroundedSingleLaneDebugRunner.laneEndpointCrossSectionTargetsForTests(lane, targets);
+        assertEquals(List.of(2, 3), endpoint.stream().map(GroundedSweepPlacementExecutor.PlacementTarget::placementIndex).toList());
     }
 
     @Test
