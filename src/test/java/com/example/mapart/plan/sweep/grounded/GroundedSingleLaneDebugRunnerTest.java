@@ -1234,7 +1234,34 @@ class GroundedSingleLaneDebugRunnerTest {
 
         GroundedSingleLaneDebugRunner.DebugStatus status = runner.status();
         assertFalse(status.active());
+        assertEquals(GroundedLaneWalkState.FAILED, status.walkState());
         assertEquals("Unable to build safe transition support path", status.failureReason().orElseThrow());
+        assertFalse(runner.awaitingTransitionSupportForTests());
+        assertTrue(runner.laneWalkCommandForTests().isEmpty());
+    }
+
+    @Test
+    void transitionSupportFailureLogsDetailedDiagnostics() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        assertTrue(runner.startFullSweep(sessionWithBridgeSupport(), GroundedSweepSettings.defaults()).isEmpty());
+        runner.setGroundedTraceEnabled(true);
+        runner.advanceSweepToNextLaneForTests();
+        assertTrue(runner.awaitingTransitionSupportForTests());
+
+        runner.failTransitionSupportForTests();
+
+        List<String> events = runner.groundedTraceEventsForTests();
+        assertTrue(events.stream().anyMatch(event -> event.contains("transition support failed: idx=")));
+        assertTrue(events.stream().anyMatch(event -> event.contains("targetsRemaining=")));
+        assertTrue(events.stream().anyMatch(event -> event.contains("pendingVerification=")));
+    }
+
+    @Test
+    void centerlineAlignmentHandlesNullLaneWithoutThrowing() {
+        Vec3d playerPosition = new Vec3d(10.5, 64.0, 12.5);
+
+        assertNull(GroundedSingleLaneDebugRunner.centerlineAlignmentDirectionForTests(playerPosition, null));
+        assertFalse(GroundedSingleLaneDebugRunner.isCenteredForLaneWalk(playerPosition, null));
     }
 
     @Test
