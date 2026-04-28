@@ -18,6 +18,7 @@ import java.util.Optional;
 import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -1235,6 +1236,31 @@ class GroundedSingleLaneDebugRunnerTest {
         GroundedSingleLaneDebugRunner.DebugStatus status = runner.status();
         assertFalse(status.active());
         assertEquals("Unable to build safe transition support path", status.failureReason().orElseThrow());
+        assertFalse(runner.hasActiveLaneTransitionStateForTests());
+    }
+
+    @Test
+    void transitionSupportFailureTraceIncludesFailureDetails() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        runner.setGroundedTraceEnabled(true);
+        assertTrue(runner.startFullSweep(sessionWithBridgeSupport(), GroundedSweepSettings.defaults()).isEmpty());
+        runner.advanceSweepToNextLaneForTests();
+        GroundedSweepPlacementExecutor.PlacementTarget target = runner.transitionSupportTargetsForTests().getFirst();
+        runner.keepOnlyTransitionSupportTargetForTests(target.placementIndex());
+        runner.recordTransitionSupportPlacedForTests(target.placementIndex(), target.worldPos(), 0);
+
+        runner.processTransitionSupportVerificationsForTests(Map.of(target.placementIndex(), false), 999);
+
+        assertTrue(runner.groundedTraceEventsForTests().stream().anyMatch(event -> event.contains("transition support failed:")));
+    }
+
+    @Test
+    void centerlineAlignmentAndDirectionAreNullSafeForMissingLane() {
+        Vec3d playerPos = new Vec3d(10.5, 64.0, 10.5);
+        assertDoesNotThrow(() -> GroundedSingleLaneDebugRunner.isCenterlineAlignedForTests(playerPos, null));
+        assertFalse(GroundedSingleLaneDebugRunner.isCenterlineAlignedForTests(playerPos, null));
+        assertDoesNotThrow(() -> GroundedSingleLaneDebugRunner.centerlineAlignmentDirectionForTests(playerPos, null));
+        assertNull(GroundedSingleLaneDebugRunner.centerlineAlignmentDirectionForTests(playerPos, null));
     }
 
     @Test
