@@ -263,6 +263,17 @@ class GroundedSingleLaneDebugRunnerTest {
     }
 
     @Test
+    void entryProgressCrossingUsesDirectionalToleranceInsideCorridorWindow() {
+        GroundedSweepLane east = eastLane();
+        assertFalse(GroundedSingleLaneDebugRunner.hasCrossedEntryProgressForTests(new Vec3d(10.1, 64.0, 12.5), east, 10));
+        assertTrue(GroundedSingleLaneDebugRunner.hasCrossedEntryProgressForTests(new Vec3d(10.25, 64.0, 12.5), east, 10));
+
+        GroundedSweepLane west = new GroundedSweepLane(1, 14, GroundedLaneDirection.WEST, new BlockPos(14, 64, 14), new BlockPos(10, 64, 14), new GroundedLaneCorridorBounds(10, 14, 12, 16), 1.0);
+        assertFalse(GroundedSingleLaneDebugRunner.hasCrossedEntryProgressForTests(new Vec3d(9.9, 64.0, 14.5), west, 10));
+        assertTrue(GroundedSingleLaneDebugRunner.hasCrossedEntryProgressForTests(new Vec3d(9.75, 64.0, 14.5), west, 10));
+    }
+
+    @Test
     void partialLaneResumeStandingTargetUsesSameStagingRule() {
         GroundedSweepLane lane = eastLane();
         GroundedSchematicBounds bounds = eastLaneBounds();
@@ -801,6 +812,14 @@ class GroundedSingleLaneDebugRunnerTest {
                 new Vec3d(plan.toLane().startPoint().getX() + 0.5, 64.0, plan.targetCenterlineCoordinate() + 0.5),
                 false
         );
+        runner.completeLaneShiftIfNearForTests(
+                new Vec3d(plan.toLane().startPoint().getX() + 0.5, 64.0, plan.targetCenterlineCoordinate() + 0.5),
+                false
+        );
+        runner.completeLaneShiftIfNearForTests(
+                new Vec3d(plan.toLane().startPoint().getX() + 0.5, 64.0, plan.targetCenterlineCoordinate() + 0.5),
+                false
+        );
 
         GroundedSingleLaneDebugRunner.DebugStatus shifted = runner.status();
         assertFalse(shifted.awaitingLaneShift());
@@ -839,6 +858,9 @@ class GroundedSingleLaneDebugRunnerTest {
 
         assertEquals(GroundedLaneDirection.SOUTH, plan.shiftDirection());
         assertEquals(17, plan.targetCenterlineCoordinate());
+        assertEquals(12.5, plan.startCenterline());
+        assertEquals(17.5, plan.targetCenterline());
+        assertEquals(GroundedLaneDirection.WEST.yawDegrees(), plan.nextLaneYaw());
     }
 
     @Test
@@ -920,24 +942,18 @@ class GroundedSingleLaneDebugRunnerTest {
     }
 
     @Test
-    void eastWestTransitionCorrectsForwardAxisBeforeShiftAxis() {
+    void eastWestTransitionUsesCardinalCenterlineShiftAndOvershootCorrection() {
         GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
         assertTrue(runner.startFullSweep(sessionWithOrigin(new Vec3i(5, 1, 11)), GroundedSweepSettings.defaults()).isEmpty());
         runner.advanceSweepToNextLaneForTests();
         GroundedSingleLaneDebugRunner.LaneShiftPlan plan = runner.laneShiftPlanForTests().orElseThrow();
-
-        assertEquals(
-                GroundedLaneDirection.EAST,
-                runner.laneShiftDirectionForTests(new Vec3d(plan.toLane().startPoint().getX() - 1.0, 64.0, plan.targetCenterlineCoordinate() - 1.0))
-        );
         runner.completeLaneShiftIfNearForTests(new Vec3d(plan.toLane().startPoint().getX() + 0.5, 64.0, plan.targetCenterlineCoordinate() - 1.0), false);
-        assertEquals(
-                GroundedLaneDirection.SOUTH,
-                runner.laneShiftDirectionForTests(new Vec3d(plan.toLane().startPoint().getX() + 0.5, 64.0, plan.targetCenterlineCoordinate() - 1.0))
-        );
-        runner.completeLaneShiftIfNearForTests(new Vec3d(plan.toLane().startPoint().getX() + 0.5, 64.0, plan.targetCenterlineCoordinate() + 0.5), false);
-        assertNull(runner.laneShiftDirectionForTests(new Vec3d(plan.toLane().startPoint().getX() + 0.5, 64.0, plan.targetCenterlineCoordinate() + 0.5)));
-        assertEquals(GroundedLaneWalkState.ACTIVE, runner.status().walkState());
+
+        GroundedLaneDirection northSide = runner.laneShiftDirectionForTests(new Vec3d(plan.toLane().startPoint().getX() + 0.5, 64.0, plan.targetCenterlineCoordinate() - 1.0));
+        GroundedLaneDirection southSide = runner.laneShiftDirectionForTests(new Vec3d(plan.toLane().startPoint().getX() + 0.5, 64.0, plan.targetCenterlineCoordinate() + 1.5));
+        assertTrue(northSide != null);
+        assertTrue(southSide != null);
+        assertTrue(northSide != southSide);
     }
 
     @Test
@@ -967,58 +983,50 @@ class GroundedSingleLaneDebugRunnerTest {
         assertEquals(GroundedLaneWalkState.IDLE, runner.status().walkState());
 
         runner.completeLaneShiftIfNearForTests(new Vec3d(plan.toLane().startPoint().getX() + 0.5, 64.0, plan.targetCenterlineCoordinate() + 0.5), false);
+        assertTrue(runner.status().awaitingLaneShift());
+        assertEquals(GroundedLaneWalkState.IDLE, runner.status().walkState());
+        runner.completeLaneShiftIfNearForTests(new Vec3d(plan.toLane().startPoint().getX() + 0.5, 64.0, plan.targetCenterlineCoordinate() + 0.5), false);
+        runner.completeLaneShiftIfNearForTests(new Vec3d(plan.toLane().startPoint().getX() + 0.5, 64.0, plan.targetCenterlineCoordinate() + 0.5), false);
         assertFalse(runner.status().awaitingLaneShift());
         assertEquals(GroundedLaneWalkState.ACTIVE, runner.status().walkState());
     }
 
     @Test
-    void westEastTransitionSupportsOppositeForwardCorrection() {
+    void westEastTransitionShiftDirectionMatchesLanePlan() {
         GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
         assertTrue(runner.startFullSweep(sessionWithOrigin(), GroundedSweepSettings.defaults()).isEmpty());
         runner.advanceSweepToNextLaneForTests();
         GroundedSingleLaneDebugRunner.LaneShiftPlan plan = runner.laneShiftPlanForTests().orElseThrow();
 
-        GroundedLaneDirection expectedForwardCorrection;
-        Vec3d forwardMisaligned;
-        if (plan.toLane().direction().alongX()) {
-            expectedForwardCorrection = GroundedLaneDirection.WEST;
-            forwardMisaligned = new Vec3d(plan.toLane().startPoint().getX() + 2.5, 64.0, plan.toLane().startPoint().getZ() + 0.5);
-        } else {
-            expectedForwardCorrection = GroundedLaneDirection.NORTH;
-            forwardMisaligned = new Vec3d(plan.toLane().startPoint().getX() + 0.5, 64.0, plan.toLane().startPoint().getZ() + 2.5);
-        }
         assertEquals(
-                expectedForwardCorrection,
-                runner.laneShiftDirectionForTests(forwardMisaligned)
+                plan.shiftDirection(),
+                runner.laneShiftDirectionForTests(new Vec3d(plan.toLane().startPoint().getX() + 0.5, 64.0, plan.targetCenterlineCoordinate() - 1.0))
         );
     }
 
     @Test
-    void northSouthTransitionCorrectsZThenShiftsX() {
+    void northSouthTransitionUsesXAxisCenterlineCorrection() {
         GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
         assertTrue(runner.startFullSweep(sessionWithOrigin(new Vec3i(11, 1, 5)), GroundedSweepSettings.defaults()).isEmpty());
         runner.advanceSweepToNextLaneForTests();
         GroundedSingleLaneDebugRunner.LaneShiftPlan plan = runner.laneShiftPlanForTests().orElseThrow();
+        runner.completeLaneShiftIfNearForTests(new Vec3d(plan.toLane().startPoint().getX() + 0.5, 64.0, plan.targetCenterlineCoordinate() - 1.0), false);
 
-        Vec3d forwardMisaligned;
-        Vec3d forwardAlignedCenterlineMisaligned;
+        Vec3d centerlineWest;
+        Vec3d centerlineEast;
         if (plan.toLane().direction().alongX()) {
-            forwardMisaligned = new Vec3d(plan.toLane().startPoint().getX() - 1.0, 64.0, plan.targetCenterlineCoordinate() - 1.0);
-            forwardAlignedCenterlineMisaligned = new Vec3d(plan.toLane().startPoint().getX() + 0.5, 64.0, plan.targetCenterlineCoordinate() - 1.0);
+            centerlineWest = new Vec3d(plan.toLane().startPoint().getX() + 0.5, 64.0, plan.targetCenterlineCoordinate() - 1.0);
+            centerlineEast = new Vec3d(plan.toLane().startPoint().getX() + 0.5, 64.0, plan.targetCenterlineCoordinate() + 1.5);
         } else {
-            forwardMisaligned = new Vec3d(plan.targetCenterlineCoordinate() - 1.0, 64.0, plan.toLane().startPoint().getZ() - 1.0);
-            forwardAlignedCenterlineMisaligned = new Vec3d(plan.targetCenterlineCoordinate() - 1.0, 64.0, plan.toLane().startPoint().getZ() + 0.5);
+            centerlineWest = new Vec3d(plan.targetCenterlineCoordinate() - 1.0, 64.0, plan.toLane().startPoint().getZ() + 0.5);
+            centerlineEast = new Vec3d(plan.targetCenterlineCoordinate() + 1.5, 64.0, plan.toLane().startPoint().getZ() + 0.5);
         }
 
-        assertEquals(
-                plan.toLane().direction().alongX() ? GroundedLaneDirection.EAST : GroundedLaneDirection.SOUTH,
-                runner.laneShiftDirectionForTests(forwardMisaligned)
-        );
-        runner.completeLaneShiftIfNearForTests(forwardAlignedCenterlineMisaligned, false);
-        assertEquals(
-                plan.shiftDirection(),
-                runner.laneShiftDirectionForTests(forwardAlignedCenterlineMisaligned)
-        );
+        GroundedLaneDirection westSideDirection = runner.laneShiftDirectionForTests(centerlineWest);
+        GroundedLaneDirection eastSideDirection = runner.laneShiftDirectionForTests(centerlineEast);
+        assertTrue(westSideDirection != null);
+        assertTrue(eastSideDirection != null);
+        assertTrue(westSideDirection != eastSideDirection);
     }
 
     @Test
@@ -1219,6 +1227,14 @@ class GroundedSingleLaneDebugRunnerTest {
         assertTrue(runner.awaitingTransitionSupportForTests());
 
         runner.completeTransitionSupportForTests();
+        runner.completeLaneShiftIfNearForTests(
+                new Vec3d(plan.toLane().startPoint().getX() + 0.5, 64.0, plan.targetCenterlineCoordinate() + 0.5),
+                false
+        );
+        runner.completeLaneShiftIfNearForTests(
+                new Vec3d(plan.toLane().startPoint().getX() + 0.5, 64.0, plan.targetCenterlineCoordinate() + 0.5),
+                false
+        );
         runner.completeLaneShiftIfNearForTests(
                 new Vec3d(plan.toLane().startPoint().getX() + 0.5, 64.0, plan.targetCenterlineCoordinate() + 0.5),
                 false
