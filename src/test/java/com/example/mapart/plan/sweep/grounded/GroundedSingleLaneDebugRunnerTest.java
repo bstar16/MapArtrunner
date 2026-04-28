@@ -96,7 +96,7 @@ class GroundedSingleLaneDebugRunnerTest {
     }
 
     @Test
-    void startApproachTargetsStandingPositionOneBlockAboveBuildPlane() {
+    void startApproachTargetsOutsideLaneStartStagingBlock() {
         RecordingBaritoneFacade baritone = new RecordingBaritoneFacade();
         GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(baritone);
         BuildSession session = sessionWithOrigin();
@@ -104,7 +104,7 @@ class GroundedSingleLaneDebugRunnerTest {
         assertTrue(runner.start(session, 0, GroundedSweepSettings.defaults()).isEmpty());
         runner.issueStartApproachIfNeeded();
 
-        assertEquals(new BlockPos(10, 65, 12), baritone.lastGoToTarget);
+        assertEquals(new BlockPos(9, 65, 12), baritone.lastGoToTarget);
     }
 
     @Test
@@ -124,24 +124,42 @@ class GroundedSingleLaneDebugRunnerTest {
                 1.0
         );
 
-        BlockPos approachTarget = GroundedSingleLaneDebugRunner.approachTargetForLaneStart(lane, bounds);
+        BlockPos approachTarget = GroundedSingleLaneDebugRunner.approachStagingTargetBeforeLaneStart(lane, bounds);
 
-        assertEquals(new BlockPos(10, 65, 12), approachTarget);
+        assertEquals(new BlockPos(9, 65, 12), approachTarget);
         assertEquals(new BlockPos(10, 64, 12), lane.startPoint());
     }
 
     @Test
     void nearStartDetectionUsesStandingStartTargetCoordinates() {
-        BlockPos standingStart = new BlockPos(10, 65, 12);
-        assertTrue(GroundedSingleLaneDebugRunner.isNearLaneStart(new Vec3d(10.5, 64.0, 12.5), standingStart));
+        BlockPos standingStart = new BlockPos(9, 65, 12);
+        assertTrue(GroundedSingleLaneDebugRunner.isNearLaneStart(new Vec3d(9.5, 64.0, 12.5), standingStart));
         assertFalse(GroundedSingleLaneDebugRunner.isNearLaneStart(new Vec3d(13.0, 64.0, 12.5), standingStart));
+    }
+
+    @Test
+    void startStagingTargetStaysOutsideBoundsForAllCardinalLaneDirections() {
+        GroundedSchematicBounds bounds = new GroundedSchematicBounds(
+                new BlockPos(10, 64, 10),
+                new BlockPos(10, 64, 10),
+                new BlockPos(20, 64, 20)
+        );
+        GroundedSweepLane east = new GroundedSweepLane(0, 12, GroundedLaneDirection.EAST, new BlockPos(10, 64, 12), new BlockPos(20, 64, 12), new GroundedLaneCorridorBounds(10, 20, 10, 14), 1.0);
+        GroundedSweepLane west = new GroundedSweepLane(1, 14, GroundedLaneDirection.WEST, new BlockPos(20, 64, 14), new BlockPos(10, 64, 14), new GroundedLaneCorridorBounds(10, 20, 12, 16), 1.0);
+        GroundedSweepLane south = new GroundedSweepLane(2, 16, GroundedLaneDirection.SOUTH, new BlockPos(16, 64, 10), new BlockPos(16, 64, 20), new GroundedLaneCorridorBounds(14, 18, 10, 20), 1.0);
+        GroundedSweepLane north = new GroundedSweepLane(3, 18, GroundedLaneDirection.NORTH, new BlockPos(18, 64, 20), new BlockPos(18, 64, 10), new GroundedLaneCorridorBounds(16, 20, 10, 20), 1.0);
+
+        assertEquals(new BlockPos(9, 65, 12), GroundedSingleLaneDebugRunner.approachStagingTargetBeforeLaneStart(east, bounds));
+        assertEquals(new BlockPos(21, 65, 14), GroundedSingleLaneDebugRunner.approachStagingTargetBeforeLaneStart(west, bounds));
+        assertEquals(new BlockPos(16, 65, 9), GroundedSingleLaneDebugRunner.approachStagingTargetBeforeLaneStart(south, bounds));
+        assertEquals(new BlockPos(18, 65, 21), GroundedSingleLaneDebugRunner.approachStagingTargetBeforeLaneStart(north, bounds));
     }
 
     @Test
     void readyForLaneStartRequiresInsideCorridorEvenWhenNearTarget() {
         GroundedSweepLane lane = eastLane();
         GroundedSchematicBounds bounds = eastLaneBounds();
-        BlockPos standing = new BlockPos(10, 65, 12);
+        BlockPos standing = new BlockPos(9, 65, 12);
 
         assertTrue(GroundedSingleLaneDebugRunner.isNearLaneStart(new Vec3d(10.55, 64.0, 13.55), standing));
         assertFalse(GroundedSingleLaneDebugRunner.isReadyForLaneStart(
@@ -183,7 +201,7 @@ class GroundedSingleLaneDebugRunnerTest {
         assertTrue(GroundedSingleLaneDebugRunner.isReadyForLaneStart(
                 new Vec3d(10.5, 64.0, 12.5),
                 eastLane(),
-                new BlockPos(10, 65, 12),
+                new BlockPos(9, 65, 12),
                 eastLaneBounds()
         ));
     }
@@ -665,8 +683,10 @@ class GroundedSingleLaneDebugRunnerTest {
         assertTrue(shifting.awaitingLaneShift());
         assertEquals(GroundedLaneWalkState.IDLE, shifting.walkState());
 
-        BlockPos shiftTarget = runner.laneShiftTargetForTests().orElseThrow();
-        runner.completeLaneShiftIfNearForTests(new Vec3d(shiftTarget.getX() + 0.5, 64.0, shiftTarget.getZ() + 0.5), false);
+        runner.completeLaneShiftIfNearForTests(
+                new Vec3d(plan.toLane().startPoint().getX() + 0.5, 64.0, plan.targetCenterlineCoordinate() + 0.5),
+                false
+        );
 
         GroundedSingleLaneDebugRunner.DebugStatus shifted = runner.status();
         assertFalse(shifted.awaitingLaneShift());
@@ -807,6 +827,21 @@ class GroundedSingleLaneDebugRunnerTest {
     }
 
     @Test
+    void centerlineCorrectionReversesDirectionWhenOvershootingTargetLane() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        assertTrue(runner.startFullSweep(sessionWithOrigin(new Vec3i(5, 1, 11)), GroundedSweepSettings.defaults()).isEmpty());
+        runner.advanceSweepToNextLaneForTests();
+        GroundedSingleLaneDebugRunner.LaneShiftPlan plan = runner.laneShiftPlanForTests().orElseThrow();
+
+        Vec3d northOfCenterline = new Vec3d(plan.toLane().startPoint().getX() + 0.5, 64.0, plan.targetCenterlineCoordinate() - 1.25);
+        Vec3d southOfCenterline = new Vec3d(plan.toLane().startPoint().getX() + 0.5, 64.0, plan.targetCenterlineCoordinate() + 1.25);
+
+        runner.completeLaneShiftIfNearForTests(northOfCenterline, false);
+        assertEquals(GroundedLaneDirection.SOUTH, runner.laneShiftDirectionForTests(northOfCenterline));
+        assertEquals(GroundedLaneDirection.NORTH, runner.laneShiftDirectionForTests(southOfCenterline));
+    }
+
+    @Test
     void transitionDoesNotStartNextLaneUntilBothAxesAligned() {
         GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
         assertTrue(runner.startFullSweep(sessionWithOrigin(new Vec3i(5, 1, 11)), GroundedSweepSettings.defaults()).isEmpty());
@@ -870,6 +905,22 @@ class GroundedSingleLaneDebugRunnerTest {
                 plan.shiftDirection(),
                 runner.laneShiftDirectionForTests(forwardAlignedCenterlineMisaligned)
         );
+    }
+
+    @Test
+    void northSouthCenterlineCorrectionReversesWhenOvershootingXCenterline() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        assertTrue(runner.startFullSweep(sessionWithOrigin(new Vec3i(11, 1, 5)), GroundedSweepSettings.defaults()).isEmpty());
+        runner.advanceSweepToNextLaneForTests();
+        GroundedSingleLaneDebugRunner.LaneShiftPlan plan = runner.laneShiftPlanForTests().orElseThrow();
+        if (plan.toLane().direction().alongX()) {
+            return;
+        }
+        Vec3d forwardAlignedWest = new Vec3d(plan.targetCenterlineCoordinate() - 1.25, 64.0, plan.toLane().startPoint().getZ() + 0.5);
+        Vec3d forwardAlignedEast = new Vec3d(plan.targetCenterlineCoordinate() + 1.25, 64.0, plan.toLane().startPoint().getZ() + 0.5);
+        runner.completeLaneShiftIfNearForTests(forwardAlignedWest, false);
+        assertEquals(GroundedLaneDirection.EAST, runner.laneShiftDirectionForTests(forwardAlignedWest));
+        assertEquals(GroundedLaneDirection.WEST, runner.laneShiftDirectionForTests(forwardAlignedEast));
     }
 
     @Test
