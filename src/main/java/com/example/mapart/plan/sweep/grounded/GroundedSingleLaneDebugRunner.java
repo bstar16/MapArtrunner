@@ -51,7 +51,7 @@ public final class GroundedSingleLaneDebugRunner {
     private static final int ENTRY_BURST_ATTEMPTS_PER_TICK = 2;
     private static final int MAX_LANE_ENTRY_STEP_TICKS = 40;
     private static final int MAX_ENTRY_CENTERLINE_ALIGN_TICKS = 40;
-    private static final double LANE_ENTRY_STEP_REACH_DISTANCE_SQ = 0.35 * 0.35;
+    private static final double ENTRY_PROGRESS_TOLERANCE = 0.2;
     private static final double LANE_START_CENTERLINE_TOLERANCE = 0.25;
     private static final double TRANSITION_WALKING_DISABLE_SPRINT_DELTA = 1.5;
 
@@ -86,7 +86,7 @@ public final class GroundedSingleLaneDebugRunner {
     private BlockPos laneShiftTarget;
     private GroundedSweepLane pendingShiftLane;
     private LaneShiftPlan laneShiftPlan;
-    private LaneTransitionStage laneTransitionStage = LaneTransitionStage.ALIGN_FORWARD_AXIS;
+    private LaneTransitionStage laneTransitionStage = LaneTransitionStage.TURN_TO_SHIFT_DIRECTION;
     private int laneTransitionTicks;
     private LaneStartStage laneStartStage = LaneStartStage.NONE;
     private GroundedSweepLane pendingLaneStart;
@@ -125,6 +125,7 @@ public final class GroundedSingleLaneDebugRunner {
     private float lastTransitionYaw;
     private boolean lastTransitionSprint;
     private boolean lastTransitionOvershootCorrected;
+    private int transitionYawLockTicks;
 
     private DebugStatus lastStatus = new DebugStatus(
             false,
@@ -273,7 +274,7 @@ public final class GroundedSingleLaneDebugRunner {
         awaitingLaneShift = false;
         laneShiftTarget = null;
         laneShiftPlan = null;
-        laneTransitionStage = LaneTransitionStage.ALIGN_FORWARD_AXIS;
+        laneTransitionStage = LaneTransitionStage.TURN_TO_SHIFT_DIRECTION;
         laneTransitionTicks = 0;
         lastStatus = new DebugStatus(
                 true,
@@ -469,6 +470,7 @@ public final class GroundedSingleLaneDebugRunner {
             laneStartStage = LaneStartStage.ALIGN_ENTRY_CENTERLINE;
             pendingLaneStartTicks = 0;
             traceGroundedEvent("lane entry step complete");
+            return;
         }
 
         if (laneStartStage == LaneStartStage.ALIGN_ENTRY_CENTERLINE) {
@@ -628,14 +630,12 @@ public final class GroundedSingleLaneDebugRunner {
     }
 
     private boolean stepToLaneEntryTarget(MinecraftClient client, GroundedSweepLane lane, GroundedLaneEntryAnchor entryAnchor) {
-        if (client == null || client.player == null || lane == null) {
+        if (client == null || client.player == null || lane == null || entryAnchor == null) {
             return false;
         }
         Vec3d playerPos = client.player.getEntityPos();
-        BlockPos entryStandingTarget = entryAnchor.entryStandingTarget();
-        Vec3d entryCenter = new Vec3d(entryStandingTarget.getX() + 0.5, playerPos.y, entryStandingTarget.getZ() + 0.5);
-        if (new Vec3d(playerPos.x, entryCenter.y, playerPos.z).squaredDistanceTo(entryCenter) <= LANE_ENTRY_STEP_REACH_DISTANCE_SQ
-                && insideCorridor(playerPos, lane, activeBounds)) {
+        if (insideCorridor(playerPos, lane, activeBounds)
+                && hasCrossedEntryProgress(playerPos, entryAnchor, lane)) {
             return true;
         }
         forcePlayerLaneYaw(client, lane);
@@ -700,11 +700,16 @@ public final class GroundedSingleLaneDebugRunner {
         if (!awaitingLaneShift || playerPosition == null || laneShiftPlan == null || pendingShiftLane == null) {
             return;
         }
-        if (laneTransitionStage == LaneTransitionStage.ALIGN_FORWARD_AXIS && isForwardAxisAligned(playerPosition, pendingShiftLane)) {
-            laneTransitionStage = LaneTransitionStage.SHIFT_TO_CENTERLINE;
+        if (laneTransitionStage == LaneTransitionStage.TURN_TO_SHIFT_DIRECTION) {
+            laneTransitionStage = LaneTransitionStage.SHIFT_TO_NEXT_CENTERLINE;
             traceGroundedEvent("lane transition stage changed: " + laneTransitionStage);
         }
-        if (laneTransitionStage == LaneTransitionStage.SHIFT_TO_CENTERLINE && isCenterlineAligned(playerPosition, pendingShiftLane)) {
+        if (laneTransitionStage == LaneTransitionStage.SHIFT_TO_NEXT_CENTERLINE && isCenterlineAligned(playerPosition, pendingShiftLane)) {
+            laneTransitionStage = LaneTransitionStage.TURN_TO_NEXT_LANE;
+            transitionYawLockTicks = MIN_LANE_YAW_LOCK_TICKS;
+            traceGroundedEvent("lane transition stage changed: " + laneTransitionStage);
+        }
+        if (laneTransitionStage == LaneTransitionStage.TURN_TO_NEXT_LANE && transitionYawLockTicks >= MIN_LANE_YAW_LOCK_TICKS) {
             laneTransitionStage = LaneTransitionStage.START_NEXT_LANE;
             traceGroundedEvent("lane transition stage changed: " + laneTransitionStage);
         }
@@ -717,10 +722,7 @@ public final class GroundedSingleLaneDebugRunner {
         if (!awaitingLaneShift || laneShiftPlan == null || pendingShiftLane == null || playerPosition == null) {
             return null;
         }
-        if (laneTransitionStage == LaneTransitionStage.ALIGN_FORWARD_AXIS && !isForwardAxisAligned(playerPosition, pendingShiftLane)) {
-            return forwardAlignmentDirection(playerPosition, pendingShiftLane);
-        }
-        if (laneTransitionStage == LaneTransitionStage.SHIFT_TO_CENTERLINE && !isCenterlineAligned(playerPosition, pendingShiftLane)) {
+        if (laneTransitionStage == LaneTransitionStage.SHIFT_TO_NEXT_CENTERLINE && !isCenterlineAligned(playerPosition, pendingShiftLane)) {
             return centerlineAlignmentDirection(playerPosition, pendingShiftLane);
         }
         return null;
@@ -1071,7 +1073,7 @@ public final class GroundedSingleLaneDebugRunner {
         laneShiftTarget = null;
         pendingShiftLane = null;
         laneShiftPlan = null;
-        laneTransitionStage = LaneTransitionStage.ALIGN_FORWARD_AXIS;
+        laneTransitionStage = LaneTransitionStage.TURN_TO_SHIFT_DIRECTION;
         laneTransitionTicks = 0;
         clearTransitionSupportState();
         laneStartStage = LaneStartStage.NONE;
@@ -1356,6 +1358,19 @@ public final class GroundedSingleLaneDebugRunner {
         return centerlineAlignmentDirection(playerPos, lane);
     }
 
+    static boolean hasCrossedEntryProgress(Vec3d playerPos, GroundedLaneEntryAnchor anchor, GroundedSweepLane lane) {
+        if (playerPos == null || anchor == null || lane == null) {
+            return false;
+        }
+        double progressCoordinate = lane.direction().alongX() ? playerPos.x : playerPos.z;
+        return switch (lane.direction()) {
+            case EAST -> progressCoordinate >= anchor.progressCoordinate() + ENTRY_PROGRESS_TOLERANCE;
+            case WEST -> progressCoordinate <= anchor.progressCoordinate() - ENTRY_PROGRESS_TOLERANCE;
+            case SOUTH -> progressCoordinate >= anchor.progressCoordinate() + ENTRY_PROGRESS_TOLERANCE;
+            case NORTH -> progressCoordinate <= anchor.progressCoordinate() - ENTRY_PROGRESS_TOLERANCE;
+        };
+    }
+
     static List<GroundedSweepPlacementExecutor.PlacementTarget> entryBurstTargets(
             GroundedSweepLane lane,
             GroundedSchematicBounds bounds,
@@ -1448,38 +1463,51 @@ public final class GroundedSingleLaneDebugRunner {
         }
         Vec3d playerPosition = client.player.getEntityPos();
         lastTransitionOvershootCorrected = false;
-        if (laneTransitionStage == LaneTransitionStage.ALIGN_FORWARD_AXIS) {
-            if (isForwardAxisAligned(playerPosition, pendingShiftLane)) {
-                laneTransitionStage = LaneTransitionStage.SHIFT_TO_CENTERLINE;
-                traceGroundedEvent("lane transition stage changed: " + laneTransitionStage);
-            } else {
-                GroundedLaneDirection correctionDirection = forwardAlignmentDirection(playerPosition, pendingShiftLane);
-                double delta = forwardAxisDelta(playerPosition, pendingShiftLane);
-                boolean sprintEnabled = shouldSprintDuringTransition(constantSprint, Math.abs(delta));
-                traceGroundedEvent("transition forward-axis correction direction=" + correctionDirection + " delta=" + delta);
-                applyShiftControls(client, correctionDirection, sprintEnabled);
-                recordTransitionDiagnostics(client, correctionDirection, sprintEnabled);
-                return;
-            }
+        if (laneTransitionStage == LaneTransitionStage.TURN_TO_SHIFT_DIRECTION) {
+            traceGroundedEvent("turn to shift direction started");
+            forcePlayerYaw(client, laneShiftPlan.shiftDirection().yawDegrees());
+            clearControls(client);
+            laneTransitionStage = LaneTransitionStage.SHIFT_TO_NEXT_CENTERLINE;
+            traceGroundedEvent("turn to shift direction confirmed");
+            traceGroundedEvent("lane transition stage changed: " + laneTransitionStage);
+            return;
         }
-        if (laneTransitionStage == LaneTransitionStage.SHIFT_TO_CENTERLINE) {
+        if (laneTransitionStage == LaneTransitionStage.SHIFT_TO_NEXT_CENTERLINE) {
+            double delta = centerlineDelta(playerPosition, pendingShiftLane);
+            traceGroundedEvent("transition shift tick: direction=" + laneShiftPlan.shiftDirection()
+                    + ", lateral=" + entryLateralCoordinate(playerPosition, pendingShiftLane)
+                    + ", targetCenterline=" + (pendingShiftLane.centerlineCoordinate() + 0.5)
+                    + ", centerlineDelta=" + delta);
             if (isCenterlineAligned(playerPosition, pendingShiftLane)) {
-                laneTransitionStage = LaneTransitionStage.START_NEXT_LANE;
+                clearControls(client);
+                laneTransitionStage = LaneTransitionStage.TURN_TO_NEXT_LANE;
+                transitionYawLockTicks = 0;
+                traceGroundedEvent("centered on next lane");
                 traceGroundedEvent("lane transition stage changed: " + laneTransitionStage);
-            } else {
-                GroundedLaneDirection correctionDirection = centerlineAlignmentDirection(playerPosition, pendingShiftLane);
-                boolean overshootCorrected = correctionDirection != laneShiftPlan.shiftDirection();
-                double delta = centerlineDelta(playerPosition, pendingShiftLane);
-                boolean sprintEnabled = shouldSprintDuringTransition(constantSprint, Math.abs(delta));
-                traceGroundedEvent("transition centerline correction direction=" + correctionDirection + " delta=" + delta);
-                if (overshootCorrected) {
-                    traceGroundedEvent("transition centerline overshoot corrected direction=" + correctionDirection);
-                }
-                lastTransitionOvershootCorrected = overshootCorrected;
-                applyShiftControls(client, correctionDirection, sprintEnabled);
-                recordTransitionDiagnostics(client, correctionDirection, sprintEnabled);
                 return;
             }
+            GroundedLaneDirection correctionDirection = centerlineAlignmentDirection(playerPosition, pendingShiftLane);
+            boolean overshootCorrected = correctionDirection != laneShiftPlan.shiftDirection();
+            boolean sprintEnabled = shouldSprintDuringTransition(constantSprint, Math.abs(delta));
+            if (overshootCorrected) {
+                traceGroundedEvent("transition centerline overshoot corrected direction=" + correctionDirection);
+            }
+            lastTransitionOvershootCorrected = overshootCorrected;
+            applyShiftControls(client, correctionDirection, sprintEnabled);
+            recordTransitionDiagnostics(client, correctionDirection, sprintEnabled);
+            return;
+        }
+        if (laneTransitionStage == LaneTransitionStage.TURN_TO_NEXT_LANE) {
+            traceGroundedEvent("turn to next lane direction started");
+            forcePlayerYaw(client, laneShiftPlan.nextLaneYaw());
+            clearControls(client);
+            transitionYawLockTicks++;
+            if (transitionYawLockTicks >= MIN_LANE_YAW_LOCK_TICKS) {
+                laneTransitionStage = LaneTransitionStage.START_NEXT_LANE;
+                traceGroundedEvent("turn to next lane direction confirmed");
+                traceGroundedEvent("lane transition stage changed: " + laneTransitionStage);
+            }
+            return;
         }
         if (laneTransitionStage == LaneTransitionStage.START_NEXT_LANE) {
             traceGroundedEvent("transition staged for next lane");
@@ -1563,7 +1591,7 @@ public final class GroundedSingleLaneDebugRunner {
         awaitingLaneShift = false;
         laneShiftTarget = null;
         laneShiftPlan = null;
-        laneTransitionStage = LaneTransitionStage.ALIGN_FORWARD_AXIS;
+        laneTransitionStage = LaneTransitionStage.TURN_TO_SHIFT_DIRECTION;
         laneTransitionTicks = 0;
         activeLane = pendingShiftLane;
         traceGroundedEvent("active lane changed: " + describeLane(activeLane));
@@ -1595,7 +1623,7 @@ public final class GroundedSingleLaneDebugRunner {
         awaitingLaneShift = false;
         laneShiftTarget = null;
         laneShiftPlan = null;
-        laneTransitionStage = LaneTransitionStage.ALIGN_FORWARD_AXIS;
+        laneTransitionStage = LaneTransitionStage.TURN_TO_SHIFT_DIRECTION;
         laneTransitionTicks = 0;
         activeLane = nextLane;
         traceGroundedEvent("active lane changed: " + describeLane(activeLane));
@@ -1614,7 +1642,7 @@ public final class GroundedSingleLaneDebugRunner {
         laneShiftTarget = null;
         laneShiftPlan = null;
         pendingShiftLane = null;
-        laneTransitionStage = LaneTransitionStage.ALIGN_FORWARD_AXIS;
+        laneTransitionStage = LaneTransitionStage.TURN_TO_SHIFT_DIRECTION;
         laneTransitionTicks = 0;
         clearTransitionSupportState();
         laneWalker.interrupt();
@@ -1863,28 +1891,8 @@ public final class GroundedSingleLaneDebugRunner {
         return playerFlat.squaredDistanceTo(standingCenter) <= LANE_SHIFT_REACH_DISTANCE_SQ;
     }
 
-    private static boolean isForwardAxisAligned(Vec3d playerPosition, GroundedSweepLane nextLane) {
-        return Math.abs(forwardAxisDelta(playerPosition, nextLane)) <= LANE_TRANSITION_AXIS_TOLERANCE;
-    }
-
     private static boolean isCenterlineAligned(Vec3d playerPosition, GroundedSweepLane nextLane) {
         return Math.abs(centerlineDelta(playerPosition, nextLane)) <= LANE_TRANSITION_AXIS_TOLERANCE;
-    }
-
-    private static GroundedLaneDirection forwardAlignmentDirection(Vec3d playerPosition, GroundedSweepLane nextLane) {
-        double delta = forwardAxisDelta(playerPosition, nextLane);
-        if (nextLane.direction().alongX()) {
-            return delta >= 0.0 ? GroundedLaneDirection.EAST : GroundedLaneDirection.WEST;
-        }
-        return delta >= 0.0 ? GroundedLaneDirection.SOUTH : GroundedLaneDirection.NORTH;
-    }
-
-    private static double forwardAxisDelta(Vec3d playerPosition, GroundedSweepLane nextLane) {
-        double targetForward = nextLane.direction().alongX()
-                ? nextLane.startPoint().getX() + 0.5
-                : nextLane.startPoint().getZ() + 0.5;
-        double playerForward = nextLane.direction().alongX() ? playerPosition.x : playerPosition.z;
-        return targetForward - playerForward;
     }
 
     private static GroundedLaneDirection centerlineAlignmentDirection(Vec3d playerPosition, GroundedSweepLane targetLane) {
@@ -1912,7 +1920,23 @@ public final class GroundedSingleLaneDebugRunner {
             shiftDirection = delta >= 0 ? GroundedLaneDirection.EAST : GroundedLaneDirection.WEST;
         }
         BlockPos shiftTarget = approachStagingTargetBeforeLaneStart(toLane, bounds);
-        return new LaneShiftPlan(shiftDirection, toLane.centerlineCoordinate(), shiftTarget, previousLane, toLane);
+        double startForward = toLane.direction().alongX() ? previousLane.endPoint().getX() + 0.5 : previousLane.endPoint().getZ() + 0.5;
+        double targetForward = toLane.direction().alongX() ? toLane.startPoint().getX() + 0.5 : toLane.startPoint().getZ() + 0.5;
+        double startCenterline = previousLane.centerlineCoordinate() + 0.5;
+        double targetCenterline = toLane.centerlineCoordinate() + 0.5;
+        Vec3d targetStanding = new Vec3d(toLane.startPoint().getX() + 0.5, bounds.minY() + 1, toLane.startPoint().getZ() + 0.5);
+        return new LaneShiftPlan(
+                previousLane,
+                toLane,
+                shiftDirection,
+                startForward,
+                targetForward,
+                startCenterline,
+                targetCenterline,
+                targetStanding,
+                shiftTarget,
+                toLane.direction().yawDegrees()
+        );
     }
 
     static LaneShiftPlan buildLaneShiftPlanForTests(GroundedSweepLane fromLane, GroundedSweepLane toLane, GroundedSchematicBounds bounds) {
@@ -2193,7 +2217,7 @@ public final class GroundedSingleLaneDebugRunner {
         laneShiftTarget = null;
         pendingShiftLane = null;
         laneShiftPlan = null;
-        laneTransitionStage = LaneTransitionStage.ALIGN_FORWARD_AXIS;
+        laneTransitionStage = LaneTransitionStage.TURN_TO_SHIFT_DIRECTION;
         laneTransitionTicks = 0;
         clearTransitionSupportState();
         laneStartStage = LaneStartStage.NONE;
@@ -2229,7 +2253,7 @@ public final class GroundedSingleLaneDebugRunner {
         awaitingTransitionSupport = false;
         laneShiftTarget = null;
         laneShiftPlan = null;
-        laneTransitionStage = LaneTransitionStage.ALIGN_FORWARD_AXIS;
+        laneTransitionStage = LaneTransitionStage.TURN_TO_SHIFT_DIRECTION;
         laneTransitionTicks = 0;
         clearTransitionSupportState();
 
@@ -2267,7 +2291,13 @@ public final class GroundedSingleLaneDebugRunner {
         laneShiftPlan = buildLaneShiftPlan(fromLane, lane, activeBounds);
         laneShiftTarget = laneShiftPlan.shiftTarget();
         pendingShiftLane = lane;
-        laneTransitionStage = LaneTransitionStage.ALIGN_FORWARD_AXIS;
+        laneTransitionStage = LaneTransitionStage.TURN_TO_SHIFT_DIRECTION;
+        transitionYawLockTicks = 0;
+        traceGroundedEvent("transition plan created: from=" + describeLane(laneShiftPlan.fromLane())
+                + ", to=" + describeLane(laneShiftPlan.toLane())
+                + ", shiftDirection=" + laneShiftPlan.shiftDirection()
+                + ", targetCenterline=" + laneShiftPlan.targetCenterline()
+                + ", nextYaw=" + laneShiftPlan.nextLaneYaw());
         laneTransitionTicks = 0;
         initializeTransitionSupportPhase(fromLane, lane);
         if (!awaitingTransitionSupport) {
@@ -2457,6 +2487,21 @@ public final class GroundedSingleLaneDebugRunner {
         return MAX_ENTRY_ATTEMPTS_PER_TARGET;
     }
 
+    static boolean hasCrossedEntryProgressForTests(Vec3d playerPos, GroundedSweepLane lane, int progressCoordinate) {
+        if (lane == null) {
+            return false;
+        }
+        GroundedLaneEntryAnchor anchor = new GroundedLaneEntryAnchor(
+                lane.laneIndex(),
+                lane.direction(),
+                lane.startPoint(),
+                lane.startPoint(),
+                progressCoordinate,
+                LaneEntrySource.FRESH_START
+        );
+        return hasCrossedEntryProgress(playerPos, anchor, lane);
+    }
+
 
     boolean queueLaneStartForTests(TestYawState yawState, GroundedSweepLane lane) {
         if (lane == null || yawState == null) {
@@ -2534,17 +2579,26 @@ public final class GroundedSingleLaneDebugRunner {
     }
 
     record LaneShiftPlan(
-            GroundedLaneDirection shiftDirection,
-            int targetCenterlineCoordinate,
-            BlockPos shiftTarget,
             GroundedSweepLane fromLane,
-            GroundedSweepLane toLane
+            GroundedSweepLane toLane,
+            GroundedLaneDirection shiftDirection,
+            double startForwardCoordinate,
+            double targetForwardCoordinate,
+            double startCenterline,
+            double targetCenterline,
+            Vec3d targetStandingPosition,
+            BlockPos shiftTarget,
+            float nextLaneYaw
     ) {
+        int targetCenterlineCoordinate() {
+            return toLane.centerlineCoordinate();
+        }
     }
 
     private enum LaneTransitionStage {
-        ALIGN_FORWARD_AXIS,
-        SHIFT_TO_CENTERLINE,
+        TURN_TO_SHIFT_DIRECTION,
+        SHIFT_TO_NEXT_CENTERLINE,
+        TURN_TO_NEXT_LANE,
         START_NEXT_LANE
     }
 
