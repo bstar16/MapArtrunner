@@ -220,8 +220,46 @@ class GroundedSingleLaneDebugRunnerTest {
                 lane,
                 bounds
         );
-        assertEquals(GroundedSingleLaneDebugRunner.LaneStartStage.AWAITING_LANE_ENTRY_SUPPORT, stageOutside);
-        assertEquals(GroundedSingleLaneDebugRunner.LaneStartStage.LOCK_LANE_YAW, stageInside);
+        assertEquals(GroundedSingleLaneDebugRunner.LaneStartStage.AWAITING_LANE_ENTRY_STEP, stageOutside);
+        assertEquals(GroundedSingleLaneDebugRunner.LaneStartStage.ALIGN_ENTRY_CENTERLINE, stageInside);
+    }
+
+    @Test
+    void playerInsideCorridorButOffCenterlineDoesNotCountAsCenteredForLaneWalkStart() {
+        GroundedSweepLane lane = eastLane();
+        assertFalse(GroundedSingleLaneDebugRunner.isCenteredForLaneWalk(new Vec3d(10.5, 64.0, 12.95), lane));
+    }
+
+    @Test
+    void playerWithinCenterlineToleranceIsCenteredForLaneWalkStart() {
+        GroundedSweepLane lane = eastLane();
+        assertTrue(GroundedSingleLaneDebugRunner.isCenteredForLaneWalk(new Vec3d(10.5, 64.0, 12.69), lane));
+    }
+
+    @Test
+    void centerlineCorrectionDirectionMatchesEastWestLaneRules() {
+        GroundedSweepLane lane = eastLane();
+        assertEquals(GroundedLaneDirection.SOUTH,
+                GroundedSingleLaneDebugRunner.entryCenterlineCorrectionDirection(new Vec3d(10.5, 64.0, 12.2), lane));
+        assertEquals(GroundedLaneDirection.NORTH,
+                GroundedSingleLaneDebugRunner.entryCenterlineCorrectionDirection(new Vec3d(10.5, 64.0, 12.8), lane));
+    }
+
+    @Test
+    void centerlineCorrectionDirectionMatchesNorthSouthLaneRules() {
+        GroundedSweepLane lane = new GroundedSweepLane(
+                0,
+                12,
+                GroundedLaneDirection.SOUTH,
+                new BlockPos(12, 64, 10),
+                new BlockPos(12, 64, 14),
+                new GroundedLaneCorridorBounds(10, 14, 10, 14),
+                1.0
+        );
+        assertEquals(GroundedLaneDirection.EAST,
+                GroundedSingleLaneDebugRunner.entryCenterlineCorrectionDirection(new Vec3d(12.2, 64.0, 10.5), lane));
+        assertEquals(GroundedLaneDirection.WEST,
+                GroundedSingleLaneDebugRunner.entryCenterlineCorrectionDirection(new Vec3d(12.8, 64.0, 10.5), lane));
     }
 
     @Test
@@ -636,6 +674,32 @@ class GroundedSingleLaneDebugRunnerTest {
         assertEquals(selectedResume.progressCoordinate(), runner.laneEntryProgressCoordinateForTests().orElseThrow());
         int laneStartProgress = resumeLane.direction().alongX() ? resumeLane.startPoint().getX() : resumeLane.startPoint().getZ();
         assertFalse(selectedResume.progressCoordinate() == laneStartProgress);
+    }
+
+    @Test
+    void entryBurstTargetsIncludeCurrentAheadAndCrossSectionBands() {
+        GroundedSweepLane lane = eastLane();
+        GroundedSchematicBounds bounds = eastLaneBounds();
+        List<GroundedSweepPlacementExecutor.PlacementTarget> pending = List.of(
+                new GroundedSweepPlacementExecutor.PlacementTarget(1, new BlockPos(10, 64, 12)),
+                new GroundedSweepPlacementExecutor.PlacementTarget(2, new BlockPos(10, 64, 11)),
+                new GroundedSweepPlacementExecutor.PlacementTarget(3, new BlockPos(11, 64, 13)),
+                new GroundedSweepPlacementExecutor.PlacementTarget(4, new BlockPos(12, 64, 12)),
+                new GroundedSweepPlacementExecutor.PlacementTarget(5, new BlockPos(14, 64, 12))
+        );
+        List<GroundedSweepPlacementExecutor.PlacementTarget> burst = GroundedSingleLaneDebugRunner.entryBurstTargetsForTests(
+                lane,
+                bounds,
+                pending,
+                2,
+                10
+        );
+        assertEquals(List.of(1, 2, 3, 4), burst.stream().map(GroundedSweepPlacementExecutor.PlacementTarget::placementIndex).toList());
+    }
+
+    @Test
+    void entryBurstTargetsAllowMultipleAttemptsPerTarget() {
+        assertEquals(2, GroundedSingleLaneDebugRunner.maxEntryAttemptsPerTargetForTests());
     }
 
     @Test
