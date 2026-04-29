@@ -715,6 +715,7 @@ public final class GroundedSingleLaneDebugRunner {
             traceGroundedEvent("lane transition stage changed: " + laneTransitionStage);
         }
         if (laneTransitionStage == LaneTransitionStage.SHIFT_TO_NEXT_CENTERLINE && isCenterlineAligned(playerPosition, pendingShiftLane)) {
+            completeTransitionSupportPhase();
             laneTransitionStage = LaneTransitionStage.TURN_TO_NEXT_LANE;
             traceGroundedEvent("lane transition stage changed: " + laneTransitionStage);
         }
@@ -1489,15 +1490,9 @@ public final class GroundedSingleLaneDebugRunner {
             if (!hasActiveLaneTransitionState()) {
                 return;
             }
-            if (!transitionSupportReady()) {
-                clearControls(client);
-                return;
-            }
-            if (!hasActiveLaneTransitionState()) {
-                return;
-            }
             if (isCenterlineAligned(playerPosition, pendingShiftLane)) {
                 clearControls(client);
+                completeTransitionSupportPhase();
                 laneTransitionStage = LaneTransitionStage.TURN_TO_NEXT_LANE;
                 laneTransitionYawLockTicks = 0;
                 traceGroundedEvent("centered on next lane");
@@ -1585,7 +1580,8 @@ public final class GroundedSingleLaneDebugRunner {
             return;
         }
         if (transitionSupportTicks > MAX_TRANSITION_SUPPORT_TICKS) {
-            failTransitionSupport(client, "RETRY timeout", null, null, (PlacementResult) null);
+            traceGroundedEvent("transition support timeout: abandoning " + pendingTransitionSupportTargets.size() + " remaining targets as leftovers");
+            completeTransitionSupportPhase();
             return;
         }
 
@@ -1620,8 +1616,8 @@ public final class GroundedSingleLaneDebugRunner {
                 }
                 case MISSING_ITEM, ERROR -> {
                     transitionSupportFailedCount++;
-                    failTransitionSupport(client, result.status().name(), target, placement, result);
-                    return;
+                    traceGroundedEvent("transition support block skipped: idx=" + target.placementIndex() + " reason=" + result.status().name());
+                    removePendingTransitionSupportTarget(target.placementIndex());
                 }
             }
             attempts++;
