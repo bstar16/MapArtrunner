@@ -1733,7 +1733,7 @@ public final class GroundedSingleLaneDebugRunner {
             PendingPlacementVerification pending
     ) {
         BlockPos failingPos = target != null ? target.worldPos() : pending == null ? null : pending.worldPos();
-        Integer failingIndex = target != null ? target.placementIndex() : pending == null ? null : pending.placementIndex();
+        Integer failingIndex = target != null ? (Integer) target.placementIndex() : pending == null ? null : pending.placementIndex();
         Placement failingPlacement = placement;
         if (failingPlacement == null && failingIndex != null) {
             failingPlacement = transitionSupportPlacementsByIndex.get(failingIndex);
