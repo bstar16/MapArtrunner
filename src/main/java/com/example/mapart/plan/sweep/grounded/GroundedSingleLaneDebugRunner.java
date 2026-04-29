@@ -130,6 +130,12 @@ public final class GroundedSingleLaneDebugRunner {
     private boolean lastTransitionSprint;
     private boolean lastTransitionOvershootCorrected;
 
+    private final GroundedRecoveryState recoveryState = new GroundedRecoveryState();
+    private double lastKnownProgressCoordinate;
+    private int ticksSinceProgressAdvance;
+    private long lastSuccessfulPlacementTick;
+    private int consecutiveYawDriftTicks;
+
     private DebugStatus lastStatus = new DebugStatus(
             false,
             null,
@@ -315,6 +321,10 @@ public final class GroundedSingleLaneDebugRunner {
         }
         traceGroundedSnapshot(client);
 
+        if (recoveryState.isActive()) {
+            return;
+        }
+
         if (awaitingStartApproach) {
             tickStartApproach(client, constantSprint);
             return;
@@ -333,24 +343,66 @@ public final class GroundedSingleLaneDebugRunner {
             return;
         }
 
-        laneWalker.tick(client.player.getEntityPos());
+        Vec3d playerPosition = client.player.getEntityPos();
+
+        // Recovery detection: BELOW_BUILD_PLANE
+        if (playerPosition.y < activeBounds.minY()) {
+            triggerRecovery(client, GroundedRecoveryReason.BELOW_BUILD_PLANE);
+            return;
+        }
+
+        // Recovery detection: OFF_CORRIDOR
+        if (!insideCorridorForDiagnostics(playerPosition)) {
+            triggerRecovery(client, GroundedRecoveryReason.OFF_CORRIDOR);
+            return;
+        }
+
+        laneWalker.tick(playerPosition);
         laneTicksElapsed++;
+
+        // Track progress coordinate for NO_PROGRESS detection
+        double currentProgress = activeLane.direction().progressCoordinate(playerPosition.x, playerPosition.z);
+        if (Math.abs(currentProgress - lastKnownProgressCoordinate) > 0.5) {
+            lastKnownProgressCoordinate = currentProgress;
+            ticksSinceProgressAdvance = 0;
+        } else {
+            ticksSinceProgressAdvance++;
+        }
+
+        // Recovery detection: NO_PROGRESS
+        if (ticksSinceProgressAdvance >= 100) {
+            triggerRecovery(client, GroundedRecoveryReason.NO_PROGRESS);
+            return;
+        }
+
+        // Recovery detection: YAW_DRIFT
+        float expectedYaw = activeLane.direction().yawDegrees();
+        float currentYaw = client.player.getYaw();
+        float yawDelta = Math.abs(MathHelper.wrapDegrees(currentYaw - expectedYaw));
+        if (yawDelta > 15.0f) {
+            consecutiveYawDriftTicks++;
+            if (consecutiveYawDriftTicks >= 20) {
+                triggerRecovery(client, GroundedRecoveryReason.YAW_DRIFT);
+                return;
+            }
+        } else {
+            consecutiveYawDriftTicks = 0;
+        }
+
         processDuePlacementVerifications(client, laneTicksElapsed, false);
         boolean walkerActiveAfterTick = shouldAttemptPlacementAfterWalkerTick(laneWalker.state());
         if (walkerActiveAfterTick) {
             tickPlacementExecutor(client);
         }
+
+        // Recovery detection: PLACEMENT_STALL
+        if (laneTicksElapsed - lastSuccessfulPlacementTick >= 200 && !pendingPlacementTargets.isEmpty()) {
+            triggerRecovery(client, GroundedRecoveryReason.PLACEMENT_STALL);
+            return;
+        }
+
         applyLaneControls(client);
         displacementAlert.tick(client, true, client.player.getY() < activeBounds.minY());
-        if (!insideCorridorForDiagnostics(client.player.getEntityPos())) {
-            if (!corridorWarningActive) {
-                corridorWarningActive = true;
-                traceGroundedEvent("corridor warning / leaving corridor: " + describeLane(activeLane));
-            }
-        } else if (corridorWarningActive) {
-            corridorWarningActive = false;
-            traceGroundedEvent("corridor warning cleared");
-        }
 
         if (!walkerActiveAfterTick) {
             handleTerminalState(client);
@@ -402,6 +454,50 @@ public final class GroundedSingleLaneDebugRunner {
             );
         }
         return lastStatus;
+    }
+
+    public GroundedRecoveryState getRecoveryState() {
+        return recoveryState;
+    }
+
+    private void triggerRecovery(MinecraftClient client, GroundedRecoveryReason reason) {
+        if (client == null || client.player == null || activeLane == null) {
+            return;
+        }
+
+        clearControls(client);
+        laneWalker.interrupt();
+        baritoneFacade.cancel();
+
+        Vec3d playerPosition = client.player.getEntityPos();
+        double progressCoordinate = activeLane.direction().progressCoordinate(playerPosition.x, playerPosition.z);
+
+        GroundedRecoverySnapshot snapshot = new GroundedRecoverySnapshot(
+                activeLane,
+                sweepPassPhase,
+                activeLane.direction(),
+                lastKnownProgressCoordinate,
+                playerPosition,
+                reason
+        );
+
+        recoveryState.activate(snapshot);
+
+        String reasonText = switch (reason) {
+            case OFF_CORRIDOR -> "player exited lane corridor bounds";
+            case BELOW_BUILD_PLANE -> "player fell below build plane";
+            case NO_PROGRESS -> "no forward progress in 100 ticks";
+            case BLOCKED -> "movement blocked";
+            case MANUAL_INPUT -> "manual input detected";
+            case YAW_DRIFT -> "yaw drift exceeded 15° for 20 ticks";
+            case CENTERLINE_DRIFT -> "centerline drift exceeded threshold";
+            case PLACEMENT_STALL -> "no successful placements in 200 ticks";
+        };
+
+        traceGroundedEvent("recovery triggered: " + reasonText);
+        if (client.player != null) {
+            client.player.sendMessage(Text.literal("[Mapart grounded] Recovery triggered: " + reasonText), false);
+        }
     }
 
     private void tickStartApproach(MinecraftClient client, boolean constantSprint) {
@@ -1175,6 +1271,7 @@ public final class GroundedSingleLaneDebugRunner {
         placementSelector.recordPlacementResult(placementIndex, groundedResult, tick);
         if (groundedResult == GroundedSweepPlacementExecutor.PlacementResult.SUCCESS) {
             successfulPlacements++;
+            lastSuccessfulPlacementTick = laneTicksElapsed;
             reversePlacementFilter.remove(placementIndex);
             removePendingPlacement(placementIndex);
             return;
@@ -2452,6 +2549,17 @@ public final class GroundedSingleLaneDebugRunner {
         laneTransitionTicks = 0;
         laneTransitionYawLockTicks = 0;
         clearTransitionSupportState();
+
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client != null && client.player != null) {
+            Vec3d playerPos = client.player.getEntityPos();
+            lastKnownProgressCoordinate = lane.direction().progressCoordinate(playerPos.x, playerPos.z);
+        } else {
+            lastKnownProgressCoordinate = lane.direction().progressCoordinate(lane.startPoint().getX(), lane.startPoint().getZ());
+        }
+        ticksSinceProgressAdvance = 0;
+        lastSuccessfulPlacementTick = 0;
+        consecutiveYawDriftTicks = 0;
 
         lastStatus = new DebugStatus(
                 true,

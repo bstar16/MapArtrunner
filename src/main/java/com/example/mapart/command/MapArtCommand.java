@@ -279,6 +279,11 @@ public final class MapArtCommand {
                                         .executes(context -> groundedTraceSet(context.getSource(), false)))
                                 .then(ClientCommandManager.literal("status")
                                         .executes(context -> groundedTraceStatus(context.getSource()))))
+                        .then(ClientCommandManager.literal("grounded-recovery")
+                                .then(ClientCommandManager.literal("status")
+                                        .executes(context -> groundedRecoveryStatus(context.getSource())))
+                                .then(ClientCommandManager.literal("clear")
+                                        .executes(context -> groundedRecoveryClear(context.getSource()))))
                 );
     }
 
@@ -566,6 +571,46 @@ public final class MapArtCommand {
             return 0;
         }
         source.sendFeedback(Text.literal("Grounded trace is " + (runner.groundedTraceEnabled() ? "on" : "off") + "."));
+        return 1;
+    }
+
+    private static int groundedRecoveryStatus(FabricClientCommandSource source) {
+        GroundedSingleLaneDebugRunner runner = MapArtRuntime.groundedSingleLaneDebugRunner();
+        if (runner == null) {
+            source.sendError(Text.literal("Grounded sweep debug runner is unavailable."));
+            return 0;
+        }
+
+        if (!runner.getRecoveryState().isActive()) {
+            source.sendFeedback(Text.literal("No recovery is active."));
+            return 0;
+        }
+
+        var snapshot = runner.getRecoveryState().snapshot().orElseThrow();
+        source.sendFeedback(Text.literal("Recovery active:"));
+        source.sendFeedback(Text.literal("  Reason: " + snapshot.reason()));
+        source.sendFeedback(Text.literal("  Lane: " + snapshot.activeLane().laneIndex() + " " + snapshot.laneDirection()));
+        source.sendFeedback(Text.literal("  Pass phase: " + snapshot.passPhase()));
+        source.sendFeedback(Text.literal("  Last safe progress: " + String.format("%.2f", snapshot.lastKnownSafeProgressCoordinate())));
+        source.sendFeedback(Text.literal("  Player position: " + String.format("%.2f, %.2f, %.2f",
+                snapshot.playerPosition().x, snapshot.playerPosition().y, snapshot.playerPosition().z)));
+        return 1;
+    }
+
+    private static int groundedRecoveryClear(FabricClientCommandSource source) {
+        GroundedSingleLaneDebugRunner runner = MapArtRuntime.groundedSingleLaneDebugRunner();
+        if (runner == null) {
+            source.sendError(Text.literal("Grounded sweep debug runner is unavailable."));
+            return 0;
+        }
+
+        if (!runner.getRecoveryState().isActive()) {
+            source.sendFeedback(Text.literal("No recovery is active."));
+            return 0;
+        }
+
+        runner.getRecoveryState().clear();
+        source.sendFeedback(Text.literal("Recovery state cleared. You can now issue a fresh start or smart resume."));
         return 1;
     }
 

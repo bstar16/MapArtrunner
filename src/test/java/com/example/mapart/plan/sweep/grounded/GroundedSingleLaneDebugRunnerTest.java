@@ -1343,6 +1343,64 @@ class GroundedSingleLaneDebugRunnerTest {
         return session;
     }
 
+    @Test
+    void recoveryNotActiveInitially() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        assertFalse(runner.getRecoveryState().isActive());
+        assertTrue(runner.getRecoveryState().snapshot().isEmpty());
+    }
+
+    @Test
+    void recoveryClearResetsState() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        BuildSession session = sessionWithOrigin();
+        runner.start(session, 0, GroundedSweepSettings.defaults());
+
+        GroundedSweepLane lane = laneForIndex(session, GroundedSweepSettings.defaults(), 0);
+        Vec3d testPosition = new Vec3d(10.5, 64.0, 10.5);
+        GroundedRecoverySnapshot snapshot = new GroundedRecoverySnapshot(
+                lane,
+                GroundedSingleLaneDebugRunner.SweepPassPhase.FORWARD,
+                GroundedLaneDirection.EAST,
+                10.0,
+                testPosition,
+                GroundedRecoveryReason.OFF_CORRIDOR
+        );
+        runner.getRecoveryState().activate(snapshot);
+
+        assertTrue(runner.getRecoveryState().isActive());
+        runner.getRecoveryState().clear();
+        assertFalse(runner.getRecoveryState().isActive());
+        assertTrue(runner.getRecoveryState().snapshot().isEmpty());
+    }
+
+    @Test
+    void recoverySnapshotPreservesLaneAndPhaseAndProgress() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        BuildSession session = sessionWithOrigin();
+        runner.start(session, 0, GroundedSweepSettings.defaults());
+
+        GroundedSweepLane lane = laneForIndex(session, GroundedSweepSettings.defaults(), 0);
+        Vec3d testPosition = new Vec3d(12.5, 64.0, 11.5);
+        GroundedRecoverySnapshot snapshot = new GroundedRecoverySnapshot(
+                lane,
+                GroundedSingleLaneDebugRunner.SweepPassPhase.FORWARD,
+                GroundedLaneDirection.EAST,
+                12.0,
+                testPosition,
+                GroundedRecoveryReason.NO_PROGRESS
+        );
+        runner.getRecoveryState().activate(snapshot);
+
+        var retrieved = runner.getRecoveryState().snapshot().orElseThrow();
+        assertEquals(lane.laneIndex(), retrieved.activeLane().laneIndex());
+        assertEquals(GroundedSingleLaneDebugRunner.SweepPassPhase.FORWARD, retrieved.passPhase());
+        assertEquals(GroundedLaneDirection.EAST, retrieved.laneDirection());
+        assertEquals(12.0, retrieved.lastKnownSafeProgressCoordinate(), 0.01);
+        assertEquals(testPosition, retrieved.playerPosition());
+        assertEquals(GroundedRecoveryReason.NO_PROGRESS, retrieved.reason());
+    }
+
     private static BuildSession rectangularSessionWithOrigin(Vec3i dimensions) {
         List<Placement> placements = new java.util.ArrayList<>();
         for (int y = 0; y < dimensions.getY(); y++) {
