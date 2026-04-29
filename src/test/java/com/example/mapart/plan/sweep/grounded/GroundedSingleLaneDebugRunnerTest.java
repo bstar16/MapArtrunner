@@ -1201,7 +1201,7 @@ class GroundedSingleLaneDebugRunnerTest {
     }
 
     @Test
-    void laneShiftWaitsUntilTransitionSupportCompletes() {
+    void laneShiftAdvancesToActiveWhenCenterlineReachedDespitePendingSupport() {
         GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
         assertTrue(runner.startFullSweep(sessionWithBridgeSupport(), GroundedSweepSettings.defaults()).isEmpty());
         runner.advanceSweepToNextLaneForTests();
@@ -1214,13 +1214,7 @@ class GroundedSingleLaneDebugRunnerTest {
                 new Vec3d(plan.toLane().startPoint().getX() + 0.5, 64.0, plan.targetCenterlineCoordinate() + 0.5),
                 false
         );
-        assertTrue(runner.awaitingTransitionSupportForTests());
-
-        runner.completeTransitionSupportForTests();
-        runner.completeLaneShiftIfNearForTests(
-                new Vec3d(plan.toLane().startPoint().getX() + 0.5, 64.0, plan.targetCenterlineCoordinate() + 0.5),
-                false
-        );
+        assertFalse(runner.awaitingTransitionSupportForTests());
         assertEquals(GroundedLaneWalkState.ACTIVE, runner.status().walkState());
     }
 
