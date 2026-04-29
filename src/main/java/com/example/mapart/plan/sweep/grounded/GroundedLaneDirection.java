@@ -36,6 +36,11 @@ public enum GroundedLaneDirection {
         return forwardSign;
     }
 
+    // Left strafe reduces the lateral coordinate for EAST/NORTH but increases it for WEST/SOUTH.
+    public int lateralStrafeSign() {
+        return (alongX ? 1 : -1) * forwardSign;
+    }
+
     public GroundedLaneDirection opposite() {
         return switch (this) {
             case EAST -> WEST;

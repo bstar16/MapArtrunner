@@ -100,6 +100,31 @@ class GroundedLaneWalkerTest {
     }
 
     @Test
+    void westLaneCenterlineConstraintAddsCorrectiveStrafe() {
+        GroundedLaneWalker walker = new GroundedLaneWalker();
+        GroundedSweepLane westLane = new GroundedSweepLane(
+                1,
+                3,
+                GroundedLaneDirection.WEST,
+                new BlockPos(8, 64, 3),
+                new BlockPos(0, 64, 3),
+                new GroundedLaneCorridorBounds(0, 8, 1, 5),
+                0.5
+        );
+        walker.start(westLane, bounds(), false);
+
+        // Player is north of centerline (z=2.8 < 3.5): facing WEST, left strafe = +Z (south) → leftPressed
+        walker.tick(new Vec3d(6.5, 64.0, 2.8));
+        assertTrue(walker.currentCommand().orElseThrow().leftPressed());
+        assertFalse(walker.currentCommand().orElseThrow().rightPressed());
+
+        // Player is south of centerline (z=4.2 > 3.5): facing WEST, right strafe = -Z (north) → rightPressed
+        walker.tick(new Vec3d(5.5, 64.0, 4.2));
+        assertTrue(walker.currentCommand().orElseThrow().rightPressed());
+        assertFalse(walker.currentCommand().orElseThrow().leftPressed());
+    }
+
+    @Test
     void cleanupClearsForcedMovementOnFailAndInterrupt() {
         GroundedLaneWalker walker = new GroundedLaneWalker();
         walker.start(eastboundLane(), bounds(), true);

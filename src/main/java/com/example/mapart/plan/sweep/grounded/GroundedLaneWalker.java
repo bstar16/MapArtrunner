@@ -80,8 +80,9 @@ public final class GroundedLaneWalker {
     }
 
     private GroundedLaneWalkCommand buildCommand(double lateralError) {
-        boolean strafeLeft = lateralError > CENTERLINE_STRAFE_DEADBAND;
-        boolean strafeRight = lateralError < -CENTERLINE_STRAFE_DEADBAND;
+        double signedError = lateralError * lane.direction().lateralStrafeSign();
+        boolean strafeLeft = signedError > CENTERLINE_STRAFE_DEADBAND;
+        boolean strafeRight = signedError < -CENTERLINE_STRAFE_DEADBAND;
         return new GroundedLaneWalkCommand(
                 lane.direction().yawDegrees(),
                 true,
