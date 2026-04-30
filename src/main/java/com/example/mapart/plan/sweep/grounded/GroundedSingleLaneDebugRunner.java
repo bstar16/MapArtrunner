@@ -7,6 +7,7 @@ import com.example.mapart.plan.Placement;
 import com.example.mapart.plan.state.BuildSession;
 import com.example.mapart.plan.state.PlacementExecutor;
 import com.example.mapart.plan.state.PlacementResult;
+import com.example.mapart.supply.SupplyStore;
 import net.minecraft.block.BlockState;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.option.KeyBinding;
@@ -130,6 +131,9 @@ public final class GroundedSingleLaneDebugRunner {
     private boolean lastTransitionSprint;
     private boolean lastTransitionOvershootCorrected;
 
+    private final SupplyStore supplyStore;
+    private final GroundedRefillController refillController = new GroundedRefillController();
+
     private final GroundedRecoveryState recoveryState = new GroundedRecoveryState();
     private double lastKnownProgressCoordinate;
     private int ticksSinceProgressAdvance;
@@ -156,7 +160,12 @@ public final class GroundedSingleLaneDebugRunner {
     );
 
     public GroundedSingleLaneDebugRunner(BaritoneFacade baritoneFacade) {
+        this(baritoneFacade, null);
+    }
+
+    public GroundedSingleLaneDebugRunner(BaritoneFacade baritoneFacade, SupplyStore supplyStore) {
         this.baritoneFacade = Objects.requireNonNull(baritoneFacade, "baritoneFacade");
+        this.supplyStore = supplyStore;
     }
 
     public boolean groundedTraceEnabled() {
@@ -325,6 +334,11 @@ public final class GroundedSingleLaneDebugRunner {
             return;
         }
 
+        if (refillController.isActive()) {
+            tickRefill(client);
+            return;
+        }
+
         if (awaitingStartApproach) {
             tickStartApproach(client, constantSprint);
             return;
@@ -409,6 +423,14 @@ public final class GroundedSingleLaneDebugRunner {
         }
     }
 
+    public void cancelRefillAndStop() {
+        if (refillController.isActive()) {
+            refillController.cancel(baritoneFacade);
+            refillController.clear();
+        }
+        stop();
+    }
+
     public Optional<String> stop() {
         MinecraftClient client = MinecraftClient.getInstance();
         if (client != null) {
@@ -460,6 +482,10 @@ public final class GroundedSingleLaneDebugRunner {
         return recoveryState;
     }
 
+    public GroundedRefillController getRefillController() {
+        return refillController;
+    }
+
     private void triggerRecovery(MinecraftClient client, GroundedRecoveryReason reason) {
         if (client == null || client.player == null || activeLane == null) {
             return;
@@ -498,6 +524,78 @@ public final class GroundedSingleLaneDebugRunner {
         if (client.player != null) {
             client.player.sendMessage(Text.literal("[Mapart grounded] Recovery triggered: " + reasonText), false);
         }
+    }
+
+    private boolean triggerRefill(MinecraftClient client, Item requiredItem) {
+        clearControls(client);
+        laneWalker.interrupt();
+        baritoneFacade.cancel();
+        boolean initiated = refillController.initiate(client, supplyStore, requiredItem, baritoneFacade);
+        if (!initiated) {
+            if (client.player != null) {
+                client.player.sendMessage(
+                        Text.literal("[Mapart grounded] Cannot refill: "
+                                + refillController.failureMessage().orElse("no supply available.")),
+                        false);
+            }
+            refillController.clear();
+            return false;
+        }
+        traceGroundedEvent("refill triggered, heading to supply #"
+                + refillController.targetSupply().map(s -> String.valueOf(s.id())).orElse("?")
+                + " at " + refillController.targetSupply().map(s -> s.pos().toShortString()).orElse("?"));
+        if (client.player != null) {
+            client.player.sendMessage(
+                    Text.literal("[Mapart grounded] Pausing sweep: heading to supply #"
+                            + refillController.targetSupply().get().id() + " at "
+                            + refillController.targetSupply().get().pos().toShortString() + "."),
+                    false);
+        }
+        return true;
+    }
+
+    private void tickRefill(MinecraftClient client) {
+        GroundedRefillController.TickResult result = refillController.tick(client, baritoneFacade);
+        switch (result) {
+            case ACTIVE -> { /* waiting */ }
+            case DONE -> handleRefillDone(client);
+            case FAILED -> handleRefillFailed(client);
+        }
+    }
+
+    private void handleRefillDone(MinecraftClient client) {
+        BuildSession session = activeSession;
+        GroundedSweepSettings settings = activeSettings;
+        refillController.clear();
+        clearActiveRunState();
+        if (session == null || settings == null) {
+            if (client != null && client.player != null) {
+                client.player.sendMessage(
+                        Text.literal("[Mapart grounded] Refill complete but session state was lost; cannot resume."),
+                        false);
+            }
+            return;
+        }
+        if (client != null && client.player != null) {
+            client.player.sendMessage(
+                    Text.literal("[Mapart grounded] Refill complete. Resuming sweep with smart resume."),
+                    false);
+        }
+        Optional<String> err = startFullSweep(session, settings);
+        if (err.isPresent() && client != null && client.player != null) {
+            client.player.sendMessage(
+                    Text.literal("[Mapart grounded] Resume after refill failed: " + err.get()),
+                    false);
+        }
+    }
+
+    private void handleRefillFailed(MinecraftClient client) {
+        String msg = refillController.failureMessage().orElse("Unknown refill failure.");
+        refillController.clear();
+        if (client != null && client.player != null) {
+            client.player.sendMessage(Text.literal("[Mapart grounded] Refill failed: " + msg), false);
+        }
+        stop();
     }
 
     private void tickStartApproach(MinecraftClient client, boolean constantSprint) {
@@ -1022,6 +1120,19 @@ public final class GroundedSingleLaneDebugRunner {
         onFinalFailure(placementIndex);
     }
 
+    void triggerRefillForTests(Item requiredItem, java.util.List<com.example.mapart.supply.SupplyPoint> supplyPoints, BaritoneFacade testBaritone) {
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client != null) {
+            clearControls(client);
+        }
+        laneWalker.interrupt();
+        refillController.initiateWithSuppliesForTests(supplyPoints, requiredItem, testBaritone);
+    }
+
+    void simulateRefillCompleteForTests() {
+        handleRefillDone(null);
+    }
+
     static boolean shouldAttemptPlacementAfterWalkerTick(GroundedLaneWalker.GroundedLaneWalkState state) {
         return state == GroundedLaneWalker.GroundedLaneWalkState.ACTIVE;
     }
@@ -1245,7 +1356,16 @@ public final class GroundedSingleLaneDebugRunner {
                 case PLACED -> onPlacementPlaced(candidate.placementIndex(), placement, candidate.worldPos(), laneTicksElapsed);
                 case ALREADY_CORRECT -> onPlacementResult(candidate.placementIndex(), GroundedSweepPlacementExecutor.PlacementResult.SUCCESS, laneTicksElapsed);
                 case RETRY, MOVE_REQUIRED -> onPlacementResult(candidate.placementIndex(), GroundedSweepPlacementExecutor.PlacementResult.MISSED, laneTicksElapsed);
-                case MISSING_ITEM, ERROR -> onFinalFailure(candidate.placementIndex());
+                case MISSING_ITEM -> {
+                    if (supplyStore != null && !refillController.isActive() && !recoveryState.isActive()
+                            && placement.block() != null) {
+                        if (triggerRefill(client, placement.block().asItem())) {
+                            return;
+                        }
+                    }
+                    onFinalFailure(candidate.placementIndex());
+                }
+                case ERROR -> onFinalFailure(candidate.placementIndex());
             }
             attempts++;
         }
