@@ -12,6 +12,7 @@ import net.minecraft.block.BlockState;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.option.KeyBinding;
 import net.minecraft.item.Item;
+import net.minecraft.item.ItemStack;
 import net.minecraft.registry.Registries;
 import net.minecraft.text.Text;
 import net.minecraft.util.math.BlockPos;
@@ -118,6 +119,8 @@ public final class GroundedSingleLaneDebugRunner {
     private GroundedSweepResumePoint selectedResumePoint;
     private int skippedCompletedForwardLanes;
     private GroundedLaneEntryAnchor laneEntryAnchor;
+    private boolean preflightChecked;
+    private boolean preflightPassed;
     private final Set<Integer> forwardLeftoverPlacements = new LinkedHashSet<>();
     private final Set<Integer> reversePlacementFilter = new LinkedHashSet<>();
     private final List<String> groundedTraceEvents = new ArrayList<>();
@@ -288,6 +291,8 @@ public final class GroundedSingleLaneDebugRunner {
                 : Optional.empty();
         activateLaneData(forwardLanes.get(selectedLaneIndex), Set.of(), minimumProgress);
         awaitingStartApproach = true;
+        preflightChecked = false;
+        preflightPassed = false;
         startApproachIssued = false;
         awaitingLaneShift = false;
         laneShiftTarget = null;
@@ -611,6 +616,17 @@ public final class GroundedSingleLaneDebugRunner {
     }
 
     private void tickStartApproach(MinecraftClient client, boolean constantSprint) {
+        if (!preflightChecked) {
+            PreflightResult preflightResult = runMaterialPreflight(client);
+            preflightChecked = true;
+            preflightPassed = preflightResult.passed();
+            if (!preflightResult.passed()) {
+                awaitingStartApproach = false;
+                captureAwaitingLaneStartStatus();
+                clearControls(client);
+                return;
+            }
+        }
         issueStartApproachIfNeeded();
 
         BlockPos stagingTarget = activeStartApproachTarget();
@@ -642,6 +658,91 @@ public final class GroundedSingleLaneDebugRunner {
         }
         captureAwaitingLaneStartStatus();
     }
+
+    private PreflightResult runMaterialPreflight(MinecraftClient client) {
+        traceGroundedEvent("preflight started");
+        if (client == null || client.player == null) {
+            traceGroundedEvent("preflight failed: client/player unavailable");
+            return PreflightResult.failure();
+        }
+        if (client.player.isCreative()) {
+            traceGroundedEvent("preflight creative mode skipped");
+            traceGroundedEvent("preflight passed");
+            return PreflightResult.success();
+        }
+
+        Set<Item> heldItems = GroundedRefillController.itemsInInventory(client.player);
+        PreflightMaterialScan scan = scanImmediateLaneMaterials(pendingPlacementTargets, lanePlacementsByIndex, heldItems);
+        traceGroundedEvent("preflight checked targets=" + scan.checkedTargetCount() + ", uniqueRequired=" + scan.checkedUniqueBlockCount());
+        if (!scan.unsupportedBlockIds().isEmpty()) {
+            String msg = "Unsupported required blocks before grounded sweep: " + String.join(", ", scan.unsupportedBlockIds());
+            traceGroundedEvent("preflight failed unsupported blocks: " + String.join(", ", scan.unsupportedBlockIds()));
+            client.player.sendMessage(Text.literal("[Mapart grounded] " + msg), false);
+            return PreflightResult.failure();
+        }
+        if (scan.missingItems().isEmpty()) {
+            traceGroundedEvent("preflight passed");
+            return PreflightResult.success();
+        }
+        String missingJoined = String.join(", ", scan.missingItemIds());
+        traceGroundedEvent("preflight failed missing block ids: " + missingJoined);
+        if (supplyStore != null && !supplyStore.list().isEmpty()) {
+            traceGroundedEvent("refill triggered due to preflight");
+            boolean triggered = triggerRefill(client, scan.missingItems().stream().findFirst().orElse(ItemStack.EMPTY.getItem()));
+            if (!triggered) {
+                client.player.sendMessage(Text.literal("[Mapart grounded] Missing required materials and no supply point is registered"), false);
+            } else {
+                client.player.sendMessage(Text.literal("[Mapart grounded] Missing required materials before grounded sweep: " + missingJoined), false);
+            }
+            return PreflightResult.failure();
+        }
+        client.player.sendMessage(Text.literal("[Mapart grounded] Missing required materials and no supply point is registered"), false);
+        client.player.sendMessage(Text.literal("[Mapart grounded] Missing required materials before grounded sweep: " + missingJoined), false);
+        return PreflightResult.failure();
+    }
+
+    private record PreflightResult(boolean passed) {
+        static PreflightResult success() { return new PreflightResult(true); }
+        static PreflightResult failure() { return new PreflightResult(false); }
+    }
+
+    static PreflightMaterialScan scanImmediateLaneMaterials(
+            List<GroundedSweepPlacementExecutor.PlacementTarget> pendingTargets,
+            Map<Integer, Placement> placementsByIndex,
+            Set<Item> heldItems
+    ) {
+        LinkedHashSet<String> missingIds = new LinkedHashSet<>();
+        LinkedHashSet<Item> missingItems = new LinkedHashSet<>();
+        LinkedHashSet<String> unsupportedBlocks = new LinkedHashSet<>();
+        LinkedHashSet<String> uniqueRequiredBlocks = new LinkedHashSet<>();
+        int checkedTargets = 0;
+        for (GroundedSweepPlacementExecutor.PlacementTarget target : pendingTargets) {
+            Placement placement = placementsByIndex.get(target.placementIndex());
+            if (placement == null || placement.block() == null) {
+                continue;
+            }
+            Item item = placement.block().asItem();
+            if (item == null || item == ItemStack.EMPTY.getItem()) {
+                unsupportedBlocks.add(Registries.BLOCK.getId(placement.block()).toString());
+                continue;
+            }
+            checkedTargets++;
+            uniqueRequiredBlocks.add(Registries.ITEM.getId(item).toString());
+            if (!heldItems.contains(item)) {
+                missingItems.add(item);
+                missingIds.add(Registries.ITEM.getId(item).toString());
+            }
+        }
+        return new PreflightMaterialScan(missingIds, missingItems, unsupportedBlocks, checkedTargets, uniqueRequiredBlocks.size());
+    }
+
+    record PreflightMaterialScan(
+            Set<String> missingItemIds,
+            Set<Item> missingItems,
+            Set<String> unsupportedBlockIds,
+            int checkedTargetCount,
+            int checkedUniqueBlockCount
+    ) { }
 
 
     private void tickPendingLaneStart(MinecraftClient client, boolean constantSprint) {

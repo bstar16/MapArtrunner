@@ -24,6 +24,27 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class GroundedSingleLaneDebugRunnerTest {
+    @Test
+    void preflightScanHandlesEmptyAndNullPlacementsWithoutCrashing() {
+        List<GroundedSweepPlacementExecutor.PlacementTarget> pending = List.of(
+                new GroundedSweepPlacementExecutor.PlacementTarget(1, BlockPos.ORIGIN),
+                new GroundedSweepPlacementExecutor.PlacementTarget(2, BlockPos.ORIGIN.east())
+        );
+        Map<Integer, Placement> placements = Map.of(
+                1, new Placement(BlockPos.ORIGIN, null)
+        );
+
+        GroundedSingleLaneDebugRunner.PreflightMaterialScan scan = GroundedSingleLaneDebugRunner.scanImmediateLaneMaterials(
+                pending,
+                placements,
+                Set.of()
+        );
+
+        assertTrue(scan.missingItemIds().isEmpty());
+        assertTrue(scan.unsupportedBlockIds().isEmpty());
+        assertEquals(0, scan.checkedTargetCount());
+        assertEquals(0, scan.checkedUniqueBlockCount());
+    }
 
     @Test
     void terminalCompletionClearsActiveStateAndAllowsRestart() {
