@@ -51,7 +51,7 @@ public class MapArtClientMod implements ClientModInitializer {
         BuildCoordinator buildCoordinator = new BuildCoordinator(new WorldPlacementResolver(), configStore, progressStore, supplyStore, baritoneFacade);
         BuildPlanService buildPlanService = new BuildPlanService(loaderRegistry, buildCoordinator);
         SingleLaneSweepDebugRunner singleLaneSweepDebugRunner = new SingleLaneSweepDebugRunner();
-        GroundedSingleLaneDebugRunner groundedSingleLaneDebugRunner = new GroundedSingleLaneDebugRunner(baritoneFacade);
+        GroundedSingleLaneDebugRunner groundedSingleLaneDebugRunner = new GroundedSingleLaneDebugRunner(baritoneFacade, supplyStore);
         MapArtRuntime.initialize(buildPlanService, configStore, progressStore, settingsStore, supplyStore, baritoneFacade, debugReporter, singleLaneSweepDebugRunner, groundedSingleLaneDebugRunner);
         KeyBinding panicKeyBinding = KeyBindingHelper.registerKeyBinding(new KeyBinding(
                 PANIC_KEY_TRANSLATION,

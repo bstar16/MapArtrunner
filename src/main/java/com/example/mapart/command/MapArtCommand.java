@@ -9,6 +9,7 @@ import com.example.mapart.plan.state.BuildSession;
 import com.example.mapart.plan.sweep.LeftoverTracker;
 import com.example.mapart.plan.sweep.SingleLaneSweepDebugRunner;
 import com.example.mapart.plan.sweep.SweepPassResult;
+import com.example.mapart.plan.sweep.grounded.GroundedRefillController;
 import com.example.mapart.plan.sweep.grounded.GroundedSingleLaneDebugRunner;
 import com.example.mapart.plan.sweep.grounded.GroundedSweepLeftoverTracker;
 import com.example.mapart.plan.sweep.grounded.GroundedSweepSettings;
@@ -190,7 +191,9 @@ public final class MapArtCommand {
                                 .then(ClientCommandManager.argument("id", IntegerArgumentType.integer(1))
                                         .executes(context -> removeSupply(context.getSource(), supplyStore, IntegerArgumentType.getInteger(context, "id")))))
                         .then(ClientCommandManager.literal("clear")
-                                .executes(context -> clearSupplies(context.getSource(), supplyStore))))
+                                .executes(context -> clearSupplies(context.getSource(), supplyStore)))
+                        .then(ClientCommandManager.literal("status")
+                                .executes(context -> groundedRefillSupplyStatus(context.getSource(), supplyStore))))
                 .then(ClientCommandManager.literal("settings")
                         .executes(context -> showSettings(context.getSource(), settingsStore))
                         .then(ClientCommandManager.literal("set")
@@ -284,6 +287,9 @@ public final class MapArtCommand {
                                         .executes(context -> groundedRecoveryStatus(context.getSource())))
                                 .then(ClientCommandManager.literal("clear")
                                         .executes(context -> groundedRecoveryClear(context.getSource()))))
+                        .then(ClientCommandManager.literal("grounded-refill")
+                                .then(ClientCommandManager.literal("cancel")
+                                        .executes(context -> groundedRefillCancel(context.getSource()))))
                 );
     }
 
@@ -594,6 +600,46 @@ public final class MapArtCommand {
         source.sendFeedback(Text.literal("  Last safe progress: " + String.format("%.2f", snapshot.lastKnownSafeProgressCoordinate())));
         source.sendFeedback(Text.literal("  Player position: " + String.format("%.2f, %.2f, %.2f",
                 snapshot.playerPosition().x, snapshot.playerPosition().y, snapshot.playerPosition().z)));
+        return 1;
+    }
+
+    private static int groundedRefillSupplyStatus(FabricClientCommandSource source, SupplyStore supplyStore) {
+        java.util.List<SupplyPoint> supplies = supplyStore.list();
+        if (supplies.isEmpty()) {
+            source.sendFeedback(Text.literal("No supply containers registered."));
+        } else {
+            source.sendFeedback(Text.literal("Registered supply containers (" + supplies.size() + "):"));
+            for (SupplyPoint s : supplies) {
+                source.sendFeedback(Text.literal("  #" + s.id() + " '"
+                        + (s.name() != null ? s.name() : "unnamed") + "' at "
+                        + s.pos().toShortString() + " [" + s.dimensionKey() + "]"));
+            }
+        }
+        com.example.mapart.plan.sweep.grounded.GroundedSingleLaneDebugRunner runner = com.example.mapart.runtime.MapArtRuntime.groundedSingleLaneDebugRunner();
+        if (runner != null && runner.getRefillController().isActive()) {
+            GroundedRefillController ctrl = runner.getRefillController();
+            source.sendFeedback(Text.literal("Refill active: state=" + ctrl.state()
+                    + ", target=" + ctrl.targetSupply()
+                    .map(s -> "#" + s.id() + " at " + s.pos().toShortString())
+                    .orElse("none")));
+        } else {
+            source.sendFeedback(Text.literal("No refill currently active."));
+        }
+        return 1;
+    }
+
+    private static int groundedRefillCancel(FabricClientCommandSource source) {
+        com.example.mapart.plan.sweep.grounded.GroundedSingleLaneDebugRunner runner = com.example.mapart.runtime.MapArtRuntime.groundedSingleLaneDebugRunner();
+        if (runner == null) {
+            source.sendError(Text.literal("Grounded sweep debug runner is unavailable."));
+            return 0;
+        }
+        if (!runner.getRefillController().isActive()) {
+            source.sendFeedback(Text.literal("No refill is currently active."));
+            return 0;
+        }
+        runner.cancelRefillAndStop();
+        source.sendFeedback(Text.literal("Refill cancelled and sweep stopped safely."));
         return 1;
     }
 
