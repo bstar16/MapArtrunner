@@ -1401,6 +1401,7 @@ class GroundedSingleLaneDebugRunnerTest {
         assertEquals(GroundedRecoveryReason.NO_PROGRESS, retrieved.reason());
     }
 
+
     private static BuildSession rectangularSessionWithOrigin(Vec3i dimensions) {
         List<Placement> placements = new java.util.ArrayList<>();
         for (int y = 0; y < dimensions.getY(); y++) {
@@ -1414,6 +1415,7 @@ class GroundedSingleLaneDebugRunnerTest {
         session.setOrigin(new BlockPos(10, 64, 10));
         return session;
     }
+
 
     private static GroundedSweepLane laneForIndex(BuildSession session, GroundedSweepSettings settings, int laneIndex) {
         GroundedSchematicBounds bounds = GroundedSchematicBounds.fromPlan(session.getPlan(), session.getOrigin());
