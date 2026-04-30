@@ -19,8 +19,10 @@ import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.Vec3d;
 
+import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 
 public final class GroundedRefillController {
     // Constants
@@ -39,7 +41,7 @@ public final class GroundedRefillController {
 
     private RefillState state = RefillState.IDLE;
     private SupplyPoint targetSupply;
-    private Item requiredItem;
+    private List<Item> neededItems;
     private String failureMessage;
     private int navTicksRemaining;
     private int containerOpenWaitPollsRemaining;
@@ -54,7 +56,7 @@ public final class GroundedRefillController {
     public Optional<SupplyPoint> targetSupply() { return Optional.ofNullable(targetSupply); }
     public Optional<String> failureMessage() { return Optional.ofNullable(failureMessage); }
 
-    public boolean initiate(MinecraftClient client, SupplyStore supplyStore, Item requiredItem, BaritoneFacade baritone) {
+    public boolean initiate(MinecraftClient client, SupplyStore supplyStore, List<Item> neededItems, BaritoneFacade baritone) {
         if (client == null || client.player == null || client.world == null) {
             fail("Cannot initiate refill: client context unavailable.");
             return false;
@@ -64,16 +66,16 @@ public final class GroundedRefillController {
         List<SupplyPoint> supplies = supplyStore != null
                 ? supplyStore.listInDimensionByDistance(dimensionKey, playerPos)
                 : List.of();
-        return initiateWithSupplies(supplies, requiredItem, baritone);
+        return initiateWithSupplies(supplies, neededItems, baritone);
     }
 
-    private boolean initiateWithSupplies(List<SupplyPoint> supplies, Item requiredItem, BaritoneFacade baritone) {
+    private boolean initiateWithSupplies(List<SupplyPoint> supplies, List<Item> neededItems, BaritoneFacade baritone) {
         if (supplies.isEmpty()) {
             fail("No supply container registered in this dimension. Cannot restock.");
             return false;
         }
         this.targetSupply = supplies.get(0);
-        this.requiredItem = requiredItem;
+        this.neededItems = neededItems != null ? neededItems : List.of();
         this.navTicksRemaining = NAV_TIMEOUT_TICKS;
         this.awaitingContainerScreen = false;
         this.actionCooldown = 0;
@@ -83,8 +85,8 @@ public final class GroundedRefillController {
     }
 
     // Package-private test helpers
-    void initiateWithSuppliesForTests(List<SupplyPoint> supplies, Item requiredItem, BaritoneFacade baritone) {
-        initiateWithSupplies(supplies, requiredItem, baritone);
+    void initiateWithSuppliesForTests(List<SupplyPoint> supplies, List<Item> neededItems, BaritoneFacade baritone) {
+        initiateWithSupplies(supplies, neededItems, baritone);
     }
 
     void simulateNavTimeoutForTests() {
@@ -183,7 +185,7 @@ public final class GroundedRefillController {
     }
 
     private TickResult tickRefilling(MinecraftClient client, BaritoneFacade baritone) {
-        if (requiredItem == null || client.player == null) {
+        if (neededItems == null || client.player == null) {
             closeScreen(client);
             fail("Refill lost required item reference.");
             return TickResult.FAILED;
@@ -192,12 +194,9 @@ public final class GroundedRefillController {
             actionCooldown--;
             return TickResult.ACTIVE;
         }
-        if (hasItemInInventory(client.player, requiredItem)) {
-            closeScreen(client);
-            baritone.cancel();
-            state = RefillState.DONE;
-            return TickResult.DONE;
-        }
+
+        Set<Item> heldItems = itemsInInventory(client.player);
+
         HandledScreen<?> screen = currentSupplyScreen(client);
         if (screen == null) {
             fail("Supply container screen closed before refill was complete.");
@@ -210,18 +209,62 @@ public final class GroundedRefillController {
             fail("Opened screen is not a recognized supply container.");
             return TickResult.FAILED;
         }
-        for (int slotIndex = 0; slotIndex < containerSlotCount; slotIndex++) {
-            ItemStack stack = handler.slots.get(slotIndex).getStack();
-            if (stack.isEmpty() || !stack.isOf(requiredItem)) {
+
+        // Pull one stack per tick for each needed item not yet in inventory
+        boolean anyUseful = false;
+        for (Item needed : neededItems) {
+            if (heldItems.contains(needed)) {
+                anyUseful = true;
                 continue;
             }
-            client.interactionManager.clickSlot(handler.syncId, slotIndex, 0, SlotActionType.QUICK_MOVE, client.player);
-            actionCooldown = ACTION_COOLDOWN_TICKS;
-            return TickResult.ACTIVE;
+            for (int slotIndex = 0; slotIndex < containerSlotCount; slotIndex++) {
+                ItemStack stack = handler.slots.get(slotIndex).getStack();
+                if (!stack.isEmpty() && stack.isOf(needed)) {
+                    client.interactionManager.clickSlot(handler.syncId, slotIndex, 0, SlotActionType.QUICK_MOVE, client.player);
+                    actionCooldown = ACTION_COOLDOWN_TICKS;
+                    return TickResult.ACTIVE;
+                }
+            }
+            // This item is absent from the container — skip it
         }
+
+        // All needed items are either held or absent from the container
         closeScreen(client);
-        fail("Required item not found in supply container.");
-        return TickResult.FAILED;
+        baritone.cancel();
+        if (!anyUseful) {
+            fail("Required items not found in supply container.");
+            return TickResult.FAILED;
+        }
+        state = RefillState.DONE;
+        return TickResult.DONE;
+    }
+
+    // Package-private test helper: simulates the refilling logic using index-based sets to avoid
+    // requiring live Item instances (which need the game registry). playerHeldIndices and
+    // containerIndices refer to positions in the neededItems list.
+    TickResult simulateRefillingForTests(Set<Integer> playerHeldIndices, Set<Integer> containerIndices, BaritoneFacade baritone) {
+        if (neededItems == null) {
+            fail("Refill lost required item reference.");
+            return TickResult.FAILED;
+        }
+        boolean anyUseful = false;
+        for (int i = 0; i < neededItems.size(); i++) {
+            if (playerHeldIndices.contains(i)) {
+                anyUseful = true;
+                continue;
+            }
+            if (containerIndices.contains(i)) {
+                playerHeldIndices.add(i);
+                anyUseful = true;
+            }
+            // not in container — skip
+        }
+        if (!anyUseful) {
+            fail("Required items not found in supply container.");
+            return TickResult.FAILED;
+        }
+        state = RefillState.DONE;
+        return TickResult.DONE;
     }
 
     public void cancel(BaritoneFacade baritone) {
@@ -234,7 +277,7 @@ public final class GroundedRefillController {
     public void clear() {
         state = RefillState.IDLE;
         targetSupply = null;
-        requiredItem = null;
+        neededItems = null;
         failureMessage = null;
         navTicksRemaining = 0;
         awaitingContainerScreen = false;
@@ -269,18 +312,20 @@ public final class GroundedRefillController {
     }
 
     private static void closeScreen(MinecraftClient client) {
-        if (client.player != null && client.currentScreen instanceof HandledScreen<?>) {
+        if (client != null && client.player != null && client.currentScreen instanceof HandledScreen<?>) {
             client.player.closeHandledScreen();
         }
     }
 
-    static boolean hasItemInInventory(ClientPlayerEntity player, Item item) {
+    static Set<Item> itemsInInventory(ClientPlayerEntity player) {
         PlayerInventory inventory = player.getInventory();
+        Set<Item> held = new HashSet<>();
         for (int slot = 0; slot < PlayerInventory.MAIN_SIZE; slot++) {
-            if (inventory.getStack(slot).isOf(item)) {
-                return true;
+            ItemStack stack = inventory.getStack(slot);
+            if (!stack.isEmpty()) {
+                held.add(stack.getItem());
             }
         }
-        return false;
+        return held;
     }
 }
