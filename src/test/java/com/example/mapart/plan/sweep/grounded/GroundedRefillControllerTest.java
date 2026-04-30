@@ -12,9 +12,12 @@ import net.minecraft.util.math.Vec3i;
 import org.junit.jupiter.api.Test;
 
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -27,7 +30,7 @@ class GroundedRefillControllerTest {
         runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults());
 
         SupplyPoint supply = new SupplyPoint(1, new BlockPos(5, 64, 5), "minecraft:overworld", "chest");
-        runner.triggerRefillForTests((Item) null, List.of(supply), baritone);
+        runner.triggerRefillForTests(List.of(), List.of(supply), baritone);
 
         assertTrue(runner.getRefillController().isActive());
         assertEquals(GroundedRefillController.RefillState.NAVIGATING, runner.getRefillController().state());
@@ -38,7 +41,7 @@ class GroundedRefillControllerTest {
         RecordingBaritoneFacade baritone = new RecordingBaritoneFacade();
         GroundedRefillController controller = new GroundedRefillController();
 
-        controller.initiateWithSuppliesForTests(List.of(), (Item) null, baritone);
+        controller.initiateWithSuppliesForTests(List.of(), List.of(), baritone);
 
         assertFalse(controller.isActive());
         assertEquals(GroundedRefillController.RefillState.FAILED, controller.state());
@@ -53,7 +56,7 @@ class GroundedRefillControllerTest {
         GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
         runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults());
 
-        runner.triggerRefillForTests((Item) null, List.of(), baritone);
+        runner.triggerRefillForTests(List.of(), List.of(), baritone);
 
         assertFalse(runner.getRefillController().isActive());
         assertEquals(0, baritone.goToCalls);
@@ -66,7 +69,7 @@ class GroundedRefillControllerTest {
         BlockPos supplyPos = new BlockPos(100, 64, 200);
         SupplyPoint supply = new SupplyPoint(1, supplyPos, "minecraft:overworld", "chest");
 
-        controller.initiateWithSuppliesForTests(List.of(supply), (Item) null, baritone);
+        controller.initiateWithSuppliesForTests(List.of(supply), List.of(), baritone);
 
         assertEquals(1, baritone.goToCalls);
         assertEquals(supplyPos, baritone.lastGoToTarget);
@@ -90,7 +93,7 @@ class GroundedRefillControllerTest {
         runner.start(session, 0, GroundedSweepSettings.defaults());
 
         SupplyPoint supply = new SupplyPoint(1, new BlockPos(5, 64, 5), "minecraft:overworld", "chest");
-        runner.triggerRefillForTests((Item) null, List.of(supply), new NoOpBaritoneFacade());
+        runner.triggerRefillForTests(List.of(), List.of(supply), new NoOpBaritoneFacade());
         assertTrue(runner.getRefillController().isActive());
 
         runner.simulateRefillCompleteForTests();
@@ -105,7 +108,7 @@ class GroundedRefillControllerTest {
         GroundedRefillController controller = new GroundedRefillController();
         SupplyPoint supply = new SupplyPoint(1, new BlockPos(1000, 64, 1000), "minecraft:overworld", "far");
 
-        controller.initiateWithSuppliesForTests(List.of(supply), (Item) null, baritone);
+        controller.initiateWithSuppliesForTests(List.of(supply), List.of(), baritone);
         assertEquals(GroundedRefillController.RefillState.NAVIGATING, controller.state());
 
         controller.simulateNavTimeoutForTests();
@@ -122,7 +125,7 @@ class GroundedRefillControllerTest {
         GroundedRefillController controller = new GroundedRefillController();
         SupplyPoint supply = new SupplyPoint(1, new BlockPos(50, 64, 50), "minecraft:overworld", "chest");
 
-        controller.initiateWithSuppliesForTests(List.of(supply), (Item) null, baritone);
+        controller.initiateWithSuppliesForTests(List.of(supply), List.of(), baritone);
         assertEquals(GroundedRefillController.RefillState.NAVIGATING, controller.state());
         int cancelCallsBefore = baritone.cancelCalls;
 
@@ -132,6 +135,33 @@ class GroundedRefillControllerTest {
         assertEquals(GroundedRefillController.RefillState.FAILED, controller.state());
         assertTrue(baritone.cancelCalls > cancelCallsBefore);
         assertNotEquals(GroundedRefillController.RefillState.DONE, controller.state());
+    }
+
+    @Test
+    void multipleItemsNeededAllInContainerAllPulledBeforeDone() {
+        RecordingBaritoneFacade baritone = new RecordingBaritoneFacade();
+        GroundedRefillController controller = new GroundedRefillController();
+        SupplyPoint supply = new SupplyPoint(1, new BlockPos(50, 64, 50), "minecraft:overworld", "chest");
+
+        // Two needed items represented as null placeholders (Item requires game registry;
+        // simulateRefillingForTests uses index-based sets to avoid constructing live Item instances).
+        List<Item> neededItems = new ArrayList<>();
+        neededItems.add(null); // slot 0
+        neededItems.add(null); // slot 1
+
+        controller.initiateWithSuppliesForTests(List.of(supply), neededItems, baritone);
+        assertEquals(GroundedRefillController.RefillState.NAVIGATING, controller.state());
+
+        // Player has nothing; container has both needed items (indices 0 and 1)
+        Set<Integer> playerHeld = new HashSet<>();
+        Set<Integer> containerItems = new HashSet<>(Set.of(0, 1));
+
+        GroundedRefillController.TickResult result = controller.simulateRefillingForTests(playerHeld, containerItems, baritone);
+
+        assertEquals(GroundedRefillController.TickResult.DONE, result);
+        assertEquals(GroundedRefillController.RefillState.DONE, controller.state());
+        assertTrue(playerHeld.contains(0), "first needed item should have been pulled from container");
+        assertTrue(playerHeld.contains(1), "second needed item should have been pulled from container");
     }
 
     // ---- Helpers ----

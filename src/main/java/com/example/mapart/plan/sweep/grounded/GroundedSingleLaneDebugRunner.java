@@ -530,7 +530,19 @@ public final class GroundedSingleLaneDebugRunner {
         clearControls(client);
         laneWalker.interrupt();
         baritoneFacade.cancel();
-        boolean initiated = refillController.initiate(client, supplyStore, requiredItem, baritoneFacade);
+
+        Set<Item> heldItems = (client != null && client.player != null)
+                ? GroundedRefillController.itemsInInventory(client.player)
+                : Set.of();
+        List<Item> neededItems = pendingPlacementTargets.stream()
+                .map(t -> lanePlacementsByIndex.get(t.placementIndex()))
+                .filter(p -> p != null && p.block() != null)
+                .map(p -> p.block().asItem())
+                .filter(item -> !heldItems.contains(item))
+                .distinct()
+                .toList();
+
+        boolean initiated = refillController.initiate(client, supplyStore, neededItems, baritoneFacade);
         if (!initiated) {
             if (client.player != null) {
                 client.player.sendMessage(
@@ -1120,13 +1132,13 @@ public final class GroundedSingleLaneDebugRunner {
         onFinalFailure(placementIndex);
     }
 
-    void triggerRefillForTests(Item requiredItem, java.util.List<com.example.mapart.supply.SupplyPoint> supplyPoints, BaritoneFacade testBaritone) {
+    void triggerRefillForTests(List<Item> neededItems, java.util.List<com.example.mapart.supply.SupplyPoint> supplyPoints, BaritoneFacade testBaritone) {
         MinecraftClient client = MinecraftClient.getInstance();
         if (client != null) {
             clearControls(client);
         }
         laneWalker.interrupt();
-        refillController.initiateWithSuppliesForTests(supplyPoints, requiredItem, testBaritone);
+        refillController.initiateWithSuppliesForTests(supplyPoints, neededItems, testBaritone);
     }
 
     void simulateRefillCompleteForTests() {
