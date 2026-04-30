@@ -12,8 +12,10 @@ import net.minecraft.block.BlockState;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.option.KeyBinding;
 import net.minecraft.item.Item;
+import net.minecraft.item.Items;
 import net.minecraft.registry.Registries;
 import net.minecraft.text.Text;
+import net.minecraft.util.Identifier;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
@@ -287,6 +289,10 @@ public final class GroundedSingleLaneDebugRunner {
                 ? Optional.of(resumePoint.progressCoordinate())
                 : Optional.empty();
         activateLaneData(forwardLanes.get(selectedLaneIndex), Set.of(), minimumProgress);
+        Optional<String> preflightFailure = runPreflightMaterialCheckBeforeSweep();
+        if (preflightFailure.isPresent()) {
+            return preflightFailure;
+        }
         awaitingStartApproach = true;
         startApproachIssued = false;
         awaitingLaneShift = false;
@@ -562,6 +568,91 @@ public final class GroundedSingleLaneDebugRunner {
                             + refillController.targetSupply().get().id() + " at "
                             + refillController.targetSupply().get().pos().toShortString() + "."),
                     false);
+        }
+        return true;
+    }
+
+    private Optional<String> runPreflightMaterialCheckBeforeSweep() {
+        MinecraftClient client = MinecraftClient.getInstance();
+        PreflightMaterialCheckResult preflight = evaluatePreflightMaterialCheck(client);
+        traceGroundedEvent("preflight started: checkedTargets=" + preflight.checkedTargetCount()
+                + ", uniqueBlocks=" + preflight.checkedUniqueBlockCount()
+                + ", creativeSkipped=" + preflight.creativeSkipped());
+        if (preflight.creativeSkipped()) {
+            traceGroundedEvent("preflight passed (creative mode)");
+            return Optional.empty();
+        }
+        if (!preflight.unsupportedBlocks().isEmpty()) {
+            traceGroundedEvent("preflight failed: unsupported=" + preflight.unsupportedBlocks());
+            return Optional.of("Required placements include blocks without obtainable item forms: "
+                    + String.join(", ", preflight.unsupportedBlocks()));
+        }
+        if (preflight.missingBlockIds().isEmpty()) {
+            traceGroundedEvent("preflight passed");
+            return Optional.empty();
+        }
+
+        String missingText = String.join(", ", preflight.missingBlockIds());
+        traceGroundedEvent("preflight failed: missing=" + preflight.missingBlockIds());
+        if (client != null) {
+            clearControls(client);
+        }
+        if (triggerRefillForMissingMaterialIds(client, preflight.missingItems())) {
+            traceGroundedEvent("preflight refill triggered due to missing materials");
+            return Optional.of("Missing required materials before grounded sweep: " + missingText + ". Triggering refill.");
+        }
+        return Optional.of("Missing required materials and no supply point is registered: " + missingText);
+    }
+
+    private PreflightMaterialCheckResult evaluatePreflightMaterialCheck(MinecraftClient client) {
+        if (client == null || client.player == null) {
+            return new PreflightMaterialCheckResult(true, 0, 0, List.of(), List.of(), List.of());
+        }
+        if (client != null && client.player != null && client.player.getAbilities().creativeMode) {
+            return new PreflightMaterialCheckResult(true, 0, 0, List.of(), List.of(), List.of());
+        }
+        Set<Item> heldItems = GroundedRefillController.itemsInInventory(client.player);
+        LinkedHashSet<Item> uniqueRequiredItems = new LinkedHashSet<>();
+        LinkedHashSet<String> missingBlockIds = new LinkedHashSet<>();
+        LinkedHashSet<Item> missingItems = new LinkedHashSet<>();
+        LinkedHashSet<String> unsupportedBlocks = new LinkedHashSet<>();
+        int checkedTargets = 0;
+        for (GroundedSweepPlacementExecutor.PlacementTarget target : pendingPlacementTargets) {
+            Placement placement = lanePlacementsByIndex.get(target.placementIndex());
+            if (placement == null || placement.block() == null) {
+                continue;
+            }
+            checkedTargets++;
+            Item expectedItem = placement.block().asItem();
+            if (expectedItem == null || expectedItem == Items.AIR) {
+                Identifier blockId = Registries.BLOCK.getId(placement.block());
+                unsupportedBlocks.add(blockId == null ? placement.block().toString() : blockId.toString());
+                continue;
+            }
+            uniqueRequiredItems.add(expectedItem);
+            if (!heldItems.contains(expectedItem)) {
+                missingItems.add(expectedItem);
+                missingBlockIds.add(Registries.ITEM.getId(expectedItem).toString());
+            }
+        }
+        return new PreflightMaterialCheckResult(
+                false,
+                checkedTargets,
+                uniqueRequiredItems.size(),
+                List.copyOf(missingBlockIds),
+                List.copyOf(missingItems),
+                List.copyOf(unsupportedBlocks)
+        );
+    }
+
+    private boolean triggerRefillForMissingMaterialIds(MinecraftClient client, List<Item> neededItems) {
+        if (neededItems.isEmpty() || supplyStore == null || refillController.isActive() || recoveryState.isActive()) {
+            return false;
+        }
+        boolean initiated = refillController.initiate(client, supplyStore, neededItems, baritoneFacade);
+        if (!initiated) {
+            refillController.clear();
+            return false;
         }
         return true;
     }
@@ -3094,5 +3185,15 @@ public final class GroundedSingleLaneDebugRunner {
         ) {
             return new LaneStartReadiness(false, centerlineDelta, forwardDelta, insideCorridor, reason, flatDistanceSq);
         }
+    }
+
+    private record PreflightMaterialCheckResult(
+            boolean creativeSkipped,
+            int checkedTargetCount,
+            int checkedUniqueBlockCount,
+            List<String> missingBlockIds,
+            List<Item> missingItems,
+            List<String> unsupportedBlocks
+    ) {
     }
 }
