@@ -1421,6 +1421,7 @@ class GroundedSingleLaneDebugRunnerTest {
         return lanes.get(laneIndex);
     }
 
+
     private static BuildPlan buildPlan(List<Placement> placements) {
         return buildPlan(new Vec3i(5, 1, 5), placements);
     }

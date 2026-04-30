@@ -38,6 +38,7 @@ public final class GroundedSingleLaneDebugRunner {
     private static final int MAX_LANE_TRANSITION_TICKS = 120;
     private static final int MAX_TRANSITION_SUPPORT_TICKS = 80;
     private static final int MAX_TRANSITION_SUPPORT_ATTEMPTS_PER_TICK = 2;
+    private static final int PREFLIGHT_LOOKAHEAD_TARGETS = 64;
     private static final int MIN_LANE_YAW_LOCK_TICKS = 2;
     private static final int MAX_LANE_YAW_LOCK_TICKS = 10;
     private static final float LANE_YAW_LOCK_TOLERANCE_DEGREES = 1.5f;
@@ -287,6 +288,10 @@ public final class GroundedSingleLaneDebugRunner {
                 ? Optional.of(resumePoint.progressCoordinate())
                 : Optional.empty();
         activateLaneData(forwardLanes.get(selectedLaneIndex), Set.of(), minimumProgress);
+        Optional<String> preflightFailure = runPreflightMaterialCheck(MinecraftClient.getInstance());
+        if (preflightFailure.isPresent()) {
+            return preflightFailure;
+        }
         awaitingStartApproach = true;
         startApproachIssued = false;
         awaitingLaneShift = false;
@@ -314,6 +319,96 @@ public final class GroundedSingleLaneDebugRunner {
                 skippedCompletedForwardLanes
         );
         return Optional.empty();
+    }
+
+    private Optional<String> runPreflightMaterialCheck(MinecraftClient client) {
+        traceGroundedEvent("preflight started");
+        if (client == null || client.player == null) {
+            traceGroundedEvent("preflight skipped: missing client/player context");
+            return Optional.empty();
+        }
+        if (client.player.getAbilities().creativeMode) {
+            traceGroundedEvent("preflight creative mode skipped");
+            return Optional.empty();
+        }
+
+        List<GroundedSweepPlacementExecutor.PlacementTarget> window = pendingPlacementTargets.stream()
+                .limit(PREFLIGHT_LOOKAHEAD_TARGETS)
+                .toList();
+        Set<Item> heldItems = GroundedRefillController.itemsInInventory(client.player);
+        PreflightMaterialCheckResult check = inspectPreflightTargets(window, lanePlacementsByIndex, heldItems);
+        Set<String> missingBlockIds = check.missingBlockIds();
+        Set<String> unsupportedBlockIds = check.unsupportedBlockIds();
+
+        traceGroundedEvent("preflight checkedTargets=" + check.checkedTargets()
+                + ", checkedUniqueBlocks=" + check.checkedUniqueBlocks()
+                + ", missing=" + missingBlockIds
+                + ", unsupported=" + unsupportedBlockIds);
+
+        if (missingBlockIds.isEmpty() && unsupportedBlockIds.isEmpty()) {
+            traceGroundedEvent("preflight passed");
+            return Optional.empty();
+        }
+
+        clearControls(client);
+        awaitingStartApproach = false;
+        startApproachIssued = false;
+
+        if (!unsupportedBlockIds.isEmpty()) {
+            String message = "Unsupported required materials before grounded sweep (no item form): "
+                    + String.join(", ", unsupportedBlockIds);
+            traceGroundedEvent("preflight failed: " + message);
+            return Optional.of(message);
+        }
+
+        String missingMessage = "Missing required materials before grounded sweep: "
+                + String.join(", ", missingBlockIds);
+        traceGroundedEvent("preflight failed: " + missingMessage);
+        if (supplyStore != null && !supplyStore.list().isEmpty()) {
+            traceGroundedEvent("preflight refill triggered");
+            if (triggerRefill(client, null)) {
+                return Optional.empty();
+            }
+        }
+        return Optional.of(missingMessage + (supplyStore == null || supplyStore.list().isEmpty()
+                ? " | Missing required materials and no supply point is registered"
+                : ""));
+    }
+
+    static PreflightMaterialCheckResult inspectPreflightTargets(
+            List<GroundedSweepPlacementExecutor.PlacementTarget> targets,
+            Map<Integer, Placement> placementsByIndex,
+            Set<Item> heldItems
+    ) {
+        Set<String> missingBlockIds = new LinkedHashSet<>();
+        Set<String> unsupportedBlockIds = new LinkedHashSet<>();
+        int checkedTargets = 0;
+        for (GroundedSweepPlacementExecutor.PlacementTarget target : targets) {
+            Placement placement = placementsByIndex.get(target.placementIndex());
+            if (placement == null || placement.block() == null || placement.block().getDefaultState().isAir()) {
+                continue;
+            }
+            checkedTargets++;
+            Item expectedItem = placement.block().asItem();
+            if (expectedItem == null) {
+                unsupportedBlockIds.add(String.valueOf(Registries.BLOCK.getId(placement.block())));
+                continue;
+            }
+            if (!heldItems.contains(expectedItem)) {
+                missingBlockIds.add(String.valueOf(Registries.BLOCK.getId(placement.block())));
+            }
+        }
+        return new PreflightMaterialCheckResult(checkedTargets, missingBlockIds, unsupportedBlockIds);
+    }
+
+    record PreflightMaterialCheckResult(
+            int checkedTargets,
+            Set<String> missingBlockIds,
+            Set<String> unsupportedBlockIds
+    ) {
+        int checkedUniqueBlocks() {
+            return missingBlockIds.size() + unsupportedBlockIds.size();
+        }
     }
 
     private BlockPos activeStartApproachTarget() {
