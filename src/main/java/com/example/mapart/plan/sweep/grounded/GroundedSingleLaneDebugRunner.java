@@ -546,14 +546,38 @@ public final class GroundedSingleLaneDebugRunner {
         laneWalker.interrupt();
         baritoneFacade.cancel();
 
+        // Log refill scan details to diagnose 5-wide lane coverage
+        Map<GroundedSweepPlacementExecutor.LaneRelativeBand, Integer> bandCounts = new HashMap<>();
         Map<Item, Integer> neededCounts = new HashMap<>();
+        int scannedCount = 0;
+
         for (GroundedSweepPlacementExecutor.PlacementTarget target : pendingPlacementTargets) {
             Placement placement = lanePlacementsByIndex.get(target.placementIndex());
             if (placement == null || placement.block() == null) {
                 continue;
             }
+            scannedCount++;
             Item item = placement.block().asItem();
             neededCounts.merge(item, 1, Integer::sum);
+
+            // Track lateral band distribution
+            if (activeLane != null) {
+                GroundedSweepPlacementExecutor.LaneRelativeBand band =
+                    GroundedSweepPlacementExecutor.laneRelativeBand(activeLane, target.worldPos());
+                bandCounts.merge(band, 1, Integer::sum);
+            }
+        }
+
+        traceGroundedEvent("refill scan: total=" + scannedCount
+                + " LEFT_TWO=" + bandCounts.getOrDefault(GroundedSweepPlacementExecutor.LaneRelativeBand.LEFT_TWO, 0)
+                + " LEFT_ONE=" + bandCounts.getOrDefault(GroundedSweepPlacementExecutor.LaneRelativeBand.LEFT_ONE, 0)
+                + " CENTER=" + bandCounts.getOrDefault(GroundedSweepPlacementExecutor.LaneRelativeBand.CENTERLINE, 0)
+                + " RIGHT_ONE=" + bandCounts.getOrDefault(GroundedSweepPlacementExecutor.LaneRelativeBand.RIGHT_ONE, 0)
+                + " RIGHT_TWO=" + bandCounts.getOrDefault(GroundedSweepPlacementExecutor.LaneRelativeBand.RIGHT_TWO, 0));
+
+        for (Map.Entry<Item, Integer> entry : neededCounts.entrySet()) {
+            String itemName = Registries.ITEM.getId(entry.getKey()).getPath();
+            traceGroundedEvent("refill scan: need " + entry.getValue() + "x " + itemName);
         }
 
         Map<Item, Integer> heldCounts = (client != null && client.player != null)
@@ -1708,6 +1732,7 @@ public final class GroundedSingleLaneDebugRunner {
         List<GroundedSweepPlacementExecutor.PlacementTarget> targets = new ArrayList<>();
         GroundedLaneCorridorBounds corridor = lane.corridorBounds();
         boolean hasFilter = placementFilter != null && !placementFilter.isEmpty();
+        Map<GroundedSweepPlacementExecutor.LaneRelativeBand, Integer> bandCounts = new HashMap<>();
 
         for (int i = 0; i < plan.placements().size(); i++) {
             if (hasFilter && !placementFilter.contains(i)) {
@@ -1737,7 +1762,21 @@ public final class GroundedSingleLaneDebugRunner {
             }
             lanePlacementsByIndex.put(i, placement);
             targets.add(new GroundedSweepPlacementExecutor.PlacementTarget(i, worldPos));
+
+            // Track band distribution for diagnostics
+            GroundedSweepPlacementExecutor.LaneRelativeBand band =
+                GroundedSweepPlacementExecutor.laneRelativeBand(lane, worldPos);
+            bandCounts.merge(band, 1, Integer::sum);
         }
+
+        MapArtMod.LOGGER.info("[grounded-trace:event] buildLanePlacementTargets: total=" + targets.size()
+                + " LEFT_TWO=" + bandCounts.getOrDefault(GroundedSweepPlacementExecutor.LaneRelativeBand.LEFT_TWO, 0)
+                + " LEFT_ONE=" + bandCounts.getOrDefault(GroundedSweepPlacementExecutor.LaneRelativeBand.LEFT_ONE, 0)
+                + " CENTER=" + bandCounts.getOrDefault(GroundedSweepPlacementExecutor.LaneRelativeBand.CENTERLINE, 0)
+                + " RIGHT_ONE=" + bandCounts.getOrDefault(GroundedSweepPlacementExecutor.LaneRelativeBand.RIGHT_ONE, 0)
+                + " RIGHT_TWO=" + bandCounts.getOrDefault(GroundedSweepPlacementExecutor.LaneRelativeBand.RIGHT_TWO, 0)
+                + " sweepHalfWidth=" + sweepHalfWidth);
+
         return List.copyOf(targets);
     }
 
@@ -2932,6 +2971,7 @@ public final class GroundedSingleLaneDebugRunner {
                 placementFilter,
                 minimumForwardProgressCoordinate
         );
+        traceGroundedEvent("activateLaneData: pendingPlacementTargets initialized with " + pendingPlacementTargets.size() + " targets");
         pendingVerificationsByPlacement = new LinkedHashMap<>();
         currentLeftovers = List.of();
     }
