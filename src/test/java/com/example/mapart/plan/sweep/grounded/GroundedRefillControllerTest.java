@@ -47,7 +47,7 @@ class GroundedRefillControllerTest {
         assertEquals(GroundedRefillController.RefillState.FAILED, controller.state());
         assertTrue(controller.failureMessage().isPresent());
         assertFalse(controller.failureMessage().get().isBlank());
-        assertEquals(0, baritone.goToCalls);
+        assertEquals(0, baritone.goNearCalls);
     }
 
     @Test
@@ -59,11 +59,11 @@ class GroundedRefillControllerTest {
         runner.triggerRefillForTests(List.of(), List.of(), baritone);
 
         assertFalse(runner.getRefillController().isActive());
-        assertEquals(0, baritone.goToCalls);
+        assertEquals(0, baritone.goNearCalls);
     }
 
     @Test
-    void baritoneGoToCalledWithSupplyPointPosition() {
+    void baritoneGoNearCalledWithSupplyPointPosition() {
         RecordingBaritoneFacade baritone = new RecordingBaritoneFacade();
         GroundedRefillController controller = new GroundedRefillController();
         BlockPos supplyPos = new BlockPos(100, 64, 200);
@@ -71,8 +71,9 @@ class GroundedRefillControllerTest {
 
         controller.initiateWithSuppliesForTests(List.of(supply), List.of(), baritone);
 
-        assertEquals(1, baritone.goToCalls);
-        assertEquals(supplyPos, baritone.lastGoToTarget);
+        assertEquals(1, baritone.goNearCalls);
+        assertEquals(supplyPos, baritone.lastGoNearTarget);
+        assertEquals(4, baritone.lastGoNearRange);
         assertEquals(GroundedRefillController.RefillState.NAVIGATING, controller.state());
     }
 
@@ -189,6 +190,9 @@ class GroundedRefillControllerTest {
     private static final class RecordingBaritoneFacade implements BaritoneFacade {
         BlockPos lastGoToTarget;
         int goToCalls;
+        BlockPos lastGoNearTarget;
+        int lastGoNearRange;
+        int goNearCalls;
         int cancelCalls;
 
         @Override
@@ -200,6 +204,9 @@ class GroundedRefillControllerTest {
 
         @Override
         public CommandResult goNear(BlockPos target, int range) {
+            lastGoNearTarget = target;
+            lastGoNearRange = range;
+            goNearCalls++;
             return CommandResult.success("ok");
         }
 
