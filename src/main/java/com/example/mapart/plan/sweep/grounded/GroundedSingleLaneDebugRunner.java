@@ -10,8 +10,11 @@ import com.example.mapart.plan.state.PlacementResult;
 import com.example.mapart.supply.SupplyStore;
 import net.minecraft.block.BlockState;
 import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.network.ClientPlayerEntity;
 import net.minecraft.client.option.KeyBinding;
+import net.minecraft.entity.player.PlayerInventory;
 import net.minecraft.item.Item;
+import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
 import net.minecraft.registry.Registries;
 import net.minecraft.text.Text;
@@ -543,15 +546,23 @@ public final class GroundedSingleLaneDebugRunner {
         laneWalker.interrupt();
         baritoneFacade.cancel();
 
-        Set<Item> heldItems = (client != null && client.player != null)
-                ? GroundedRefillController.itemsInInventory(client.player)
-                : Set.of();
-        List<Item> neededItems = pendingPlacementTargets.stream()
-                .map(t -> lanePlacementsByIndex.get(t.placementIndex()))
-                .filter(p -> p != null && p.block() != null)
-                .map(p -> p.block().asItem())
-                .filter(item -> !heldItems.contains(item))
-                .distinct()
+        Map<Item, Integer> neededCounts = new HashMap<>();
+        for (GroundedSweepPlacementExecutor.PlacementTarget target : pendingPlacementTargets) {
+            Placement placement = lanePlacementsByIndex.get(target.placementIndex());
+            if (placement == null || placement.block() == null) {
+                continue;
+            }
+            Item item = placement.block().asItem();
+            neededCounts.merge(item, 1, Integer::sum);
+        }
+
+        Map<Item, Integer> heldCounts = (client != null && client.player != null)
+                ? countItemsInInventory(client.player)
+                : Map.of();
+
+        List<Item> neededItems = neededCounts.entrySet().stream()
+                .filter(entry -> heldCounts.getOrDefault(entry.getKey(), 0) < entry.getValue())
+                .map(Map.Entry::getKey)
                 .toList();
 
         boolean initiated = refillController.initiate(client, supplyStore, neededItems, baritoneFacade);
@@ -700,6 +711,18 @@ public final class GroundedSingleLaneDebugRunner {
             return false;
         }
         return true;
+    }
+
+    private static Map<Item, Integer> countItemsInInventory(ClientPlayerEntity player) {
+        PlayerInventory inventory = player.getInventory();
+        Map<Item, Integer> counts = new HashMap<>();
+        for (int slot = 0; slot < PlayerInventory.MAIN_SIZE; slot++) {
+            ItemStack stack = inventory.getStack(slot);
+            if (!stack.isEmpty()) {
+                counts.merge(stack.getItem(), stack.getCount(), Integer::sum);
+            }
+        }
+        return counts;
     }
 
     private void tickRefill(MinecraftClient client) {
