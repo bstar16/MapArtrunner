@@ -40,6 +40,8 @@ public final class GroundedRefillController {
     }
 
     private RefillState state = RefillState.IDLE;
+    private List<SupplyPoint> supplyCandidates = List.of();
+    private int supplyCandidateIndex = 0;
     private SupplyPoint targetSupply;
     private List<Item> neededItems;
     private String failureMessage;
@@ -74,14 +76,30 @@ public final class GroundedRefillController {
             fail("No supply container registered in this dimension. Cannot restock.");
             return false;
         }
-        this.targetSupply = supplies.get(0);
+        this.supplyCandidates = List.copyOf(supplies);
+        this.supplyCandidateIndex = 0;
         this.neededItems = neededItems != null ? neededItems : List.of();
+        return navigateToSupply(supplyCandidates.get(0), baritone);
+    }
+
+    private boolean navigateToSupply(SupplyPoint supply, BaritoneFacade baritone) {
+        this.targetSupply = supply;
         this.navTicksRemaining = NAV_TIMEOUT_TICKS;
         this.awaitingContainerScreen = false;
         this.actionCooldown = 0;
         this.state = RefillState.NAVIGATING;
         baritone.goTo(targetSupply.pos());
         return true;
+    }
+
+    private TickResult tryNextSupply(String skipReason, BaritoneFacade baritone) {
+        supplyCandidateIndex++;
+        if (supplyCandidateIndex >= supplyCandidates.size()) {
+            fail("Required items not found in any registered supply container.");
+            return TickResult.FAILED;
+        }
+        navigateToSupply(supplyCandidates.get(supplyCandidateIndex), baritone);
+        return TickResult.ACTIVE;
     }
 
     // Package-private test helpers
@@ -95,13 +113,13 @@ public final class GroundedRefillController {
 
     public TickResult tick(MinecraftClient client, BaritoneFacade baritone) {
         if (state == RefillState.NAVIGATING) {
-            return tickNavigating(client);
+            return tickNavigating(client, baritone);
         }
         if (client == null || client.player == null || client.world == null) {
             return TickResult.ACTIVE;
         }
         return switch (state) {
-            case OPENING_CONTAINER -> tickOpeningContainer(client);
+            case OPENING_CONTAINER -> tickOpeningContainer(client, baritone);
             case REFILLING -> tickRefilling(client, baritone);
             case DONE -> TickResult.DONE;
             case FAILED -> TickResult.FAILED;
@@ -109,7 +127,7 @@ public final class GroundedRefillController {
         };
     }
 
-    private TickResult tickNavigating(MinecraftClient client) {
+    private TickResult tickNavigating(MinecraftClient client, BaritoneFacade baritone) {
         if (targetSupply == null) {
             fail("Refill navigation target is missing.");
             return TickResult.FAILED;
@@ -124,6 +142,9 @@ public final class GroundedRefillController {
         }
         BlockPos playerPos = client.player.getBlockPos();
         if (isWithinContainerReach(playerPos, targetSupply.pos())) {
+            if (baritone != null) {
+                baritone.cancel();
+            }
             state = RefillState.OPENING_CONTAINER;
             awaitingContainerScreen = false;
             containerOpenWaitPollsRemaining = 0;
@@ -132,14 +153,13 @@ public final class GroundedRefillController {
         return TickResult.ACTIVE;
     }
 
-    private TickResult tickOpeningContainer(MinecraftClient client) {
+    private TickResult tickOpeningContainer(MinecraftClient client, BaritoneFacade baritone) {
         if (targetSupply == null || client.world == null) {
             fail("Supply target lost during container opening.");
             return TickResult.FAILED;
         }
         if (!isUsableContainer(client, targetSupply.pos())) {
-            fail("No container at supply #" + targetSupply.id() + " (" + targetSupply.pos().toShortString() + ").");
-            return TickResult.FAILED;
+            return tryNextSupply("No container at supply #" + targetSupply.id() + " (" + targetSupply.pos().toShortString() + ").", baritone);
         }
         if (actionCooldown > 0) {
             actionCooldown--;
@@ -157,8 +177,7 @@ public final class GroundedRefillController {
                 containerOpenWaitPollsRemaining--;
                 return TickResult.ACTIVE;
             }
-            fail("Timed out waiting for supply container to open at " + targetSupply.pos().toShortString() + ".");
-            return TickResult.FAILED;
+            return tryNextSupply("Timed out waiting for supply container to open at " + targetSupply.pos().toShortString() + ".", baritone);
         }
         if (client.interactionManager == null) {
             fail("Interaction manager unavailable.");
@@ -175,8 +194,7 @@ public final class GroundedRefillController {
                 )
         );
         if (!result.isAccepted()) {
-            fail("Failed to open supply container at " + targetSupply.pos().toShortString() + ".");
-            return TickResult.FAILED;
+            return tryNextSupply("Failed to open supply container at " + targetSupply.pos().toShortString() + ".", baritone);
         }
         awaitingContainerScreen = true;
         containerOpenWaitPollsRemaining = CONTAINER_OPEN_WAIT_POLLS;
@@ -228,11 +246,17 @@ public final class GroundedRefillController {
             // This item is absent from the container — skip it
         }
 
-        // All needed items are either held or absent from the container
+        // All needed items are either held or absent from this container
         closeScreen(client);
+
+        boolean allSatisfied = neededItems.stream().allMatch(heldItems::contains);
+        if (!allSatisfied && supplyCandidateIndex < supplyCandidates.size() - 1) {
+            return tryNextSupply("Supply #" + targetSupply.id() + " did not have all needed items", baritone);
+        }
+
         baritone.cancel();
         if (!anyUseful) {
-            fail("Required items not found in supply container.");
+            fail("Required items not found in any registered supply container.");
             return TickResult.FAILED;
         }
         state = RefillState.DONE;
@@ -276,6 +300,8 @@ public final class GroundedRefillController {
 
     public void clear() {
         state = RefillState.IDLE;
+        supplyCandidates = List.of();
+        supplyCandidateIndex = 0;
         targetSupply = null;
         neededItems = null;
         failureMessage = null;
