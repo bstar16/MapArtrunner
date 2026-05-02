@@ -48,7 +48,7 @@ public final class GroundedRefillController {
     private List<SupplyPoint> supplyCandidates = List.of();
     private int supplyCandidateIndex = 0;
     private SupplyPoint targetSupply;
-    private java.util.Map<Item, Integer> neededItemCounts = java.util.Map.of();
+    private Map<Identifier, Integer> deficits = Map.of();
     private BlockPos returnTarget;
     private String failureMessage;
     private int navTicksRemaining;
@@ -64,11 +64,11 @@ public final class GroundedRefillController {
     public Optional<SupplyPoint> targetSupply() { return Optional.ofNullable(targetSupply); }
     public Optional<String> failureMessage() { return Optional.ofNullable(failureMessage); }
 
-    public boolean initiate(MinecraftClient client, SupplyStore supplyStore, java.util.Map<Item, Integer> neededItemCounts, BaritoneFacade baritone) {
-        return initiate(client, supplyStore, neededItemCounts, null, baritone);
+    public boolean initiate(MinecraftClient client, SupplyStore supplyStore, Map<Identifier, Integer> deficits, BaritoneFacade baritone) {
+        return initiate(client, supplyStore, deficits, null, baritone);
     }
 
-    public boolean initiate(MinecraftClient client, SupplyStore supplyStore, java.util.Map<Item, Integer> neededItemCounts, BlockPos returnTarget, BaritoneFacade baritone) {
+    public boolean initiate(MinecraftClient client, SupplyStore supplyStore, Map<Identifier, Integer> deficits, BlockPos returnTarget, BaritoneFacade baritone) {
         if (client == null || client.player == null || client.world == null) {
             fail("Cannot initiate refill: client context unavailable.");
             return false;
@@ -78,21 +78,21 @@ public final class GroundedRefillController {
         List<SupplyPoint> supplies = supplyStore != null
                 ? supplyStore.listInDimensionByDistance(dimensionKey, playerPos)
                 : List.of();
-        return initiateWithSupplies(supplies, neededItemCounts, returnTarget, baritone);
+        return initiateWithSupplies(supplies, deficits, returnTarget, baritone);
     }
 
-    private boolean initiateWithSupplies(List<SupplyPoint> supplies, java.util.Map<Item, Integer> neededItemCounts, BaritoneFacade baritone) {
-        return initiateWithSupplies(supplies, neededItemCounts, null, baritone);
+    private boolean initiateWithSupplies(List<SupplyPoint> supplies, Map<Identifier, Integer> deficits, BaritoneFacade baritone) {
+        return initiateWithSupplies(supplies, deficits, null, baritone);
     }
 
-    private boolean initiateWithSupplies(List<SupplyPoint> supplies, java.util.Map<Item, Integer> neededItemCounts, BlockPos returnTarget, BaritoneFacade baritone) {
+    private boolean initiateWithSupplies(List<SupplyPoint> supplies, Map<Identifier, Integer> deficits, BlockPos returnTarget, BaritoneFacade baritone) {
         if (supplies.isEmpty()) {
             fail("No supply container registered in this dimension. Cannot restock.");
             return false;
         }
         this.supplyCandidates = List.copyOf(supplies);
         this.supplyCandidateIndex = 0;
-        this.neededItemCounts = neededItemCounts != null ? new java.util.LinkedHashMap<>(neededItemCounts) : java.util.Map.of();
+        this.deficits = deficits != null ? new LinkedHashMap<>(deficits) : Map.of();
         this.returnTarget = returnTarget;
         return navigateToSupply(supplyCandidates.get(0), baritone);
     }
@@ -124,12 +124,22 @@ public final class GroundedRefillController {
     }
 
     // Package-private test helpers
-    void initiateWithSuppliesForTests(List<SupplyPoint> supplies, java.util.Map<Item, Integer> neededItemCounts, BaritoneFacade baritone) {
-        initiateWithSupplies(supplies, neededItemCounts, null, baritone);
+    void initiateWithSuppliesForTests(List<SupplyPoint> supplies, List<Item> items, BaritoneFacade baritone) {
+        Map<Identifier, Integer> map = new LinkedHashMap<>();
+        for (int i = 0; i < items.size(); i++) {
+            Item item = items.get(i);
+            Identifier id = (item != null) ? Registries.ITEM.getId(item) : Identifier.of("mapart", "_slot_" + i);
+            map.merge(id, 1, Integer::sum);
+        }
+        initiateWithSupplies(supplies, map, null, baritone);
     }
 
-    void initiateWithSuppliesForTests(List<SupplyPoint> supplies, java.util.Map<Item, Integer> neededItemCounts, BlockPos returnTarget, BaritoneFacade baritone) {
-        initiateWithSupplies(supplies, neededItemCounts, returnTarget, baritone);
+    void initiateWithSuppliesForTests(List<SupplyPoint> supplies, Map<Identifier, Integer> deficits, BaritoneFacade baritone) {
+        initiateWithSupplies(supplies, deficits, null, baritone);
+    }
+
+    void initiateWithSuppliesForTests(List<SupplyPoint> supplies, Map<Identifier, Integer> deficits, BlockPos returnTarget, BaritoneFacade baritone) {
+        initiateWithSupplies(supplies, deficits, returnTarget, baritone);
     }
 
     void simulateNavTimeoutForTests() {
@@ -305,20 +315,6 @@ public final class GroundedRefillController {
         state = RefillState.DONE;
         return TickResult.DONE;
     }
-    private TickResult tickReturning(MinecraftClient client, BaritoneFacade baritone) {
-        if (returnTarget == null || client == null || client.player == null) {
-            state = RefillState.DONE;
-            return TickResult.DONE;
-        }
-        if (isWithinContainerReach(client.player.getBlockPos(), returnTarget)) {
-            if (baritone != null) {
-                baritone.cancel();
-            }
-            state = RefillState.DONE;
-            return TickResult.DONE;
-        }
-        return TickResult.ACTIVE;
-    }
 
     private TickResult tickReturning(MinecraftClient client, BaritoneFacade baritone) {
         if (returnTarget == null) {
@@ -343,12 +339,8 @@ public final class GroundedRefillController {
 
     // Package-private test helper: simulates the refilling logic using index-based sets to avoid
     // requiring live Item instances (which need the game registry). playerHeldIndices and
-    // containerIndices refer to positions in the neededItems list.
+    // containerIndices refer to positions in the deficits list.
     TickResult simulateRefillingForTests(Set<Integer> playerHeldIndices, Set<Integer> containerIndices, BaritoneFacade baritone) {
-        if (deficits == null) {
-            fail("Refill lost required item reference.");
-            return TickResult.FAILED;
-        }
         boolean anyUseful = false;
         for (int i = 0; i < deficits.size(); i++) {
             if (playerHeldIndices.contains(i)) {
@@ -360,6 +352,62 @@ public final class GroundedRefillController {
                 anyUseful = true;
             }
             // not in container — skip
+        }
+        if (!anyUseful) {
+            fail("Required items not found in supply container.");
+            return TickResult.FAILED;
+        }
+        if (returnTarget != null) {
+            if (baritone == null) {
+                fail("Failed to start return-to-build navigation near " + returnTarget.toShortString() + ": baritone unavailable.");
+                return TickResult.FAILED;
+            }
+            BaritoneFacade.CommandResult result = baritone.goNear(returnTarget, RETURN_REACH_FLAT);
+            if (!result.success()) {
+                fail("Failed to start return-to-build navigation near " + returnTarget.toShortString() + ": " + result.message());
+                return TickResult.FAILED;
+            }
+            state = RefillState.RETURNING;
+            return TickResult.ACTIVE;
+        }
+        state = RefillState.DONE;
+        return TickResult.DONE;
+    }
+
+    // Package-private test helper: simulates refilling when deficits are given as Map<Identifier,Integer>.
+    // Primarily used to test return navigation success/failure.
+    TickResult simulateRefillingForTests(Map<Integer, Integer> playerHeld, Map<Integer, Integer> containerPulled, Set<Integer> containerIndices, BaritoneFacade baritone) {
+        if (deficits.isEmpty()) {
+            if (returnTarget != null) {
+                if (baritone == null) {
+                    fail("Failed to start return-to-build navigation near " + returnTarget.toShortString() + ": baritone unavailable.");
+                    return TickResult.FAILED;
+                }
+                BaritoneFacade.CommandResult result = baritone.goNear(returnTarget, RETURN_REACH_FLAT);
+                if (!result.success()) {
+                    fail("Failed to start return-to-build navigation near " + returnTarget.toShortString() + ": " + result.message());
+                    return TickResult.FAILED;
+                }
+                state = RefillState.RETURNING;
+                return TickResult.ACTIVE;
+            }
+            state = RefillState.DONE;
+            return TickResult.DONE;
+        }
+        int i = 0;
+        boolean anyUseful = false;
+        for (Identifier id : deficits.keySet()) {
+            Integer held = playerHeld.get(i);
+            if (held != null && held > 0) {
+                anyUseful = true;
+                i++;
+                continue;
+            }
+            if (containerIndices.contains(i)) {
+                playerHeld.put(i, 1);
+                anyUseful = true;
+            }
+            i++;
         }
         if (!anyUseful) {
             fail("Required items not found in supply container.");
@@ -394,7 +442,7 @@ public final class GroundedRefillController {
         supplyCandidates = List.of();
         supplyCandidateIndex = 0;
         targetSupply = null;
-        neededItemCounts = java.util.Map.of();
+        deficits = Map.of();
         returnTarget = null;
         failureMessage = null;
         navTicksRemaining = 0;
