@@ -51,6 +51,19 @@ class GroundedRefillControllerTest {
     }
 
     @Test
+    void supplyNavigationGoNearFailureFailsClearly() {
+        RecordingBaritoneFacade baritone = new RecordingBaritoneFacade();
+        baritone.goNearShouldFail = true;
+        GroundedRefillController controller = new GroundedRefillController();
+        SupplyPoint supply = new SupplyPoint(1, new BlockPos(100, 64, 200), "minecraft:overworld", "chest");
+
+        controller.initiateWithSuppliesForTests(List.of(supply), Map.of(), baritone);
+
+        assertEquals(GroundedRefillController.RefillState.FAILED, controller.state());
+        assertTrue(controller.failureMessage().orElse("").contains("Failed to start supply navigation near"));
+    }
+
+    @Test
     void emptySupplyListDoesNotTriggerGoTo() {
         RecordingBaritoneFacade baritone = new RecordingBaritoneFacade();
         GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
@@ -94,7 +107,7 @@ class GroundedRefillControllerTest {
         runner.start(session, 0, GroundedSweepSettings.defaults());
 
         SupplyPoint supply = new SupplyPoint(1, new BlockPos(5, 64, 5), "minecraft:overworld", "chest");
-        runner.triggerRefillForTests(List.of(), List.of(supply), new NoOpBaritoneFacade());
+        runner.triggerRefillForTests(Map.of(), List.of(supply), new RecordingBaritoneFacade());
         assertTrue(runner.getRefillController().isActive());
 
         runner.simulateRefillCompleteForTests();
@@ -165,6 +178,31 @@ class GroundedRefillControllerTest {
         assertTrue(playerHeld.contains(1), "second needed item should have been pulled from container");
     }
 
+    @Test
+    void returnNavigationFailureFailsAndDoesNotEnterReturning() {
+        RecordingBaritoneFacade baritone = new RecordingBaritoneFacade();
+        baritone.goNearShouldFail = true;
+        GroundedRefillController controller = new GroundedRefillController();
+        SupplyPoint supply = new SupplyPoint(1, new BlockPos(50, 64, 50), "minecraft:overworld", "chest");
+        controller.initiateWithSuppliesForTests(List.of(supply), Map.of(), new BlockPos(10, 64, 10), baritone);
+
+        GroundedRefillController.TickResult result = controller.simulateRefillingForTests(Map.of(), new java.util.HashMap<>(), Set.of(), baritone);
+        assertEquals(GroundedRefillController.TickResult.FAILED, result);
+        assertEquals(GroundedRefillController.RefillState.FAILED, controller.state());
+    }
+
+    @Test
+    void returnNavigationSuccessEntersReturning() {
+        RecordingBaritoneFacade baritone = new RecordingBaritoneFacade();
+        GroundedRefillController controller = new GroundedRefillController();
+        SupplyPoint supply = new SupplyPoint(1, new BlockPos(50, 64, 50), "minecraft:overworld", "chest");
+        controller.initiateWithSuppliesForTests(List.of(supply), Map.of(), new BlockPos(10, 64, 10), baritone);
+
+        GroundedRefillController.TickResult result = controller.simulateRefillingForTests(Map.of(0, 1), new java.util.HashMap<>(), Set.of(0), baritone);
+        assertEquals(GroundedRefillController.TickResult.ACTIVE, result);
+        assertEquals(GroundedRefillController.RefillState.RETURNING, controller.state());
+    }
+
     // ---- Helpers ----
 
     private static BuildSession sessionWithOrigin() {
@@ -194,6 +232,7 @@ class GroundedRefillControllerTest {
         int lastGoNearRange;
         int goNearCalls;
         int cancelCalls;
+        boolean goNearShouldFail;
 
         @Override
         public CommandResult goTo(BlockPos target) {
@@ -207,6 +246,9 @@ class GroundedRefillControllerTest {
             lastGoNearTarget = target;
             lastGoNearRange = range;
             goNearCalls++;
+            if (goNearShouldFail) {
+                return CommandResult.failure("failed");
+            }
             return CommandResult.success("ok");
         }
 
