@@ -10,8 +10,10 @@ import net.minecraft.client.network.ClientPlayerEntity;
 import net.minecraft.entity.player.PlayerInventory;
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
+import net.minecraft.registry.Registries;
 import net.minecraft.screen.ScreenHandler;
 import net.minecraft.screen.slot.SlotActionType;
+import net.minecraft.util.Identifier;
 import net.minecraft.util.ActionResult;
 import net.minecraft.util.Hand;
 import net.minecraft.util.hit.BlockHitResult;
@@ -19,10 +21,12 @@ import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.Vec3d;
 
-import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.HashSet;
 
 public final class GroundedRefillController {
     // Constants
@@ -32,7 +36,7 @@ public final class GroundedRefillController {
     private static final int ACTION_COOLDOWN_TICKS = 4;
 
     public enum RefillState {
-        IDLE, NAVIGATING, OPENING_CONTAINER, REFILLING, DONE, FAILED
+        IDLE, NAVIGATING, OPENING_CONTAINER, REFILLING, RETURNING, DONE, FAILED
     }
 
     public enum TickResult {
@@ -43,7 +47,8 @@ public final class GroundedRefillController {
     private List<SupplyPoint> supplyCandidates = List.of();
     private int supplyCandidateIndex = 0;
     private SupplyPoint targetSupply;
-    private List<Item> neededItems;
+    private Map<Identifier, Integer> deficits = Map.of();
+    private BlockPos returnTarget;
     private String failureMessage;
     private int navTicksRemaining;
     private int containerOpenWaitPollsRemaining;
@@ -58,7 +63,7 @@ public final class GroundedRefillController {
     public Optional<SupplyPoint> targetSupply() { return Optional.ofNullable(targetSupply); }
     public Optional<String> failureMessage() { return Optional.ofNullable(failureMessage); }
 
-    public boolean initiate(MinecraftClient client, SupplyStore supplyStore, List<Item> neededItems, BaritoneFacade baritone) {
+    public boolean initiate(MinecraftClient client, SupplyStore supplyStore, Map<Identifier, Integer> requestedDeficits, BlockPos requestedReturnTarget, BaritoneFacade baritone) {
         if (client == null || client.player == null || client.world == null) {
             fail("Cannot initiate refill: client context unavailable.");
             return false;
@@ -68,17 +73,18 @@ public final class GroundedRefillController {
         List<SupplyPoint> supplies = supplyStore != null
                 ? supplyStore.listInDimensionByDistance(dimensionKey, playerPos)
                 : List.of();
-        return initiateWithSupplies(supplies, neededItems, baritone);
+        return initiateWithSupplies(supplies, requestedDeficits, requestedReturnTarget, baritone);
     }
 
-    private boolean initiateWithSupplies(List<SupplyPoint> supplies, List<Item> neededItems, BaritoneFacade baritone) {
+    private boolean initiateWithSupplies(List<SupplyPoint> supplies, Map<Identifier, Integer> requestedDeficits, BlockPos requestedReturnTarget, BaritoneFacade baritone) {
         if (supplies.isEmpty()) {
             fail("No supply container registered in this dimension. Cannot restock.");
             return false;
         }
         this.supplyCandidates = List.copyOf(supplies);
         this.supplyCandidateIndex = 0;
-        this.neededItems = neededItems != null ? neededItems : List.of();
+        this.deficits = requestedDeficits == null ? Map.of() : new LinkedHashMap<>(requestedDeficits);
+        this.returnTarget = requestedReturnTarget == null ? null : requestedReturnTarget.toImmutable();
         return navigateToSupply(supplyCandidates.get(0), baritone);
     }
 
@@ -105,8 +111,17 @@ public final class GroundedRefillController {
     }
 
     // Package-private test helpers
+    void initiateWithSuppliesForTests(List<SupplyPoint> supplies, Map<Identifier, Integer> requestedDeficits, BlockPos requestedReturnTarget, BaritoneFacade baritone) {
+        initiateWithSupplies(supplies, requestedDeficits, requestedReturnTarget, baritone);
+    }
     void initiateWithSuppliesForTests(List<SupplyPoint> supplies, List<Item> neededItems, BaritoneFacade baritone) {
-        initiateWithSupplies(supplies, neededItems, baritone);
+        Map<Identifier, Integer> requestedDeficits = new LinkedHashMap<>();
+        if (neededItems != null) {
+            for (int i = 0; i < neededItems.size(); i++) {
+                requestedDeficits.merge(Identifier.of("mapartrunner", "test_" + i), 1, Integer::sum);
+            }
+        }
+        initiateWithSupplies(supplies, requestedDeficits, null, baritone);
     }
 
     void simulateNavTimeoutForTests() {
@@ -123,6 +138,7 @@ public final class GroundedRefillController {
         return switch (state) {
             case OPENING_CONTAINER -> tickOpeningContainer(client, baritone);
             case REFILLING -> tickRefilling(client, baritone);
+            case RETURNING -> tickReturning(client, baritone);
             case DONE -> TickResult.DONE;
             case FAILED -> TickResult.FAILED;
             case IDLE, NAVIGATING -> TickResult.ACTIVE;
@@ -205,9 +221,9 @@ public final class GroundedRefillController {
     }
 
     private TickResult tickRefilling(MinecraftClient client, BaritoneFacade baritone) {
-        if (neededItems == null || client.player == null) {
+        if (client.player == null) {
             closeScreen(client);
-            fail("Refill lost required item reference.");
+            fail("Refill lost player context.");
             return TickResult.FAILED;
         }
         if (actionCooldown > 0) {
@@ -215,7 +231,17 @@ public final class GroundedRefillController {
             return TickResult.ACTIVE;
         }
 
-        Set<Item> heldItems = itemsInInventory(client.player);
+        Map<Identifier, Integer> remaining = computeRemainingDeficits(client.player, deficits);
+        if (remaining.isEmpty()) {
+            closeScreen(client);
+            if (returnTarget != null && baritone != null) {
+                baritone.goNear(returnTarget, CONTAINER_REACH_FLAT);
+                state = RefillState.RETURNING;
+                return TickResult.ACTIVE;
+            }
+            state = RefillState.DONE;
+            return TickResult.DONE;
+        }
 
         HandledScreen<?> screen = currentSupplyScreen(client);
         if (screen == null) {
@@ -230,29 +256,21 @@ public final class GroundedRefillController {
             return TickResult.FAILED;
         }
 
-        // Pull one stack per tick for each needed item not yet in inventory
         boolean anyUseful = false;
-        for (Item needed : neededItems) {
-            if (heldItems.contains(needed)) {
-                anyUseful = true;
-                continue;
-            }
+        for (Map.Entry<Identifier, Integer> missing : remaining.entrySet()) {
+            Identifier needed = missing.getKey();
             for (int slotIndex = 0; slotIndex < containerSlotCount; slotIndex++) {
                 ItemStack stack = handler.slots.get(slotIndex).getStack();
-                if (!stack.isEmpty() && stack.isOf(needed)) {
+                if (!stack.isEmpty() && needed.equals(Registries.ITEM.getId(stack.getItem()))) {
                     client.interactionManager.clickSlot(handler.syncId, slotIndex, 0, SlotActionType.QUICK_MOVE, client.player);
                     actionCooldown = ACTION_COOLDOWN_TICKS;
+                    anyUseful = true;
                     return TickResult.ACTIVE;
                 }
             }
-            // This item is absent from the container — skip it
         }
-
-        // All needed items are either held or absent from this container
         closeScreen(client);
-
-        boolean allSatisfied = neededItems.stream().allMatch(heldItems::contains);
-        if (!allSatisfied && supplyCandidateIndex < supplyCandidates.size() - 1) {
+        if (supplyCandidateIndex < supplyCandidates.size() - 1) {
             return tryNextSupply("Supply #" + targetSupply.id() + " did not have all needed items", baritone);
         }
 
@@ -264,17 +282,31 @@ public final class GroundedRefillController {
         state = RefillState.DONE;
         return TickResult.DONE;
     }
+    private TickResult tickReturning(MinecraftClient client, BaritoneFacade baritone) {
+        if (returnTarget == null || client == null || client.player == null) {
+            state = RefillState.DONE;
+            return TickResult.DONE;
+        }
+        if (isWithinContainerReach(client.player.getBlockPos(), returnTarget)) {
+            if (baritone != null) {
+                baritone.cancel();
+            }
+            state = RefillState.DONE;
+            return TickResult.DONE;
+        }
+        return TickResult.ACTIVE;
+    }
 
     // Package-private test helper: simulates the refilling logic using index-based sets to avoid
     // requiring live Item instances (which need the game registry). playerHeldIndices and
     // containerIndices refer to positions in the neededItems list.
     TickResult simulateRefillingForTests(Set<Integer> playerHeldIndices, Set<Integer> containerIndices, BaritoneFacade baritone) {
-        if (neededItems == null) {
+        if (deficits == null) {
             fail("Refill lost required item reference.");
             return TickResult.FAILED;
         }
         boolean anyUseful = false;
-        for (int i = 0; i < neededItems.size(); i++) {
+        for (int i = 0; i < deficits.size(); i++) {
             if (playerHeldIndices.contains(i)) {
                 anyUseful = true;
                 continue;
@@ -305,7 +337,8 @@ public final class GroundedRefillController {
         supplyCandidates = List.of();
         supplyCandidateIndex = 0;
         targetSupply = null;
-        neededItems = null;
+        deficits = Map.of();
+        returnTarget = null;
         failureMessage = null;
         navTicksRemaining = 0;
         awaitingContainerScreen = false;
@@ -345,7 +378,7 @@ public final class GroundedRefillController {
         }
     }
 
-    static Set<Item> itemsInInventory(ClientPlayerEntity player) {
+    static Set<net.minecraft.item.Item> itemsInInventory(ClientPlayerEntity player) {
         PlayerInventory inventory = player.getInventory();
         Set<Item> held = new HashSet<>();
         for (int slot = 0; slot < PlayerInventory.MAIN_SIZE; slot++) {
@@ -355,5 +388,23 @@ public final class GroundedRefillController {
             }
         }
         return held;
+    }
+
+    private static Map<Identifier, Integer> computeRemainingDeficits(ClientPlayerEntity player, Map<Identifier, Integer> targetDeficits) {
+        Map<Identifier, Integer> inventory = new LinkedHashMap<>();
+        for (int slot = 0; slot < PlayerInventory.MAIN_SIZE; slot++) {
+            ItemStack stack = player.getInventory().getStack(slot);
+            if (!stack.isEmpty()) {
+                inventory.merge(Registries.ITEM.getId(stack.getItem()), stack.getCount(), Integer::sum);
+            }
+        }
+        Map<Identifier, Integer> remaining = new LinkedHashMap<>();
+        targetDeficits.forEach((id, count) -> {
+            int deficit = count - inventory.getOrDefault(id, 0);
+            if (deficit > 0) {
+                remaining.put(id, deficit);
+            }
+        });
+        return remaining;
     }
 }
