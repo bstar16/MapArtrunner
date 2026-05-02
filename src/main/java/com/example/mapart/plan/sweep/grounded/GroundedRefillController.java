@@ -1,5 +1,6 @@
 package com.example.mapart.plan.sweep.grounded;
 
+import com.example.mapart.MapArtMod;
 import com.example.mapart.baritone.BaritoneFacade;
 import com.example.mapart.supply.SupplyPoint;
 import com.example.mapart.supply.SupplyStore;
@@ -250,7 +251,11 @@ public final class GroundedRefillController {
         }
 
         Map<Identifier, Integer> remaining = computeRemainingDeficits(client.player, deficits);
+        MapArtMod.LOGGER.info("[grounded-trace:refill] tickRefilling: deficits={}, remaining={}, screenOpen={}",
+                deficits, remaining, currentSupplyScreen(client) != null);
         if (remaining.isEmpty()) {
+            MapArtMod.LOGGER.info("[grounded-trace:refill] all deficits satisfied, transitioning: returnTarget={}",
+                    returnTarget);
             closeScreen(client);
             if (returnTarget != null && baritone != null) {
                 baritone.goNear(returnTarget, CONTAINER_REACH_FLAT);
@@ -263,6 +268,7 @@ public final class GroundedRefillController {
 
         HandledScreen<?> screen = currentSupplyScreen(client);
         if (screen == null) {
+            MapArtMod.LOGGER.info("[grounded-trace:refill] screen closed mid-refill, remaining={}", remaining);
             fail("Supply container screen closed before refill was complete.");
             return TickResult.FAILED;
         }
@@ -280,6 +286,8 @@ public final class GroundedRefillController {
             for (int slotIndex = 0; slotIndex < containerSlotCount; slotIndex++) {
                 ItemStack stack = handler.slots.get(slotIndex).getStack();
                 if (!stack.isEmpty() && needed.equals(Registries.ITEM.getId(stack.getItem()))) {
+                    MapArtMod.LOGGER.info("[grounded-trace:refill] pulling {} x{} from slot {}",
+                            needed, stack.getCount(), slotIndex);
                     client.interactionManager.clickSlot(handler.syncId, slotIndex, 0, SlotActionType.QUICK_MOVE, client.player);
                     actionCooldown = ACTION_COOLDOWN_TICKS;
                     anyUseful = true;
