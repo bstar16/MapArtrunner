@@ -164,6 +164,31 @@ class GroundedRefillControllerTest {
         assertEquals(1, playerHeld.get(1));
     }
 
+    @Test
+    void returnNavigationFailureFailsAndDoesNotEnterReturning() {
+        RecordingBaritoneFacade baritone = new RecordingBaritoneFacade();
+        baritone.goNearShouldFail = true;
+        GroundedRefillController controller = new GroundedRefillController();
+        SupplyPoint supply = new SupplyPoint(1, new BlockPos(50, 64, 50), "minecraft:overworld", "chest");
+        controller.initiateWithSuppliesForTests(List.of(supply), Map.of(), new BlockPos(10, 64, 10), baritone);
+
+        GroundedRefillController.TickResult result = controller.simulateRefillingForTests(Map.of(), new java.util.HashMap<>(), Set.of(), baritone);
+        assertEquals(GroundedRefillController.TickResult.FAILED, result);
+        assertEquals(GroundedRefillController.RefillState.FAILED, controller.state());
+    }
+
+    @Test
+    void returnNavigationSuccessEntersReturning() {
+        RecordingBaritoneFacade baritone = new RecordingBaritoneFacade();
+        GroundedRefillController controller = new GroundedRefillController();
+        SupplyPoint supply = new SupplyPoint(1, new BlockPos(50, 64, 50), "minecraft:overworld", "chest");
+        controller.initiateWithSuppliesForTests(List.of(supply), Map.of(), new BlockPos(10, 64, 10), baritone);
+
+        GroundedRefillController.TickResult result = controller.simulateRefillingForTests(Map.of(0, 1), new java.util.HashMap<>(), Set.of(0), baritone);
+        assertEquals(GroundedRefillController.TickResult.ACTIVE, result);
+        assertEquals(GroundedRefillController.RefillState.RETURNING, controller.state());
+    }
+
     // ---- Helpers ----
 
     private static BuildSession sessionWithOrigin() {
@@ -193,6 +218,7 @@ class GroundedRefillControllerTest {
         int lastGoNearRange;
         int goNearCalls;
         int cancelCalls;
+        boolean goNearShouldFail;
 
         @Override
         public CommandResult goTo(BlockPos target) {
@@ -206,6 +232,9 @@ class GroundedRefillControllerTest {
             lastGoNearTarget = target;
             lastGoNearRange = range;
             goNearCalls++;
+            if (goNearShouldFail) {
+                return CommandResult.failure("failed");
+            }
             return CommandResult.success("ok");
         }
 

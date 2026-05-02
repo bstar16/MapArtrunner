@@ -592,7 +592,11 @@ public final class GroundedSingleLaneDebugRunner {
             }
         });
 
-        boolean initiated = refillController.initiate(client, supplyStore, neededItems, baritoneFacade);
+        BlockPos returnTarget = selectRefillReturnTarget(client);
+        traceGroundedEvent("grounded refill request created: source=placement-failure");
+        traceGroundedEvent("deficit map=" + summarizeItemCounts(neededItems));
+        traceGroundedEvent("selected return target=" + (returnTarget == null ? "<none>" : returnTarget.toShortString()));
+        boolean initiated = refillController.initiate(client, supplyStore, neededItems, returnTarget, baritoneFacade);
         if (!initiated) {
             if (client.player != null) {
                 client.player.sendMessage(
@@ -662,44 +666,44 @@ public final class GroundedSingleLaneDebugRunner {
         if (client != null && client.player != null && client.player.getAbilities().creativeMode) {
             return new PreflightMaterialCheckResult(true, 0, 0, List.of(), java.util.Map.of(), List.of());
         }
-        Set<Item> heldItems = GroundedRefillController.itemsInInventory(client.player);
+        Map<Item, Integer> heldCounts = GroundedRefillController.countItemsInInventory(client.player);
         List<GroundedSweepPlacementExecutor.PlacementTarget> preflightTargets = pendingPlacementTargets.stream()
                 .limit(PREFLIGHT_LOOKAHEAD_TARGETS)
                 .toList();
-        return evaluatePreflightTargets(preflightTargets, heldItems);
+        return evaluatePreflightTargets(preflightTargets, heldCounts);
     }
 
     PreflightMaterialCheckResult evaluatePreflightTargetsForTests(
             List<GroundedSweepPlacementExecutor.PlacementTarget> targets,
-            Set<Item> heldItems
+            Map<Item, Integer> heldItems
     ) {
         return evaluatePreflightTargets(targets, heldItems);
     }
 
-    PreflightMaterialCheckResult evaluatePendingPreflightForTests(Set<Item> heldItems) {
+    PreflightMaterialCheckResult evaluatePendingPreflightForTests(Map<Item, Integer> heldItems) {
         List<GroundedSweepPlacementExecutor.PlacementTarget> preflightTargets = pendingPlacementTargets.stream()
                 .limit(PREFLIGHT_LOOKAHEAD_TARGETS)
                 .toList();
         return evaluatePreflightTargets(preflightTargets, heldItems);
     }
 
-    int preflightCheckedTargetCountForTests(Set<Item> heldItems) {
+    int preflightCheckedTargetCountForTests(Map<Item, Integer> heldItems) {
         return evaluatePendingPreflightForTests(heldItems).checkedTargetCount();
     }
 
-    Map<Item, Integer> preflightMissingItemsForTests(Set<Item> heldItems) {
+    Map<Item, Integer> preflightMissingItemsForTests(Map<Item, Integer> heldItems) {
         return evaluatePendingPreflightForTests(heldItems).missingItemCounts();
     }
 
     private PreflightMaterialCheckResult evaluatePreflightTargets(
             List<GroundedSweepPlacementExecutor.PlacementTarget> targets,
-            Set<Item> heldItems
+            Map<Item, Integer> heldItems
     ) {
         LinkedHashSet<Item> uniqueRequiredItems = new LinkedHashSet<>();
         LinkedHashSet<String> missingBlockIds = new LinkedHashSet<>();
         java.util.LinkedHashMap<Item, Integer> requiredCounts = new java.util.LinkedHashMap<>();
         java.util.LinkedHashMap<Item, Integer> inventoryCounts = new java.util.LinkedHashMap<>();
-        heldItems.forEach(item -> inventoryCounts.merge(item, 1, Integer::sum));
+        inventoryCounts.putAll(heldItems);
         LinkedHashSet<String> unsupportedBlocks = new LinkedHashSet<>();
         int checkedTargets = 0;
         for (GroundedSweepPlacementExecutor.PlacementTarget target : targets) {
@@ -715,9 +719,7 @@ public final class GroundedSingleLaneDebugRunner {
                 continue;
             }
             uniqueRequiredItems.add(expectedItem);
-            if (!heldItems.contains(expectedItem)) {
-                requiredCounts.merge(expectedItem, 1, Integer::sum);
-            }
+            requiredCounts.merge(expectedItem, 1, Integer::sum);
         }
         java.util.Map<Item, Integer> missingItemCounts = new java.util.LinkedHashMap<>();
         requiredCounts.forEach((item, required) -> {
@@ -741,7 +743,11 @@ public final class GroundedSingleLaneDebugRunner {
         if (neededItems.isEmpty() || supplyStore == null || refillController.isActive() || recoveryState.isActive()) {
             return false;
         }
-        boolean initiated = refillController.initiate(client, supplyStore, neededItems, baritoneFacade);
+        BlockPos returnTarget = selectRefillReturnTarget(client);
+        traceGroundedEvent("grounded refill request created: source=preflight");
+        traceGroundedEvent("deficit map=" + summarizeItemCounts(neededItems));
+        traceGroundedEvent("selected return target=" + (returnTarget == null ? "<none>" : returnTarget.toShortString()));
+        boolean initiated = refillController.initiate(client, supplyStore, neededItems, returnTarget, baritoneFacade);
         if (!initiated) {
             refillController.clear();
             return false;
@@ -788,12 +794,34 @@ public final class GroundedSingleLaneDebugRunner {
                     Text.literal("[Mapart grounded] Refill complete. Resuming sweep with smart resume."),
                     false);
         }
+        traceGroundedEvent("smart resume after refill");
         Optional<String> err = startFullSweep(session, settings);
         if (err.isPresent() && client != null && client.player != null) {
             client.player.sendMessage(
                     Text.literal("[Mapart grounded] Resume after refill failed: " + err.get()),
                     false);
         }
+    }
+
+    private BlockPos selectRefillReturnTarget(MinecraftClient client) {
+        if (laneEntryAnchor != null && laneEntryAnchor.stagingTarget() != null) {
+            return laneEntryAnchor.stagingTarget();
+        }
+        if (activeLane != null && activeBounds != null) {
+            return activeStartApproachTarget();
+        }
+        if (client != null && client.player != null) {
+            return client.player.getBlockPos();
+        }
+        return null;
+    }
+
+    private String summarizeItemCounts(Map<Item, Integer> counts) {
+        if (counts == null || counts.isEmpty()) return "{}";
+        return counts.entrySet().stream()
+                .map(e -> Registries.ITEM.getId(e.getKey()).getPath() + "=" + e.getValue())
+                .sorted()
+                .collect(java.util.stream.Collectors.joining(", ", "{", "}"));
     }
 
     private void handleRefillFailed(MinecraftClient client) {
