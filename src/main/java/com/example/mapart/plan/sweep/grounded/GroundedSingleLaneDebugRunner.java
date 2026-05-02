@@ -584,12 +584,7 @@ public final class GroundedSingleLaneDebugRunner {
                 ? countItemsInInventory(client.player)
                 : Map.of();
 
-        List<Item> neededItems = neededCounts.entrySet().stream()
-                .filter(entry -> heldCounts.getOrDefault(entry.getKey(), 0) < entry.getValue())
-                .map(Map.Entry::getKey)
-                .toList();
-
-        boolean initiated = refillController.initiate(client, supplyStore, neededItems, baritoneFacade);
+        boolean initiated = refillController.initiate(client, supplyStore, neededCounts.entrySet().stream().filter(entry -> heldCounts.getOrDefault(entry.getKey(), 0) < entry.getValue()).collect(java.util.stream.Collectors.toMap(Map.Entry::getKey, e -> e.getValue() - heldCounts.getOrDefault(e.getKey(), 0), Integer::sum, java.util.LinkedHashMap::new)), determineGroundedRefillReturnTarget(client), baritoneFacade);
         if (!initiated) {
             if (client.player != null) {
                 client.player.sendMessage(
@@ -659,7 +654,7 @@ public final class GroundedSingleLaneDebugRunner {
         if (client != null && client.player != null && client.player.getAbilities().creativeMode) {
             return new PreflightMaterialCheckResult(true, 0, 0, List.of(), List.of(), List.of());
         }
-        Set<Item> heldItems = GroundedRefillController.itemsInInventory(client.player);
+        Set<Item> heldItems = GroundedRefillController.countItemsInInventory(client.player).keySet();
         List<GroundedSweepPlacementExecutor.PlacementTarget> preflightTargets = pendingPlacementTargets.stream()
                 .limit(PREFLIGHT_LOOKAHEAD_TARGETS)
                 .toList();
@@ -729,7 +724,9 @@ public final class GroundedSingleLaneDebugRunner {
         if (neededItems.isEmpty() || supplyStore == null || refillController.isActive() || recoveryState.isActive()) {
             return false;
         }
-        boolean initiated = refillController.initiate(client, supplyStore, neededItems, baritoneFacade);
+        Map<Item, Integer> deficits = new java.util.LinkedHashMap<>();
+        for (Item item : neededItems) deficits.merge(item, 1, Integer::sum);
+        boolean initiated = refillController.initiate(client, supplyStore, deficits, determineGroundedRefillReturnTarget(client), baritoneFacade);
         if (!initiated) {
             refillController.clear();
             return false;
@@ -737,6 +734,12 @@ public final class GroundedSingleLaneDebugRunner {
         return true;
     }
 
+
+    private BlockPos determineGroundedRefillReturnTarget(MinecraftClient client) {
+        if (client != null && client.player != null) return client.player.getBlockPos().toImmutable();
+        if (activeLane != null) return activeLane.startPoint().toImmutable();
+        return null;
+    }
     private static Map<Item, Integer> countItemsInInventory(ClientPlayerEntity player) {
         PlayerInventory inventory = player.getInventory();
         Map<Item, Integer> counts = new HashMap<>();
