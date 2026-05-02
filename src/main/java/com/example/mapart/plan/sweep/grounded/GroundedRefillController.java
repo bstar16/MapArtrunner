@@ -100,7 +100,11 @@ public final class GroundedRefillController {
         this.actionCooldown = 0;
         this.state = RefillState.NAVIGATING;
         if (baritone != null) {
-            baritone.goNear(targetSupply.pos(), CONTAINER_REACH_FLAT);
+            BaritoneFacade.CommandResult result = baritone.goNear(targetSupply.pos(), CONTAINER_REACH_FLAT);
+            if (!result.success()) {
+                fail("Failed to start supply navigation near " + targetSupply.pos().toShortString() + ": " + result.message());
+                return false;
+            }
         }
         return true;
     }
