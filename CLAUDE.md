@@ -57,6 +57,8 @@ in a 5-wide corridor, serpentining until the schematic is complete.
 - Do not change lane planning logic unless the prompt explicitly asks
 - Do not change smart resume logic unless the prompt explicitly asks
 - Do not jump ahead in the roadmap unless explicitly asked
+- Before implementing any new system, check whether the existing codebase 
+already solves this problem. Reuse before reinvent.
 
 ### Commands
 - Keep /mapart as the main command namespace
