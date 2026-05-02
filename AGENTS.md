@@ -84,6 +84,9 @@ Before proposing any fix, trace the full execution path end to end.
 
 Do not fix only the surface symptom.
 
+Before implementing any new system, check whether the existing codebase 
+already solves this problem. Reuse before reinvent.
+
 For movement bugs, trace at least:
 
 ```text
