@@ -650,7 +650,7 @@ public final class GroundedSingleLaneDebugRunner {
         if (client != null) {
             clearControls(client);
         }
-        if (triggerRefillForMissingMaterialIds(client, preflight.missingItems())) {
+        if (triggerRefillForMissingMaterialIds(client, preflight.missingItemDeficits())) {
             awaitingStartApproach = false;
             startApproachIssued = false;
             traceGroundedEvent("preflight refill started due to missing materials");
@@ -665,10 +665,10 @@ public final class GroundedSingleLaneDebugRunner {
 
     private PreflightMaterialCheckResult evaluatePreflightMaterialCheck(MinecraftClient client) {
         if (client == null || client.player == null) {
-            return new PreflightMaterialCheckResult(true, 0, 0, List.of(), List.of(), List.of());
+            return new PreflightMaterialCheckResult(true, 0, 0, List.of(), List.of(), Map.of(), List.of());
         }
         if (client != null && client.player != null && client.player.getAbilities().creativeMode) {
-            return new PreflightMaterialCheckResult(true, 0, 0, List.of(), List.of(), List.of());
+            return new PreflightMaterialCheckResult(true, 0, 0, List.of(), List.of(), Map.of(), List.of());
         }
         Map<Item, Integer> heldCounts = countItemsInInventory(client.player);
         List<GroundedSweepPlacementExecutor.PlacementTarget> preflightTargets = pendingPlacementTargets.stream()
@@ -731,12 +731,16 @@ public final class GroundedSingleLaneDebugRunner {
             requiredCounts.merge(expectedItem, 1, Integer::sum);
         }
         List<Item> missingItems = new ArrayList<>();
+        Map<Identifier, Integer> missingItemDeficits = new LinkedHashMap<>();
         for (Map.Entry<Item, Integer> entry : requiredCounts.entrySet()) {
             int held = inventoryCounts.getOrDefault(entry.getKey(), 0);
             if (held < entry.getValue()) {
                 missingItems.add(entry.getKey());
                 Identifier itemId = Registries.ITEM.getId(entry.getKey());
                 missingBlockIds.add(itemId != null ? itemId.toString() : entry.getKey().toString());
+                if (itemId != null) {
+                    missingItemDeficits.put(itemId, entry.getValue() - held);
+                }
             }
         }
         return new PreflightMaterialCheckResult(
@@ -745,17 +749,14 @@ public final class GroundedSingleLaneDebugRunner {
                 uniqueRequiredItems.size(),
                 List.copyOf(missingBlockIds),
                 List.copyOf(missingItems),
+                Map.copyOf(missingItemDeficits),
                 List.copyOf(unsupportedBlocks)
         );
     }
 
-    private boolean triggerRefillForMissingMaterialIds(MinecraftClient client, List<Item> neededItems) {
-        if (neededItems.isEmpty() || supplyStore == null || refillController.isActive() || recoveryState.isActive()) {
+    private boolean triggerRefillForMissingMaterialIds(MinecraftClient client, Map<Identifier, Integer> deficitMap) {
+        if (deficitMap.isEmpty() || supplyStore == null || refillController.isActive() || recoveryState.isActive()) {
             return false;
-        }
-        Map<Identifier, Integer> deficitMap = new LinkedHashMap<>();
-        for (Item item : neededItems) {
-            deficitMap.merge(Registries.ITEM.getId(item), 1, Integer::sum);
         }
         BlockPos returnTarget = selectRefillReturnTarget(client);
         traceGroundedEvent("grounded refill request created: source=preflight");
@@ -3383,6 +3384,7 @@ public final class GroundedSingleLaneDebugRunner {
             int checkedUniqueBlockCount,
             List<String> missingBlockIds,
             List<Item> missingItems,
+            Map<Identifier, Integer> missingItemDeficits,
             List<String> unsupportedBlocks
     ) {
     }
