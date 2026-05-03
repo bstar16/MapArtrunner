@@ -1,4 +1,4 @@
-# AGENT.md — MapArtRunner Agent Instructions
+# AGENTS.md — MapArtRunner Agent Instructions
 
 Project-specific instructions for AI coding agents working on MapArtRunner.
 
