@@ -89,3 +89,13 @@ Do not skip ahead unless explicitly told to.
   tick before yaw was committed
 - Transition support null crash — pendingShiftLane/laneShiftPlan cleared on 
   failure then accessed by tickLaneShift()
+
+The codebase currently has two parallel build/refill paths:
+- BuildCoordinator (used by /mapart start) — older
+- GroundedSingleLaneDebugRunner / GroundedRefillController 
+  (used by /mapart debug grounded-sweep start) — current focus
+
+When fixing the grounded sweep, ALWAYS apply changes to the grounded path 
+files. Do not modify BuildCoordinator unless explicitly asked. The two 
+paths will be unified in a future cleanup pass — for now, fixes go to the 
+grounded path only.

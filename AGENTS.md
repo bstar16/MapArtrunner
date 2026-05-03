@@ -87,6 +87,16 @@ Do not fix only the surface symptom.
 Before implementing any new system, check whether the existing codebase 
 already solves this problem. Reuse before reinvent.
 
+The codebase currently has two parallel build/refill paths:
+- BuildCoordinator (used by /mapart start) — older
+- GroundedSingleLaneDebugRunner / GroundedRefillController 
+  (used by /mapart debug grounded-sweep start) — current focus
+
+When fixing the grounded sweep, ALWAYS apply changes to the grounded path 
+files. Do not modify BuildCoordinator unless explicitly asked. The two 
+paths will be unified in a future cleanup pass — for now, fixes go to the 
+grounded path only.
+
 For movement bugs, trace at least:
 
 ```text
