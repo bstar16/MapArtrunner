@@ -291,6 +291,7 @@ public final class GroundedRefillController {
             MapArtMod.LOGGER.info("[grounded-trace:refill] all deficits satisfied, transitioning: returnTarget={}",
                     returnTarget);
             closeScreen(client);
+            MapArtMod.LOGGER.info("[grounded-trace:refill] screen closed before state transition");
             if (returnTarget != null && baritone != null) {
                 baritone.goNear(returnTarget, CONTAINER_REACH_FLAT);
                 state = RefillState.RETURNING;
@@ -365,6 +366,12 @@ public final class GroundedRefillController {
         }
         if (client == null || client.player == null) {
             return TickResult.ACTIVE;
+        }
+        // Defensive: ensure screen is closed before navigation
+        if (currentSupplyScreen(client) != null) {
+            closeScreen(client);
+            MapArtMod.LOGGER.info("[grounded-trace:refill] screen still open on return entry, closing");
+            return TickResult.ACTIVE; // Wait one tick after closing
         }
         BlockPos playerPos = client.player.getBlockPos();
         double dx = playerPos.getX() - returnTarget.getX();
@@ -523,6 +530,7 @@ public final class GroundedRefillController {
 
     private static void closeScreen(MinecraftClient client) {
         if (client != null && client.player != null && client.currentScreen instanceof HandledScreen<?>) {
+            MapArtMod.LOGGER.info("[grounded-trace:refill] closing container screen");
             client.player.closeHandledScreen();
         }
     }
