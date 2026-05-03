@@ -32,6 +32,8 @@ import java.util.HashSet;
 public final class GroundedRefillController {
     // Constants
     static final int NAV_TIMEOUT_TICKS = 400;
+    private static final int NO_PROGRESS_CHECK_INTERVAL_TICKS = 200;
+    private static final double MIN_PROGRESS_BLOCKS = 1.0;
     private static final int CONTAINER_REACH_FLAT = 4;
     private static final int RETURN_REACH_FLAT = 4;
     private static final int CONTAINER_OPEN_WAIT_POLLS = 5;
@@ -58,6 +60,8 @@ public final class GroundedRefillController {
     private BlockPos returnTarget;
     private String failureMessage;
     private int navTicksRemaining;
+    private double lastProgressCheckDistance;
+    private int ticksSinceLastProgressCheck;
     private int containerOpenWaitPollsRemaining;
     private boolean awaitingContainerScreen;
     private int actionCooldown;
@@ -106,6 +110,8 @@ public final class GroundedRefillController {
     private boolean navigateToSupply(SupplyPoint supply, BaritoneFacade baritone) {
         this.targetSupply = supply;
         this.navTicksRemaining = NAV_TIMEOUT_TICKS;
+        this.lastProgressCheckDistance = Double.MAX_VALUE;
+        this.ticksSinceLastProgressCheck = 0;
         this.awaitingContainerScreen = false;
         this.actionCooldown = 0;
         this.state = RefillState.NAVIGATING;
@@ -150,6 +156,8 @@ public final class GroundedRefillController {
 
     void simulateNavTimeoutForTests() {
         navTicksRemaining = 0;
+        ticksSinceLastProgressCheck = NO_PROGRESS_CHECK_INTERVAL_TICKS;
+        lastProgressCheckDistance = 1000.0;
     }
 
     public TickResult tick(MinecraftClient client, BaritoneFacade baritone) {
@@ -174,14 +182,16 @@ public final class GroundedRefillController {
             fail("Refill navigation target is missing.");
             return TickResult.FAILED;
         }
-        navTicksRemaining--;
-        if (navTicksRemaining <= 0) {
-            fail("Navigation to supply #" + targetSupply.id() + " at " + targetSupply.pos().toShortString() + " timed out.");
-            return TickResult.FAILED;
-        }
+
         if (client == null || client.player == null) {
+            navTicksRemaining--;
+            if (navTicksRemaining <= 0) {
+                fail("Navigation to supply #" + targetSupply.id() + " at " + targetSupply.pos().toShortString() + " failed.");
+                return TickResult.FAILED;
+            }
             return TickResult.ACTIVE;
         }
+
         BlockPos playerPos = client.player.getBlockPos();
         if (isWithinContainerReach(playerPos, targetSupply.pos())) {
             if (baritone != null) {
@@ -191,7 +201,26 @@ public final class GroundedRefillController {
             awaitingContainerScreen = false;
             containerOpenWaitPollsRemaining = 0;
             actionCooldown = 0;
+            return TickResult.ACTIVE;
         }
+
+        ticksSinceLastProgressCheck++;
+        if (ticksSinceLastProgressCheck >= NO_PROGRESS_CHECK_INTERVAL_TICKS) {
+            double currentDistance = playerPos.getSquaredDistance(targetSupply.pos());
+
+            if (lastProgressCheckDistance != Double.MAX_VALUE) {
+                double progressMade = Math.sqrt(lastProgressCheckDistance) - Math.sqrt(currentDistance);
+                if (progressMade < MIN_PROGRESS_BLOCKS) {
+                    fail("Navigation to supply #" + targetSupply.id() + " at " + targetSupply.pos().toShortString()
+                            + " failed: no progress made in the last " + NO_PROGRESS_CHECK_INTERVAL_TICKS + " ticks.");
+                    return TickResult.FAILED;
+                }
+            }
+
+            lastProgressCheckDistance = currentDistance;
+            ticksSinceLastProgressCheck = 0;
+        }
+
         return TickResult.ACTIVE;
     }
 
@@ -459,6 +488,8 @@ public final class GroundedRefillController {
         returnTarget = null;
         failureMessage = null;
         navTicksRemaining = 0;
+        lastProgressCheckDistance = Double.MAX_VALUE;
+        ticksSinceLastProgressCheck = 0;
         awaitingContainerScreen = false;
         containerOpenWaitPollsRemaining = 0;
         actionCooldown = 0;
