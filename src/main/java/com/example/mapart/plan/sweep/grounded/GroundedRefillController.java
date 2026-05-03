@@ -49,6 +49,11 @@ public final class GroundedRefillController {
     private List<SupplyPoint> supplyCandidates = List.of();
     private int supplyCandidateIndex = 0;
     private SupplyPoint targetSupply;
+    /**
+     * Map of item ID to TOTAL count required.
+     * Value represents the absolute count the player should have (NOT deficit).
+     * Refill pulls items until player inventory >= these totals.
+     */
     private Map<Identifier, Integer> deficits = Map.of();
     private BlockPos returnTarget;
     private String failureMessage;
@@ -503,7 +508,13 @@ public final class GroundedRefillController {
         return held;
     }
 
-    private static Map<Identifier, Integer> computeRemainingDeficits(ClientPlayerEntity player, Map<Identifier, Integer> targetDeficits) {
+    /**
+     * Computes remaining deficit by comparing current player inventory against target totals.
+     * @param player The player whose inventory to check
+     * @param targetTotals Map of item ID to TOTAL count required (NOT deficit)
+     * @return Map of item ID to remaining deficit (how many more needed)
+     */
+    private static Map<Identifier, Integer> computeRemainingDeficits(ClientPlayerEntity player, Map<Identifier, Integer> targetTotals) {
         Map<Identifier, Integer> inventory = new LinkedHashMap<>();
         for (int slot = 0; slot < PlayerInventory.MAIN_SIZE; slot++) {
             ItemStack stack = player.getInventory().getStack(slot);
@@ -512,12 +523,15 @@ public final class GroundedRefillController {
             }
         }
         Map<Identifier, Integer> remaining = new LinkedHashMap<>();
-        targetDeficits.forEach((id, count) -> {
-            int deficit = count - inventory.getOrDefault(id, 0);
+        targetTotals.forEach((id, totalRequired) -> {
+            int currentCount = inventory.getOrDefault(id, 0);
+            int deficit = totalRequired - currentCount;
             if (deficit > 0) {
                 remaining.put(id, deficit);
             }
         });
+        MapArtMod.LOGGER.info("[grounded-trace:refill] computeRemainingDeficits: targetTotals={}, currentInventory={}, remaining={}",
+                targetTotals, inventory, remaining);
         return remaining;
     }
 }

@@ -650,7 +650,7 @@ public final class GroundedSingleLaneDebugRunner {
         if (client != null) {
             clearControls(client);
         }
-        if (triggerRefillForMissingMaterialIds(client, preflight.missingItemDeficits())) {
+        if (triggerRefillForMissingMaterialIds(client, preflight.requiredItemCounts())) {
             awaitingStartApproach = false;
             startApproachIssued = false;
             traceGroundedEvent("preflight refill started due to missing materials");
@@ -731,7 +731,12 @@ public final class GroundedSingleLaneDebugRunner {
             requiredCounts.merge(expectedItem, 1, Integer::sum);
         }
         List<Item> missingItems = new ArrayList<>();
-        Map<Identifier, Integer> missingItemDeficits = new LinkedHashMap<>();
+        /**
+         * Map of item ID to TOTAL count required for checked targets.
+         * This is the absolute count needed (NOT a deficit).
+         * GroundedRefillController will pull items until player inventory meets these totals.
+         */
+        Map<Identifier, Integer> requiredItemCounts = new LinkedHashMap<>();
         for (Map.Entry<Item, Integer> entry : requiredCounts.entrySet()) {
             int held = inventoryCounts.getOrDefault(entry.getKey(), 0);
             if (held < entry.getValue()) {
@@ -739,7 +744,8 @@ public final class GroundedSingleLaneDebugRunner {
                 Identifier itemId = Registries.ITEM.getId(entry.getKey());
                 missingBlockIds.add(itemId != null ? itemId.toString() : entry.getKey().toString());
                 if (itemId != null) {
-                    missingItemDeficits.put(itemId, entry.getValue() - held);
+                    // Store TOTAL required, not deficit (entry.getValue() - held)
+                    requiredItemCounts.put(itemId, entry.getValue());
                 }
             }
         }
@@ -749,7 +755,7 @@ public final class GroundedSingleLaneDebugRunner {
                 uniqueRequiredItems.size(),
                 List.copyOf(missingBlockIds),
                 List.copyOf(missingItems),
-                Map.copyOf(missingItemDeficits),
+                Map.copyOf(requiredItemCounts),
                 List.copyOf(unsupportedBlocks)
         );
     }
@@ -3378,13 +3384,17 @@ public final class GroundedSingleLaneDebugRunner {
         }
     }
 
+    /**
+     * Preflight material check result.
+     * @param requiredItemCounts Map of item ID to TOTAL count required for checked targets (NOT deficit).
+     */
     private record PreflightMaterialCheckResult(
             boolean creativeSkipped,
             int checkedTargetCount,
             int checkedUniqueBlockCount,
             List<String> missingBlockIds,
             List<Item> missingItems,
-            Map<Identifier, Integer> missingItemDeficits,
+            Map<Identifier, Integer> requiredItemCounts,
             List<String> unsupportedBlocks
     ) {
     }
