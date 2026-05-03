@@ -10,6 +10,7 @@ import com.example.mapart.plan.sweep.LeftoverTracker;
 import com.example.mapart.plan.sweep.SingleLaneSweepDebugRunner;
 import com.example.mapart.plan.sweep.SweepPassResult;
 import com.example.mapart.plan.sweep.grounded.GroundedRefillController;
+import com.example.mapart.plan.sweep.grounded.GroundedRecoveryState;
 import com.example.mapart.plan.sweep.grounded.GroundedSingleLaneDebugRunner;
 import com.example.mapart.plan.sweep.grounded.GroundedSweepLeftoverTracker;
 import com.example.mapart.plan.sweep.grounded.GroundedSweepSettings;
@@ -286,7 +287,12 @@ public final class MapArtCommand {
                                 .then(ClientCommandManager.literal("status")
                                         .executes(context -> groundedRecoveryStatus(context.getSource())))
                                 .then(ClientCommandManager.literal("clear")
-                                        .executes(context -> groundedRecoveryClear(context.getSource()))))
+                                        .executes(context -> groundedRecoveryClear(context.getSource())))
+                                .then(ClientCommandManager.literal("auto")
+                                        .then(ClientCommandManager.literal("on")
+                                                .executes(context -> groundedRecoveryAutoOn(context.getSource())))
+                                        .then(ClientCommandManager.literal("off")
+                                                .executes(context -> groundedRecoveryAutoOff(context.getSource())))))
                         .then(ClientCommandManager.literal("grounded-refill")
                                 .then(ClientCommandManager.literal("cancel")
                                         .executes(context -> groundedRefillCancel(context.getSource()))))
@@ -587,12 +593,15 @@ public final class MapArtCommand {
             return 0;
         }
 
-        if (!runner.getRecoveryState().isActive()) {
-            source.sendFeedback(Text.literal("No recovery is active."));
-            return 0;
+        GroundedRecoveryState recoveryState = runner.getRecoveryState();
+        source.sendFeedback(Text.literal("Recovery auto-resume: " + (recoveryState.isAutoResumeEnabled() ? "enabled" : "disabled")));
+
+        if (!recoveryState.isActive()) {
+            source.sendFeedback(Text.literal("No recovery is currently active."));
+            return 1;
         }
 
-        var snapshot = runner.getRecoveryState().snapshot().orElseThrow();
+        var snapshot = recoveryState.snapshot().orElseThrow();
         source.sendFeedback(Text.literal("Recovery active:"));
         source.sendFeedback(Text.literal("  Reason: " + snapshot.reason()));
         source.sendFeedback(Text.literal("  Lane: " + snapshot.activeLane().laneIndex() + " " + snapshot.laneDirection()));
@@ -600,6 +609,15 @@ public final class MapArtCommand {
         source.sendFeedback(Text.literal("  Last safe progress: " + String.format("%.2f", snapshot.lastKnownSafeProgressCoordinate())));
         source.sendFeedback(Text.literal("  Player position: " + String.format("%.2f, %.2f, %.2f",
                 snapshot.playerPosition().x, snapshot.playerPosition().y, snapshot.playerPosition().z)));
+
+        if (recoveryState.isStabilizing()) {
+            source.sendFeedback(Text.literal("  Status: Stabilizing..."));
+        } else if (recoveryState.isRetrying()) {
+            source.sendFeedback(Text.literal("  Status: Retrying auto-resume (waiting for player to stabilize)"));
+        } else if (recoveryState.isReadyForAutoResume()) {
+            source.sendFeedback(Text.literal("  Status: Ready for auto-resume"));
+        }
+
         return 1;
     }
 
@@ -657,6 +675,30 @@ public final class MapArtCommand {
 
         runner.getRecoveryState().clear();
         source.sendFeedback(Text.literal("Recovery state cleared. You can now issue a fresh start or smart resume."));
+        return 1;
+    }
+
+    private static int groundedRecoveryAutoOn(FabricClientCommandSource source) {
+        GroundedSingleLaneDebugRunner runner = MapArtRuntime.groundedSingleLaneDebugRunner();
+        if (runner == null) {
+            source.sendError(Text.literal("Grounded sweep debug runner is unavailable."));
+            return 0;
+        }
+
+        runner.getRecoveryState().setAutoResumeEnabled(true);
+        source.sendFeedback(Text.literal("Recovery auto-resume enabled. When recovery triggers, the sweep will automatically resume after stabilization."));
+        return 1;
+    }
+
+    private static int groundedRecoveryAutoOff(FabricClientCommandSource source) {
+        GroundedSingleLaneDebugRunner runner = MapArtRuntime.groundedSingleLaneDebugRunner();
+        if (runner == null) {
+            source.sendError(Text.literal("Grounded sweep debug runner is unavailable."));
+            return 0;
+        }
+
+        runner.getRecoveryState().setAutoResumeEnabled(false);
+        source.sendFeedback(Text.literal("Recovery auto-resume disabled. You must manually resume sweep after recovery triggers."));
         return 1;
     }
 

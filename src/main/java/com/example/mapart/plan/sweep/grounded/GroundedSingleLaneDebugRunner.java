@@ -350,6 +350,7 @@ public final class GroundedSingleLaneDebugRunner {
         traceGroundedSnapshot(client);
 
         if (recoveryState.isActive()) {
+            tickRecovery(client);
             return;
         }
 
@@ -541,8 +542,104 @@ public final class GroundedSingleLaneDebugRunner {
 
         traceGroundedEvent("recovery triggered: " + reasonText);
         if (client.player != null) {
-            client.player.sendMessage(Text.literal("[Mapart grounded] Recovery triggered: " + reasonText), false);
+            client.player.sendMessage(Text.literal("[Mapart grounded] Recovery triggered: " + reasonText + ". Stabilizing..."), false);
         }
+    }
+
+    private void tickRecovery(MinecraftClient client) {
+        if (!recoveryState.isActive()) {
+            return;
+        }
+
+        // Phase 1: Stabilization period
+        if (recoveryState.isStabilizing()) {
+            recoveryState.tickStabilization();
+            if (!recoveryState.isStabilizing()) {
+                // Stabilization complete
+                if (recoveryState.isAutoResumeEnabled()) {
+                    traceGroundedEvent("recovery stabilized, checking if auto-resume is possible");
+                    if (client.player != null) {
+                        client.player.sendMessage(Text.literal("[Mapart grounded] Recovery stabilized. Checking if safe to auto-resume..."), false);
+                    }
+                } else {
+                    traceGroundedEvent("recovery stabilized, auto-resume disabled");
+                    if (client.player != null) {
+                        client.player.sendMessage(Text.literal("[Mapart grounded] Recovery stabilized. Auto-resume disabled — run /mapart debug grounded-sweep start to continue."), false);
+                    }
+                }
+            }
+            return;
+        }
+
+        // Phase 2: Auto-resume if enabled
+        if (recoveryState.isReadyForAutoResume()) {
+            if (isPlayerInSaneState(client)) {
+                // Player is in good state, auto-resume
+                BuildSession session = activeSession;
+                GroundedSweepSettings settings = activeSettings;
+                recoveryState.clear();
+
+                if (session == null || settings == null) {
+                    if (client.player != null) {
+                        client.player.sendMessage(
+                                Text.literal("[Mapart grounded] Recovery auto-resume failed: session state was lost."),
+                                false);
+                    }
+                    return;
+                }
+
+                traceGroundedEvent("recovery auto-resume: resuming sweep with smart resume");
+                if (client.player != null) {
+                    client.player.sendMessage(
+                            Text.literal("[Mapart grounded] Recovery auto-resume: restarting sweep with smart resume."),
+                            false);
+                }
+
+                Optional<String> err = startFullSweep(session, settings);
+                if (err.isPresent() && client.player != null) {
+                    client.player.sendMessage(
+                            Text.literal("[Mapart grounded] Recovery auto-resume failed: " + err.get()),
+                            false);
+                }
+            } else {
+                // Player not in sane state, retry
+                recoveryState.tickRetry();
+                if (!recoveryState.hasRetriesRemaining()) {
+                    // Out of retries
+                    traceGroundedEvent("recovery auto-resume failed: player not in sane state after 10 seconds");
+                    if (client.player != null) {
+                        client.player.sendMessage(
+                                Text.literal("[Mapart grounded] Recovery failed to stabilize after 10 seconds. Manual intervention required."),
+                                false);
+                    }
+                    // Keep recovery active so sweep doesn't continue in bad state
+                }
+            }
+        }
+    }
+
+    private boolean isPlayerInSaneState(MinecraftClient client) {
+        if (client == null || client.player == null || client.world == null) {
+            return false;
+        }
+
+        Vec3d playerPos = client.player.getEntityPos();
+
+        // Check if player is still falling
+        if (client.player.getVelocity().y < -0.5) {
+            return false;
+        }
+
+        // Check if player is in lava
+        if (client.player.isInLava()) {
+            return false;
+        }
+
+        // Check if player is on solid ground or at least has stopped moving vertically
+        boolean onGround = client.player.isOnGround();
+        boolean stableVertically = Math.abs(client.player.getVelocity().y) < 0.1;
+
+        return onGround || stableVertically;
     }
 
     private boolean triggerRefill(MinecraftClient client, Item requiredItem) {
@@ -778,11 +875,18 @@ public final class GroundedSingleLaneDebugRunner {
             return false;
         }
 
+        // Build lookahead across current and future lanes to utilize full inventory
+        List<GroundedSweepPlacementExecutor.PlacementTarget> lookaheadTargets = buildRefillLookaheadPlacements(MAX_REFILL_LOOKAHEAD_ITEMS);
+
         Map<Item, Integer> neededCounts = new HashMap<>();
-        int lookaheadLimit = Math.min(pendingPlacementTargets.size(), MAX_REFILL_LOOKAHEAD_ITEMS);
-        for (int i = 0; i < lookaheadLimit; i++) {
-            GroundedSweepPlacementExecutor.PlacementTarget target = pendingPlacementTargets.get(i);
+        for (GroundedSweepPlacementExecutor.PlacementTarget target : lookaheadTargets) {
             Placement placement = lanePlacementsByIndex.get(target.placementIndex());
+            if (placement == null || placement.block() == null) {
+                // Placement might be from a future lane, fetch from plan directly
+                if (activeSession != null && target.placementIndex() >= 0 && target.placementIndex() < activeSession.getPlan().placements().size()) {
+                    placement = activeSession.getPlan().placements().get(target.placementIndex());
+                }
+            }
             if (placement == null || placement.block() == null) {
                 continue;
             }
@@ -1919,6 +2023,57 @@ public final class GroundedSingleLaneDebugRunner {
                 + " sweepHalfWidth=" + sweepHalfWidth);
 
         return List.copyOf(targets);
+    }
+
+    /**
+     * Builds a read-only lookahead view of upcoming placements across current and future lanes
+     * in serpentine order, capped at maxItems. Used for refill deficit scanning to fill entire
+     * inventory with materials needed across multiple lanes.
+     * Does NOT activate future lanes or mutate sweep state.
+     */
+    private List<GroundedSweepPlacementExecutor.PlacementTarget> buildRefillLookaheadPlacements(int maxItems) {
+        if (activeSession == null || activeBounds == null || activeSettings == null || runMode != SweepRunMode.FULL_SWEEP) {
+            return List.copyOf(pendingPlacementTargets.subList(0, Math.min(pendingPlacementTargets.size(), maxItems)));
+        }
+
+        List<GroundedSweepPlacementExecutor.PlacementTarget> lookahead = new ArrayList<>(maxItems);
+        Map<Integer, Integer> laneBreakdown = new LinkedHashMap<>();
+
+        // Add remaining placements from current lane
+        int remainingInCurrentLane = Math.min(pendingPlacementTargets.size(), maxItems);
+        lookahead.addAll(pendingPlacementTargets.subList(0, remainingInCurrentLane));
+        if (activeLane != null) {
+            laneBreakdown.put(activeLane.laneIndex(), remainingInCurrentLane);
+        }
+
+        // Scan future lanes in serpentine order until we hit maxItems
+        List<GroundedSweepLane> activeLaneList = sweepPassPhase == SweepPassPhase.FORWARD ? forwardLanes : reverseLanes;
+        for (int futureLaneIndex = laneCursor + 1; futureLaneIndex < activeLaneList.size() && lookahead.size() < maxItems; futureLaneIndex++) {
+            GroundedSweepLane futureLane = activeLaneList.get(futureLaneIndex);
+            Map<Integer, Placement> tempPlacementLookup = new HashMap<>();
+            List<GroundedSweepPlacementExecutor.PlacementTarget> futureLanePlacements = buildLanePlacementTargets(
+                    activeSession.getPlan(),
+                    activeSession.getOrigin(),
+                    activeBounds,
+                    futureLane,
+                    activeSettings.sweepHalfWidth(),
+                    tempPlacementLookup,
+                    Set.of(),
+                    Optional.empty()
+            );
+
+            int toTake = Math.min(futureLanePlacements.size(), maxItems - lookahead.size());
+            lookahead.addAll(futureLanePlacements.subList(0, toTake));
+            laneBreakdown.put(futureLane.laneIndex(), toTake);
+        }
+
+        // Log breakdown
+        StringBuilder breakdown = new StringBuilder("lookahead window built: ");
+        laneBreakdown.forEach((laneIdx, count) -> breakdown.append("lane#").append(laneIdx).append("=").append(count).append(" "));
+        breakdown.append("→ total=").append(lookahead.size()).append(" capped at ").append(maxItems);
+        traceGroundedEvent(breakdown.toString());
+
+        return lookahead;
     }
 
     private static int lateralDeltaFromCenterline(GroundedLaneDirection direction, int centerlineCoordinate, BlockPos worldPos) {
