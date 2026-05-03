@@ -74,14 +74,23 @@ already solves this problem. Reuse before reinvent.
 - Test: ./gradlew test
 
 ## Current roadmap order
+
 Do not skip ahead unless explicitly told to.
-1. ✅ Recovery (Prompt 9)
-2. ✅ Refill (Prompt 10)
-3. Smart skip/resume polish (Prompt 11)
-4. Leftover/reverse cleanup hardening (Prompt 12)
-5. Command cleanup and release prep (Prompt 13)
-6. Documentation / README / usage guide (Prompt 14)
-7. Discord webhook notifications (Prompt 14b — after 14)
+
+### Completed
+
+- ✅ Prompt 9: Recovery — recovery system with auto-resume after stabilization
+- ✅ Prompt 10: Refill — full inventory utilization, multi-block-type, prioritization, smart resume after refill
+- ✅ Prompt 12 (largely): Leftover/reverse cleanup hardening — skip reverse if no leftovers, only visit lanes with leftovers
+
+### Still to do
+
+- ⏳ Prompt 11: Smart skip/resume polish — improving smart resume for completed lanes, partial lanes, recovery resumes, refill returns. Some of this has been done implicitly through the refill work but the formal polish prompt hasn't been run
+- ⏳ AFK Alarm — looping ding sound for unrecoverable failures (prompt is drafted, ready to use)
+- ⏳ Architectural cleanup — unifying the BuildCoordinator path and grounded sweep path. Recommended between Prompts 12 and 13
+- ⏳ Prompt 13: Command cleanup and release prep — clean up duplicate aliases, organize debug commands, prepare for release
+- ⏳ Prompt 14: Documentation / README / usage guide
+- ⏳ Prompt 14b: Discord webhook notifications — slot this in after Prompt 14
 
 ## Known fixed bugs — do not reintroduce
 - lateralStrafeSign() fix (PR #166) — WEST/SOUTH strafe direction
