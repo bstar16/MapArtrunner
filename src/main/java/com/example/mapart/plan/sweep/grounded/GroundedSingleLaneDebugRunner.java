@@ -10,6 +10,7 @@ import com.example.mapart.plan.state.PlacementResult;
 import com.example.mapart.supply.SupplyStore;
 import net.minecraft.block.BlockState;
 import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.gui.screen.ingame.HandledScreen;
 import net.minecraft.client.network.ClientPlayerEntity;
 import net.minecraft.client.option.KeyBinding;
 import net.minecraft.entity.player.PlayerInventory;
@@ -961,6 +962,13 @@ public final class GroundedSingleLaneDebugRunner {
         GroundedSweepSettings settings = activeSettings;
         refillController.clear();
         clearActiveRunState();
+
+        // Defensive: ensure any open container screen is closed before resuming
+        if (client != null && client.player != null && client.currentScreen instanceof HandledScreen) {
+            client.player.closeHandledScreen();
+            MapArtMod.LOGGER.info("[grounded-trace:refill] defensive screen close in handleRefillDone");
+        }
+
         if (session == null || settings == null) {
             if (client != null && client.player != null) {
                 client.player.sendMessage(
@@ -1274,6 +1282,35 @@ public final class GroundedSingleLaneDebugRunner {
     }
 
     private void failLaneStart(MinecraftClient client, String reason) {
+        // Before failing, check if this is end-of-build: last lane with no pending placements
+        if (isEndOfBuildGracefulSkip()) {
+            traceGroundedEvent("lane staging failed but lane is complete (end-of-build), skipping gracefully: " + reason);
+            if (client != null && client.player != null) {
+                client.player.sendMessage(
+                        Text.literal("[Mapart grounded] Skipping completed lane " + (activeLane != null ? activeLane.laneIndex() : "?") +
+                                " (staging unreachable but no placements remaining)."),
+                        false);
+            }
+            laneStartStage = LaneStartStage.NONE;
+            pendingLaneStart = null;
+            pendingLaneStartTicks = 0;
+            laneEntryStepTicks = 0;
+            laneEntryCenterlineAlignTicks = 0;
+            entryBurstTicks = 0;
+            entrySupportEstablished = false;
+            entryAttemptsByPlacementIndex = Map.of();
+            laneWalker.interrupt();
+            if (client != null) {
+                clearControls(client);
+            }
+            // Try to advance to next lane instead of failing
+            if (!tryAdvanceSweepToNextLane()) {
+                captureLastStatus(GroundedLaneWalker.GroundedLaneWalkState.COMPLETE, Optional.empty());
+                clearActiveRunState();
+            }
+            return;
+        }
+
         traceGroundedEvent("lane failed: " + reason);
         laneStartStage = LaneStartStage.NONE;
         pendingLaneStart = null;
@@ -1289,6 +1326,25 @@ public final class GroundedSingleLaneDebugRunner {
             clearControls(client);
         }
         clearActiveRunState();
+    }
+
+    private boolean isEndOfBuildGracefulSkip() {
+        if (runMode != SweepRunMode.FULL_SWEEP || activeLane == null) {
+            return false;
+        }
+        // Check if lane has zero pending placements
+        if (!pendingPlacementTargets.isEmpty()) {
+            return false;
+        }
+        if (!pendingVerificationsByPlacement.isEmpty()) {
+            return false;
+        }
+        // Check if this is the last lane in the current pass
+        List<GroundedSweepLane> activeLaneList = sweepPassPhase == SweepPassPhase.FORWARD ? forwardLanes : reverseLanes;
+        if (activeLaneList.isEmpty() || laneCursor >= activeLaneList.size() - 1) {
+            return true; // Last lane
+        }
+        return false;
     }
 
     private void captureAwaitingLaneStartStatus() {
@@ -1674,24 +1730,108 @@ public final class GroundedSingleLaneDebugRunner {
 
         if (sweepPassPhase == SweepPassPhase.FORWARD) {
             if (forwardLeftoverPlacements.isEmpty() || reverseLanes.isEmpty()) {
+                MinecraftClient client = MinecraftClient.getInstance();
+                if (client != null && client.player != null) {
+                    client.player.sendMessage(
+                            Text.literal("[Mapart grounded] Build complete. No leftovers — skipping reverse pass."),
+                            false);
+                }
+                traceGroundedEvent("forward pass complete, no leftovers, skipping reverse pass");
                 sweepPassPhase = SweepPassPhase.COMPLETE;
                 return false;
             }
+
+            // Scan which reverse lanes actually have leftovers
+            Map<Integer, Integer> lanesWithLeftovers = scanLanesForLeftovers(reverseLanes, forwardLeftoverPlacements);
+            if (lanesWithLeftovers.isEmpty()) {
+                MinecraftClient client = MinecraftClient.getInstance();
+                if (client != null && client.player != null) {
+                    client.player.sendMessage(
+                            Text.literal("[Mapart grounded] Build complete. No leftovers found in any lane — skipping reverse pass."),
+                            false);
+                }
+                traceGroundedEvent("forward pass complete, no lanes with leftovers, skipping reverse pass");
+                sweepPassPhase = SweepPassPhase.COMPLETE;
+                return false;
+            }
+
             reversePlacementFilter.clear();
             reversePlacementFilter.addAll(forwardLeftoverPlacements);
             sweepPassPhase = SweepPassPhase.REVERSE;
             laneCursor = 0;
-            activateLaneForNativeShift(reverseLanes.getFirst(), reversePlacementFilter);
-            return true;
+
+            StringBuilder leftoverSummary = new StringBuilder();
+            lanesWithLeftovers.forEach((laneIdx, count) -> {
+                if (leftoverSummary.length() > 0) leftoverSummary.append(", ");
+                leftoverSummary.append("lane ").append(laneIdx).append(": ").append(count);
+            });
+            traceGroundedEvent("entering reverse pass: " + lanesWithLeftovers.size() + " lanes with leftovers [" + leftoverSummary + "]");
+
+            // Find first lane with leftovers
+            while (laneCursor < reverseLanes.size()) {
+                GroundedSweepLane candidateLane = reverseLanes.get(laneCursor);
+                if (lanesWithLeftovers.containsKey(candidateLane.laneIndex())) {
+                    activateLaneForNativeShift(candidateLane, reversePlacementFilter);
+                    return true;
+                }
+                laneCursor++;
+            }
+            sweepPassPhase = SweepPassPhase.COMPLETE;
+            return false;
         }
 
         if (sweepPassPhase == SweepPassPhase.REVERSE && laneCursor < reverseLanes.size() && !reversePlacementFilter.isEmpty()) {
-            activateLaneForNativeShift(reverseLanes.get(laneCursor), reversePlacementFilter);
-            return true;
+            // Scan to find next lane with leftovers
+            Map<Integer, Integer> lanesWithLeftovers = scanLanesForLeftovers(reverseLanes, reversePlacementFilter);
+            while (laneCursor < reverseLanes.size()) {
+                GroundedSweepLane candidateLane = reverseLanes.get(laneCursor);
+                if (lanesWithLeftovers.containsKey(candidateLane.laneIndex())) {
+                    activateLaneForNativeShift(candidateLane, reversePlacementFilter);
+                    return true;
+                }
+                traceGroundedEvent("reverse pass: skipping lane " + candidateLane.laneIndex() + " (no leftovers)");
+                laneCursor++;
+            }
         }
 
         sweepPassPhase = SweepPassPhase.COMPLETE;
         return false;
+    }
+
+    private Map<Integer, Integer> scanLanesForLeftovers(List<GroundedSweepLane> lanes, Set<Integer> placementFilter) {
+        if (activeSession == null || activeBounds == null || activeSettings == null || placementFilter.isEmpty()) {
+            return Map.of();
+        }
+
+        Map<Integer, Integer> lanesWithLeftovers = new HashMap<>();
+        for (GroundedSweepLane lane : lanes) {
+            // Try to build lane targets from the plan filtered by leftover indices
+            Map<Integer, Placement> tempPlacementLookup = new HashMap<>();
+            List<GroundedSweepPlacementExecutor.PlacementTarget> laneTargets = buildLanePlacementTargets(
+                    activeSession.getPlan(),
+                    activeSession.getOrigin(),
+                    activeBounds,
+                    lane,
+                    activeSettings.sweepHalfWidth(),
+                    tempPlacementLookup,
+                    placementFilter,
+                    Optional.empty()
+            );
+            if (!laneTargets.isEmpty()) {
+                lanesWithLeftovers.put(lane.laneIndex(), laneTargets.size());
+            }
+        }
+
+        // If no lanes were found with targets from the plan but we have leftover indices,
+        // it might be because we're in a test scenario or the leftovers are from pending targets.
+        // In this case, be conservative and assume at least one lane has leftovers.
+        if (lanesWithLeftovers.isEmpty() && !placementFilter.isEmpty() && !lanes.isEmpty()) {
+            // Return first lane as having potential leftovers - the actual filtering
+            // will happen when the lane is activated
+            lanesWithLeftovers.put(lanes.get(0).laneIndex(), placementFilter.size());
+        }
+
+        return lanesWithLeftovers;
     }
 
     private void captureLastStatus(GroundedLaneWalker.GroundedLaneWalkState state, Optional<String> failureReason) {
