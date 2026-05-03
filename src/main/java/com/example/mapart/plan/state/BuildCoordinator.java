@@ -403,13 +403,20 @@ public class BuildCoordinator {
         }
 
         Map<Identifier, Integer> inventory = countInventoryMaterials(client.player);
-        Map<Identifier, Integer> missing = new LinkedHashMap<>();
-        required.forEach((id, count) -> {
-            int deficit = count - inventory.getOrDefault(id, 0);
-            if (deficit > 0) {
-                missing.put(id, deficit);
-            }
-        });
+        Map<Identifier, Integer> missing = required.entrySet().stream()
+                .map(entry -> {
+                    int deficit = entry.getValue() - inventory.getOrDefault(entry.getKey(), 0);
+                    return deficit > 0 ? Map.entry(entry.getKey(), deficit) : null;
+                })
+                .filter(entry -> entry != null)
+                .sorted(Map.Entry.<Identifier, Integer>comparingByValue(Comparator.reverseOrder())
+                        .thenComparing(entry -> entry.getKey().toString()))
+                .collect(Collectors.toMap(
+                        Map.Entry::getKey,
+                        Map.Entry::getValue,
+                        (a, b) -> a,
+                        LinkedHashMap::new
+                ));
 
         if (missing.isEmpty()) {
             session.setRefillStatus(null);
@@ -665,7 +672,7 @@ public class BuildCoordinator {
         }
 
         Map<Identifier, Integer> required = new LinkedHashMap<>();
-        int endIndex = computeRefillLookaheadEndIndex(startIndex, plan.placements().size());
+        int endIndex = computeRegionAwareLookaheadEndIndex(startIndex, plan.regions(), plan.placements().size());
         for (int i = startIndex; i < endIndex; i++) {
             Placement placement = plan.placements().get(i);
             Identifier id = Registries.BLOCK.getId(placement.block());
@@ -708,6 +715,25 @@ public class BuildCoordinator {
             return Math.max(0, Math.min(startIndex, totalPlacements));
         }
         return Math.min(totalPlacements, startIndex + MAX_REFILL_LOOKAHEAD_ITEMS);
+    }
+
+    private int computeRegionAwareLookaheadEndIndex(int startIndex, List<Region> regions, int totalPlacements) {
+        if (startIndex < 0 || totalPlacements <= 0 || startIndex >= totalPlacements || regions.isEmpty()) {
+            return Math.max(0, Math.min(startIndex, totalPlacements));
+        }
+
+        int currentRegionIndex = session.getCurrentRegionIndex();
+        if (currentRegionIndex < 0 || currentRegionIndex >= regions.size()) {
+            return computeRefillLookaheadEndIndex(startIndex, totalPlacements);
+        }
+
+        int runningPlacementCount = 0;
+        for (int i = 0; i <= currentRegionIndex; i++) {
+            runningPlacementCount += regions.get(i).placements().size();
+        }
+
+        int regionEndIndex = runningPlacementCount;
+        return Math.min(regionEndIndex, Math.min(totalPlacements, startIndex + MAX_REFILL_LOOKAHEAD_ITEMS));
     }
 
     private boolean isUsableContainer(ClientWorld world, BlockPos pos) {
@@ -985,6 +1011,7 @@ public class BuildCoordinator {
         PlacementResult result = placementExecutor.execute(client, session, stepResult.placement(), stepResult.targetPos());
         return switch (result.status()) {
             case PLACED, ALREADY_CORRECT -> {
+                session.getProgress().setLastPlacedBlockPos(stepResult.targetPos().toImmutable());
                 applyProgressAdvance(session.getPlan(), session.getCurrentPlacementIndex() + 1, 1);
                 debugToChatAndFile(result.message());
                 yield continueBuildingAfterPlacement(client, result.message());
@@ -1162,6 +1189,11 @@ public class BuildCoordinator {
     private BlockPos determineReturnTarget() {
         if (session == null) {
             return null;
+        }
+
+        BlockPos lastPlaced = session.getProgress().getLastPlacedBlockPos();
+        if (lastPlaced != null) {
+            return lastPlaced.toImmutable();
         }
 
         Optional<NextTarget> nextTarget = resolveNextTarget(session);
