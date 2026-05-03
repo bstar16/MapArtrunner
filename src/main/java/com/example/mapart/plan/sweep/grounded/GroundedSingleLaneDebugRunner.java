@@ -24,6 +24,7 @@ import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
 
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
@@ -65,6 +66,7 @@ public final class GroundedSingleLaneDebugRunner {
     private static final int MIN_TRANSITION_YAW_LOCK_TICKS = 2;
     private static final int MAX_TRANSITION_YAW_LOCK_TICKS = 8;
     private static final int PREFLIGHT_LOOKAHEAD_TARGETS = 64;
+    private static final int MAX_REFILL_LOOKAHEAD_ITEMS = PlayerInventory.MAIN_SIZE * 64;
 
     private final GroundedSweepLanePlanner lanePlanner = new GroundedSweepLanePlanner();
     private final GroundedLaneWalker laneWalker = new GroundedLaneWalker();
@@ -137,6 +139,7 @@ public final class GroundedSingleLaneDebugRunner {
     private float lastTransitionYaw;
     private boolean lastTransitionSprint;
     private boolean lastTransitionOvershootCorrected;
+    private BlockPos lastPlacedBlockPos;
 
     private final SupplyStore supplyStore;
     private final GroundedRefillController refillController = new GroundedRefillController();
@@ -552,7 +555,9 @@ public final class GroundedSingleLaneDebugRunner {
         Map<Item, Integer> neededCounts = new HashMap<>();
         int scannedCount = 0;
 
-        for (GroundedSweepPlacementExecutor.PlacementTarget target : pendingPlacementTargets) {
+        int lookaheadLimit = Math.min(pendingPlacementTargets.size(), MAX_REFILL_LOOKAHEAD_ITEMS);
+        for (int i = 0; i < lookaheadLimit; i++) {
+            GroundedSweepPlacementExecutor.PlacementTarget target = pendingPlacementTargets.get(i);
             Placement placement = lanePlacementsByIndex.get(target.placementIndex());
             if (placement == null || placement.block() == null) {
                 continue;
@@ -570,6 +575,7 @@ public final class GroundedSingleLaneDebugRunner {
         }
 
         traceGroundedEvent("refill scan: total=" + scannedCount
+                + " lookaheadLimit=" + lookaheadLimit
                 + " LEFT_TWO=" + bandCounts.getOrDefault(GroundedSweepPlacementExecutor.LaneRelativeBand.LEFT_TWO, 0)
                 + " LEFT_ONE=" + bandCounts.getOrDefault(GroundedSweepPlacementExecutor.LaneRelativeBand.LEFT_ONE, 0)
                 + " CENTER=" + bandCounts.getOrDefault(GroundedSweepPlacementExecutor.LaneRelativeBand.CENTERLINE, 0)
@@ -585,13 +591,20 @@ public final class GroundedSingleLaneDebugRunner {
                 ? countItemsInInventory(client.player)
                 : Map.of();
 
-        Map<Item, Integer> neededItems = new java.util.LinkedHashMap<>();
-        neededCounts.forEach((item, required) -> {
-            int deficit = required - heldCounts.getOrDefault(item, 0);
-            if (deficit > 0) {
-                neededItems.put(item, deficit);
-            }
-        });
+        Map<Item, Integer> neededItems = neededCounts.entrySet().stream()
+                .map(entry -> {
+                    int deficit = entry.getValue() - heldCounts.getOrDefault(entry.getKey(), 0);
+                    return deficit > 0 ? Map.entry(entry.getKey(), deficit) : null;
+                })
+                .filter(entry -> entry != null)
+                .sorted(Map.Entry.<Item, Integer>comparingByValue(Comparator.reverseOrder())
+                        .thenComparing(entry -> Registries.ITEM.getId(entry.getKey()).toString()))
+                .collect(Collectors.toMap(
+                        Map.Entry::getKey,
+                        Map.Entry::getValue,
+                        (a, b) -> a,
+                        LinkedHashMap::new
+                ));
 
         Map<Identifier, Integer> deficitMap = new LinkedHashMap<>();
         neededItems.forEach((item, count) -> deficitMap.put(Registries.ITEM.getId(item), count));
@@ -760,10 +773,45 @@ public final class GroundedSingleLaneDebugRunner {
         );
     }
 
-    private boolean triggerRefillForMissingMaterialIds(MinecraftClient client, Map<Identifier, Integer> deficitMap) {
-        if (deficitMap.isEmpty() || supplyStore == null || refillController.isActive() || recoveryState.isActive()) {
+    private boolean triggerRefillForMissingMaterialIds(MinecraftClient client, Map<Identifier, Integer> preflightDeficitMap) {
+        if (preflightDeficitMap.isEmpty() || supplyStore == null || refillController.isActive() || recoveryState.isActive()) {
             return false;
         }
+
+        Map<Item, Integer> neededCounts = new HashMap<>();
+        int lookaheadLimit = Math.min(pendingPlacementTargets.size(), MAX_REFILL_LOOKAHEAD_ITEMS);
+        for (int i = 0; i < lookaheadLimit; i++) {
+            GroundedSweepPlacementExecutor.PlacementTarget target = pendingPlacementTargets.get(i);
+            Placement placement = lanePlacementsByIndex.get(target.placementIndex());
+            if (placement == null || placement.block() == null) {
+                continue;
+            }
+            Item item = placement.block().asItem();
+            neededCounts.merge(item, 1, Integer::sum);
+        }
+
+        Map<Item, Integer> heldCounts = (client != null && client.player != null)
+                ? countItemsInInventory(client.player)
+                : Map.of();
+
+        Map<Item, Integer> neededItems = neededCounts.entrySet().stream()
+                .map(entry -> {
+                    int deficit = entry.getValue() - heldCounts.getOrDefault(entry.getKey(), 0);
+                    return deficit > 0 ? Map.entry(entry.getKey(), deficit) : null;
+                })
+                .filter(entry -> entry != null)
+                .sorted(Map.Entry.<Item, Integer>comparingByValue(Comparator.reverseOrder())
+                        .thenComparing(entry -> Registries.ITEM.getId(entry.getKey()).toString()))
+                .collect(Collectors.toMap(
+                        Map.Entry::getKey,
+                        Map.Entry::getValue,
+                        (a, b) -> a,
+                        LinkedHashMap::new
+                ));
+
+        Map<Identifier, Integer> deficitMap = new LinkedHashMap<>();
+        neededItems.forEach((item, count) -> deficitMap.put(Registries.ITEM.getId(item), count));
+
         BlockPos returnTarget = selectRefillReturnTarget(client);
         traceGroundedEvent("grounded refill request created: source=preflight");
         traceGroundedEvent("deficit map=" + summarizeDeficitMap(deficitMap));
@@ -832,6 +880,9 @@ public final class GroundedSingleLaneDebugRunner {
     }
 
     private BlockPos selectRefillReturnTarget(MinecraftClient client) {
+        if (lastPlacedBlockPos != null) {
+            return lastPlacedBlockPos.toImmutable();
+        }
         if (laneEntryAnchor != null && laneEntryAnchor.stagingTarget() != null) {
             return laneEntryAnchor.stagingTarget();
         }
@@ -1663,6 +1714,7 @@ public final class GroundedSingleLaneDebugRunner {
             return;
         }
 
+        lastPlacedBlockPos = worldPos.toImmutable();
         pendingVerificationsByPlacement = mutablePendingVerifications();
         pendingVerificationsByPlacement.put(
                 placementIndex,
