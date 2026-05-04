@@ -19,6 +19,16 @@ public class RealBaritoneFacade implements BaritoneFacade {
     private GoalRequest lastIssuedGoal;
     private GoalRequest pausedGoal;
 
+    // Store original settings to restore when clearing constraints
+    private Boolean originalAllowParkour;
+    private Boolean originalAllowParkourPlace;
+    private Boolean originalAllowJumpAt256;
+    private Boolean originalAllowDescend;
+    private Boolean originalAllowDownward;
+    private Integer originalMaxFallHeightNoWater;
+    private Integer originalMaxFallHeightBucket;
+    private Boolean originalAllowDiagonalDescend;
+
     @Override
     public synchronized CommandResult goTo(BlockPos target) {
         return sendGoal(new GoalRequest(target.toImmutable(), 0));
@@ -204,6 +214,110 @@ public class RealBaritoneFacade implements BaritoneFacade {
     private Object invoke(Object target, String methodName) throws ReflectiveOperationException {
         Method method = target.getClass().getMethod(methodName);
         return method.invoke(target);
+    }
+
+    @Override
+    public void applyOnPlaneConstraints() {
+        try {
+            Object baritone = getPrimaryBaritone();
+            Object settings = invoke(baritone, "getSettings");
+
+            // Store original values before modifying
+            originalAllowParkour = getBooleanSetting(settings, "allowParkour");
+            originalAllowParkourPlace = getBooleanSetting(settings, "allowParkourPlace");
+            originalAllowJumpAt256 = getBooleanSetting(settings, "allowJumpAt256");
+            originalAllowDescend = getBooleanSetting(settings, "allowDescend");
+            originalAllowDownward = getBooleanSetting(settings, "allowDownward");
+            originalMaxFallHeightNoWater = getIntSetting(settings, "maxFallHeightNoWater");
+            originalMaxFallHeightBucket = getIntSetting(settings, "maxFallHeightBucket");
+            originalAllowDiagonalDescend = getBooleanSetting(settings, "allowDiagonalDescend");
+
+            // Apply on-plane constraints
+            setBooleanSetting(settings, "allowParkour", false);
+            setBooleanSetting(settings, "allowParkourPlace", false);
+            setBooleanSetting(settings, "allowJumpAt256", false);
+            setBooleanSetting(settings, "allowDescend", false);
+            setBooleanSetting(settings, "allowDownward", false);
+            setIntSetting(settings, "maxFallHeightNoWater", 0);
+            setIntSetting(settings, "maxFallHeightBucket", 0);
+            setBooleanSetting(settings, "allowDiagonalDescend", false);
+
+            com.example.mapart.MapArtMod.LOGGER.info("[baritone-trace] Applied on-plane navigation constraints");
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            com.example.mapart.MapArtMod.LOGGER.warn("[baritone-trace] Failed to apply on-plane constraints: {}", e.getMessage());
+        }
+    }
+
+    @Override
+    public void clearOnPlaneConstraints() {
+        try {
+            Object baritone = getPrimaryBaritone();
+            Object settings = invoke(baritone, "getSettings");
+
+            // Restore original values
+            if (originalAllowParkour != null) {
+                setBooleanSetting(settings, "allowParkour", originalAllowParkour);
+            }
+            if (originalAllowParkourPlace != null) {
+                setBooleanSetting(settings, "allowParkourPlace", originalAllowParkourPlace);
+            }
+            if (originalAllowJumpAt256 != null) {
+                setBooleanSetting(settings, "allowJumpAt256", originalAllowJumpAt256);
+            }
+            if (originalAllowDescend != null) {
+                setBooleanSetting(settings, "allowDescend", originalAllowDescend);
+            }
+            if (originalAllowDownward != null) {
+                setBooleanSetting(settings, "allowDownward", originalAllowDownward);
+            }
+            if (originalMaxFallHeightNoWater != null) {
+                setIntSetting(settings, "maxFallHeightNoWater", originalMaxFallHeightNoWater);
+            }
+            if (originalMaxFallHeightBucket != null) {
+                setIntSetting(settings, "maxFallHeightBucket", originalMaxFallHeightBucket);
+            }
+            if (originalAllowDiagonalDescend != null) {
+                setBooleanSetting(settings, "allowDiagonalDescend", originalAllowDiagonalDescend);
+            }
+
+            // Clear stored values
+            originalAllowParkour = null;
+            originalAllowParkourPlace = null;
+            originalAllowJumpAt256 = null;
+            originalAllowDescend = null;
+            originalAllowDownward = null;
+            originalMaxFallHeightNoWater = null;
+            originalMaxFallHeightBucket = null;
+            originalAllowDiagonalDescend = null;
+
+            com.example.mapart.MapArtMod.LOGGER.info("[baritone-trace] Cleared on-plane navigation constraints");
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            com.example.mapart.MapArtMod.LOGGER.warn("[baritone-trace] Failed to clear on-plane constraints: {}", e.getMessage());
+        }
+    }
+
+    private Boolean getBooleanSetting(Object settings, String settingName) throws ReflectiveOperationException {
+        Object setting = settings.getClass().getField(settingName).get(settings);
+        Object value = invoke(setting, "value");
+        return value instanceof Boolean ? (Boolean) value : null;
+    }
+
+    private Integer getIntSetting(Object settings, String settingName) throws ReflectiveOperationException {
+        Object setting = settings.getClass().getField(settingName).get(settings);
+        Object value = invoke(setting, "value");
+        return value instanceof Integer ? (Integer) value : null;
+    }
+
+    private void setBooleanSetting(Object settings, String settingName, boolean value) throws ReflectiveOperationException {
+        Object setting = settings.getClass().getField(settingName).get(settings);
+        Method setValue = setting.getClass().getMethod("value", Boolean.class);
+        setValue.invoke(setting, value);
+    }
+
+    private void setIntSetting(Object settings, String settingName, int value) throws ReflectiveOperationException {
+        Object setting = settings.getClass().getField(settingName).get(settings);
+        Method setValue = setting.getClass().getMethod("value", Integer.class);
+        setValue.invoke(setting, value);
     }
 
     private record GoalRequest(BlockPos target, int range) {

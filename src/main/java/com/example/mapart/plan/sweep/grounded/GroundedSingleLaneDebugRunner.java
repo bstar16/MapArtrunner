@@ -470,6 +470,7 @@ public final class GroundedSingleLaneDebugRunner {
         laneShiftPlan = null;
         laneWalker.interrupt();
         baritoneFacade.cancel();
+        baritoneFacade.clearOnPlaneConstraints();
         traceGroundedEvent("Baritone cancelled");
         handleTerminalState(client);
         return Optional.empty();
@@ -1055,6 +1056,7 @@ public final class GroundedSingleLaneDebugRunner {
         }
 
         baritoneFacade.cancel();
+        baritoneFacade.clearOnPlaneConstraints();
         traceGroundedEvent("Baritone approach reached/cancelled at " + stagingTarget.toShortString());
         awaitingStartApproach = false;
         clearControls(client);
@@ -1321,6 +1323,7 @@ public final class GroundedSingleLaneDebugRunner {
         entrySupportEstablished = false;
         entryAttemptsByPlacementIndex = Map.of();
         laneWalker.interrupt();
+        baritoneFacade.clearOnPlaneConstraints();
         captureLastStatus(GroundedLaneWalker.GroundedLaneWalkState.FAILED, Optional.of(reason));
         if (client != null) {
             clearControls(client);
@@ -1371,7 +1374,21 @@ public final class GroundedSingleLaneDebugRunner {
     void issueStartApproachIfNeeded() {
         if (awaitingStartApproach && !startApproachIssued && activeLane != null && activeBounds != null) {
             BlockPos approachTarget = activeStartApproachTarget();
-            traceGroundedEvent("Baritone approach target issued: " + approachTarget.toShortString());
+
+            // Apply on-plane constraints for all navigation except the very first start.
+            // The only exception is the initial sweep start before any blocks are placed.
+            // After refill or recovery, navigation must stay on placed blocks.
+            boolean isTrulyFreshStart = laneEntryAnchor != null
+                && laneEntryAnchor.source() == LaneEntrySource.FRESH_START
+                && !smartResumeUsed;
+
+            if (isTrulyFreshStart) {
+                traceGroundedEvent("Baritone approach target issued (unconstrained, fresh start): " + approachTarget.toShortString());
+            } else {
+                baritoneFacade.applyOnPlaneConstraints();
+                traceGroundedEvent("Baritone approach target issued (on-plane constrained, resume): " + approachTarget.toShortString());
+            }
+
             baritoneFacade.goTo(approachTarget);
             startApproachIssued = true;
         }

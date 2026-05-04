@@ -44,4 +44,14 @@ public class NoOpBaritoneFacade implements BaritoneFacade {
     public boolean isBusy() {
         return false;
     }
+
+    @Override
+    public void applyOnPlaneConstraints() {
+        // No-op: Baritone not available
+    }
+
+    @Override
+    public void clearOnPlaneConstraints() {
+        // No-op: Baritone not available
+    }
 }

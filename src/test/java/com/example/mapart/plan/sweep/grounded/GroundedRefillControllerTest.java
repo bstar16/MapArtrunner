@@ -272,5 +272,15 @@ class GroundedRefillControllerTest {
         public boolean isBusy() {
             return false;
         }
+
+        @Override
+        public void applyOnPlaneConstraints() {
+            // No-op for tests
+        }
+
+        @Override
+        public void clearOnPlaneConstraints() {
+            // No-op for tests
+        }
     }
 }

@@ -293,6 +293,7 @@ public final class GroundedRefillController {
             closeScreen(client);
             MapArtMod.LOGGER.info("[grounded-trace:refill] screen closed before state transition");
             if (returnTarget != null && baritone != null) {
+                baritone.applyOnPlaneConstraints();
                 baritone.goNear(returnTarget, CONTAINER_REACH_FLAT);
                 state = RefillState.RETURNING;
                 return TickResult.ACTIVE;
@@ -335,6 +336,7 @@ public final class GroundedRefillController {
             MapArtMod.LOGGER.info("[grounded-trace:refill] inventory full, ending refill with remaining={}", remaining);
             closeScreen(client);
             if (returnTarget != null && baritone != null) {
+                baritone.applyOnPlaneConstraints();
                 baritone.goNear(returnTarget, CONTAINER_REACH_FLAT);
                 state = RefillState.RETURNING;
             } else {
@@ -375,6 +377,7 @@ public final class GroundedRefillController {
                 fail("Failed to start return-to-build navigation near " + returnTarget.toShortString() + ": baritone unavailable.");
                 return TickResult.FAILED;
             }
+            baritone.applyOnPlaneConstraints();
             BaritoneFacade.CommandResult result = baritone.goNear(returnTarget, RETURN_REACH_FLAT);
             if (!result.success()) {
                 fail("Failed to start return-to-build navigation near " + returnTarget.toShortString() + ": " + result.message());
@@ -389,6 +392,9 @@ public final class GroundedRefillController {
 
     private TickResult tickReturning(MinecraftClient client, BaritoneFacade baritone) {
         if (returnTarget == null) {
+            if (baritone != null) {
+                baritone.clearOnPlaneConstraints();
+            }
             state = RefillState.DONE;
             return TickResult.DONE;
         }
@@ -407,6 +413,7 @@ public final class GroundedRefillController {
         if (dx * dx + dz * dz <= (double) RETURN_REACH_FLAT * RETURN_REACH_FLAT) {
             if (baritone != null) {
                 baritone.cancel();
+                baritone.clearOnPlaneConstraints();
             }
             state = RefillState.DONE;
             return TickResult.DONE;
@@ -439,6 +446,7 @@ public final class GroundedRefillController {
                 fail("Failed to start return-to-build navigation near " + returnTarget.toShortString() + ": baritone unavailable.");
                 return TickResult.FAILED;
             }
+            baritone.applyOnPlaneConstraints();
             BaritoneFacade.CommandResult result = baritone.goNear(returnTarget, RETURN_REACH_FLAT);
             if (!result.success()) {
                 fail("Failed to start return-to-build navigation near " + returnTarget.toShortString() + ": " + result.message());
@@ -460,6 +468,7 @@ public final class GroundedRefillController {
                     fail("Failed to start return-to-build navigation near " + returnTarget.toShortString() + ": baritone unavailable.");
                     return TickResult.FAILED;
                 }
+                baritone.applyOnPlaneConstraints();
                 BaritoneFacade.CommandResult result = baritone.goNear(returnTarget, RETURN_REACH_FLAT);
                 if (!result.success()) {
                     fail("Failed to start return-to-build navigation near " + returnTarget.toShortString() + ": " + result.message());
@@ -495,6 +504,7 @@ public final class GroundedRefillController {
                 fail("Failed to start return-to-build navigation near " + returnTarget.toShortString() + ": baritone unavailable.");
                 return TickResult.FAILED;
             }
+            baritone.applyOnPlaneConstraints();
             BaritoneFacade.CommandResult result = baritone.goNear(returnTarget, RETURN_REACH_FLAT);
             if (!result.success()) {
                 fail("Failed to start return-to-build navigation near " + returnTarget.toShortString() + ": " + result.message());
@@ -508,8 +518,12 @@ public final class GroundedRefillController {
     }
 
     public void cancel(BaritoneFacade baritone) {
-        if (baritone != null && state == RefillState.NAVIGATING) {
-            baritone.cancel();
+        if (baritone != null) {
+            if (state == RefillState.NAVIGATING || state == RefillState.RETURNING) {
+                baritone.cancel();
+            }
+            // Always clear constraints on cancel to ensure clean state
+            baritone.clearOnPlaneConstraints();
         }
         fail("Refill cancelled.");
     }
@@ -533,6 +547,15 @@ public final class GroundedRefillController {
     private void fail(String message) {
         this.state = RefillState.FAILED;
         this.failureMessage = message;
+    }
+
+    /**
+     * Called when refill completes or is cancelled to ensure constraints are cleared.
+     */
+    public void clearConstraintsOnCompletion(BaritoneFacade baritone) {
+        if (baritone != null && (state == RefillState.DONE || state == RefillState.FAILED)) {
+            baritone.clearOnPlaneConstraints();
+        }
     }
 
     private static boolean isWithinContainerReach(BlockPos playerPos, BlockPos supplyPos) {
