@@ -23,6 +23,9 @@ import net.minecraft.util.Identifier;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
+import java.time.Instant;
 
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -131,6 +134,9 @@ public final class GroundedSingleLaneDebugRunner {
     private final Set<Integer> forwardLeftoverPlacements = new LinkedHashSet<>();
     private final Set<Integer> reversePlacementFilter = new LinkedHashSet<>();
     private final List<String> groundedTraceEvents = new ArrayList<>();
+    private final List<String> diagnosticsEvents = new ArrayList<>();
+    private final List<Integer> recentPlacementIndices = new ArrayList<>();
+    private final List<String> recentVerificationResults = new ArrayList<>();
 
     private boolean groundedTraceEnabled;
     private long lastGroundedSnapshotTick = -1;
@@ -144,6 +150,7 @@ public final class GroundedSingleLaneDebugRunner {
 
     private final SupplyStore supplyStore;
     private final GroundedRefillController refillController = new GroundedRefillController();
+    private final GroundedDiagnostics diagnostics = new GroundedDiagnostics();
 
     private final GroundedRecoveryState recoveryState = new GroundedRecoveryState();
     private double lastKnownProgressCoordinate;
@@ -179,6 +186,18 @@ public final class GroundedSingleLaneDebugRunner {
         this.supplyStore = supplyStore;
     }
 
+    public boolean diagnosticsEnabled() {
+        return diagnostics.enabled();
+    }
+
+    public void setDiagnosticsEnabled(boolean enabled) {
+        diagnostics.setEnabled(enabled);
+    }
+
+    public java.nio.file.Path diagnosticsPath() {
+        return diagnostics.path();
+    }
+
     public boolean groundedTraceEnabled() {
         return groundedTraceEnabled;
     }
@@ -191,6 +210,8 @@ public final class GroundedSingleLaneDebugRunner {
     List<String> groundedTraceEventsForTests() {
         return List.copyOf(groundedTraceEvents);
     }
+
+    void addDiagnosticsEventForTests(String event) { diagnosticsEvents.add(event); }
 
     public Optional<String> start(BuildSession session, int laneIndex, GroundedSweepSettings settings) {
         Optional<String> validation = validateStart(session, settings);
@@ -349,6 +370,7 @@ public final class GroundedSingleLaneDebugRunner {
             return;
         }
         traceGroundedSnapshot(client);
+        writeDiagnosticsSnapshot(client);
 
         if (recoveryState.isActive()) {
             tickRecovery(client);
@@ -3043,10 +3065,14 @@ public final class GroundedSingleLaneDebugRunner {
     }
 
     private void traceGroundedEvent(String message) {
+        String event = "[grounded-trace:event] " + message;
+        diagnosticsEvents.add(event);
+        if (diagnosticsEvents.size() > 200) {
+            diagnosticsEvents.remove(0);
+        }
         if (!groundedTraceEnabled) {
             return;
         }
-        String event = "[grounded-trace:event] " + message;
         groundedTraceEvents.add(event);
         if (groundedTraceEvents.size() > 200) {
             groundedTraceEvents.remove(0);
@@ -3074,6 +3100,28 @@ public final class GroundedSingleLaneDebugRunner {
         }
         lastGroundedSnapshotTick = groundedTraceTickCounter;
         MapArtMod.LOGGER.info("[grounded-trace:snapshot] {}", groundedSnapshot(client));
+    }
+
+
+    private void writeDiagnosticsSnapshot(MinecraftClient client) {
+        if (!diagnostics.enabled() || !shouldEmitGroundedSnapshotForTick(groundedTraceTickCounter)) {
+            return;
+        }
+        JsonObject snapshot = new JsonObject();
+        snapshot.addProperty("type", "snapshot");
+        snapshot.addProperty("timestamp", Instant.now().toString());
+        snapshot.addProperty("tickNumber", groundedTraceTickCounter);
+        snapshot.addProperty("sweepRunMode", runMode.name());
+        snapshot.addProperty("sweepPassPhase", sweepPassPhase.name());
+        snapshot.addProperty("smartResumeUsed", smartResumeUsed);
+        snapshot.addProperty("selectedResumePoint", selectedResumePoint == null ? "" : describeResumePoint(selectedResumePoint));
+        JsonArray events = new JsonArray();
+        int start = Math.max(0, diagnosticsEvents.size() - 50);
+        for (int i = start; i < diagnosticsEvents.size(); i++) events.add(diagnosticsEvents.get(i));
+        snapshot.add("events", events);
+        snapshot.addProperty("events_truncated", diagnosticsEvents.size() > 50);
+        diagnosticsEvents.clear();
+        diagnostics.writeSnapshot(snapshot);
     }
 
     static boolean shouldEmitGroundedSnapshotForTick(long diagnosticsTickCounter) {

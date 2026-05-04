@@ -26,6 +26,12 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class GroundedSingleLaneDebugRunnerTest {
 
     @Test
+    void snapshotCadenceEvery20Ticks() {
+        assertFalse(GroundedSingleLaneDebugRunner.shouldEmitGroundedSnapshotForTick(19));
+        assertTrue(GroundedSingleLaneDebugRunner.shouldEmitGroundedSnapshotForTick(20));
+    }
+
+    @Test
     void terminalCompletionClearsActiveStateAndAllowsRestart() {
         GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
         BuildSession session = sessionWithOrigin();
