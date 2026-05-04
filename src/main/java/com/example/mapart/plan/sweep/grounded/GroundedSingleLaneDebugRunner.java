@@ -3073,25 +3073,97 @@ public final class GroundedSingleLaneDebugRunner {
         if (!groundedDiagnostics.enabled() || !GroundedDiagnostics.shouldEmitSnapshotForTick(groundedTraceTickCounter)) {
             return;
         }
+        try {
+            groundedDiagnostics.writeSnapshot(groundedTraceTickCounter, buildDiagnosticsPayload(client), drainDiagnosticsEvents());
+        } catch (Exception exception) {
+            traceGroundedEvent("diagnostics snapshot error: " + exception.getClass().getSimpleName() + ": " + exception.getMessage());
+        }
+    }
+
+    Map<String, Object> buildDiagnosticsPayload(MinecraftClient client) {
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("sweepRunMode", runMode.name());
         payload.put("sweepPassPhase", sweepPassPhase.name());
         payload.put("smartResumeUsed", smartResumeUsed);
         payload.put("selectedResumePoint", selectedResumePoint == null ? null : describeResumePoint(selectedResumePoint));
-        payload.put("walker", Map.of("state", laneWalker.state().name(), "commandYaw", laneWalker.currentCommand().map(GroundedLaneWalker.GroundedLaneWalkCommand::yaw).orElse(0.0f)));
-        payload.put("awaitingStartApproach", awaitingStartApproach);
-        payload.put("awaitingLaneShift", awaitingLaneShift);
-        payload.put("laneStartStage", laneStartStage.name());
-        payload.put("transition", Map.of("stage", laneTransitionStage.name()));
-        payload.put("placements", Map.of("pendingCount", pendingPlacementTargets.size(), "pendingVerificationCount", pendingVerificationsByPlacement.size(),
-                "transitionSupportPendingCount", pendingTransitionSupportTargets.size(), "transitionSupportVerificationCount", pendingTransitionSupportVerifications.size(),
-                "successfulCount", successfulPlacements, "failedCount", failedPlacements, "missedCount", missedPlacements,
-                "lastPlacedPos", lastPlacedBlockPos == null ? null : Map.of("x", lastPlacedBlockPos.getX(), "y", lastPlacedBlockPos.getY(), "z", lastPlacedBlockPos.getZ()),
-                "recentPlacementIndices", List.copyOf(recentPlacementIndices), "recentVerificationResults", List.copyOf(recentVerificationResults)));
-        payload.put("refill", Map.of("active", refillController.isActive(), "state", refillController.state().name(), "deficits", refillController.diagnosticsDeficits(), "remaining", refillController.diagnosticsRemaining(), "returnTarget", refillController.diagnosticsReturnTarget()));
-        payload.put("recovery", Map.of("active", recoveryState.isActive(), "stabilizing", recoveryState.isStabilizing(), "autoResumeEnabled", recoveryState.isAutoResumeEnabled(), "snapshot", recoveryState.snapshot().map(Object::toString).orElse(null)));
-        payload.put("baritone", Map.of("busy", baritoneFacade.isBusy(), "lastIssuedGoal", baritoneFacade.diagnosticsLastIssuedGoal().orElse(null), "lastIssuedGoalRange", baritoneFacade.diagnosticsLastIssuedGoalRange().orElse(null), "constraintsApplied", baritoneFacade.diagnosticsConstraintsApplied().map(Object::toString).orElse("unknown")));
-        groundedDiagnostics.writeSnapshot(groundedTraceTickCounter, payload, drainDiagnosticsEvents());
+
+        Map<String, Object> player = new LinkedHashMap<>();
+        ClientPlayerEntity p = client == null ? null : client.player;
+        player.put("position", p == null ? null : vecMap(p.getEntityPos()));
+        player.put("velocity", p == null ? null : vecMap(p.getVelocity()));
+        player.put("yaw", p == null ? null : p.getYaw());
+        payload.put("player", player);
+
+        Map<String, Object> lane = new LinkedHashMap<>();
+        lane.put("index", activeLane == null ? null : activeLane.laneIndex());
+        lane.put("direction", activeLane == null ? null : activeLane.direction().name());
+        lane.put("start", activeLane == null ? null : posMap(activeLane.startPoint()));
+        lane.put("end", activeLane == null ? null : posMap(activeLane.endPoint()));
+        payload.put("lane", lane);
+
+        Map<String, Object> walker = new LinkedHashMap<>();
+        walker.put("state", laneWalker.state().name());
+        walker.put("commandYaw", laneWalker.currentCommand().map(GroundedLaneWalker.GroundedLaneWalkCommand::yaw).orElse(null));
+        payload.put("walker", walker);
+
+        Map<String, Object> transition = new LinkedHashMap<>();
+        transition.put("stage", laneTransitionStage.name());
+        transition.put("direction", lastTransitionDirection == null ? null : lastTransitionDirection.name());
+        payload.put("transition", transition);
+
+        Map<String, Object> placements = new LinkedHashMap<>();
+        placements.put("pendingCount", pendingPlacementTargets.size());
+        placements.put("pendingVerificationCount", pendingVerificationsByPlacement.size());
+        placements.put("transitionSupportPendingCount", pendingTransitionSupportTargets.size());
+        placements.put("transitionSupportVerificationCount", pendingTransitionSupportVerifications.size());
+        placements.put("successfulCount", successfulPlacements);
+        placements.put("failedCount", failedPlacements);
+        placements.put("missedCount", missedPlacements);
+        placements.put("lastPlacedPos", posMap(lastPlacedBlockPos));
+        placements.put("recentPlacementIndices", List.copyOf(recentPlacementIndices));
+        placements.put("recentVerificationResults", List.copyOf(recentVerificationResults));
+        payload.put("placements", placements);
+
+        Map<String, Object> refill = new LinkedHashMap<>();
+        refill.put("active", refillController.isActive());
+        refill.put("state", refillController.state().name());
+        refill.put("deficits", refillController.diagnosticsDeficits());
+        refill.put("remaining", refillController.diagnosticsRemaining());
+        refill.put("returnTarget", refillController.diagnosticsReturnTarget());
+        payload.put("refill", refill);
+
+        Map<String, Object> recovery = new LinkedHashMap<>();
+        recovery.put("active", recoveryState.isActive());
+        recovery.put("stabilizing", recoveryState.isStabilizing());
+        recovery.put("autoResumeEnabled", recoveryState.isAutoResumeEnabled());
+        recovery.put("snapshot", recoveryState.snapshot().map(Object::toString).orElse(null));
+        payload.put("recovery", recovery);
+
+        Map<String, Object> baritone = new LinkedHashMap<>();
+        baritone.put("busy", baritoneFacade.isBusy());
+        baritone.put("lastIssuedGoal", baritoneFacade.diagnosticsLastIssuedGoal().orElse(null));
+        baritone.put("lastIssuedGoalRange", baritoneFacade.diagnosticsLastIssuedGoalRange().orElse(null));
+        baritone.put("constraintsApplied", baritoneFacade.diagnosticsConstraintsApplied().map(Object::toString).orElse("unknown"));
+        payload.put("baritone", baritone);
+        return payload;
+    }
+
+    private static Map<String, Object> posMap(BlockPos pos) {
+        if (pos == null) return null;
+        Map<String, Object> map = new LinkedHashMap<>();
+        map.put("x", pos.getX());
+        map.put("y", pos.getY());
+        map.put("z", pos.getZ());
+        return map;
+    }
+
+    private static Map<String, Object> vecMap(Vec3d vec) {
+        if (vec == null) return null;
+        Map<String, Object> map = new LinkedHashMap<>();
+        map.put("x", vec.x);
+        map.put("y", vec.y);
+        map.put("z", vec.z);
+        return map;
     }
 
     private List<String> drainDiagnosticsEvents() {
