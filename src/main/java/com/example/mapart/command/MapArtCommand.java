@@ -283,6 +283,11 @@ public final class MapArtCommand {
                                         .executes(context -> groundedTraceSet(context.getSource(), false)))
                                 .then(ClientCommandManager.literal("status")
                                         .executes(context -> groundedTraceStatus(context.getSource()))))
+                        .then(ClientCommandManager.literal("diagnostics")
+                                .then(ClientCommandManager.literal("on").executes(context -> groundedDiagnosticsSet(context.getSource(), true)))
+                                .then(ClientCommandManager.literal("off").executes(context -> groundedDiagnosticsSet(context.getSource(), false)))
+                                .then(ClientCommandManager.literal("status").executes(context -> groundedDiagnosticsStatus(context.getSource())))
+                                .then(ClientCommandManager.literal("path").executes(context -> groundedDiagnosticsPath(context.getSource()))))
                         .then(ClientCommandManager.literal("grounded-recovery")
                                 .then(ClientCommandManager.literal("status")
                                         .executes(context -> groundedRecoveryStatus(context.getSource())))
@@ -586,6 +591,28 @@ public final class MapArtCommand {
         return 1;
     }
 
+
+    private static int groundedDiagnosticsSet(FabricClientCommandSource source, boolean enabled) {
+        GroundedSingleLaneDebugRunner runner = MapArtRuntime.groundedSingleLaneDebugRunner();
+        if (runner == null) { source.sendError(Text.literal("Grounded sweep debug runner is unavailable.")); return 0; }
+        runner.setDiagnosticsEnabled(enabled);
+        source.sendFeedback(Text.literal("Grounded diagnostics " + (enabled ? "enabled" : "disabled") + "."));
+        return 1;
+    }
+
+    private static int groundedDiagnosticsStatus(FabricClientCommandSource source) {
+        GroundedSingleLaneDebugRunner runner = MapArtRuntime.groundedSingleLaneDebugRunner();
+        if (runner == null) { source.sendError(Text.literal("Grounded sweep debug runner is unavailable.")); return 0; }
+        source.sendFeedback(Text.literal("Grounded diagnostics are " + (runner.diagnosticsEnabled() ? "on" : "off") + "."));
+        return 1;
+    }
+
+    private static int groundedDiagnosticsPath(FabricClientCommandSource source) {
+        GroundedSingleLaneDebugRunner runner = MapArtRuntime.groundedSingleLaneDebugRunner();
+        if (runner == null) { source.sendError(Text.literal("Grounded sweep debug runner is unavailable.")); return 0; }
+        source.sendFeedback(Text.literal(runner.diagnosticsPath()));
+        return 1;
+    }
     private static int groundedRecoveryStatus(FabricClientCommandSource source) {
         GroundedSingleLaneDebugRunner runner = MapArtRuntime.groundedSingleLaneDebugRunner();
         if (runner == null) {

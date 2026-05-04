@@ -37,6 +37,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
 import java.util.function.Predicate;
+import java.time.Instant;
 
 public final class GroundedSingleLaneDebugRunner {
     private static final int MAX_PLACEMENT_ATTEMPTS_PER_TICK = 2;
@@ -131,8 +132,12 @@ public final class GroundedSingleLaneDebugRunner {
     private final Set<Integer> forwardLeftoverPlacements = new LinkedHashSet<>();
     private final Set<Integer> reversePlacementFilter = new LinkedHashSet<>();
     private final List<String> groundedTraceEvents = new ArrayList<>();
+    private final List<String> diagnosticsEventBuffer = new ArrayList<>();
+    private final List<Integer> recentPlacementIndices = new ArrayList<>();
+    private final List<Map<String, Object>> recentVerificationResults = new ArrayList<>();
 
     private boolean groundedTraceEnabled;
+    private final GroundedDiagnostics groundedDiagnostics = new GroundedDiagnostics();
     private long lastGroundedSnapshotTick = -1;
     private long groundedTraceTickCounter;
     private boolean corridorWarningActive;
@@ -177,6 +182,18 @@ public final class GroundedSingleLaneDebugRunner {
     public GroundedSingleLaneDebugRunner(BaritoneFacade baritoneFacade, SupplyStore supplyStore) {
         this.baritoneFacade = Objects.requireNonNull(baritoneFacade, "baritoneFacade");
         this.supplyStore = supplyStore;
+    }
+
+    public boolean diagnosticsEnabled() {
+        return groundedDiagnostics.enabled();
+    }
+
+    public void setDiagnosticsEnabled(boolean enabled) {
+        groundedDiagnostics.setEnabled(enabled);
+    }
+
+    public String diagnosticsPath() {
+        return groundedDiagnostics.path().toString();
     }
 
     public boolean groundedTraceEnabled() {
@@ -349,6 +366,7 @@ public final class GroundedSingleLaneDebugRunner {
             return;
         }
         traceGroundedSnapshot(client);
+        traceGroundedDiagnosticsSnapshot(client);
 
         if (recoveryState.isActive()) {
             tickRecovery(client);
@@ -1969,6 +1987,8 @@ public final class GroundedSingleLaneDebugRunner {
 
     private void onPlacementResult(int placementIndex, GroundedSweepPlacementExecutor.PlacementResult groundedResult, long tick) {
         placementSelector.recordPlacementResult(placementIndex, groundedResult, tick);
+        recentPlacementIndices.add(placementIndex);
+        if (recentPlacementIndices.size() > 10) recentPlacementIndices.remove(0);
         if (groundedResult == GroundedSweepPlacementExecutor.PlacementResult.SUCCESS) {
             successfulPlacements++;
             lastSuccessfulPlacementTick = laneTicksElapsed;
@@ -2074,7 +2094,10 @@ public final class GroundedSingleLaneDebugRunner {
             return false;
         }
         BlockState worldState = client.world.getBlockState(pending.worldPos());
-        return worldState.isOf(pending.expectedBlock());
+        boolean ok = worldState.isOf(pending.expectedBlock());
+        recentVerificationResults.add(Map.of("index", pending.placementIndex(), "expectedBlockId", Registries.BLOCK.getId(pending.expectedBlock()).toString(), "actualBlockId", Registries.BLOCK.getId(worldState.getBlock()).toString(), "position", Map.of("x", pending.worldPos().getX(), "y", pending.worldPos().getY(), "z", pending.worldPos().getZ()), "result", ok ? "success" : "mismatch"));
+        if (recentVerificationResults.size() > 10) recentVerificationResults.remove(0);
+        return ok;
     }
 
     private void refreshCurrentLeftovers() {
@@ -3043,6 +3066,8 @@ public final class GroundedSingleLaneDebugRunner {
     }
 
     private void traceGroundedEvent(String message) {
+        diagnosticsEventBuffer.add(message);
+        if (diagnosticsEventBuffer.size() > 400) diagnosticsEventBuffer.remove(0);
         if (!groundedTraceEnabled) {
             return;
         }
@@ -3076,6 +3101,32 @@ public final class GroundedSingleLaneDebugRunner {
         MapArtMod.LOGGER.info("[grounded-trace:snapshot] {}", groundedSnapshot(client));
     }
 
+
+    private void traceGroundedDiagnosticsSnapshot(MinecraftClient client) {
+        if (!groundedDiagnostics.enabled()) return;
+        if (!shouldEmitGroundedSnapshotForTick(groundedTraceTickCounter)) return;
+        Map<String, Object> row = new LinkedHashMap<>();
+        row.put("timestamp", Instant.now().toString());
+        row.put("tickNumber", groundedTraceTickCounter);
+        row.put("sweepRunMode", runMode.name());
+        row.put("sweepPassPhase", sweepPassPhase.name());
+        row.put("smartResumeUsed", smartResumeUsed);
+        row.put("selectedResumePoint", selectedResumePoint == null ? null : describeResumePoint(selectedResumePoint));
+        Map<String,Object> placements = new LinkedHashMap<>();
+        placements.put("pendingCount", pendingPlacementTargets.size());
+        placements.put("pendingVerificationCount", pendingVerificationsByPlacement.size());
+        placements.put("transitionSupportPendingCount", pendingTransitionSupportTargets.size());
+        placements.put("transitionSupportVerificationCount", pendingTransitionSupportVerifications.size());
+        placements.put("successfulCount", successfulPlacements);
+        placements.put("failedCount", failedPlacements);
+        placements.put("missedCount", missedPlacements);
+        placements.put("lastPlacedPos", lastPlacedBlockPos == null ? null : Map.of("x",lastPlacedBlockPos.getX(),"y",lastPlacedBlockPos.getY(),"z",lastPlacedBlockPos.getZ()));
+        placements.put("recentPlacementIndices", List.copyOf(recentPlacementIndices));
+        placements.put("recentVerificationResults", List.copyOf(recentVerificationResults));
+        row.put("placements", placements);
+        groundedDiagnostics.writeSnapshot(row, List.copyOf(diagnosticsEventBuffer));
+        diagnosticsEventBuffer.clear();
+    }
     static boolean shouldEmitGroundedSnapshotForTick(long diagnosticsTickCounter) {
         return diagnosticsTickCounter > 0
                 && diagnosticsTickCounter % GROUNDED_TRACE_SNAPSHOT_INTERVAL_TICKS == 0;
