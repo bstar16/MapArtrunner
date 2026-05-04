@@ -21,6 +21,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class GroundedSingleLaneDebugRunnerTest {
@@ -1438,6 +1439,19 @@ class GroundedSingleLaneDebugRunnerTest {
         );
     }
 
+
+    @Test
+    void diagnosticsPayloadHandlesNullOptionalSubsystemFields() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        BuildSession session = sessionWithOrigin();
+        assertTrue(runner.start(session, 0, GroundedSweepSettings.defaults()).isEmpty());
+        var payload = runner.buildDiagnosticsPayload(null);
+        assertNotNull(payload);
+        assertDoesNotThrow(() -> payload.get("selectedResumePoint"));
+        assertDoesNotThrow(() -> ((Map<?, ?>) payload.get("placements")).get("lastPlacedPos"));
+        assertDoesNotThrow(() -> ((Map<?, ?>) payload.get("refill")).get("returnTarget"));
+        assertDoesNotThrow(() -> ((Map<?, ?>) payload.get("baritone")).get("lastIssuedGoal"));
+    }
     private static final class RecordingBaritoneFacade implements BaritoneFacade {
         private BlockPos lastGoToTarget;
         private int goToCalls;

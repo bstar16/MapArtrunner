@@ -15,6 +15,12 @@ public interface BaritoneFacade {
 
     boolean isBusy();
 
+    default java.util.Optional<String> diagnosticsLastIssuedGoal() { return java.util.Optional.empty(); }
+
+    default java.util.Optional<Integer> diagnosticsLastIssuedGoalRange() { return java.util.Optional.empty(); }
+
+    default java.util.Optional<Boolean> diagnosticsConstraintsApplied() { return java.util.Optional.empty(); }
+
     record CommandResult(boolean success, String message) {
         public static CommandResult success(String message) {
             return new CommandResult(true, message);
