@@ -131,8 +131,12 @@ public final class GroundedSingleLaneDebugRunner {
     private final Set<Integer> forwardLeftoverPlacements = new LinkedHashSet<>();
     private final Set<Integer> reversePlacementFilter = new LinkedHashSet<>();
     private final List<String> groundedTraceEvents = new ArrayList<>();
+    private final List<String> diagnosticsEventBuffer = new ArrayList<>();
+    private final List<Integer> recentPlacementIndices = new ArrayList<>();
+    private final List<Map<String, Object>> recentVerificationResults = new ArrayList<>();
 
     private boolean groundedTraceEnabled;
+    private final GroundedDiagnostics groundedDiagnostics = new GroundedDiagnostics();
     private long lastGroundedSnapshotTick = -1;
     private long groundedTraceTickCounter;
     private boolean corridorWarningActive;
@@ -349,6 +353,7 @@ public final class GroundedSingleLaneDebugRunner {
             return;
         }
         traceGroundedSnapshot(client);
+        writeDiagnosticsSnapshot(client);
 
         if (recoveryState.isActive()) {
             tickRecovery(client);
@@ -3043,10 +3048,12 @@ public final class GroundedSingleLaneDebugRunner {
     }
 
     private void traceGroundedEvent(String message) {
+        String event = "[grounded-trace:event] " + message;
+        diagnosticsEventBuffer.add(event);
+        if (diagnosticsEventBuffer.size() > 500) { diagnosticsEventBuffer.remove(0); }
         if (!groundedTraceEnabled) {
             return;
         }
-        String event = "[grounded-trace:event] " + message;
         groundedTraceEvents.add(event);
         if (groundedTraceEvents.size() > 200) {
             groundedTraceEvents.remove(0);
@@ -3055,6 +3062,43 @@ public final class GroundedSingleLaneDebugRunner {
         sendGroundedTraceChat(message);
     }
 
+
+    public boolean groundedDiagnosticsEnabled() { return groundedDiagnostics.enabled(); }
+
+    public void setGroundedDiagnosticsEnabled(boolean enabled) { groundedDiagnostics.setEnabled(enabled); }
+
+    public java.nio.file.Path groundedDiagnosticsPath() { return groundedDiagnostics.logPath(); }
+
+    private void writeDiagnosticsSnapshot(MinecraftClient client) {
+        if (!groundedDiagnostics.enabled() || !GroundedDiagnostics.shouldEmitSnapshotForTick(groundedTraceTickCounter)) {
+            return;
+        }
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("sweepRunMode", runMode.name());
+        payload.put("sweepPassPhase", sweepPassPhase.name());
+        payload.put("smartResumeUsed", smartResumeUsed);
+        payload.put("selectedResumePoint", selectedResumePoint == null ? null : describeResumePoint(selectedResumePoint));
+        payload.put("walker", Map.of("state", laneWalker.state().name(), "commandYaw", laneWalker.currentCommand().map(GroundedLaneWalker.GroundedLaneWalkCommand::yaw).orElse(0.0f)));
+        payload.put("awaitingStartApproach", awaitingStartApproach);
+        payload.put("awaitingLaneShift", awaitingLaneShift);
+        payload.put("laneStartStage", laneStartStage.name());
+        payload.put("transition", Map.of("stage", laneTransitionStage.name()));
+        payload.put("placements", Map.of("pendingCount", pendingPlacementTargets.size(), "pendingVerificationCount", pendingVerificationsByPlacement.size(),
+                "transitionSupportPendingCount", pendingTransitionSupportTargets.size(), "transitionSupportVerificationCount", pendingTransitionSupportVerifications.size(),
+                "successfulCount", successfulPlacements, "failedCount", failedPlacements, "missedCount", missedPlacements,
+                "lastPlacedPos", lastPlacedBlockPos == null ? null : Map.of("x", lastPlacedBlockPos.getX(), "y", lastPlacedBlockPos.getY(), "z", lastPlacedBlockPos.getZ()),
+                "recentPlacementIndices", List.copyOf(recentPlacementIndices), "recentVerificationResults", List.copyOf(recentVerificationResults)));
+        payload.put("refill", Map.of("active", refillController.isActive(), "state", refillController.state().name(), "deficits", refillController.diagnosticsDeficits(), "remaining", refillController.diagnosticsRemaining(), "returnTarget", refillController.diagnosticsReturnTarget()));
+        payload.put("recovery", Map.of("active", recoveryState.isActive(), "stabilizing", recoveryState.isStabilizing(), "autoResumeEnabled", recoveryState.isAutoResumeEnabled(), "snapshot", recoveryState.snapshot().map(Object::toString).orElse(null)));
+        payload.put("baritone", Map.of("busy", baritoneFacade.isBusy(), "lastIssuedGoal", baritoneFacade.diagnosticsLastIssuedGoal().orElse(null), "lastIssuedGoalRange", baritoneFacade.diagnosticsLastIssuedGoalRange().orElse(null), "constraintsApplied", baritoneFacade.diagnosticsConstraintsApplied().map(Object::toString).orElse("unknown")));
+        groundedDiagnostics.writeSnapshot(groundedTraceTickCounter, payload, drainDiagnosticsEvents());
+    }
+
+    private List<String> drainDiagnosticsEvents() {
+        List<String> copy = List.copyOf(diagnosticsEventBuffer);
+        diagnosticsEventBuffer.clear();
+        return copy;
+    }
     private void sendGroundedTraceChat(String message) {
         MinecraftClient client = MinecraftClient.getInstance();
         if (client != null && client.player != null) {

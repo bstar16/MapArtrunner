@@ -514,6 +514,26 @@ public final class GroundedRefillController {
         fail("Refill cancelled.");
     }
 
+
+    public Map<String, Integer> diagnosticsDeficits() {
+        Map<String, Integer> out = new LinkedHashMap<>();
+        for (Map.Entry<Identifier, Integer> e : deficits.entrySet()) out.put(e.getKey().toString(), e.getValue());
+        return out;
+    }
+
+    public Map<String, Integer> diagnosticsRemaining() {
+        MinecraftClient c = MinecraftClient.getInstance();
+        if (c == null || c.player == null) return Map.of();
+        Map<Identifier,Integer> rem = computeRemainingDeficits(c.player, deficits);
+        Map<String,Integer> out = new LinkedHashMap<>();
+        for (Map.Entry<Identifier,Integer> e: rem.entrySet()) out.put(e.getKey().toString(), e.getValue());
+        return out;
+    }
+
+    public Map<String, Integer> diagnosticsReturnTarget() {
+        if (returnTarget == null) return null;
+        return Map.of("x", returnTarget.getX(), "y", returnTarget.getY(), "z", returnTarget.getZ());
+    }
     public void clear() {
         state = RefillState.IDLE;
         supplyCandidates = List.of();

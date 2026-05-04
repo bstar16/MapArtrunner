@@ -206,6 +206,16 @@ public class RealBaritoneFacade implements BaritoneFacade {
         return method.invoke(target);
     }
 
+    @Override
+    public synchronized java.util.Optional<String> diagnosticsLastIssuedGoal() {
+        return lastIssuedGoal == null ? java.util.Optional.empty() : java.util.Optional.of(lastIssuedGoal.target().toShortString());
+    }
+
+    @Override
+    public synchronized java.util.Optional<Integer> diagnosticsLastIssuedGoalRange() {
+        return lastIssuedGoal == null ? java.util.Optional.empty() : java.util.Optional.of(lastIssuedGoal.range());
+    }
+
     private record GoalRequest(BlockPos target, int range) {
     }
 }
