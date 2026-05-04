@@ -315,6 +315,34 @@ public final class GroundedRefillController {
             return TickResult.FAILED;
         }
 
+        // Check if player inventory has free slots before attempting to pull
+        PlayerInventory inventory = client.player.getInventory();
+        int freeSlots = 0;
+        for (int slot = 0; slot < PlayerInventory.MAIN_SIZE; slot++) {
+            ItemStack stack = inventory.getStack(slot);
+            if (stack.isEmpty()) {
+                freeSlots++;
+            } else {
+                // Check if this stack can accept more of a needed item
+                Identifier stackId = Registries.ITEM.getId(stack.getItem());
+                if (remaining.containsKey(stackId) && stack.getCount() < stack.getMaxCount()) {
+                    freeSlots++;
+                }
+            }
+        }
+        if (freeSlots == 0) {
+            // Inventory is full, can't pull more even though deficits remain
+            MapArtMod.LOGGER.info("[grounded-trace:refill] inventory full, ending refill with remaining={}", remaining);
+            closeScreen(client);
+            if (returnTarget != null && baritone != null) {
+                baritone.goNear(returnTarget, CONTAINER_REACH_FLAT);
+                state = RefillState.RETURNING;
+            } else {
+                state = RefillState.DONE;
+            }
+            return TickResult.ACTIVE;
+        }
+
         boolean anyUseful = false;
         for (Map.Entry<Identifier, Integer> missing : remaining.entrySet()) {
             Identifier needed = missing.getKey();
@@ -532,6 +560,9 @@ public final class GroundedRefillController {
         if (client != null && client.player != null && client.currentScreen instanceof HandledScreen<?>) {
             MapArtMod.LOGGER.info("[grounded-trace:refill] closing container screen");
             client.player.closeHandledScreen();
+            client.setScreen(null);
+            MapArtMod.LOGGER.info("[grounded-trace:refill] closeScreen complete: currentScreen=" +
+                    (client.currentScreen == null ? "null" : client.currentScreen.getClass().getSimpleName()));
         }
     }
 
