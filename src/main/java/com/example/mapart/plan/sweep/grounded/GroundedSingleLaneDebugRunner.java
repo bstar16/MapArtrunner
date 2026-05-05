@@ -291,26 +291,36 @@ public final class GroundedSingleLaneDebugRunner {
         initializeRunState(session, bounds, settings, SweepRunMode.FULL_SWEEP, lanes, reverse, SweepPassPhase.FORWARD);
 
         int selectedLaneIndex = Math.max(0, Math.min(resumePoint.laneIndex(), forwardLanes.size() - 1));
+        traceGroundedEvent("smart resume selected: " + describeResumePoint(resumePoint));
+
+        // If a refill hint is available, use it as a hard constraint — it captures the exact
+        // lane and progress where building was active when refill fired, which is more reliable
+        // than smart resume's block-scan result (smart resume may pick an earlier lane if few
+        // blocks have been placed in the hinted lane yet).
+        if (refillLaneCursorHint != null && refillLaneCursorHint >= 0 && refillLaneCursorHint < forwardLanes.size()) {
+            traceGroundedEvent("refill hint consumed: overriding smart resume lane "
+                    + selectedLaneIndex + " with hint lane " + refillLaneCursorHint);
+            selectedLaneIndex = refillLaneCursorHint;
+        }
         laneCursor = selectedLaneIndex;
         smartResumeUsed = useSmartResume;
         selectedResumePoint = resumePoint;
-        traceGroundedEvent("smart resume selected: " + describeResumePoint(resumePoint));
         skippedCompletedForwardLanes = selectedLaneIndex;
-        laneEntryAnchor = resumePoint.reason() == GroundedSweepResumePoint.ResumeReason.PARTIAL_LANE
+
+        // Use the resume point's anchor only if smart resume picked the same lane as the hint;
+        // otherwise the resume point is for a different lane and a fresh start is correct.
+        boolean resumePointMatchesSelectedLane = resumePoint.laneIndex() == selectedLaneIndex;
+        laneEntryAnchor = (resumePointMatchesSelectedLane && resumePoint.reason() == GroundedSweepResumePoint.ResumeReason.PARTIAL_LANE)
                 ? buildLaneEntryAnchorFromResumePoint(forwardLanes.get(selectedLaneIndex), bounds, resumePoint)
                 : buildLaneEntryAnchorForFreshStart(forwardLanes.get(selectedLaneIndex), bounds, LaneEntrySource.FRESH_START);
 
-        Optional<Integer> minimumProgress = resumePoint.reason() == GroundedSweepResumePoint.ResumeReason.PARTIAL_LANE
+        Optional<Integer> minimumProgress = (resumePointMatchesSelectedLane && resumePoint.reason() == GroundedSweepResumePoint.ResumeReason.PARTIAL_LANE)
                 ? Optional.of(resumePoint.progressCoordinate())
                 : Optional.empty();
-        // If smart resume couldn't determine a partial-lane progress (e.g. no blocks placed
-        // before MISSING_ITEM fired), use the progress coordinate captured at refill trigger
-        // time so the sweep resumes from the right point rather than the lane start.
-        if (minimumProgress.isEmpty() && refillLaneCursorHint != null && refillLaneProgressHint != null
-                && refillLaneCursorHint == selectedLaneIndex) {
+        if (minimumProgress.isEmpty() && refillLaneProgressHint != null) {
             minimumProgress = Optional.of(refillLaneProgressHint);
-            traceGroundedEvent("applying refill progress hint: laneCursor=" + refillLaneCursorHint
-                    + " progress=" + refillLaneProgressHint);
+            traceGroundedEvent("refill hint consumed: applying progress=" + refillLaneProgressHint
+                    + " for lane " + selectedLaneIndex);
         }
         refillLaneProgressHint = null;
         refillLaneCursorHint = null;
@@ -976,6 +986,7 @@ public final class GroundedSingleLaneDebugRunner {
         GroundedSweepSettings settings = activeSettings;
         refillController.clear();
         clearActiveRunState();
+        traceGroundedEvent("refill hint after clearActiveRunState: laneCursor=" + refillLaneCursorHint + " progress=" + refillLaneProgressHint);
 
         // Defensive: ensure any open container screen is closed before resuming
         if (client != null && client.player != null && client.currentScreen instanceof HandledScreen) {
@@ -1395,10 +1406,31 @@ public final class GroundedSingleLaneDebugRunner {
     void issueStartApproachIfNeeded() {
         if (awaitingStartApproach && !startApproachIssued && activeLane != null && activeBounds != null) {
             BlockPos approachTarget = activeStartApproachTarget();
-            traceGroundedEvent("Baritone approach target issued: " + approachTarget.toShortString());
-            baritoneFacade.goTo(approachTarget);
+            BlockPos clamped = clampApproachTargetToBounds(approachTarget);
+            if (!clamped.equals(approachTarget)) {
+                traceGroundedEvent("approach target clamped to build bounds: original="
+                        + approachTarget.toShortString() + " clamped=" + clamped.toShortString());
+            } else {
+                traceGroundedEvent("approach target valid, no clamping needed: " + approachTarget.toShortString());
+            }
+            traceGroundedEvent("Baritone approach target issued: " + clamped.toShortString());
+            baritoneFacade.goTo(clamped);
             startApproachIssued = true;
         }
+    }
+
+    // Staging anchors are legitimately 1 block outside the build bounds, so allow a small
+    // grace margin to avoid clamping normal approach targets. Only targets that are far
+    // outside the bounds (e.g. from a wrong lane selection) get clamped.
+    private static final int APPROACH_TARGET_BOUNDS_GRACE = 2;
+
+    private BlockPos clampApproachTargetToBounds(BlockPos pos) {
+        int x = Math.max(activeBounds.minX() - APPROACH_TARGET_BOUNDS_GRACE,
+                         Math.min(activeBounds.maxX() + APPROACH_TARGET_BOUNDS_GRACE, pos.getX()));
+        int y = Math.max(activeBounds.minY(), pos.getY());
+        int z = Math.max(activeBounds.minZ() - APPROACH_TARGET_BOUNDS_GRACE,
+                         Math.min(activeBounds.maxZ() + APPROACH_TARGET_BOUNDS_GRACE, pos.getZ()));
+        return new BlockPos(x, y, z);
     }
 
     void advanceSweepToNextLaneForTests() {
@@ -3149,6 +3181,26 @@ public final class GroundedSingleLaneDebugRunner {
         refill.put("deficits", refillController.diagnosticsDeficits());
         refill.put("remaining", refillController.diagnosticsRemaining());
         refill.put("returnTarget", refillController.diagnosticsReturnTarget());
+        GroundedRefillController.RefillState refillState = refillController.state();
+        if (client != null
+                && (refillState == GroundedRefillController.RefillState.OPENING_CONTAINER
+                        || refillState == GroundedRefillController.RefillState.REFILLING)
+                && client.currentScreen instanceof HandledScreen<?> supplyScreen) {
+            var handler = supplyScreen.getScreenHandler();
+            int containerSlots = Math.max(0, handler.slots.size() - net.minecraft.entity.player.PlayerInventory.MAIN_SIZE);
+            List<Map<String, Object>> chestContents = new java.util.ArrayList<>();
+            for (int si = 0; si < containerSlots; si++) {
+                ItemStack stack = handler.slots.get(si).getStack();
+                if (!stack.isEmpty()) {
+                    Map<String, Object> entry = new LinkedHashMap<>();
+                    entry.put("slot", si);
+                    entry.put("itemId", Registries.ITEM.getId(stack.getItem()).toString());
+                    entry.put("count", stack.getCount());
+                    chestContents.add(entry);
+                }
+            }
+            refill.put("supplyChestContents", chestContents);
+        }
         payload.put("refill", refill);
 
         Map<String, Object> recovery = new LinkedHashMap<>();
