@@ -145,6 +145,8 @@ public final class GroundedSingleLaneDebugRunner {
     private boolean lastTransitionSprint;
     private boolean lastTransitionOvershootCorrected;
     private BlockPos lastPlacedBlockPos;
+    private Integer refillLaneProgressHint;
+    private Integer refillLaneCursorHint;
 
     private final SupplyStore supplyStore;
     private final GroundedRefillController refillController = new GroundedRefillController();
@@ -301,6 +303,17 @@ public final class GroundedSingleLaneDebugRunner {
         Optional<Integer> minimumProgress = resumePoint.reason() == GroundedSweepResumePoint.ResumeReason.PARTIAL_LANE
                 ? Optional.of(resumePoint.progressCoordinate())
                 : Optional.empty();
+        // If smart resume couldn't determine a partial-lane progress (e.g. no blocks placed
+        // before MISSING_ITEM fired), use the progress coordinate captured at refill trigger
+        // time so the sweep resumes from the right point rather than the lane start.
+        if (minimumProgress.isEmpty() && refillLaneCursorHint != null && refillLaneProgressHint != null
+                && refillLaneCursorHint == selectedLaneIndex) {
+            minimumProgress = Optional.of(refillLaneProgressHint);
+            traceGroundedEvent("applying refill progress hint: laneCursor=" + refillLaneCursorHint
+                    + " progress=" + refillLaneProgressHint);
+        }
+        refillLaneProgressHint = null;
+        refillLaneCursorHint = null;
         activateLaneData(forwardLanes.get(selectedLaneIndex), Set.of(), minimumProgress);
         Optional<String> preflightFailure = runPreflightMaterialCheckBeforeSweep();
         if (preflightFailure.isPresent()) {
@@ -653,38 +666,34 @@ public final class GroundedSingleLaneDebugRunner {
         laneWalker.interrupt();
         baritoneFacade.cancel();
 
-        // Log refill scan details to diagnose 5-wide lane coverage
-        Map<GroundedSweepPlacementExecutor.LaneRelativeBand, Integer> bandCounts = new HashMap<>();
-        Map<Item, Integer> neededCounts = new HashMap<>();
-        int scannedCount = 0;
+        // Capture lane progress hint before any state changes, so smart resume can
+        // return to the exact position after refill rather than defaulting to lane start.
+        if (client != null && client.player != null && activeLane != null) {
+            BlockPos playerPos = client.player.getBlockPos();
+            refillLaneProgressHint = activeLane.direction().alongX() ? playerPos.getX() : playerPos.getZ();
+            refillLaneCursorHint = laneCursor;
+            traceGroundedEvent("refill progress hint captured: laneCursor=" + refillLaneCursorHint + " progress=" + refillLaneProgressHint);
+        }
 
-        int lookaheadLimit = Math.min(pendingPlacementTargets.size(), MAX_REFILL_LOOKAHEAD_ITEMS);
-        for (int i = 0; i < lookaheadLimit; i++) {
-            GroundedSweepPlacementExecutor.PlacementTarget target = pendingPlacementTargets.get(i);
+        // Use the same multi-lane lookahead as the preflight path so deficit counts
+        // cover the full remaining build, not just the current lane's pending targets.
+        List<GroundedSweepPlacementExecutor.PlacementTarget> lookaheadTargets = buildRefillLookaheadPlacements(MAX_REFILL_LOOKAHEAD_ITEMS);
+        Map<Item, Integer> neededCounts = new HashMap<>();
+        for (GroundedSweepPlacementExecutor.PlacementTarget target : lookaheadTargets) {
             Placement placement = lanePlacementsByIndex.get(target.placementIndex());
+            if (placement == null || placement.block() == null) {
+                if (activeSession != null && target.placementIndex() >= 0
+                        && target.placementIndex() < activeSession.getPlan().placements().size()) {
+                    placement = activeSession.getPlan().placements().get(target.placementIndex());
+                }
+            }
             if (placement == null || placement.block() == null) {
                 continue;
             }
-            scannedCount++;
-            Item item = placement.block().asItem();
-            neededCounts.merge(item, 1, Integer::sum);
-
-            // Track lateral band distribution
-            if (activeLane != null) {
-                GroundedSweepPlacementExecutor.LaneRelativeBand band =
-                    GroundedSweepPlacementExecutor.laneRelativeBand(activeLane, target.worldPos());
-                bandCounts.merge(band, 1, Integer::sum);
-            }
+            neededCounts.merge(placement.block().asItem(), 1, Integer::sum);
         }
 
-        traceGroundedEvent("refill scan: total=" + scannedCount
-                + " lookaheadLimit=" + lookaheadLimit
-                + " LEFT_TWO=" + bandCounts.getOrDefault(GroundedSweepPlacementExecutor.LaneRelativeBand.LEFT_TWO, 0)
-                + " LEFT_ONE=" + bandCounts.getOrDefault(GroundedSweepPlacementExecutor.LaneRelativeBand.LEFT_ONE, 0)
-                + " CENTER=" + bandCounts.getOrDefault(GroundedSweepPlacementExecutor.LaneRelativeBand.CENTERLINE, 0)
-                + " RIGHT_ONE=" + bandCounts.getOrDefault(GroundedSweepPlacementExecutor.LaneRelativeBand.RIGHT_ONE, 0)
-                + " RIGHT_TWO=" + bandCounts.getOrDefault(GroundedSweepPlacementExecutor.LaneRelativeBand.RIGHT_TWO, 0));
-
+        traceGroundedEvent("refill scan: lookaheadTargets=" + lookaheadTargets.size());
         for (Map.Entry<Item, Integer> entry : neededCounts.entrySet()) {
             String itemName = Registries.ITEM.getId(entry.getKey()).getPath();
             traceGroundedEvent("refill scan: need " + entry.getValue() + "x " + itemName);
@@ -998,16 +1007,26 @@ public final class GroundedSingleLaneDebugRunner {
 
     private BlockPos selectRefillReturnTarget(MinecraftClient client) {
         if (lastPlacedBlockPos != null) {
+            traceGroundedEvent("selectRefillReturnTarget: lastPlacedBlockPos=" + lastPlacedBlockPos.toShortString());
             return lastPlacedBlockPos.toImmutable();
         }
+        // When no block has been placed yet (e.g. first attempt in lane fails), use the
+        // player's current position — they are at the failure point, which is a better
+        // return target than the lane entry staging anchor.
+        if (client != null && client.player != null) {
+            BlockPos playerPos = client.player.getBlockPos();
+            traceGroundedEvent("selectRefillReturnTarget: lastPlacedBlockPos=null, using player pos="
+                    + playerPos.toShortString()
+                    + " laneEntryAnchor=" + (laneEntryAnchor != null ? laneEntryAnchor.stagingTarget().toShortString() : "null"));
+            return playerPos;
+        }
         if (laneEntryAnchor != null && laneEntryAnchor.stagingTarget() != null) {
+            traceGroundedEvent("selectRefillReturnTarget: falling back to laneEntryAnchor stagingTarget="
+                    + laneEntryAnchor.stagingTarget().toShortString());
             return laneEntryAnchor.stagingTarget();
         }
         if (activeLane != null && activeBounds != null) {
             return activeStartApproachTarget();
-        }
-        if (client != null && client.player != null) {
-            return client.player.getBlockPos();
         }
         return null;
     }
