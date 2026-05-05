@@ -22,12 +22,15 @@ import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.Vec3d;
 
+import net.minecraft.text.Text;
+
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.HashSet;
+import java.util.stream.Collectors;
 
 public final class GroundedRefillController {
     // Constants
@@ -309,6 +312,8 @@ public final class GroundedRefillController {
         }
         ScreenHandler handler = screen.getScreenHandler();
         int containerSlotCount = Math.max(0, handler.slots.size() - PlayerInventory.MAIN_SIZE);
+        MapArtMod.LOGGER.info("[grounded-trace:refill] containerSlotCount={} (handler.slots.size={}, MAIN_SIZE={})",
+                containerSlotCount, handler.slots.size(), PlayerInventory.MAIN_SIZE);
         if (containerSlotCount <= 0) {
             closeScreen(client);
             fail("Opened screen is not a recognized supply container.");
@@ -348,7 +353,11 @@ public final class GroundedRefillController {
             Identifier needed = missing.getKey();
             for (int slotIndex = 0; slotIndex < containerSlotCount; slotIndex++) {
                 ItemStack stack = handler.slots.get(slotIndex).getStack();
-                if (!stack.isEmpty() && needed.equals(Registries.ITEM.getId(stack.getItem()))) {
+                Identifier slotItemId = stack.isEmpty() ? null : Registries.ITEM.getId(stack.getItem());
+                boolean matched = !stack.isEmpty() && needed.equals(slotItemId);
+                MapArtMod.LOGGER.info("[grounded-trace:refill] scan slot={} item={} count={} seeking={} matched={}",
+                        slotIndex, slotItemId, stack.getCount(), needed, matched);
+                if (matched) {
                     MapArtMod.LOGGER.info("[grounded-trace:refill] pulling {} x{} from slot {}",
                             needed, stack.getCount(), slotIndex);
                     client.interactionManager.clickSlot(handler.syncId, slotIndex, 0, SlotActionType.QUICK_MOVE, client.player);
@@ -367,6 +376,31 @@ public final class GroundedRefillController {
             baritone.cancel();
         }
         if (!anyUseful) {
+            // Before hard-failing, check whether the player already carries some of the needed
+            // materials. If so, continue with available inventory rather than stopping entirely.
+            Map<Identifier, Integer> playerInventory = buildInventoryMap(client.player);
+            boolean playerHasAnyNeeded = deficits.keySet().stream()
+                    .anyMatch(id -> playerInventory.getOrDefault(id, 0) > 0);
+            if (playerHasAnyNeeded) {
+                String missingList = remaining.keySet().stream()
+                        .map(Identifier::getPath)
+                        .sorted()
+                        .collect(Collectors.joining(", "));
+                MapArtMod.LOGGER.warn("[grounded-trace:refill] chest empty for needed items but player has partial supply; missing: {}", missingList);
+                if (client.player != null) {
+                    client.player.sendMessage(
+                            Text.literal("[Mapart grounded] Supply chest missing "
+                                    + missingList + ". Continuing with available materials — may run short."),
+                            false);
+                }
+                if (returnTarget != null && baritone != null) {
+                    baritone.goNear(returnTarget, RETURN_REACH_FLAT);
+                    state = RefillState.RETURNING;
+                    return TickResult.ACTIVE;
+                }
+                state = RefillState.DONE;
+                return TickResult.DONE;
+            }
             fail("Required items not found in any registered supply container.");
             return TickResult.FAILED;
         }
@@ -604,6 +638,18 @@ public final class GroundedRefillController {
      * @param targetTotals Map of item ID to TOTAL count required (NOT deficit)
      * @return Map of item ID to remaining deficit (how many more needed)
      */
+    private static Map<Identifier, Integer> buildInventoryMap(ClientPlayerEntity player) {
+        Map<Identifier, Integer> inventory = new LinkedHashMap<>();
+        if (player == null) return inventory;
+        for (int slot = 0; slot < PlayerInventory.MAIN_SIZE; slot++) {
+            ItemStack stack = player.getInventory().getStack(slot);
+            if (!stack.isEmpty()) {
+                inventory.merge(Registries.ITEM.getId(stack.getItem()), stack.getCount(), Integer::sum);
+            }
+        }
+        return inventory;
+    }
+
     private static Map<Identifier, Integer> computeRemainingDeficits(ClientPlayerEntity player, Map<Identifier, Integer> targetTotals) {
         Map<Identifier, Integer> inventory = new LinkedHashMap<>();
         for (int slot = 0; slot < PlayerInventory.MAIN_SIZE; slot++) {
