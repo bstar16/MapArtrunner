@@ -147,6 +147,8 @@ public final class GroundedSingleLaneDebugRunner {
     private BlockPos lastPlacedBlockPos;
     private Integer refillLaneProgressHint;
     private Integer refillLaneCursorHint;
+    private final Map<Identifier, SupplyExhaustedReason> exhaustedMaterials = new LinkedHashMap<>();
+    private final Set<Identifier> exhaustedWarningSent = new LinkedHashSet<>();
 
     private final SupplyStore supplyStore;
     private final GroundedRefillController refillController = new GroundedRefillController();
@@ -535,6 +537,13 @@ public final class GroundedSingleLaneDebugRunner {
         return refillController;
     }
 
+    enum SupplyExhaustedReason {
+        NOT_FOUND_IN_SUPPLIES,
+        INSUFFICIENT_SUPPLY,
+        SUPPLY_EMPTY,
+        CONTAINER_UNAVAILABLE
+    }
+
     private void triggerRecovery(MinecraftClient client, GroundedRecoveryReason reason) {
         if (client == null || client.player == null || activeLane == null) {
             return;
@@ -672,6 +681,11 @@ public final class GroundedSingleLaneDebugRunner {
     }
 
     private boolean triggerRefill(MinecraftClient client, Item requiredItem) {
+        Identifier requiredId = Registries.ITEM.getId(requiredItem);
+        if (shouldStopForKnownExhausted(client, Set.of(requiredId))) {
+            traceGroundedEvent("refill skipped because item is known exhausted: " + requiredId);
+            return false;
+        }
         clearControls(client);
         laneWalker.interrupt();
         baritoneFacade.cancel();
@@ -982,6 +996,7 @@ public final class GroundedSingleLaneDebugRunner {
     }
 
     private void handleRefillDone(MinecraftClient client) {
+        recordExhaustedFromRemainingDeficits(client, refillController.diagnosticsRemaining(), SupplyExhaustedReason.INSUFFICIENT_SUPPLY);
         BuildSession session = activeSession;
         GroundedSweepSettings settings = activeSettings;
         refillController.clear();
@@ -1060,6 +1075,7 @@ public final class GroundedSingleLaneDebugRunner {
 
     private void handleRefillFailed(MinecraftClient client) {
         String msg = refillController.failureMessage().orElse("Unknown refill failure.");
+        recordExhaustedFromRemainingDeficits(client, refillController.diagnosticsRemaining(), inferExhaustedReason(msg));
         refillController.clear();
         if (client != null && client.player != null) {
             client.player.sendMessage(Text.literal("[Mapart grounded] Refill failed: " + msg), false);
@@ -1957,6 +1973,8 @@ public final class GroundedSingleLaneDebugRunner {
         laneEntryAnchor = null;
         forwardLeftoverPlacements.clear();
         reversePlacementFilter.clear();
+        exhaustedMaterials.clear();
+        exhaustedWarningSent.clear();
     }
 
     private void tickPlacementExecutor(MinecraftClient client) {
@@ -3181,6 +3199,8 @@ public final class GroundedSingleLaneDebugRunner {
         refill.put("deficits", refillController.diagnosticsDeficits());
         refill.put("remaining", refillController.diagnosticsRemaining());
         refill.put("returnTarget", refillController.diagnosticsReturnTarget());
+        refill.put("exhaustedMaterials", exhaustedMaterials.entrySet().stream()
+                .collect(Collectors.toMap(e -> e.getKey().toString(), e -> e.getValue().name(), (a,b) -> a, LinkedHashMap::new)));
         GroundedRefillController.RefillState refillState = refillController.state();
         if (client != null
                 && (refillState == GroundedRefillController.RefillState.OPENING_CONTAINER
@@ -3407,6 +3427,75 @@ public final class GroundedSingleLaneDebugRunner {
 
     public boolean isActive() {
         return activeLane != null;
+    }
+
+    private boolean shouldStopForKnownExhausted(MinecraftClient client, Set<Identifier> needed) {
+        if (needed.isEmpty() || client == null || client.player == null) return false;
+        boolean allExhaustedAndEmpty = true;
+        for (Identifier id : needed) {
+            SupplyExhaustedReason reason = exhaustedMaterials.get(id);
+            int count = countItemInInventory(client.player, id);
+            traceGroundedEvent("supply exhausted decision: item=" + id + " reason=" + reason + " inventoryCount=" + count);
+            if (reason == null) {
+                allExhaustedAndEmpty = false;
+                continue;
+            }
+            if (count > 0) {
+                if (exhaustedWarningSent.add(id)) {
+                    client.player.sendMessage(Text.literal("[Mapart grounded] Supply is out of " + id
+                            + "; continuing with remaining inventory and may run short."), false);
+                    traceGroundedEvent("continuing with remaining inventory for exhausted item=" + id + " inventoryCount=" + count);
+                }
+                allExhaustedAndEmpty = false;
+            }
+        }
+        if (allExhaustedAndEmpty) {
+            stopForExhaustedMaterial(client, needed.iterator().next());
+            return true;
+        }
+        return false;
+    }
+
+    private void stopForExhaustedMaterial(MinecraftClient client, Identifier id) {
+        traceGroundedEvent("hard stop due to fully exhausted material=" + id + " inventoryCount=0");
+        if (client != null && client.player != null) {
+            client.player.sendMessage(Text.literal("[Mapart grounded] Build stopped: " + id
+                    + " exhausted in inventory and no registered supply contains more."), false);
+            clearControls(client);
+        }
+        laneWalker.interrupt();
+        baritoneFacade.cancel();
+        clearActiveRunState();
+    }
+
+    private void recordExhaustedFromRemainingDeficits(MinecraftClient client, Map<String, Integer> remaining, SupplyExhaustedReason reason) {
+        if (remaining == null || remaining.isEmpty()) return;
+        for (String idText : remaining.keySet()) {
+            Identifier id = Identifier.tryParse(idText);
+            if (id == null) continue;
+            exhaustedMaterials.put(id, reason);
+            int count = (client != null && client.player != null) ? countItemInInventory(client.player, id) : -1;
+            traceGroundedEvent("supply exhausted item marked: item=" + id + " reason=" + reason + " inventoryCount=" + count);
+        }
+    }
+
+    private static int countItemInInventory(ClientPlayerEntity player, Identifier itemId) {
+        int total = 0;
+        for (int slot = 0; slot < PlayerInventory.MAIN_SIZE; slot++) {
+            ItemStack stack = player.getInventory().getStack(slot);
+            if (!stack.isEmpty() && itemId.equals(Registries.ITEM.getId(stack.getItem()))) {
+                total += stack.getCount();
+            }
+        }
+        return total;
+    }
+
+    private SupplyExhaustedReason inferExhaustedReason(String msg) {
+        String lower = msg == null ? "" : msg.toLowerCase(java.util.Locale.ROOT);
+        if (lower.contains("open") || lower.contains("screen") || lower.contains("unavailable")) return SupplyExhaustedReason.CONTAINER_UNAVAILABLE;
+        if (lower.contains("not found")) return SupplyExhaustedReason.NOT_FOUND_IN_SUPPLIES;
+        if (lower.contains("empty")) return SupplyExhaustedReason.SUPPLY_EMPTY;
+        return SupplyExhaustedReason.INSUFFICIENT_SUPPLY;
     }
 
     private Optional<String> validateStart(BuildSession session, GroundedSweepSettings settings) {
