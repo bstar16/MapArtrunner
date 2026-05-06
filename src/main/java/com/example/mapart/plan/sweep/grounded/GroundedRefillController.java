@@ -33,6 +33,9 @@ import java.util.HashSet;
 import java.util.stream.Collectors;
 
 public final class GroundedRefillController {
+    public enum SupplyExhaustedReason {
+        NOT_FOUND_IN_SUPPLIES, INSUFFICIENT_SUPPLY, SUPPLY_EMPTY, CONTAINER_UNAVAILABLE
+    }
     // Constants
     static final int NAV_TIMEOUT_TICKS = 400;
     private static final int NO_PROGRESS_CHECK_INTERVAL_TICKS = 200;
@@ -68,6 +71,7 @@ public final class GroundedRefillController {
     private int containerOpenWaitPollsRemaining;
     private boolean awaitingContainerScreen;
     private int actionCooldown;
+    private final Map<Identifier, SupplyExhaustedReason> exhaustedReasons = new LinkedHashMap<>();
 
     public boolean isActive() {
         return state != RefillState.IDLE && state != RefillState.DONE && state != RefillState.FAILED;
@@ -129,6 +133,7 @@ public final class GroundedRefillController {
     }
 
     private TickResult tryNextSupply(String skipReason, BaritoneFacade baritone) {
+        markRemainingAsExhausted(SupplyExhaustedReason.CONTAINER_UNAVAILABLE);
         supplyCandidateIndex++;
         if (supplyCandidateIndex >= supplyCandidates.size()) {
             fail("Required items not found in any registered supply container.");
@@ -315,6 +320,7 @@ public final class GroundedRefillController {
         MapArtMod.LOGGER.info("[grounded-trace:refill] containerSlotCount={} (handler.slots.size={}, MAIN_SIZE={})",
                 containerSlotCount, handler.slots.size(), PlayerInventory.MAIN_SIZE);
         if (containerSlotCount <= 0) {
+            markRemainingAsExhausted(SupplyExhaustedReason.SUPPLY_EMPTY);
             closeScreen(client);
             fail("Opened screen is not a recognized supply container.");
             return TickResult.FAILED;
@@ -349,6 +355,13 @@ public final class GroundedRefillController {
         }
 
         boolean anyUseful = false;
+        Map<Identifier, Integer> availableInContainer = new LinkedHashMap<>();
+        for (int slotIndex = 0; slotIndex < containerSlotCount; slotIndex++) {
+            ItemStack stack = handler.slots.get(slotIndex).getStack();
+            if (!stack.isEmpty()) {
+                availableInContainer.merge(Registries.ITEM.getId(stack.getItem()), stack.getCount(), Integer::sum);
+            }
+        }
         for (Map.Entry<Identifier, Integer> missing : remaining.entrySet()) {
             Identifier needed = missing.getKey();
             for (int slotIndex = 0; slotIndex < containerSlotCount; slotIndex++) {
@@ -368,6 +381,18 @@ public final class GroundedRefillController {
             }
         }
         closeScreen(client);
+        if (availableInContainer.isEmpty()) {
+            markRemainingAsExhausted(SupplyExhaustedReason.SUPPLY_EMPTY);
+        } else {
+            for (Map.Entry<Identifier, Integer> missing : remaining.entrySet()) {
+                int available = availableInContainer.getOrDefault(missing.getKey(), 0);
+                if (available <= 0) {
+                    noteExhaustedReason(missing.getKey(), SupplyExhaustedReason.NOT_FOUND_IN_SUPPLIES);
+                } else if (available < missing.getValue()) {
+                    noteExhaustedReason(missing.getKey(), SupplyExhaustedReason.INSUFFICIENT_SUPPLY);
+                }
+            }
+        }
         if (supplyCandidateIndex < supplyCandidates.size() - 1) {
             return tryNextSupply("Supply #" + targetSupply.id() + " did not have all needed items", baritone);
         }
@@ -582,6 +607,11 @@ public final class GroundedRefillController {
         awaitingContainerScreen = false;
         containerOpenWaitPollsRemaining = 0;
         actionCooldown = 0;
+        exhaustedReasons.clear();
+    }
+
+    public Map<Identifier, SupplyExhaustedReason> exhaustedReasons() {
+        return Map.copyOf(exhaustedReasons);
     }
 
     private void fail(String message) {
@@ -669,5 +699,18 @@ public final class GroundedRefillController {
         MapArtMod.LOGGER.info("[grounded-trace:refill] computeRemainingDeficits: targetTotals={}, currentInventory={}, remaining={}",
                 targetTotals, inventory, remaining);
         return remaining;
+    }
+
+    private void markRemainingAsExhausted(SupplyExhaustedReason reason) {
+        for (Identifier id : deficits.keySet()) {
+            noteExhaustedReason(id, reason);
+        }
+    }
+
+    private void noteExhaustedReason(Identifier id, SupplyExhaustedReason reason) {
+        SupplyExhaustedReason existing = exhaustedReasons.get(id);
+        if (existing == null || existing == SupplyExhaustedReason.NOT_FOUND_IN_SUPPLIES) {
+            exhaustedReasons.put(id, reason);
+        }
     }
 }

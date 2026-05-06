@@ -150,6 +150,7 @@ public final class GroundedSingleLaneDebugRunner {
 
     private final SupplyStore supplyStore;
     private final GroundedRefillController refillController = new GroundedRefillController();
+    private final Map<Identifier, GroundedRefillController.SupplyExhaustedReason> exhaustedMaterials = new LinkedHashMap<>();
 
     private final GroundedRecoveryState recoveryState = new GroundedRecoveryState();
     private double lastKnownProgressCoordinate;
@@ -500,6 +501,7 @@ public final class GroundedSingleLaneDebugRunner {
         baritoneFacade.cancel();
         traceGroundedEvent("Baritone cancelled");
         handleTerminalState(client);
+        exhaustedMaterials.clear();
         return Optional.empty();
     }
 
@@ -982,6 +984,7 @@ public final class GroundedSingleLaneDebugRunner {
     }
 
     private void handleRefillDone(MinecraftClient client) {
+        noteExhaustedFromRefill(client);
         BuildSession session = activeSession;
         GroundedSweepSettings settings = activeSettings;
         refillController.clear();
@@ -1059,10 +1062,42 @@ public final class GroundedSingleLaneDebugRunner {
     }
 
     private void handleRefillFailed(MinecraftClient client) {
+        noteExhaustedFromRefill(client);
         String msg = refillController.failureMessage().orElse("Unknown refill failure.");
         refillController.clear();
         if (client != null && client.player != null) {
             client.player.sendMessage(Text.literal("[Mapart grounded] Refill failed: " + msg), false);
+        }
+        stop();
+    }
+
+
+    private void noteExhaustedFromRefill(MinecraftClient client) {
+        for (Map.Entry<Identifier, GroundedRefillController.SupplyExhaustedReason> e : refillController.exhaustedReasons().entrySet()) {
+            exhaustedMaterials.put(e.getKey(), e.getValue());
+            int held = client != null && client.player != null ? countItemInInventory(client.player, e.getKey()) : -1;
+            traceGroundedEvent("supply exhausted marked: item=" + e.getKey() + " reason=" + e.getValue() + " held=" + held);
+        }
+    }
+
+    private int countItemInInventory(ClientPlayerEntity player, Identifier id) {
+        if (player == null || id == null) return 0;
+        return countItemsInInventory(player).entrySet().stream()
+                .filter(e -> id.equals(Registries.ITEM.getId(e.getKey())))
+                .mapToInt(Map.Entry::getValue)
+                .sum();
+    }
+
+    private void hardStopForExhaustedItem(MinecraftClient client, Identifier itemId) {
+        traceGroundedEvent("hard stop exhausted item=" + itemId + " held=0 reason=" + exhaustedMaterials.get(itemId));
+        if (client != null) {
+            clearControls(client);
+        }
+        laneWalker.interrupt();
+        baritoneFacade.cancel();
+        if (client != null && client.player != null) {
+            client.player.sendMessage(Text.literal("[Mapart grounded] Build stopped: " + itemId
+                    + " exhausted in inventory and no registered supply contains more."), false);
         }
         stop();
     }
@@ -1812,6 +1847,7 @@ public final class GroundedSingleLaneDebugRunner {
             }
 
             reversePlacementFilter.clear();
+        exhaustedMaterials.clear();
             reversePlacementFilter.addAll(forwardLeftoverPlacements);
             sweepPassPhase = SweepPassPhase.REVERSE;
             laneCursor = 0;
@@ -1992,6 +2028,21 @@ public final class GroundedSingleLaneDebugRunner {
                 case ALREADY_CORRECT -> onPlacementResult(candidate.placementIndex(), GroundedSweepPlacementExecutor.PlacementResult.SUCCESS, laneTicksElapsed);
                 case RETRY, MOVE_REQUIRED -> onPlacementResult(candidate.placementIndex(), GroundedSweepPlacementExecutor.PlacementResult.MISSED, laneTicksElapsed);
                 case MISSING_ITEM -> {
+                    Identifier itemId = placement.block() == null ? null : Registries.ITEM.getId(placement.block().asItem());
+                    int heldCount = countItemInInventory(client.player, itemId);
+                    if (itemId != null && exhaustedMaterials.containsKey(itemId)) {
+                        traceGroundedEvent("refill skipped: known exhausted item=" + itemId + " held=" + heldCount
+                                + " reason=" + exhaustedMaterials.get(itemId));
+                        if (heldCount > 0) {
+                            client.player.sendMessage(Text.literal("[Mapart grounded] Supply is out of " + itemId
+                                    + "; continuing with remaining inventory and may run short."), false);
+                            onPlacementResult(candidate.placementIndex(), GroundedSweepPlacementExecutor.PlacementResult.MISSED, laneTicksElapsed);
+                            attempts++;
+                            continue;
+                        }
+                        hardStopForExhaustedItem(client, itemId);
+                        return;
+                    }
                     if (supplyStore != null && !refillController.isActive() && !recoveryState.isActive()
                             && placement.block() != null) {
                         if (triggerRefill(client, placement.block().asItem())) {
