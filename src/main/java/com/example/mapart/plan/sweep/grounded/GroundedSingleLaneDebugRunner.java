@@ -467,7 +467,7 @@ public final class GroundedSingleLaneDebugRunner {
         }
 
         applyLaneControls(client);
-        displacementAlert.tick(client, true, client.player.getY() < activeBounds.minY());
+        displacementAlert.tick(client, true, activeBounds != null && client.player.getY() < activeBounds.minY());
 
         if (!walkerActiveAfterTick) {
             handleTerminalState(client);
@@ -1506,6 +1506,7 @@ public final class GroundedSingleLaneDebugRunner {
     private static final int APPROACH_TARGET_BOUNDS_GRACE = 2;
 
     private BlockPos clampApproachTargetToBounds(BlockPos pos) {
+        if (activeBounds == null) return pos;
         int x = Math.max(activeBounds.minX() - APPROACH_TARGET_BOUNDS_GRACE,
                          Math.min(activeBounds.maxX() + APPROACH_TARGET_BOUNDS_GRACE, pos.getX()));
         int y = Math.max(activeBounds.minY(), pos.getY());
