@@ -463,6 +463,7 @@ public final class MapArtCommand {
 
         GroundedSweepSettings groundedSettings = groundedSettings(settingsStore.current());
 
+        runner.resetExhaustedStateForNewRun();
         Optional<String> error = runner.start(session.get(), laneIndex, groundedSettings);
         if (error.isPresent()) {
             source.sendError(Text.literal(error.get()));
@@ -560,6 +561,7 @@ public final class MapArtCommand {
         }
 
         GroundedSweepSettings groundedSettings = groundedSettings(settingsStore.current());
+        runner.resetExhaustedStateForNewRun();
         Optional<String> error = runner.startFullSweep(session.get(), groundedSettings);
         if (error.isPresent()) {
             source.sendError(Text.literal(error.get()));

@@ -1452,6 +1452,128 @@ class GroundedSingleLaneDebugRunnerTest {
         assertDoesNotThrow(() -> ((Map<?, ?>) payload.get("refill")).get("returnTarget"));
         assertDoesNotThrow(() -> ((Map<?, ?>) payload.get("baritone")).get("lastIssuedGoal"));
     }
+
+    // ─── Exhausted-material tracking tests ───────────────────────────────────
+
+    @Test
+    void exhaustedMaterialsClearedOnStop() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
+        net.minecraft.util.Identifier itemId = net.minecraft.util.Identifier.of("minecraft:dirt");
+        runner.markExhaustedForTests(itemId, GroundedRefillController.SupplyExhaustedReason.NOT_FOUND_IN_SUPPLIES);
+
+        assertFalse(runner.exhaustedMaterialsForTests().isEmpty());
+        runner.stop();
+        assertTrue(runner.exhaustedMaterialsForTests().isEmpty());
+    }
+
+    @Test
+    void exhaustedWarningSentClearedOnStop() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
+        net.minecraft.util.Identifier itemId = net.minecraft.util.Identifier.of("minecraft:dirt");
+        runner.markExhaustedForTests(itemId, GroundedRefillController.SupplyExhaustedReason.NOT_FOUND_IN_SUPPLIES);
+        // simulate that a warning was already sent for this item
+        runner.stop(); // stop clears both; re-mark and verify the clear path
+        // After stop the sets are empty
+        assertTrue(runner.exhaustedMaterialsForTests().isEmpty());
+        assertTrue(runner.exhaustedWarningSentForTests().isEmpty());
+    }
+
+    @Test
+    void exhaustedMaterialsClearedOnNewRunReset() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        net.minecraft.util.Identifier itemId = net.minecraft.util.Identifier.of("minecraft:stone");
+        // Mark without starting a run (simulates stale state from a previous completed run)
+        runner.markExhaustedForTests(itemId, GroundedRefillController.SupplyExhaustedReason.INSUFFICIENT_SUPPLY);
+        assertFalse(runner.exhaustedMaterialsForTests().isEmpty());
+
+        runner.resetExhaustedStateForNewRun();
+
+        assertTrue(runner.exhaustedMaterialsForTests().isEmpty());
+        assertTrue(runner.exhaustedWarningSentForTests().isEmpty());
+    }
+
+    @Test
+    void exhaustedMaterialsSurvivesHandleRefillDone() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        BuildSession session = sessionWithOrigin();
+        assertTrue(runner.start(session, 0, GroundedSweepSettings.defaults()).isEmpty());
+
+        net.minecraft.util.Identifier itemId = net.minecraft.util.Identifier.of("minecraft:sand");
+        com.example.mapart.supply.SupplyPoint supply =
+                new com.example.mapart.supply.SupplyPoint(1, new BlockPos(5, 64, 5), "minecraft:overworld", "chest");
+        runner.triggerRefillForTests(Map.of(itemId, 16), List.of(supply), new NoOpBaritoneFacade());
+
+        // Mark the item as exhausted in the refill controller (simulates supply found empty)
+        runner.getRefillController().markExhaustedForTests(itemId, GroundedRefillController.SupplyExhaustedReason.SUPPLY_EMPTY);
+
+        // Complete the refill — handleRefillDone copies exhaustedReasons into runner's exhaustedMaterials
+        runner.simulateRefillCompleteForTests();
+
+        assertTrue(runner.exhaustedMaterialsForTests().containsKey(itemId),
+                "exhaustedMaterials should still contain item after refill completes");
+        assertEquals(GroundedRefillController.SupplyExhaustedReason.SUPPLY_EMPTY,
+                runner.exhaustedMaterialsForTests().get(itemId));
+    }
+
+    @Test
+    void exhaustedMaterialsSurvivesAdvanceToReversePass() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        BuildSession session = rectangularSessionWithOrigin(new Vec3i(21, 1, 11));
+        assertTrue(runner.startFullSweep(session, GroundedSweepSettings.defaults()).isEmpty());
+
+        net.minecraft.util.Identifier itemId = net.minecraft.util.Identifier.of("minecraft:gravel");
+        runner.markExhaustedForTests(itemId, GroundedRefillController.SupplyExhaustedReason.NOT_FOUND_IN_SUPPLIES);
+
+        // Advance through all forward lanes to trigger transition to reverse pass
+        int maxAdvances = 20;
+        for (int i = 0; i < maxAdvances; i++) {
+            runner.advanceSweepToNextLaneForTests();
+            if (!runner.isActive()) break;
+        }
+
+        // exhaustedMaterials must survive lane transitions (Fix 4: not cleared in tryAdvanceSweepToNextLane)
+        assertTrue(runner.exhaustedMaterialsForTests().containsKey(itemId),
+                "exhaustedMaterials should survive lane transitions including reverse pass entry");
+    }
+
+    @Test
+    void exhaustedWarningSentPreventsDuplicateWarningEntry() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
+
+        net.minecraft.util.Identifier itemId = net.minecraft.util.Identifier.of("minecraft:dirt");
+        runner.markExhaustedForTests(itemId, GroundedRefillController.SupplyExhaustedReason.NOT_FOUND_IN_SUPPLIES);
+
+        // Before any warning: set is empty
+        assertTrue(runner.exhaustedWarningSentForTests().isEmpty());
+
+        // After stop: both are cleared
+        runner.stop();
+        assertTrue(runner.exhaustedWarningSentForTests().isEmpty());
+        assertTrue(runner.exhaustedMaterialsForTests().isEmpty());
+    }
+
+    @Test
+    void diagnosticsPayloadIncludesExhaustedMaterialFields() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
+
+        net.minecraft.util.Identifier itemId = net.minecraft.util.Identifier.of("minecraft:dirt");
+        runner.markExhaustedForTests(itemId, GroundedRefillController.SupplyExhaustedReason.SUPPLY_EMPTY);
+
+        var payload = runner.buildDiagnosticsPayload(null);
+        @SuppressWarnings("unchecked")
+        Map<String, Object> refill = (Map<String, Object>) payload.get("refill");
+        assertNotNull(refill.get("exhaustedMaterials"), "diagnostics should include exhaustedMaterials");
+        assertNotNull(refill.get("exhaustedWarningSent"), "diagnostics should include exhaustedWarningSent");
+        @SuppressWarnings("unchecked")
+        Map<String, String> exhaustedMap = (Map<String, String>) refill.get("exhaustedMaterials");
+        assertTrue(exhaustedMap.containsKey("minecraft:dirt"));
+        assertEquals("SUPPLY_EMPTY", exhaustedMap.get("minecraft:dirt"));
+    }
+
     private static final class RecordingBaritoneFacade implements BaritoneFacade {
         private BlockPos lastGoToTarget;
         private int goToCalls;

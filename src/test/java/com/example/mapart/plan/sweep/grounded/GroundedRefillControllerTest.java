@@ -11,6 +11,8 @@ import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Vec3i;
 import org.junit.jupiter.api.Test;
 
+import net.minecraft.util.Identifier;
+
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -201,6 +203,50 @@ class GroundedRefillControllerTest {
         GroundedRefillController.TickResult result = controller.simulateRefillingForTests(Map.of(0, 1), new java.util.HashMap<>(), Set.of(0), baritone);
         assertEquals(GroundedRefillController.TickResult.ACTIVE, result);
         assertEquals(GroundedRefillController.RefillState.RETURNING, controller.state());
+    }
+
+    @Test
+    void tryNextSupplyDoesNotMarkContainerUnavailable() {
+        RecordingBaritoneFacade baritone = new RecordingBaritoneFacade();
+        GroundedRefillController controller = new GroundedRefillController();
+        SupplyPoint supply1 = new SupplyPoint(1, new BlockPos(50, 64, 50), "minecraft:overworld", "chest1");
+        SupplyPoint supply2 = new SupplyPoint(2, new BlockPos(60, 64, 60), "minecraft:overworld", "chest2");
+        Identifier dirtId = Identifier.of("minecraft:dirt");
+
+        controller.initiateWithSuppliesForTests(List.of(supply1, supply2), Map.of(dirtId, 5), baritone);
+        assertEquals(GroundedRefillController.RefillState.NAVIGATING, controller.state());
+
+        // Simulate skipping to next supply (as if container at supply1 was inaccessible or lacked items)
+        GroundedRefillController.TickResult result = controller.invokeTryNextSupplyForTests("supply lacked items", baritone);
+
+        // Should navigate to the second supply, not mark as exhausted
+        assertEquals(GroundedRefillController.TickResult.ACTIVE, result);
+        assertEquals(GroundedRefillController.RefillState.NAVIGATING, controller.state());
+        assertFalse(
+            controller.exhaustedReasons().containsValue(GroundedRefillController.SupplyExhaustedReason.CONTAINER_UNAVAILABLE),
+            "tryNextSupply must not mark items as CONTAINER_UNAVAILABLE — container was accessible, it just lacked stock"
+        );
+    }
+
+    @Test
+    void tryNextSupplyFailsWhenAllSuppliesExhausted() {
+        RecordingBaritoneFacade baritone = new RecordingBaritoneFacade();
+        GroundedRefillController controller = new GroundedRefillController();
+        SupplyPoint supply = new SupplyPoint(1, new BlockPos(50, 64, 50), "minecraft:overworld", "chest");
+        Identifier dirtId = Identifier.of("minecraft:dirt");
+
+        controller.initiateWithSuppliesForTests(List.of(supply), Map.of(dirtId, 5), baritone);
+        assertEquals(GroundedRefillController.RefillState.NAVIGATING, controller.state());
+
+        // With only one supply, advancing to next should fail
+        GroundedRefillController.TickResult result = controller.invokeTryNextSupplyForTests("no more supplies", baritone);
+
+        assertEquals(GroundedRefillController.TickResult.FAILED, result);
+        assertEquals(GroundedRefillController.RefillState.FAILED, controller.state());
+        // Still must not mark CONTAINER_UNAVAILABLE
+        assertFalse(
+            controller.exhaustedReasons().containsValue(GroundedRefillController.SupplyExhaustedReason.CONTAINER_UNAVAILABLE)
+        );
     }
 
     // ---- Helpers ----
