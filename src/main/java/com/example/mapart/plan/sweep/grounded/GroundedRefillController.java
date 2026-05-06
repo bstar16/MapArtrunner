@@ -133,7 +133,6 @@ public final class GroundedRefillController {
     }
 
     private TickResult tryNextSupply(String skipReason, BaritoneFacade baritone) {
-        markRemainingAsExhausted(SupplyExhaustedReason.CONTAINER_UNAVAILABLE);
         supplyCandidateIndex++;
         if (supplyCandidateIndex >= supplyCandidates.size()) {
             fail("Required items not found in any registered supply container.");
@@ -166,6 +165,14 @@ public final class GroundedRefillController {
         navTicksRemaining = 0;
         ticksSinceLastProgressCheck = NO_PROGRESS_CHECK_INTERVAL_TICKS;
         lastProgressCheckDistance = 1000.0;
+    }
+
+    TickResult invokeTryNextSupplyForTests(String reason, BaritoneFacade baritone) {
+        return tryNextSupply(reason, baritone);
+    }
+
+    void markExhaustedForTests(Identifier id, SupplyExhaustedReason reason) {
+        noteExhaustedReason(id, reason);
     }
 
     public TickResult tick(MinecraftClient client, BaritoneFacade baritone) {

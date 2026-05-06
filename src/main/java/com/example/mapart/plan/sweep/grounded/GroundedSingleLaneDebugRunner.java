@@ -151,6 +151,7 @@ public final class GroundedSingleLaneDebugRunner {
     private final SupplyStore supplyStore;
     private final GroundedRefillController refillController = new GroundedRefillController();
     private final Map<Identifier, GroundedRefillController.SupplyExhaustedReason> exhaustedMaterials = new LinkedHashMap<>();
+    private final Set<Identifier> exhaustedWarningSent = new LinkedHashSet<>();
 
     private final GroundedRecoveryState recoveryState = new GroundedRecoveryState();
     private double lastKnownProgressCoordinate;
@@ -502,7 +503,13 @@ public final class GroundedSingleLaneDebugRunner {
         traceGroundedEvent("Baritone cancelled");
         handleTerminalState(client);
         exhaustedMaterials.clear();
+        exhaustedWarningSent.clear();
         return Optional.empty();
+    }
+
+    public void resetExhaustedStateForNewRun() {
+        exhaustedMaterials.clear();
+        exhaustedWarningSent.clear();
     }
 
     public DebugStatus status() {
@@ -793,6 +800,10 @@ public final class GroundedSingleLaneDebugRunner {
             traceGroundedEvent("preflight refill started due to missing materials");
             return Optional.empty();
         }
+        if (!isActive()) {
+            // Runner was hard-stopped by exhausted material check — message already sent to player
+            return Optional.empty();
+        }
         if (supplyStore == null || supplyStore.list().isEmpty()) {
             traceGroundedEvent("preflight refill unavailable due to no supply");
             return Optional.of("Missing required materials and no supply point is registered: " + missingText);
@@ -940,8 +951,43 @@ public final class GroundedSingleLaneDebugRunner {
                         LinkedHashMap::new
                 ));
 
-        Map<Identifier, Integer> deficitMap = new LinkedHashMap<>();
-        neededItems.forEach((item, count) -> deficitMap.put(Registries.ITEM.getId(item), count));
+        Map<Identifier, Integer> rawDeficitMap = new LinkedHashMap<>();
+        neededItems.forEach((item, count) -> rawDeficitMap.put(Registries.ITEM.getId(item), count));
+
+        // FIX 2: Filter known-exhausted items from the deficit before triggering a refill.
+        // This prevents an infinite refill loop when supplies can't satisfy a material.
+        final Map<Identifier, Integer> deficitMap;
+        if (!exhaustedMaterials.isEmpty() && client != null && client.player != null) {
+            Map<Identifier, Integer> filteredDeficit = new LinkedHashMap<>();
+            for (Map.Entry<Identifier, Integer> entry : rawDeficitMap.entrySet()) {
+                Identifier id = entry.getKey();
+                if (exhaustedMaterials.containsKey(id)) {
+                    int held = countItemInInventory(client.player, id);
+                    if (held == 0) {
+                        traceGroundedEvent("preflight: exhausted item " + id + " has 0 held — hard stopping");
+                        hardStopForExhaustedItem(client, id);
+                        return false;
+                    }
+                    // Player has some remaining — warn once and skip this item from the refill request
+                    if (!exhaustedWarningSent.contains(id)) {
+                        exhaustedWarningSent.add(id);
+                        client.player.sendMessage(Text.literal("[Mapart grounded] Supply is out of " + id.getPath()
+                                + "; continuing with remaining inventory and may run short."), false);
+                    }
+                    traceGroundedEvent("preflight: exhausted item " + id + " has " + held + " held — skipping from refill");
+                } else {
+                    filteredDeficit.put(id, entry.getValue());
+                }
+            }
+            if (filteredDeficit.isEmpty()) {
+                // All deficits were for exhausted items; player has some of each — continue without a refill trip
+                traceGroundedEvent("preflight: all deficits are for exhausted items and player has partial supply — continuing without refill");
+                return true;
+            }
+            deficitMap = filteredDeficit;
+        } else {
+            deficitMap = rawDeficitMap;
+        }
 
         BlockPos returnTarget = selectRefillReturnTarget(client);
         traceGroundedEvent("grounded refill request created: source=preflight");
@@ -1719,6 +1765,18 @@ public final class GroundedSingleLaneDebugRunner {
         handleRefillDone(null);
     }
 
+    void markExhaustedForTests(Identifier id, GroundedRefillController.SupplyExhaustedReason reason) {
+        exhaustedMaterials.put(id, reason);
+    }
+
+    Map<Identifier, GroundedRefillController.SupplyExhaustedReason> exhaustedMaterialsForTests() {
+        return Map.copyOf(exhaustedMaterials);
+    }
+
+    Set<Identifier> exhaustedWarningSentForTests() {
+        return Set.copyOf(exhaustedWarningSent);
+    }
+
     static boolean shouldAttemptPlacementAfterWalkerTick(GroundedLaneWalker.GroundedLaneWalkState state) {
         return state == GroundedLaneWalker.GroundedLaneWalkState.ACTIVE;
     }
@@ -1847,7 +1905,6 @@ public final class GroundedSingleLaneDebugRunner {
             }
 
             reversePlacementFilter.clear();
-        exhaustedMaterials.clear();
             reversePlacementFilter.addAll(forwardLeftoverPlacements);
             sweepPassPhase = SweepPassPhase.REVERSE;
             laneCursor = 0;
@@ -2034,8 +2091,11 @@ public final class GroundedSingleLaneDebugRunner {
                         traceGroundedEvent("refill skipped: known exhausted item=" + itemId + " held=" + heldCount
                                 + " reason=" + exhaustedMaterials.get(itemId));
                         if (heldCount > 0) {
-                            client.player.sendMessage(Text.literal("[Mapart grounded] Supply is out of " + itemId
-                                    + "; continuing with remaining inventory and may run short."), false);
+                            if (!exhaustedWarningSent.contains(itemId)) {
+                                exhaustedWarningSent.add(itemId);
+                                client.player.sendMessage(Text.literal("[Mapart grounded] Supply is out of " + itemId
+                                        + "; continuing with remaining inventory and may run short."), false);
+                            }
                             onPlacementResult(candidate.placementIndex(), GroundedSweepPlacementExecutor.PlacementResult.MISSED, laneTicksElapsed);
                             attempts++;
                             continue;
@@ -3232,6 +3292,10 @@ public final class GroundedSingleLaneDebugRunner {
         refill.put("deficits", refillController.diagnosticsDeficits());
         refill.put("remaining", refillController.diagnosticsRemaining());
         refill.put("returnTarget", refillController.diagnosticsReturnTarget());
+        Map<String, String> exhaustedMap = new LinkedHashMap<>();
+        exhaustedMaterials.forEach((id, reason) -> exhaustedMap.put(id.toString(), reason.name()));
+        refill.put("exhaustedMaterials", exhaustedMap);
+        refill.put("exhaustedWarningSent", exhaustedWarningSent.stream().map(Identifier::toString).collect(Collectors.toList()));
         GroundedRefillController.RefillState refillState = refillController.state();
         if (client != null
                 && (refillState == GroundedRefillController.RefillState.OPENING_CONTAINER
