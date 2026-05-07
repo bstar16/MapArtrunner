@@ -1,3 +1,17 @@
+/**
+ * Refill state machine lifecycle.
+ *
+ * IDLE             → initiateWithSupplies() sets deficits, supplyCandidates
+ * NAVIGATING       → no state changes
+ * OPENING_CONTAINER → no state changes
+ * REFILLING        → exhaustedReasons populated, deficits consumed tick by tick
+ * RETURNING        → deficits must still be valid (do NOT clear yet)
+ * DONE             → clear() called by runner AFTER noteExhaustedFromRefill
+ * FAILED           → clear() called by runner AFTER noteExhaustedFromRefill
+ *
+ * Clearing order matters. Never call clear() before noteExhaustedFromRefill
+ * has had a chance to read exhaustedReasons.
+ */
 package com.example.mapart.plan.sweep.grounded;
 
 import com.example.mapart.MapArtMod;
