@@ -1030,6 +1030,7 @@ public final class GroundedSingleLaneDebugRunner {
     }
 
     private void handleRefillDone(MinecraftClient client) {
+        resetExhaustedStateForNewRun();
         noteExhaustedFromRefill(client);
         BuildSession session = activeSession;
         GroundedSweepSettings settings = activeSettings;
@@ -1108,6 +1109,7 @@ public final class GroundedSingleLaneDebugRunner {
     }
 
     private void handleRefillFailed(MinecraftClient client) {
+        resetExhaustedStateForNewRun();
         noteExhaustedFromRefill(client);
         String msg = refillController.failureMessage().orElse("Unknown refill failure.");
         refillController.clear();
