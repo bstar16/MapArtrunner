@@ -87,6 +87,8 @@ Do not fix only the surface symptom.
 Before implementing any new system, check whether the existing codebase 
 already solves this problem. Reuse before reinvent.
 
+Document state lifecycle in comments when implementing state machines. Clearing order matters.
+
 The codebase currently has two parallel build/refill paths:
 - BuildCoordinator (used by /mapart start) — older
 - GroundedSingleLaneDebugRunner / GroundedRefillController 
