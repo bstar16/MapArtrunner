@@ -1119,6 +1119,12 @@ public final class GroundedSingleLaneDebugRunner {
 
 
     private void noteExhaustedFromRefill(MinecraftClient client) {
+        if (!refillController.chestWasScanned()) {
+            // Chest was never actually scanned — deficits were either empty or navigation failed
+            // before the container opened. Do not record any exhaustion to avoid false positives.
+            MapArtMod.LOGGER.info("[grounded-trace:refill] noteExhaustedFromRefill: skipping — chest was not scanned");
+            return;
+        }
         for (Map.Entry<Identifier, GroundedRefillController.SupplyExhaustedReason> e : refillController.exhaustedReasons().entrySet()) {
             exhaustedMaterials.put(e.getKey(), e.getValue());
             int held = client != null && client.player != null ? countItemInInventory(client.player, e.getKey()) : -1;
@@ -3222,7 +3228,7 @@ public final class GroundedSingleLaneDebugRunner {
             groundedTraceEvents.remove(0);
         }
         MapArtMod.LOGGER.info(event);
-        sendGroundedTraceChat(message);
+        // Trace events go to the log only; only user-facing messages use sendMessage/sendGroundedTraceChat.
     }
 
 
