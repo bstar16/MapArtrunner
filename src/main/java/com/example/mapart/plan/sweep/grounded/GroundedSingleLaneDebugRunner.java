@@ -1224,6 +1224,13 @@ public final class GroundedSingleLaneDebugRunner {
         if (laneStartStage == LaneStartStage.AWAITING_LANE_ENTRY_STEP) {
             laneEntryStepTicks++;
             if (laneEntryStepTicks > MAX_LANE_ENTRY_STEP_TICKS) {
+                if (client.world != null && laneEntryAlreadyBuilt(client, pendingLaneStart, activeBounds, entryAnchor)) {
+                    traceGroundedEvent("entry step timed out: lane partially built, skipping to centerline align");
+                    clearControls(client);
+                    laneStartStage = LaneStartStage.ALIGN_ENTRY_CENTERLINE;
+                    pendingLaneStartTicks = 0;
+                    return;
+                }
                 failLaneStart(client, "Timed out stepping onto lane start.");
                 return;
             }
@@ -2462,6 +2469,23 @@ public final class GroundedSingleLaneDebugRunner {
             selected.add(target);
         }
         return List.copyOf(selected);
+    }
+
+    private boolean laneEntryAlreadyBuilt(MinecraftClient client, GroundedSweepLane lane, GroundedSchematicBounds bounds, GroundedLaneEntryAnchor entryAnchor) {
+        if (client.world == null || activeSettings == null || pendingPlacementTargets.isEmpty()) {
+            return false;
+        }
+        List<GroundedSweepPlacementExecutor.PlacementTarget> candidates = entryBurstTargets(lane, bounds, entryAnchor, pendingPlacementTargets, activeSettings.sweepHalfWidth());
+        for (GroundedSweepPlacementExecutor.PlacementTarget target : candidates) {
+            Placement placement = lanePlacementsByIndex.get(target.placementIndex());
+            if (placement == null || placement.block() == null) {
+                continue;
+            }
+            if (client.world.getBlockState(target.worldPos()).isOf(placement.block())) {
+                return true;
+            }
+        }
+        return false;
     }
 
     static List<GroundedSweepPlacementExecutor.PlacementTarget> entryBurstTargetsForTests(
