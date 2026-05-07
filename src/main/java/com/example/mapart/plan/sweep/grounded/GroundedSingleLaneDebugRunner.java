@@ -309,7 +309,10 @@ public final class GroundedSingleLaneDebugRunner {
                         + " out of bounds (0–" + (forwardLanes.size() - 1) + ")");
             }
         }
-        boolean hintOverrodeLane = refillLaneCursorHint != null && selectedLaneIndex != smartResumeLaneIndex;
+        // hintApplied: the hint was present and in-bounds — always wins over smart resume progress
+        boolean hintApplied = refillLaneCursorHint != null
+                && refillLaneCursorHint >= 0
+                && refillLaneCursorHint < forwardLanes.size();
         laneCursor = selectedLaneIndex;
         smartResumeUsed = useSmartResume;
         selectedResumePoint = resumePoint;
@@ -317,12 +320,12 @@ public final class GroundedSingleLaneDebugRunner {
 
         boolean resumePointMatchesSelectedLane = resumePoint.laneIndex() == selectedLaneIndex;
         Optional<Integer> minimumProgress;
-        if (hintOverrodeLane && refillLaneProgressHint != null) {
+        if (hintApplied && refillLaneProgressHint != null) {
             laneEntryAnchor = buildLaneEntryAnchorFromProgressHint(
                     forwardLanes.get(selectedLaneIndex), bounds, refillLaneProgressHint);
             minimumProgress = Optional.of(refillLaneProgressHint);
-            traceGroundedEvent("refill hint applied: overriding lane " + smartResumeLaneIndex
-                    + " → " + selectedLaneIndex + ", progress " + refillLaneProgressHint);
+            traceGroundedEvent("hint applied: lane=" + selectedLaneIndex
+                    + " progress=" + refillLaneProgressHint + " anchor=" + laneEntryAnchor);
         } else if (resumePointMatchesSelectedLane && resumePoint.reason() == GroundedSweepResumePoint.ResumeReason.PARTIAL_LANE) {
             laneEntryAnchor = buildLaneEntryAnchorFromResumePoint(
                     forwardLanes.get(selectedLaneIndex), bounds, resumePoint);
@@ -331,11 +334,6 @@ public final class GroundedSingleLaneDebugRunner {
             laneEntryAnchor = buildLaneEntryAnchorForFreshStart(
                     forwardLanes.get(selectedLaneIndex), bounds, LaneEntrySource.FRESH_START);
             minimumProgress = Optional.empty();
-        }
-        if (minimumProgress.isEmpty() && refillLaneProgressHint != null) {
-            minimumProgress = Optional.of(refillLaneProgressHint);
-            traceGroundedEvent("refill hint consumed: applying progress=" + refillLaneProgressHint
-                    + " for lane " + selectedLaneIndex);
         }
         refillLaneProgressHint = null;
         refillLaneCursorHint = null;
