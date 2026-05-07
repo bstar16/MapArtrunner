@@ -90,6 +90,7 @@ public final class GroundedRefillController {
     // Exhaustion reasons are only recorded when this is true, preventing false
     // NOT_FOUND_IN_SUPPLIES marks when the refill completed with empty deficits.
     private boolean chestWasScanned = false;
+    private boolean inventoryWasFullDuringRefill = false;
 
     public boolean isActive() {
         return state != RefillState.IDLE && state != RefillState.DONE && state != RefillState.FAILED;
@@ -132,6 +133,7 @@ public final class GroundedRefillController {
         // Reset per-cycle state so stale data from a previous cycle does not carry over.
         exhaustedReasons.clear();
         chestWasScanned = false;
+        inventoryWasFullDuringRefill = false;
         this.supplyCandidates = List.copyOf(supplies);
         this.supplyCandidateIndex = 0;
         this.deficits = new LinkedHashMap<>(deficits);
@@ -379,6 +381,7 @@ public final class GroundedRefillController {
         }
         if (freeSlots == 0) {
             // Inventory is full, can't pull more even though deficits remain
+            inventoryWasFullDuringRefill = true;
             MapArtMod.LOGGER.info("[grounded-trace:refill] inventory full, ending refill with remaining={}", remaining);
             closeScreen(client);
             if (returnTarget != null && baritone != null) {
@@ -417,15 +420,17 @@ public final class GroundedRefillController {
             }
         }
         closeScreen(client);
-        if (availableInContainer.isEmpty()) {
-            markRemainingAsExhausted(SupplyExhaustedReason.SUPPLY_EMPTY);
-        } else {
-            for (Map.Entry<Identifier, Integer> missing : remaining.entrySet()) {
-                int available = availableInContainer.getOrDefault(missing.getKey(), 0);
-                if (available <= 0) {
-                    noteExhaustedReason(missing.getKey(), SupplyExhaustedReason.NOT_FOUND_IN_SUPPLIES);
-                } else if (available < missing.getValue()) {
-                    noteExhaustedReason(missing.getKey(), SupplyExhaustedReason.INSUFFICIENT_SUPPLY);
+        if (!inventoryWasFullDuringRefill) {
+            if (availableInContainer.isEmpty()) {
+                markRemainingAsExhausted(SupplyExhaustedReason.SUPPLY_EMPTY);
+            } else {
+                for (Map.Entry<Identifier, Integer> missing : remaining.entrySet()) {
+                    int available = availableInContainer.getOrDefault(missing.getKey(), 0);
+                    if (available <= 0) {
+                        noteExhaustedReason(missing.getKey(), SupplyExhaustedReason.NOT_FOUND_IN_SUPPLIES);
+                    } else if (available < missing.getValue()) {
+                        noteExhaustedReason(missing.getKey(), SupplyExhaustedReason.INSUFFICIENT_SUPPLY);
+                    }
                 }
             }
         }
@@ -644,6 +649,7 @@ public final class GroundedRefillController {
         containerOpenWaitPollsRemaining = 0;
         actionCooldown = 0;
         chestWasScanned = false;
+        inventoryWasFullDuringRefill = false;
         exhaustedReasons.clear();
     }
 
