@@ -975,18 +975,19 @@ public final class GroundedSingleLaneDebugRunner {
                 Identifier id = entry.getKey();
                 if (exhaustedMaterials.containsKey(id)) {
                     int held = countItemInInventory(client.player, id);
-                    if (held == 0) {
-                        traceGroundedEvent("preflight: exhausted item " + id + " has 0 held — hard stopping");
-                        hardStopForExhaustedItem(client, id);
-                        return false;
+                    if (held > 0) {
+                        // Player has some remaining — warn once and skip this item from the refill request
+                        if (!exhaustedWarningSent.contains(id)) {
+                            exhaustedWarningSent.add(id);
+                            client.player.sendMessage(Text.literal("[Mapart grounded] Supply is out of " + id.getPath()
+                                    + "; continuing with remaining inventory and may run short."), false);
+                        }
+                        traceGroundedEvent("preflight: exhausted item " + id + " has " + held + " held — skipping from refill");
+                        continue;
                     }
-                    // Player has some remaining — warn once and skip this item from the refill request
-                    if (!exhaustedWarningSent.contains(id)) {
-                        exhaustedWarningSent.add(id);
-                        client.player.sendMessage(Text.literal("[Mapart grounded] Supply is out of " + id.getPath()
-                                + "; continuing with remaining inventory and may run short."), false);
-                    }
-                    traceGroundedEvent("preflight: exhausted item " + id + " has " + held + " held — skipping from refill");
+                    // held == 0: exhaustion mark may be stale, fall through to include in refill request
+                    traceGroundedEvent("preflight: exhausted item " + id + " has 0 held — including in refill request (mark may be stale)");
+                    filteredDeficit.put(id, entry.getValue());
                 } else {
                     filteredDeficit.put(id, entry.getValue());
                 }
@@ -1525,7 +1526,7 @@ public final class GroundedSingleLaneDebugRunner {
             if (startApproachIsTrulyFreshStart) {
                 baritoneFacade.goTo(clamped);
             } else {
-                baritoneFacade.goNear(clamped, 3);
+                baritoneFacade.goTo(clamped);
             }
             startApproachIssued = true;
         }
@@ -2119,21 +2120,16 @@ public final class GroundedSingleLaneDebugRunner {
                 case MISSING_ITEM -> {
                     Identifier itemId = placement.block() == null ? null : Registries.ITEM.getId(placement.block().asItem());
                     int heldCount = countItemInInventory(client.player, itemId);
-                    if (itemId != null && exhaustedMaterials.containsKey(itemId)) {
-                        traceGroundedEvent("refill skipped: known exhausted item=" + itemId + " held=" + heldCount
-                                + " reason=" + exhaustedMaterials.get(itemId));
-                        if (heldCount > 0) {
-                            if (!exhaustedWarningSent.contains(itemId)) {
-                                exhaustedWarningSent.add(itemId);
-                                client.player.sendMessage(Text.literal("[Mapart grounded] Supply is out of " + itemId
-                                        + "; continuing with remaining inventory and may run short."), false);
-                            }
-                            onPlacementResult(candidate.placementIndex(), GroundedSweepPlacementExecutor.PlacementResult.MISSED, laneTicksElapsed);
-                            attempts++;
-                            continue;
+                    if (itemId != null && exhaustedMaterials.containsKey(itemId) && heldCount > 0) {
+                        traceGroundedEvent("exhausted item=" + itemId + " held=" + heldCount + " — continuing with remaining inventory");
+                        if (!exhaustedWarningSent.contains(itemId)) {
+                            exhaustedWarningSent.add(itemId);
+                            client.player.sendMessage(Text.literal("[Mapart grounded] Supply is out of " + itemId
+                                    + "; continuing with remaining inventory and may run short."), false);
                         }
-                        hardStopForExhaustedItem(client, itemId);
-                        return;
+                        onPlacementResult(candidate.placementIndex(), GroundedSweepPlacementExecutor.PlacementResult.MISSED, laneTicksElapsed);
+                        attempts++;
+                        continue;
                     }
                     if (supplyStore != null && !refillController.isActive() && !recoveryState.isActive()
                             && placement.block() != null) {
