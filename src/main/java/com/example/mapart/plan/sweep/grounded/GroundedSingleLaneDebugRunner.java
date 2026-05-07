@@ -95,6 +95,7 @@ public final class GroundedSingleLaneDebugRunner {
     private long laneTicksElapsed;
     private boolean awaitingStartApproach;
     private boolean startApproachIssued;
+    private boolean startApproachIsTrulyFreshStart;
     private boolean awaitingLaneShift;
     private boolean awaitingTransitionSupport;
     private BlockPos laneShiftTarget;
@@ -299,26 +300,38 @@ public final class GroundedSingleLaneDebugRunner {
         // lane and progress where building was active when refill fired, which is more reliable
         // than smart resume's block-scan result (smart resume may pick an earlier lane if few
         // blocks have been placed in the hinted lane yet).
-        if (refillLaneCursorHint != null && refillLaneCursorHint >= 0 && refillLaneCursorHint < forwardLanes.size()) {
-            traceGroundedEvent("refill hint consumed: overriding smart resume lane "
-                    + selectedLaneIndex + " with hint lane " + refillLaneCursorHint);
-            selectedLaneIndex = refillLaneCursorHint;
+        int smartResumeLaneIndex = selectedLaneIndex;
+        if (refillLaneCursorHint != null) {
+            if (refillLaneCursorHint >= 0 && refillLaneCursorHint < forwardLanes.size()) {
+                selectedLaneIndex = refillLaneCursorHint;
+            } else {
+                traceGroundedEvent("refill hint ignored: lane " + refillLaneCursorHint
+                        + " out of bounds (0–" + (forwardLanes.size() - 1) + ")");
+            }
         }
+        boolean hintOverrodeLane = refillLaneCursorHint != null && selectedLaneIndex != smartResumeLaneIndex;
         laneCursor = selectedLaneIndex;
         smartResumeUsed = useSmartResume;
         selectedResumePoint = resumePoint;
         skippedCompletedForwardLanes = selectedLaneIndex;
 
-        // Use the resume point's anchor only if smart resume picked the same lane as the hint;
-        // otherwise the resume point is for a different lane and a fresh start is correct.
         boolean resumePointMatchesSelectedLane = resumePoint.laneIndex() == selectedLaneIndex;
-        laneEntryAnchor = (resumePointMatchesSelectedLane && resumePoint.reason() == GroundedSweepResumePoint.ResumeReason.PARTIAL_LANE)
-                ? buildLaneEntryAnchorFromResumePoint(forwardLanes.get(selectedLaneIndex), bounds, resumePoint)
-                : buildLaneEntryAnchorForFreshStart(forwardLanes.get(selectedLaneIndex), bounds, LaneEntrySource.FRESH_START);
-
-        Optional<Integer> minimumProgress = (resumePointMatchesSelectedLane && resumePoint.reason() == GroundedSweepResumePoint.ResumeReason.PARTIAL_LANE)
-                ? Optional.of(resumePoint.progressCoordinate())
-                : Optional.empty();
+        Optional<Integer> minimumProgress;
+        if (hintOverrodeLane && refillLaneProgressHint != null) {
+            laneEntryAnchor = buildLaneEntryAnchorFromProgressHint(
+                    forwardLanes.get(selectedLaneIndex), bounds, refillLaneProgressHint);
+            minimumProgress = Optional.of(refillLaneProgressHint);
+            traceGroundedEvent("refill hint applied: overriding lane " + smartResumeLaneIndex
+                    + " → " + selectedLaneIndex + ", progress " + refillLaneProgressHint);
+        } else if (resumePointMatchesSelectedLane && resumePoint.reason() == GroundedSweepResumePoint.ResumeReason.PARTIAL_LANE) {
+            laneEntryAnchor = buildLaneEntryAnchorFromResumePoint(
+                    forwardLanes.get(selectedLaneIndex), bounds, resumePoint);
+            minimumProgress = Optional.of(resumePoint.progressCoordinate());
+        } else {
+            laneEntryAnchor = buildLaneEntryAnchorForFreshStart(
+                    forwardLanes.get(selectedLaneIndex), bounds, LaneEntrySource.FRESH_START);
+            minimumProgress = Optional.empty();
+        }
         if (minimumProgress.isEmpty() && refillLaneProgressHint != null) {
             minimumProgress = Optional.of(refillLaneProgressHint);
             traceGroundedEvent("refill hint consumed: applying progress=" + refillLaneProgressHint
@@ -336,6 +349,7 @@ public final class GroundedSingleLaneDebugRunner {
             startApproachIssued = false;
             return Optional.empty();
         }
+        startApproachIsTrulyFreshStart = (lastPlacedBlockPos == null);
         awaitingStartApproach = true;
         startApproachIssued = false;
         awaitingLaneShift = false;
@@ -1503,7 +1517,11 @@ public final class GroundedSingleLaneDebugRunner {
                 traceGroundedEvent("approach target valid, no clamping needed: " + approachTarget.toShortString());
             }
             traceGroundedEvent("Baritone approach target issued: " + clamped.toShortString());
-            baritoneFacade.goTo(clamped);
+            if (startApproachIsTrulyFreshStart) {
+                baritoneFacade.goTo(clamped);
+            } else {
+                baritoneFacade.goNear(clamped, 3);
+            }
             startApproachIssued = true;
         }
     }
@@ -2981,6 +2999,25 @@ public final class GroundedSingleLaneDebugRunner {
         );
     }
 
+    private static GroundedLaneEntryAnchor buildLaneEntryAnchorFromProgressHint(
+            GroundedSweepLane lane,
+            GroundedSchematicBounds bounds,
+            int progressCoord
+    ) {
+        int y = bounds.minY() + 1;
+        BlockPos entryStandingTarget = lane.direction().alongX()
+                ? new BlockPos(progressCoord, y, lane.startPoint().getZ())
+                : new BlockPos(lane.startPoint().getX(), y, progressCoord);
+        return new GroundedLaneEntryAnchor(
+                lane.laneIndex(),
+                lane.direction(),
+                entryStandingTarget,
+                stagingTargetForEntry(lane.direction(), entryStandingTarget),
+                progressCoord,
+                LaneEntrySource.PARTIAL_RESUME
+        );
+    }
+
     private GroundedLaneEntryAnchor laneEntryAnchorForActiveLane(GroundedSweepLane lane, GroundedSchematicBounds bounds) {
         if (lane == null || bounds == null) {
             return null;
@@ -3612,6 +3649,7 @@ public final class GroundedSingleLaneDebugRunner {
         laneEntryAnchor = buildLaneEntryAnchorForFreshStart(lane, activeBounds, LaneEntrySource.FRESH_START);
         pendingShiftLane = null;
 
+        startApproachIsTrulyFreshStart = (lastPlacedBlockPos == null);
         awaitingStartApproach = true;
         traceGroundedEvent("awaitingStartApproach=true");
         startApproachIssued = false;
