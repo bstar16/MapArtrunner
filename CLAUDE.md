@@ -51,6 +51,7 @@ in a 5-wide corridor, serpentining until the schematic is complete.
   Consider how the fix behaves for all four directions: EAST, WEST, NORTH, SOUTH.
 
 ### Code changes
+- Document state lifecycle in comments when implementing state machines. Clearing order matters.
 - Avoid broad refactors
 - Prefer small, scoped fixes
 - Do not change placement executor logic unless the prompt explicitly asks
