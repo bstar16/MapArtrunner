@@ -72,6 +72,10 @@ public final class GroundedRefillController {
     private boolean awaitingContainerScreen;
     private int actionCooldown;
     private final Map<Identifier, SupplyExhaustedReason> exhaustedReasons = new LinkedHashMap<>();
+    // Set to true once the container screen is open and slots are being scanned.
+    // Exhaustion reasons are only recorded when this is true, preventing false
+    // NOT_FOUND_IN_SUPPLIES marks when the refill completed with empty deficits.
+    private boolean chestWasScanned = false;
 
     public boolean isActive() {
         return state != RefillState.IDLE && state != RefillState.DONE && state != RefillState.FAILED;
@@ -107,9 +111,16 @@ public final class GroundedRefillController {
             fail("No supply container registered in this dimension. Cannot restock.");
             return false;
         }
+        if (deficits == null || deficits.isEmpty()) {
+            fail("Refill initiated with empty deficit map — nothing to pull.");
+            return false;
+        }
+        // Reset per-cycle state so stale data from a previous cycle does not carry over.
+        exhaustedReasons.clear();
+        chestWasScanned = false;
         this.supplyCandidates = List.copyOf(supplies);
         this.supplyCandidateIndex = 0;
-        this.deficits = deficits != null ? new LinkedHashMap<>(deficits) : Map.of();
+        this.deficits = new LinkedHashMap<>(deficits);
         this.returnTarget = returnTarget;
         return navigateToSupply(supplyCandidates.get(0), baritone);
     }
@@ -172,6 +183,7 @@ public final class GroundedRefillController {
     }
 
     void markExhaustedForTests(Identifier id, SupplyExhaustedReason reason) {
+        chestWasScanned = true; // simulating a real scan result
         noteExhaustedReason(id, reason);
     }
 
@@ -332,6 +344,9 @@ public final class GroundedRefillController {
             fail("Opened screen is not a recognized supply container.");
             return TickResult.FAILED;
         }
+        // Container is open and has slots — mark that a real scan is underway so
+        // that exhaustion reasons recorded below are trusted.
+        chestWasScanned = true;
 
         // Check if player inventory has free slots before attempting to pull
         PlayerInventory inventory = client.player.getInventory();
@@ -614,11 +629,17 @@ public final class GroundedRefillController {
         awaitingContainerScreen = false;
         containerOpenWaitPollsRemaining = 0;
         actionCooldown = 0;
+        chestWasScanned = false;
         exhaustedReasons.clear();
     }
 
     public Map<Identifier, SupplyExhaustedReason> exhaustedReasons() {
         return Map.copyOf(exhaustedReasons);
+    }
+
+    /** True if the container was successfully opened and slots were scanned during this refill cycle. */
+    public boolean chestWasScanned() {
+        return chestWasScanned;
     }
 
     private void fail(String message) {
