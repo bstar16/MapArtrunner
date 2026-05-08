@@ -7,15 +7,17 @@ public record MapartSettings(
         boolean overlayShowOnlyIncorrect,
         boolean hudCompact,
         int clientTimerSpeed,
+        boolean clientTimerEnabled,
         int hudX,
         int hudY,
-        boolean preferLongerAxis,
         int sweepHalfWidth,
         int sweepTotalWidth,
         int laneStride,
         int forwardLookaheadSteps,
         int trivialBehindCleanupSteps,
-        boolean groundedSweepConstantSprint
+        boolean groundedSweepConstantSprint,
+        int placementDelayTicks,
+        int inventoryClickDelayTicks
 ) {
     public static MapartSettings defaults() {
         return new MapartSettings(
@@ -25,15 +27,17 @@ public record MapartSettings(
                 false,
                 false,
                 1,
+                true,
                 8,
                 8,
-                false,
                 2,
                 5,
                 5,
                 1,
                 1,
-                true
+                true,
+                0,
+                0
         );
     }
 }

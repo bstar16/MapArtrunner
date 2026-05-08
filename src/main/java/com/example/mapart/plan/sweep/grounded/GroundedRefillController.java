@@ -91,6 +91,17 @@ public final class GroundedRefillController {
     // NOT_FOUND_IN_SUPPLIES marks when the refill completed with empty deficits.
     private boolean chestWasScanned = false;
     private boolean inventoryWasFullDuringRefill = false;
+    private int configuredClickDelayTicks = 0;
+
+    public void setInventoryClickDelayTicks(int ticks) {
+        this.configuredClickDelayTicks = Math.max(0, ticks);
+    }
+
+    private int effectiveClickDelay() {
+        return configuredClickDelayTicks > 0
+                ? Math.max(ACTION_COOLDOWN_TICKS, configuredClickDelayTicks)
+                : ACTION_COOLDOWN_TICKS;
+    }
 
     public boolean isActive() {
         return state != RefillState.IDLE && state != RefillState.DONE && state != RefillState.FAILED;
@@ -312,7 +323,7 @@ public final class GroundedRefillController {
         }
         awaitingContainerScreen = true;
         containerOpenWaitPollsRemaining = CONTAINER_OPEN_WAIT_POLLS;
-        actionCooldown = ACTION_COOLDOWN_TICKS;
+        actionCooldown = effectiveClickDelay();
         return TickResult.ACTIVE;
     }
 
@@ -413,7 +424,7 @@ public final class GroundedRefillController {
                     MapArtMod.LOGGER.info("[grounded-trace:refill] pulling {} x{} from slot {}",
                             needed, stack.getCount(), slotIndex);
                     client.interactionManager.clickSlot(handler.syncId, slotIndex, 0, SlotActionType.QUICK_MOVE, client.player);
-                    actionCooldown = ACTION_COOLDOWN_TICKS;
+                    actionCooldown = effectiveClickDelay();
                     anyUseful = true;
                     return TickResult.ACTIVE;
                 }

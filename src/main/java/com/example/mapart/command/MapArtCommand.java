@@ -1,6 +1,7 @@
 package com.example.mapart.command;
 
 import com.example.mapart.baritone.BaritoneFacade;
+import com.example.mapart.gui.MapArtConfigScreen;
 import com.example.mapart.plan.BuildPlan;
 import com.example.mapart.plan.Placement;
 import com.example.mapart.plan.state.BuildCoordinator;
@@ -196,7 +197,9 @@ public final class MapArtCommand {
                         .then(ClientCommandManager.literal("status")
                                 .executes(context -> groundedRefillSupplyStatus(context.getSource(), supplyStore))))
                 .then(ClientCommandManager.literal("settings")
-                        .executes(context -> showSettings(context.getSource(), settingsStore))
+                        .executes(context -> openSettingsScreen(context.getSource(), settingsStore))
+                        .then(ClientCommandManager.literal("show")
+                                .executes(context -> showSettings(context.getSource(), settingsStore)))
                         .then(ClientCommandManager.literal("set")
                                 .then(ClientCommandManager.argument("key", StringArgumentType.word())
                                         .then(ClientCommandManager.argument("value", StringArgumentType.greedyString())
@@ -733,7 +736,7 @@ public final class MapArtCommand {
 
     private static GroundedSweepSettings groundedSettings(MapartSettings settings) {
         return new GroundedSweepSettings(
-                settings.preferLongerAxis(),
+                true,
                 settings.sweepHalfWidth(),
                 settings.sweepTotalWidth(),
                 settings.laneStride(),
@@ -888,17 +891,24 @@ public final class MapArtCommand {
         return 1;
     }
 
+    private static int openSettingsScreen(FabricClientCommandSource source, MapartSettingsStore settingsStore) {
+        net.minecraft.client.MinecraftClient mc = source.getClient();
+        mc.execute(() -> mc.setScreen(new MapArtConfigScreen(settingsStore, mc.currentScreen)));
+        return 1;
+    }
+
     private static int showSettings(FabricClientCommandSource source, MapartSettingsStore settingsStore) {
         MapartSettings settings = settingsStore.current();
         source.sendFeedback(Text.literal("showHud=" + settings.showHud()));
+        source.sendFeedback(Text.literal("hudCompact=" + settings.hudCompact()));
         source.sendFeedback(Text.literal("showSchematicOverlay=" + settings.showSchematicOverlay()));
         source.sendFeedback(Text.literal("overlayCurrentRegionOnly=" + settings.overlayCurrentRegionOnly()));
         source.sendFeedback(Text.literal("overlayShowOnlyIncorrect=" + settings.overlayShowOnlyIncorrect()));
-        source.sendFeedback(Text.literal("hudCompact=" + settings.hudCompact()));
+        source.sendFeedback(Text.literal("groundedSweepConstantSprint=" + settings.groundedSweepConstantSprint()));
+        source.sendFeedback(Text.literal("placementDelayTicks=" + settings.placementDelayTicks()));
+        source.sendFeedback(Text.literal("inventoryClickDelayTicks=" + settings.inventoryClickDelayTicks()));
         source.sendFeedback(Text.literal("clientTimerSpeed=" + settings.clientTimerSpeed()));
-        source.sendFeedback(Text.literal("hudX=" + settings.hudX()));
-        source.sendFeedback(Text.literal("hudY=" + settings.hudY()));
-        source.sendFeedback(Text.literal("clientTimerSpeed=" + ClientTimerController.getMultiplier()));
+        source.sendFeedback(Text.literal("clientTimerEnabled=" + settings.clientTimerEnabled()));
         return 1;
     }
 
