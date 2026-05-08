@@ -485,7 +485,11 @@ public final class GroundedSingleLaneDebugRunner {
             return;
         }
 
-        applyLaneControls(client);
+        if (placementDelayCooldown > 0) {
+            clearControls(client);
+        } else {
+            applyLaneControls(client);
+        }
         displacementAlert.tick(client, true, activeBounds != null && client.player.getY() < activeBounds.minY());
 
         if (!walkerActiveAfterTick) {
