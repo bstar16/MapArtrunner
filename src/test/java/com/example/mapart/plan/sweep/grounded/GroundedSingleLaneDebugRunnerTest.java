@@ -749,7 +749,7 @@ class GroundedSingleLaneDebugRunnerTest {
     @Test
     void laneZeroToLaneOneTransitionRemainsForwardPhaseAndAwaitsShift() {
         GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
-        assertTrue(runner.startFullSweep(sessionWithOrigin(new Vec3i(5, 1, 11)), GroundedSweepSettings.defaults()).isEmpty());
+        assertTrue(runner.startFullSweep(sessionWithOrigin(new Vec3i(11, 1, 11)), GroundedSweepSettings.defaults()).isEmpty());
 
         runner.advanceSweepToNextLaneForTests();
 
@@ -764,7 +764,7 @@ class GroundedSingleLaneDebugRunnerTest {
     @Test
     void shiftedLaneCompletionQueuesYawLockBeforeWalkerStartsInRuntimeFlow() {
         GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
-        assertTrue(runner.startFullSweep(sessionWithOrigin(new Vec3i(5, 1, 11)), GroundedSweepSettings.defaults()).isEmpty());
+        assertTrue(runner.startFullSweep(sessionWithOrigin(new Vec3i(11, 1, 11)), GroundedSweepSettings.defaults()).isEmpty());
         runner.advanceSweepToNextLaneForTests();
         GroundedSingleLaneDebugRunner.LaneShiftPlan plan = runner.laneShiftPlanForTests().orElseThrow();
 
@@ -782,7 +782,7 @@ class GroundedSingleLaneDebugRunnerTest {
     @Test
     void laneOneWestYawLockAppliesPlayerHeadAndBodyYawInTestHook() {
         GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
-        assertTrue(runner.startFullSweep(sessionWithOrigin(new Vec3i(5, 1, 11)), GroundedSweepSettings.defaults()).isEmpty());
+        assertTrue(runner.startFullSweep(sessionWithOrigin(new Vec3i(11, 1, 11)), GroundedSweepSettings.defaults()).isEmpty());
         runner.advanceSweepToNextLaneForTests();
         GroundedSweepLane westLane = runner.laneShiftPlanForTests().orElseThrow().toLane();
         assertEquals(1, westLane.laneIndex());
@@ -949,7 +949,7 @@ class GroundedSingleLaneDebugRunnerTest {
     @Test
     void eastWestTransitionUsesCardinalShiftOnly() {
         GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
-        assertTrue(runner.startFullSweep(sessionWithOrigin(new Vec3i(5, 1, 11)), GroundedSweepSettings.defaults()).isEmpty());
+        assertTrue(runner.startFullSweep(sessionWithOrigin(new Vec3i(11, 1, 11)), GroundedSweepSettings.defaults()).isEmpty());
         runner.advanceSweepToNextLaneForTests();
         GroundedSingleLaneDebugRunner.LaneShiftPlan plan = runner.laneShiftPlanForTests().orElseThrow();
 
@@ -963,7 +963,7 @@ class GroundedSingleLaneDebugRunnerTest {
     @Test
     void centerlineCorrectionReversesDirectionWhenOvershootingTargetLane() {
         GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
-        assertTrue(runner.startFullSweep(sessionWithOrigin(new Vec3i(5, 1, 11)), GroundedSweepSettings.defaults()).isEmpty());
+        assertTrue(runner.startFullSweep(sessionWithOrigin(new Vec3i(11, 1, 11)), GroundedSweepSettings.defaults()).isEmpty());
         runner.advanceSweepToNextLaneForTests();
         GroundedSingleLaneDebugRunner.LaneShiftPlan plan = runner.laneShiftPlanForTests().orElseThrow();
 
@@ -978,7 +978,7 @@ class GroundedSingleLaneDebugRunnerTest {
     @Test
     void transitionDoesNotStartNextLaneUntilBothAxesAligned() {
         GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
-        assertTrue(runner.startFullSweep(sessionWithOrigin(new Vec3i(5, 1, 11)), GroundedSweepSettings.defaults()).isEmpty());
+        assertTrue(runner.startFullSweep(sessionWithOrigin(new Vec3i(11, 1, 11)), GroundedSweepSettings.defaults()).isEmpty());
         runner.advanceSweepToNextLaneForTests();
         GroundedSingleLaneDebugRunner.LaneShiftPlan plan = runner.laneShiftPlanForTests().orElseThrow();
 
@@ -1081,7 +1081,7 @@ class GroundedSingleLaneDebugRunnerTest {
     @Test
     void reversePhaseDoesNotStartAfterFirstForwardLane() {
         GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
-        assertTrue(runner.startFullSweep(sessionWithOrigin(new Vec3i(5, 1, 11)), GroundedSweepSettings.defaults()).isEmpty());
+        assertTrue(runner.startFullSweep(sessionWithOrigin(new Vec3i(11, 1, 11)), GroundedSweepSettings.defaults()).isEmpty());
 
         runner.advanceSweepToNextLaneForTests();
 

@@ -1,7 +1,6 @@
 package com.example.mapart.plan.sweep.grounded;
 
 public record GroundedSweepSettings(
-        boolean preferLongerAxis,
         int sweepHalfWidth,
         int sweepTotalWidth,
         int laneStride,
@@ -36,7 +35,6 @@ public record GroundedSweepSettings(
 
     public static GroundedSweepSettings defaults() {
         return new GroundedSweepSettings(
-                false,
                 2,
                 5,
                 5,

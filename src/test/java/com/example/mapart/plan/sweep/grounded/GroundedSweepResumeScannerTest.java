@@ -128,7 +128,7 @@ class GroundedSweepResumeScannerTest {
 
     @Test
     void scannerRespectsLaneYawAndDirection() {
-        Fixture fixture = fixture(new Vec3i(6, 1, 16), new BlockPos(0, 64, 0));
+        Fixture fixture = fixture(new Vec3i(16, 1, 6), new BlockPos(0, 64, 0));
 
         GroundedSweepResumeSelection selection = fixture.scan(java.util.Set.of(), new Vec3d(0.5, 65, 0.5));
         GroundedSweepResumePoint point = selection.resumePoint().orElseThrow();

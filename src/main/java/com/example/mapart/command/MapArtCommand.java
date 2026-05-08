@@ -736,7 +736,6 @@ public final class MapArtCommand {
 
     private static GroundedSweepSettings groundedSettings(MapartSettings settings) {
         return new GroundedSweepSettings(
-                true,
                 settings.sweepHalfWidth(),
                 settings.sweepTotalWidth(),
                 settings.laneStride(),
