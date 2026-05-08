@@ -42,7 +42,7 @@ class GroundedSweepLanePlannerTest {
     }
 
     @Test
-    void usesNorthSouthOrientationWhenZSpanIsLonger() {
+    void usesEastWestOrientationEvenWhenZSpanIsLonger() {
         GroundedSweepSettings settings = new GroundedSweepSettings(2, 5, 5, 1, 1, true, 1.0);
         GroundedSchematicBounds zLongerBounds = new GroundedSchematicBounds(
                 new BlockPos(10, 64, 10),
@@ -52,9 +52,9 @@ class GroundedSweepLanePlannerTest {
 
         List<GroundedSweepLane> lanes = planner.planLanes(zLongerBounds, settings);
 
-        assertEquals(GroundedLaneDirection.SOUTH, lanes.getFirst().direction());
-        assertEquals(new BlockPos(12, 64, 10), lanes.getFirst().startPoint());
-        assertEquals(new BlockPos(12, 64, 24), lanes.getFirst().endPoint());
+        assertEquals(GroundedLaneDirection.EAST, lanes.getFirst().direction());
+        assertEquals(new BlockPos(10, 64, 12), lanes.getFirst().startPoint());
+        assertEquals(new BlockPos(15, 64, 12), lanes.getFirst().endPoint());
     }
 
     @Test

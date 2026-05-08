@@ -62,7 +62,7 @@ public final class GroundedSweepLanePlanner {
     }
 
     private static Orientation chooseOrientation(GroundedSchematicBounds bounds) {
-        return bounds.xSpan() >= bounds.zSpan() ? Orientation.EAST_WEST : Orientation.NORTH_SOUTH;
+        return Orientation.EAST_WEST;
     }
 
     private enum Orientation {
