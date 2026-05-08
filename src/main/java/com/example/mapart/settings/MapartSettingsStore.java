@@ -44,15 +44,17 @@ public class MapartSettingsStore {
                 case "overlayshowonlyincorrect" -> settings = with(overlayShowOnlyIncorrect(parseBoolean(value)));
                 case "hudcompact" -> settings = with(hudCompact(parseBoolean(value)));
                 case "clienttimerspeed" -> settings = with(clientTimerSpeed(parseClientTimerSpeed(value)));
+                case "clienttimerenabled" -> settings = with(clientTimerEnabled(parseBoolean(value)));
                 case "hudx" -> settings = with(hudX(parseInt(value)));
                 case "hudy" -> settings = with(hudY(parseInt(value)));
-                case "preferlongeraxis" -> settings = with(preferLongerAxis(parseBoolean(value)));
                 case "sweephalfwidth" -> settings = with(sweepHalfWidth(parseNonNegativeInt(value, "sweepHalfWidth")));
                 case "sweeptotalwidth" -> settings = with(sweepTotalWidth(parsePositiveInt(value, "sweepTotalWidth")));
                 case "lanestride" -> settings = with(laneStride(parsePositiveInt(value, "laneStride")));
                 case "forwardlookaheadsteps" -> settings = with(forwardLookaheadSteps(parseNonNegativeInt(value, "forwardLookaheadSteps")));
                 case "trivialbehindcleanupsteps" -> settings = with(trivialBehindCleanupSteps(parseNonNegativeInt(value, "trivialBehindCleanupSteps")));
                 case "groundedsweepconstantsprint" -> settings = with(groundedSweepConstantSprint(parseBoolean(value)));
+                case "placementdelayticks" -> settings = with(placementDelayTicks(parseBoundedInt(value, "placementDelayTicks", 0, 10)));
+                case "inventoryclickdelayticks" -> settings = with(inventoryClickDelayTicks(parseBoundedInt(value, "inventoryClickDelayTicks", 0, 10)));
                 default -> {
                     return Optional.of("Unknown settings key: " + key);
                 }
@@ -74,15 +76,17 @@ public class MapartSettingsStore {
                 mutator.overlayShowOnlyIncorrect != null ? mutator.overlayShowOnlyIncorrect : current.overlayShowOnlyIncorrect(),
                 mutator.hudCompact != null ? mutator.hudCompact : current.hudCompact(),
                 mutator.clientTimerSpeed != null ? mutator.clientTimerSpeed : current.clientTimerSpeed(),
+                mutator.clientTimerEnabled != null ? mutator.clientTimerEnabled : current.clientTimerEnabled(),
                 mutator.hudX != null ? mutator.hudX : current.hudX(),
                 mutator.hudY != null ? mutator.hudY : current.hudY(),
-                mutator.preferLongerAxis != null ? mutator.preferLongerAxis : current.preferLongerAxis(),
                 mutator.sweepHalfWidth != null ? mutator.sweepHalfWidth : current.sweepHalfWidth(),
                 mutator.sweepTotalWidth != null ? mutator.sweepTotalWidth : current.sweepTotalWidth(),
                 mutator.laneStride != null ? mutator.laneStride : current.laneStride(),
                 mutator.forwardLookaheadSteps != null ? mutator.forwardLookaheadSteps : current.forwardLookaheadSteps(),
                 mutator.trivialBehindCleanupSteps != null ? mutator.trivialBehindCleanupSteps : current.trivialBehindCleanupSteps(),
-                mutator.groundedSweepConstantSprint != null ? mutator.groundedSweepConstantSprint : current.groundedSweepConstantSprint()
+                mutator.groundedSweepConstantSprint != null ? mutator.groundedSweepConstantSprint : current.groundedSweepConstantSprint(),
+                mutator.placementDelayTicks != null ? mutator.placementDelayTicks : current.placementDelayTicks(),
+                mutator.inventoryClickDelayTicks != null ? mutator.inventoryClickDelayTicks : current.inventoryClickDelayTicks()
         );
 
         validateGroundedSweepWidths(updated.sweepHalfWidth(), updated.sweepTotalWidth());
@@ -95,15 +99,17 @@ public class MapartSettingsStore {
     private static SettingsMutator overlayShowOnlyIncorrect(boolean value) { return new SettingsMutator().overlayShowOnlyIncorrect(value); }
     private static SettingsMutator hudCompact(boolean value) { return new SettingsMutator().hudCompact(value); }
     private static SettingsMutator clientTimerSpeed(int value) { return new SettingsMutator().clientTimerSpeed(value); }
+    private static SettingsMutator clientTimerEnabled(boolean value) { return new SettingsMutator().clientTimerEnabled(value); }
     private static SettingsMutator hudX(int value) { return new SettingsMutator().hudX(value); }
     private static SettingsMutator hudY(int value) { return new SettingsMutator().hudY(value); }
-    private static SettingsMutator preferLongerAxis(boolean value) { return new SettingsMutator().preferLongerAxis(value); }
     private static SettingsMutator sweepHalfWidth(int value) { return new SettingsMutator().sweepHalfWidth(value); }
     private static SettingsMutator sweepTotalWidth(int value) { return new SettingsMutator().sweepTotalWidth(value); }
     private static SettingsMutator laneStride(int value) { return new SettingsMutator().laneStride(value); }
     private static SettingsMutator forwardLookaheadSteps(int value) { return new SettingsMutator().forwardLookaheadSteps(value); }
     private static SettingsMutator trivialBehindCleanupSteps(int value) { return new SettingsMutator().trivialBehindCleanupSteps(value); }
     private static SettingsMutator groundedSweepConstantSprint(boolean value) { return new SettingsMutator().groundedSweepConstantSprint(value); }
+    private static SettingsMutator placementDelayTicks(int value) { return new SettingsMutator().placementDelayTicks(value); }
+    private static SettingsMutator inventoryClickDelayTicks(int value) { return new SettingsMutator().inventoryClickDelayTicks(value); }
 
     private static boolean parseBoolean(String value) {
         if ("true".equalsIgnoreCase(value) || "false".equalsIgnoreCase(value)) {
@@ -132,6 +138,14 @@ public class MapartSettingsStore {
         int parsed = parseInt(value);
         if (parsed <= 0) {
             throw new IllegalArgumentException(key + " must be > 0.");
+        }
+        return parsed;
+    }
+
+    private static int parseBoundedInt(String value, String key, int min, int max) {
+        int parsed = parseInt(value);
+        if (parsed < min || parsed > max) {
+            throw new IllegalArgumentException(key + " must be between " + min + " and " + max + ".");
         }
         return parsed;
     }
@@ -177,15 +191,17 @@ public class MapartSettingsStore {
                     stored.overlayShowOnlyIncorrect == null ? defaults.overlayShowOnlyIncorrect() : stored.overlayShowOnlyIncorrect,
                     stored.hudCompact == null ? defaults.hudCompact() : stored.hudCompact,
                     stored.clientTimerSpeed == null ? defaults.clientTimerSpeed() : parseClientTimerSpeed(Integer.toString(stored.clientTimerSpeed)),
+                    stored.clientTimerEnabled == null ? defaults.clientTimerEnabled() : stored.clientTimerEnabled,
                     stored.hudX == null ? defaults.hudX() : stored.hudX,
                     stored.hudY == null ? defaults.hudY() : stored.hudY,
-                    stored.preferLongerAxis == null ? defaults.preferLongerAxis() : stored.preferLongerAxis,
                     sweepHalfWidth,
                     sweepTotalWidth,
                     stored.laneStride == null ? defaults.laneStride() : parsePositiveInt(Integer.toString(stored.laneStride), "laneStride"),
                     stored.forwardLookaheadSteps == null ? defaults.forwardLookaheadSteps() : parseNonNegativeInt(Integer.toString(stored.forwardLookaheadSteps), "forwardLookaheadSteps"),
                     stored.trivialBehindCleanupSteps == null ? defaults.trivialBehindCleanupSteps() : parseNonNegativeInt(Integer.toString(stored.trivialBehindCleanupSteps), "trivialBehindCleanupSteps"),
-                    stored.groundedSweepConstantSprint == null ? defaults.groundedSweepConstantSprint() : stored.groundedSweepConstantSprint
+                    stored.groundedSweepConstantSprint == null ? defaults.groundedSweepConstantSprint() : stored.groundedSweepConstantSprint,
+                    stored.placementDelayTicks == null ? defaults.placementDelayTicks() : parseBoundedInt(Integer.toString(stored.placementDelayTicks), "placementDelayTicks", 0, 10),
+                    stored.inventoryClickDelayTicks == null ? defaults.inventoryClickDelayTicks() : parseBoundedInt(Integer.toString(stored.inventoryClickDelayTicks), "inventoryClickDelayTicks", 0, 10)
             );
         } catch (RuntimeException exception) {
             MapArtMod.LOGGER.warn("Settings file {} is malformed; using defaults.", storagePath, exception);
@@ -229,15 +245,17 @@ public class MapartSettingsStore {
         private Boolean overlayShowOnlyIncorrect;
         private Boolean hudCompact;
         private Integer clientTimerSpeed;
+        private Boolean clientTimerEnabled;
         private Integer hudX;
         private Integer hudY;
-        private Boolean preferLongerAxis;
         private Integer sweepHalfWidth;
         private Integer sweepTotalWidth;
         private Integer laneStride;
         private Integer forwardLookaheadSteps;
         private Integer trivialBehindCleanupSteps;
         private Boolean groundedSweepConstantSprint;
+        private Integer placementDelayTicks;
+        private Integer inventoryClickDelayTicks;
 
         SettingsMutator showHud(boolean value) { this.showHud = value; return this; }
         SettingsMutator showSchematicOverlay(boolean value) { this.showSchematicOverlay = value; return this; }
@@ -245,15 +263,17 @@ public class MapartSettingsStore {
         SettingsMutator overlayShowOnlyIncorrect(boolean value) { this.overlayShowOnlyIncorrect = value; return this; }
         SettingsMutator hudCompact(boolean value) { this.hudCompact = value; return this; }
         SettingsMutator clientTimerSpeed(int value) { this.clientTimerSpeed = value; return this; }
+        SettingsMutator clientTimerEnabled(boolean value) { this.clientTimerEnabled = value; return this; }
         SettingsMutator hudX(int value) { this.hudX = value; return this; }
         SettingsMutator hudY(int value) { this.hudY = value; return this; }
-        SettingsMutator preferLongerAxis(boolean value) { this.preferLongerAxis = value; return this; }
         SettingsMutator sweepHalfWidth(int value) { this.sweepHalfWidth = value; return this; }
         SettingsMutator sweepTotalWidth(int value) { this.sweepTotalWidth = value; return this; }
         SettingsMutator laneStride(int value) { this.laneStride = value; return this; }
         SettingsMutator forwardLookaheadSteps(int value) { this.forwardLookaheadSteps = value; return this; }
         SettingsMutator trivialBehindCleanupSteps(int value) { this.trivialBehindCleanupSteps = value; return this; }
         SettingsMutator groundedSweepConstantSprint(boolean value) { this.groundedSweepConstantSprint = value; return this; }
+        SettingsMutator placementDelayTicks(int value) { this.placementDelayTicks = value; return this; }
+        SettingsMutator inventoryClickDelayTicks(int value) { this.inventoryClickDelayTicks = value; return this; }
     }
 
     private static final class StoredSettings {
@@ -263,8 +283,11 @@ public class MapartSettingsStore {
         Boolean overlayShowOnlyIncorrect;
         Boolean hudCompact;
         Integer clientTimerSpeed;
+        Boolean clientTimerEnabled;
         Integer hudX;
         Integer hudY;
+        // preferLongerAxis kept for reading old JSON files, ignored on load
+        @SuppressWarnings("unused")
         Boolean preferLongerAxis;
         Integer sweepHalfWidth;
         Integer sweepTotalWidth;
@@ -272,6 +295,8 @@ public class MapartSettingsStore {
         Integer forwardLookaheadSteps;
         Integer trivialBehindCleanupSteps;
         Boolean groundedSweepConstantSprint;
+        Integer placementDelayTicks;
+        Integer inventoryClickDelayTicks;
 
         StoredSettings() {
         }
@@ -283,15 +308,17 @@ public class MapartSettingsStore {
             this.overlayShowOnlyIncorrect = settings.overlayShowOnlyIncorrect();
             this.hudCompact = settings.hudCompact();
             this.clientTimerSpeed = settings.clientTimerSpeed();
+            this.clientTimerEnabled = settings.clientTimerEnabled();
             this.hudX = settings.hudX();
             this.hudY = settings.hudY();
-            this.preferLongerAxis = settings.preferLongerAxis();
             this.sweepHalfWidth = settings.sweepHalfWidth();
             this.sweepTotalWidth = settings.sweepTotalWidth();
             this.laneStride = settings.laneStride();
             this.forwardLookaheadSteps = settings.forwardLookaheadSteps();
             this.trivialBehindCleanupSteps = settings.trivialBehindCleanupSteps();
             this.groundedSweepConstantSprint = settings.groundedSweepConstantSprint();
+            this.placementDelayTicks = settings.placementDelayTicks();
+            this.inventoryClickDelayTicks = settings.inventoryClickDelayTicks();
         }
     }
 }

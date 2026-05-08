@@ -2,6 +2,7 @@ package com.example.mapart.plan.sweep.grounded;
 
 import com.example.mapart.MapArtMod;
 import com.example.mapart.baritone.BaritoneFacade;
+import com.example.mapart.settings.MapartSettings;
 import com.example.mapart.plan.BuildPlan;
 import com.example.mapart.plan.Placement;
 import com.example.mapart.plan.state.BuildSession;
@@ -68,6 +69,9 @@ public final class GroundedSingleLaneDebugRunner {
     private static final int MAX_TRANSITION_YAW_LOCK_TICKS = 8;
     private static final int PREFLIGHT_LOOKAHEAD_TARGETS = 64;
     private static final int MAX_REFILL_LOOKAHEAD_ITEMS = PlayerInventory.MAIN_SIZE * 64;
+
+    private MapartSettings currentSettings = MapartSettings.defaults();
+    private int placementDelayCooldown = 0;
 
     private final GroundedSweepLanePlanner lanePlanner = new GroundedSweepLanePlanner();
     private final GroundedLaneWalker laneWalker = new GroundedLaneWalker();
@@ -384,7 +388,10 @@ public final class GroundedSingleLaneDebugRunner {
         return buildLaneEntryAnchorForFreshStart(activeLane, activeBounds, LaneEntrySource.FRESH_START).stagingTarget();
     }
 
-    public void tick(MinecraftClient client, boolean constantSprint) {
+    public void tick(MinecraftClient client, MapartSettings settings) {
+        this.currentSettings = settings != null ? settings : MapartSettings.defaults();
+        refillController.setInventoryClickDelayTicks(this.currentSettings.inventoryClickDelayTicks());
+        boolean constantSprint = this.currentSettings.groundedSweepConstantSprint();
         groundedTraceTickCounter++;
         if (client == null || client.player == null || activeLane == null || activeBounds == null || activeSession == null) {
             return;
@@ -516,6 +523,7 @@ public final class GroundedSingleLaneDebugRunner {
         handleTerminalState(client);
         exhaustedMaterials.clear();
         exhaustedWarningSent.clear();
+        placementDelayCooldown = 0;
         return Optional.empty();
     }
 
@@ -2089,6 +2097,10 @@ public final class GroundedSingleLaneDebugRunner {
         if (activeLane == null || activeBounds == null || activeSession == null || placementSelector == null || pendingPlacementTargets.isEmpty()) {
             return;
         }
+        if (placementDelayCooldown > 0) {
+            placementDelayCooldown--;
+            return;
+        }
 
         BlockPos playerPos = client.player.getBlockPos();
         int currentProgress = activeLane.direction().alongX() ? playerPos.getX() : playerPos.getZ();
@@ -2114,7 +2126,13 @@ public final class GroundedSingleLaneDebugRunner {
 
             PlacementResult result = placementExecutor.execute(client, activeSession, placement, candidate.worldPos());
             switch (result.status()) {
-                case PLACED -> onPlacementPlaced(candidate.placementIndex(), placement, candidate.worldPos(), laneTicksElapsed);
+                case PLACED -> {
+                    onPlacementPlaced(candidate.placementIndex(), placement, candidate.worldPos(), laneTicksElapsed);
+                    if (currentSettings.placementDelayTicks() > 0) {
+                        placementDelayCooldown = currentSettings.placementDelayTicks();
+                        return;
+                    }
+                }
                 case ALREADY_CORRECT -> onPlacementResult(candidate.placementIndex(), GroundedSweepPlacementExecutor.PlacementResult.SUCCESS, laneTicksElapsed);
                 case RETRY, MOVE_REQUIRED -> onPlacementResult(candidate.placementIndex(), GroundedSweepPlacementExecutor.PlacementResult.MISSED, laneTicksElapsed);
                 case MISSING_ITEM -> {

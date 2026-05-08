@@ -3,6 +3,7 @@ package com.example.mapart;
 import com.example.mapart.baritone.BaritoneFacade;
 import com.example.mapart.baritone.BaritoneFacadeFactory;
 import com.example.mapart.command.MapArtCommand;
+import com.example.mapart.gui.MapArtConfigScreen;
 import com.example.mapart.persistence.ConfigStore;
 import com.example.mapart.persistence.ProgressStore;
 import com.example.mapart.plan.PlanLoaderRegistry;
@@ -17,6 +18,7 @@ import com.example.mapart.render.HudRenderer;
 import com.example.mapart.render.SchematicOverlayRenderer;
 import com.example.mapart.runtime.DebugReporter;
 import com.example.mapart.runtime.MapArtRuntime;
+import com.example.mapart.settings.MapartSettings;
 import com.example.mapart.settings.MapartSettingsStore;
 import com.example.mapart.supply.SupplyInteractionTracker;
 import com.example.mapart.supply.SupplyStore;
@@ -34,6 +36,7 @@ import org.lwjgl.glfw.GLFW;
 
 public class MapArtClientMod implements ClientModInitializer {
     private static final String PANIC_KEY_TRANSLATION = "key.mapart.panic";
+    private static final String CONFIG_KEY_TRANSLATION = "key.mapart.config";
 
     @Override
     public void onInitializeClient() {
@@ -59,6 +62,12 @@ public class MapArtClientMod implements ClientModInitializer {
                 GLFW.GLFW_KEY_UNKNOWN,
                 KeyBinding.Category.create(Identifier.of("mapart", "general"))
         ));
+        KeyBinding configKeyBinding = KeyBindingHelper.registerKeyBinding(new KeyBinding(
+                CONFIG_KEY_TRANSLATION,
+                InputUtil.Type.KEYSYM,
+                GLFW.GLFW_KEY_K,
+                KeyBinding.Category.create(Identifier.of("mapart", "general"))
+        ));
 
         ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) -> {
             dispatcher.register(MapArtCommand.create(buildPlanService, settingsStore, supplyStore, supplyInteractionTracker, baritoneFacade));
@@ -75,10 +84,17 @@ public class MapArtClientMod implements ClientModInitializer {
                 }
             }
 
-            int clientTimerSpeed = settingsStore.current().clientTimerSpeed();
+            while (configKeyBinding.wasPressed()) {
+                if (client.currentScreen == null) {
+                    client.setScreen(new MapArtConfigScreen(settingsStore, null));
+                }
+            }
+
+            MapartSettings settings = settingsStore.current();
+            int clientTimerSpeed = settings.clientTimerEnabled() ? settings.clientTimerSpeed() : 1;
             for (int iteration = 0; iteration < clientTimerSpeed; iteration++) {
                 singleLaneSweepDebugRunner.tick(client);
-                groundedSingleLaneDebugRunner.tick(client, settingsStore.current().groundedSweepConstantSprint());
+                groundedSingleLaneDebugRunner.tick(client, settings);
                 BuildCoordinator.AssistedStepResult assistedStep = buildCoordinator.tickAssisted(client);
                 if (!assistedStep.didWork()) {
                     break;

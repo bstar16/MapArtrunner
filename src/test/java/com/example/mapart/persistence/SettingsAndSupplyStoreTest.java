@@ -23,12 +23,16 @@ class SettingsAndSupplyStoreTest {
         MapartSettingsStore store = new MapartSettingsStore(settingsPath);
         assertTrue(store.set("showHud", "false").isEmpty());
         assertTrue(store.set("hudX", "42").isEmpty());
-        assertTrue(store.set("preferLongerAxis", "true").isEmpty());
+        assertTrue(store.set("placementDelayTicks", "5").isEmpty());
+        assertTrue(store.set("inventoryClickDelayTicks", "3").isEmpty());
+        assertTrue(store.set("clientTimerEnabled", "false").isEmpty());
 
         MapartSettingsStore restored = new MapartSettingsStore(settingsPath);
         assertFalse(restored.current().showHud());
         assertEquals(42, restored.current().hudX());
-        assertTrue(restored.current().preferLongerAxis());
+        assertEquals(5, restored.current().placementDelayTicks());
+        assertEquals(3, restored.current().inventoryClickDelayTicks());
+        assertFalse(restored.current().clientTimerEnabled());
     }
 
     @Test
