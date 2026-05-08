@@ -485,8 +485,10 @@ public final class GroundedSingleLaneDebugRunner {
             return;
         }
 
-        if (currentSettings.placementDelayTicks() > 0 && hasPendingPlacementsAtCurrentColumn(client)) {
+        if (placementDelayCooldown > 0) {
             clearControls(client);
+            client.player.setVelocity(0, client.player.getVelocity().y, 0);
+            placementDelayCooldown--;
         } else {
             applyLaneControls(client);
         }
@@ -2102,7 +2104,6 @@ public final class GroundedSingleLaneDebugRunner {
             return;
         }
         if (placementDelayCooldown > 0) {
-            placementDelayCooldown--;
             return;
         }
 
@@ -2167,18 +2168,6 @@ public final class GroundedSingleLaneDebugRunner {
         }
 
         currentLeftovers = placementSelector.select(activeLane, activeBounds, currentProgress, laneTicksElapsed, pendingPlacementTargets).leftovers();
-    }
-
-    private boolean hasPendingPlacementsAtCurrentColumn(MinecraftClient client) {
-        if (activeLane == null || pendingPlacementTargets.isEmpty()) {
-            return false;
-        }
-        BlockPos playerPos = client.player.getBlockPos();
-        int currentProgress = activeLane.direction().alongX() ? playerPos.getX() : playerPos.getZ();
-        return pendingPlacementTargets.stream().anyMatch(t -> {
-            int targetProgress = activeLane.direction().alongX() ? t.worldPos().getX() : t.worldPos().getZ();
-            return targetProgress == currentProgress;
-        });
     }
 
     private void onPlacementPlaced(int placementIndex, Placement placement, BlockPos worldPos, long tick) {
