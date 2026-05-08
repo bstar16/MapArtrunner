@@ -56,17 +56,18 @@ public class MapArtClientMod implements ClientModInitializer {
         SingleLaneSweepDebugRunner singleLaneSweepDebugRunner = new SingleLaneSweepDebugRunner();
         GroundedSingleLaneDebugRunner groundedSingleLaneDebugRunner = new GroundedSingleLaneDebugRunner(baritoneFacade, supplyStore);
         MapArtRuntime.initialize(buildPlanService, configStore, progressStore, settingsStore, supplyStore, baritoneFacade, debugReporter, singleLaneSweepDebugRunner, groundedSingleLaneDebugRunner);
+        KeyBinding.Category mapartCategory = KeyBinding.Category.create(Identifier.of("mapart", "general"));
         KeyBinding panicKeyBinding = KeyBindingHelper.registerKeyBinding(new KeyBinding(
                 PANIC_KEY_TRANSLATION,
                 InputUtil.Type.KEYSYM,
                 GLFW.GLFW_KEY_UNKNOWN,
-                KeyBinding.Category.create(Identifier.of("mapart", "general"))
+                mapartCategory
         ));
         KeyBinding configKeyBinding = KeyBindingHelper.registerKeyBinding(new KeyBinding(
                 CONFIG_KEY_TRANSLATION,
                 InputUtil.Type.KEYSYM,
                 GLFW.GLFW_KEY_K,
-                KeyBinding.Category.create(Identifier.of("mapart", "general"))
+                mapartCategory
         ));
 
         ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) -> {
