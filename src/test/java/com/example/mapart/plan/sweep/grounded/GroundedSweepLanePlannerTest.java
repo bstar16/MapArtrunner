@@ -17,7 +17,7 @@ class GroundedSweepLanePlannerTest {
         GroundedSchematicBounds bounds = new GroundedSchematicBounds(
                 new BlockPos(100, 64, 200),
                 new BlockPos(100, 64, 200),
-                new BlockPos(109, 64, 210)
+                new BlockPos(110, 64, 209)
         );
 
         List<GroundedSweepLane> lanes = planner.planLanes(bounds, settings);
@@ -26,24 +26,24 @@ class GroundedSweepLanePlannerTest {
     }
 
     @Test
-    void usesEastFirstWhenPreferLongerAxisIsDisabled() {
-        GroundedSweepSettings settings = new GroundedSweepSettings(false, 2, 5, 5, 1, 1, true, 1.0);
+    void usesEastWestOrientationWhenXSpanIsLonger() {
+        GroundedSweepSettings settings = new GroundedSweepSettings(2, 5, 5, 1, 1, true, 1.0);
         GroundedSchematicBounds bounds = new GroundedSchematicBounds(
                 new BlockPos(0, 64, 0),
                 new BlockPos(0, 64, 0),
-                new BlockPos(8, 64, 14)
+                new BlockPos(14, 64, 8)
         );
 
         List<GroundedSweepLane> lanes = planner.planLanes(bounds, settings);
 
         assertEquals(GroundedLaneDirection.EAST, lanes.getFirst().direction());
         assertEquals(new BlockPos(0, 64, 2), lanes.getFirst().startPoint());
-        assertEquals(new BlockPos(8, 64, 2), lanes.getFirst().endPoint());
+        assertEquals(new BlockPos(14, 64, 2), lanes.getFirst().endPoint());
     }
 
     @Test
-    void followsLongerAxisOrientationWhenEnabled() {
-        GroundedSweepSettings settings = new GroundedSweepSettings(true, 2, 5, 5, 1, 1, true, 1.0);
+    void usesEastWestOrientationEvenWhenZSpanIsLonger() {
+        GroundedSweepSettings settings = new GroundedSweepSettings(2, 5, 5, 1, 1, true, 1.0);
         GroundedSchematicBounds zLongerBounds = new GroundedSchematicBounds(
                 new BlockPos(10, 64, 10),
                 new BlockPos(10, 64, 10),
@@ -52,9 +52,9 @@ class GroundedSweepLanePlannerTest {
 
         List<GroundedSweepLane> lanes = planner.planLanes(zLongerBounds, settings);
 
-        assertEquals(GroundedLaneDirection.SOUTH, lanes.getFirst().direction());
-        assertEquals(new BlockPos(12, 64, 10), lanes.getFirst().startPoint());
-        assertEquals(new BlockPos(12, 64, 24), lanes.getFirst().endPoint());
+        assertEquals(GroundedLaneDirection.EAST, lanes.getFirst().direction());
+        assertEquals(new BlockPos(10, 64, 12), lanes.getFirst().startPoint());
+        assertEquals(new BlockPos(15, 64, 12), lanes.getFirst().endPoint());
     }
 
     @Test
@@ -96,7 +96,7 @@ class GroundedSweepLanePlannerTest {
         GroundedSchematicBounds bounds = new GroundedSchematicBounds(
                 new BlockPos(50, 70, 50),
                 new BlockPos(50, 70, 50),
-                new BlockPos(58, 70, 60)
+                new BlockPos(58, 70, 58)
         );
 
         List<GroundedSweepLane> lanes = planner.planLanes(bounds, settings);

@@ -213,7 +213,6 @@ class GroundedSweepPlacementExecutorTest {
     @Test
     void mapsExecutorSettingsFromGroundedSweepSettings() {
         GroundedSweepSettings groundedSettings = new GroundedSweepSettings(
-                false,
                 3,
                 7,
                 5,

@@ -286,9 +286,6 @@ public class MapartSettingsStore {
         Boolean clientTimerEnabled;
         Integer hudX;
         Integer hudY;
-        // preferLongerAxis kept for reading old JSON files, ignored on load
-        @SuppressWarnings("unused")
-        Boolean preferLongerAxis;
         Integer sweepHalfWidth;
         Integer sweepTotalWidth;
         Integer laneStride;

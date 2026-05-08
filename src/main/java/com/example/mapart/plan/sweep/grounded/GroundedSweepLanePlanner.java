@@ -8,7 +8,7 @@ import java.util.List;
 public final class GroundedSweepLanePlanner {
 
     public List<GroundedSweepLane> planLanes(GroundedSchematicBounds bounds, GroundedSweepSettings settings) {
-        Orientation orientation = chooseOrientation(bounds, settings.preferLongerAxis());
+        Orientation orientation = chooseOrientation(bounds);
         int minSweep = orientation.minSweep(bounds);
         int maxSweep = orientation.maxSweep(bounds);
 
@@ -61,11 +61,8 @@ public final class GroundedSweepLanePlanner {
         return Math.max(min, Math.min(max, value));
     }
 
-    private static Orientation chooseOrientation(GroundedSchematicBounds bounds, boolean preferLongerAxis) {
-        if (!preferLongerAxis || bounds.xSpan() >= bounds.zSpan()) {
-            return Orientation.EAST_WEST;
-        }
-        return Orientation.NORTH_SOUTH;
+    private static Orientation chooseOrientation(GroundedSchematicBounds bounds) {
+        return Orientation.EAST_WEST;
     }
 
     private enum Orientation {
