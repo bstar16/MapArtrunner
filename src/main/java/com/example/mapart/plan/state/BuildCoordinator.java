@@ -1,3 +1,4 @@
+// @Deprecated — superseded by GroundedSingleLaneDebugRunner (grounded sweep path). Retained until the two paths are unified.
 package com.example.mapart.plan.state;
 
 import com.example.mapart.baritone.BaritoneFacade;

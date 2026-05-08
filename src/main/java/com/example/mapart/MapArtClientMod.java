@@ -71,14 +71,19 @@ public class MapArtClientMod implements ClientModInitializer {
         ));
 
         ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) -> {
-            dispatcher.register(MapArtCommand.create(buildPlanService, settingsStore, supplyStore, supplyInteractionTracker, baritoneFacade));
-            dispatcher.register(MapArtCommand.createAlias(buildPlanService, settingsStore, supplyStore, supplyInteractionTracker, baritoneFacade));
-            dispatcher.register(MapArtCommand.createRunnerAlias(buildPlanService, settingsStore, supplyStore, supplyInteractionTracker, baritoneFacade));
+            dispatcher.register(MapArtCommand.create(buildPlanService, settingsStore, supplyStore, supplyInteractionTracker));
+            dispatcher.register(MapArtCommand.createAlias(buildPlanService, settingsStore, supplyStore, supplyInteractionTracker));
+            dispatcher.register(MapArtCommand.createRunnerAlias(buildPlanService, settingsStore, supplyStore, supplyInteractionTracker));
         });
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
             while (panicKeyBinding.wasPressed()) {
                 if (client.player != null) {
-                    boolean didAnything = MapArtCommand.triggerPanic(buildPlanService).didAnything();
+                    GroundedSingleLaneDebugRunner runner = MapArtRuntime.groundedSingleLaneDebugRunner();
+                    boolean runnerWasActive = runner != null && runner.status().active();
+                    if (runner != null) {
+                        runner.cancelRefillAndStop();
+                    }
+                    boolean didAnything = MapArtCommand.triggerPanic(buildPlanService).didAnything() || runnerWasActive;
                     client.player.sendMessage(Text.literal(didAnything
                             ? "MapArt panic button triggered."
                             : "MapArt panic button pressed, but nothing was active."), true);
@@ -96,18 +101,6 @@ public class MapArtClientMod implements ClientModInitializer {
             for (int iteration = 0; iteration < clientTimerSpeed; iteration++) {
                 singleLaneSweepDebugRunner.tick(client);
                 groundedSingleLaneDebugRunner.tick(client, settings);
-                BuildCoordinator.AssistedStepResult assistedStep = buildCoordinator.tickAssisted(client);
-                if (!assistedStep.didWork()) {
-                    break;
-                }
-
-                if (client.player != null && !assistedStep.message().isBlank()) {
-                    debugReporter.logToFile("Assisted tick: " + assistedStep.message());
-                }
-
-                if (assistedStep.done() || assistedStep.failed()) {
-                    break;
-                }
             }
         });
 
