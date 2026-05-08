@@ -1,36 +1,27 @@
 package com.example.mapart.command;
 
-import com.example.mapart.baritone.BaritoneFacade;
 import com.example.mapart.gui.MapArtConfigScreen;
 import com.example.mapart.plan.BuildPlan;
-import com.example.mapart.plan.Placement;
 import com.example.mapart.plan.state.BuildCoordinator;
 import com.example.mapart.plan.state.BuildPlanService;
 import com.example.mapart.plan.state.BuildSession;
-import com.example.mapart.plan.sweep.LeftoverTracker;
-import com.example.mapart.plan.sweep.SingleLaneSweepDebugRunner;
-import com.example.mapart.plan.sweep.SweepPassResult;
 import com.example.mapart.plan.sweep.grounded.GroundedRefillController;
 import com.example.mapart.plan.sweep.grounded.GroundedRecoveryState;
 import com.example.mapart.plan.sweep.grounded.GroundedSingleLaneDebugRunner;
 import com.example.mapart.plan.sweep.grounded.GroundedSweepLeftoverTracker;
 import com.example.mapart.plan.sweep.grounded.GroundedSweepSettings;
-import com.example.mapart.runtime.ClientTimerController;
 import com.example.mapart.runtime.MapArtRuntime;
 import com.example.mapart.settings.MapartSettings;
 import com.example.mapart.settings.MapartSettingsStore;
-import com.example.mapart.plan.state.RefillStatus;
 import com.example.mapart.supply.SupplyInteractionTracker;
 import com.example.mapart.supply.SupplyPoint;
 import com.example.mapart.supply.SupplyStore;
 import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.brigadier.arguments.StringArgumentType;
-import com.mojang.brigadier.arguments.DoubleArgumentType;
 import com.mojang.brigadier.builder.LiteralArgumentBuilder;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager;
 import net.fabricmc.fabric.api.client.command.v2.FabricClientCommandSource;
 import net.minecraft.block.Block;
-import net.minecraft.item.Item;
 import net.minecraft.registry.Registries;
 import net.minecraft.text.Text;
 import net.minecraft.util.math.BlockPos;
@@ -54,30 +45,27 @@ public final class MapArtCommand {
             BuildPlanService planService,
             MapartSettingsStore settingsStore,
             SupplyStore supplyStore,
-            SupplyInteractionTracker supplyInteractionTracker,
-            BaritoneFacade baritoneFacade
+            SupplyInteractionTracker supplyInteractionTracker
     ) {
-        return createForName(PRIMARY_COMMAND, planService, settingsStore, supplyStore, supplyInteractionTracker, baritoneFacade);
+        return createForName(PRIMARY_COMMAND, planService, settingsStore, supplyStore, supplyInteractionTracker);
     }
 
     public static LiteralArgumentBuilder<FabricClientCommandSource> createAlias(
             BuildPlanService planService,
             MapartSettingsStore settingsStore,
             SupplyStore supplyStore,
-            SupplyInteractionTracker supplyInteractionTracker,
-            BaritoneFacade baritoneFacade
+            SupplyInteractionTracker supplyInteractionTracker
     ) {
-        return createForName(LEGACY_ALIAS, planService, settingsStore, supplyStore, supplyInteractionTracker, baritoneFacade);
+        return createForName(LEGACY_ALIAS, planService, settingsStore, supplyStore, supplyInteractionTracker);
     }
 
     public static LiteralArgumentBuilder<FabricClientCommandSource> createRunnerAlias(
             BuildPlanService planService,
             MapartSettingsStore settingsStore,
             SupplyStore supplyStore,
-            SupplyInteractionTracker supplyInteractionTracker,
-            BaritoneFacade baritoneFacade
+            SupplyInteractionTracker supplyInteractionTracker
     ) {
-        return createForName(MOD_NAME_ALIAS, planService, settingsStore, supplyStore, supplyInteractionTracker, baritoneFacade);
+        return createForName(MOD_NAME_ALIAS, planService, settingsStore, supplyStore, supplyInteractionTracker);
     }
 
     private static LiteralArgumentBuilder<FabricClientCommandSource> createForName(
@@ -85,8 +73,7 @@ public final class MapArtCommand {
             BuildPlanService planService,
             MapartSettingsStore settingsStore,
             SupplyStore supplyStore,
-            SupplyInteractionTracker supplyInteractionTracker,
-            BaritoneFacade baritoneFacade
+            SupplyInteractionTracker supplyInteractionTracker
     ) {
         return ClientCommandManager.literal(commandName)
                 .then(ClientCommandManager.literal("load")
@@ -111,7 +98,6 @@ public final class MapArtCommand {
                                 context.getSource().sendFeedback(Text.literal("No build plan loaded."));
                                 return 0;
                             }
-
                             context.getSource().sendFeedback(Text.literal("Unloaded current build plan and cleared session progress."));
                             return 1;
                         }))
@@ -132,56 +118,78 @@ public final class MapArtCommand {
                                                                 IntegerArgumentType.getInteger(context, "z")
                                                         )))))))
                 .then(ClientCommandManager.literal("status")
-                        .executes(context -> showStatus(planService, context.getSource())))
+                        .executes(context -> showGroundedStatus(context.getSource())))
                 .then(ClientCommandManager.literal("start")
                         .executes(context -> {
-                            Optional<String> error = planService.coordinator().start();
+                            GroundedSingleLaneDebugRunner runner = MapArtRuntime.groundedSingleLaneDebugRunner();
+                            if (runner == null) {
+                                context.getSource().sendError(Text.literal("Grounded sweep runner is unavailable."));
+                                return 0;
+                            }
+                            Optional<BuildSession> session = planService.currentSession();
+                            if (session.isEmpty()) {
+                                context.getSource().sendError(Text.literal("No build plan loaded."));
+                                return 0;
+                            }
+                            GroundedSweepSettings groundedSettings = groundedSettings(settingsStore.current());
+                            runner.resetExhaustedStateForNewRun();
+                            Optional<String> error = runner.startFullSweep(session.get(), groundedSettings);
                             if (error.isPresent()) {
                                 context.getSource().sendError(Text.literal(error.get()));
                                 return 0;
                             }
-
-                            context.getSource().sendFeedback(Text.literal("Build session started."));
+                            context.getSource().sendFeedback(Text.literal("Build started."));
                             return 1;
                         }))
                 .then(ClientCommandManager.literal("pause")
-                        .executes(context -> pauseBuild(context.getSource(), planService)))
-                .then(ClientCommandManager.literal("resume")
-                        .executes(context -> resumeBuild(context.getSource(), planService)))
-                .then(ClientCommandManager.literal("stop")
                         .executes(context -> {
-                            Optional<String> error = planService.coordinator().stop();
+                            GroundedSingleLaneDebugRunner runner = MapArtRuntime.groundedSingleLaneDebugRunner();
+                            if (runner == null) {
+                                context.getSource().sendError(Text.literal("Grounded sweep runner is unavailable."));
+                                return 0;
+                            }
+                            if (!runner.status().active()) {
+                                context.getSource().sendError(Text.literal("No build is currently active."));
+                                return 0;
+                            }
+                            runner.stop();
+                            context.getSource().sendFeedback(Text.literal("Build paused."));
+                            return 1;
+                        }))
+                .then(ClientCommandManager.literal("resume")
+                        .executes(context -> {
+                            GroundedSingleLaneDebugRunner runner = MapArtRuntime.groundedSingleLaneDebugRunner();
+                            if (runner == null) {
+                                context.getSource().sendError(Text.literal("Grounded sweep runner is unavailable."));
+                                return 0;
+                            }
+                            Optional<BuildSession> session = planService.currentSession();
+                            if (session.isEmpty()) {
+                                context.getSource().sendError(Text.literal("No build plan loaded."));
+                                return 0;
+                            }
+                            GroundedSweepSettings groundedSettings = groundedSettings(settingsStore.current());
+                            Optional<String> error = runner.startFullSweep(session.get(), groundedSettings);
                             if (error.isPresent()) {
                                 context.getSource().sendError(Text.literal(error.get()));
                                 return 0;
                             }
-
-                            context.getSource().sendFeedback(Text.literal("Build session stopped and progress reset."));
+                            context.getSource().sendFeedback(Text.literal("Build resumed."));
+                            return 1;
+                        }))
+                .then(ClientCommandManager.literal("stop")
+                        .executes(context -> {
+                            GroundedSingleLaneDebugRunner runner = MapArtRuntime.groundedSingleLaneDebugRunner();
+                            if (runner == null) {
+                                context.getSource().sendError(Text.literal("Grounded sweep runner is unavailable."));
+                                return 0;
+                            }
+                            runner.stop();
+                            context.getSource().sendFeedback(Text.literal("Build stopped."));
                             return 1;
                         }))
                 .then(ClientCommandManager.literal("panic")
                         .executes(context -> panic(planService, context.getSource())))
-                .then(ClientCommandManager.literal("next")
-                        .executes(context -> {
-                            BuildCoordinator.StepResult result = planService.coordinator().next(context.getSource().getClient());
-                            if (!result.actionable() && !result.done()) {
-                                context.getSource().sendError(Text.literal(result.message()));
-                                return 0;
-                            }
-
-                            if (result.done()) {
-                                planService.coordinator().unload();
-                                context.getSource().sendFeedback(Text.literal("Build completed and schematic unloaded."));
-                                return 1;
-                            }
-
-                            Placement placement = result.placement();
-                            context.getSource().sendFeedback(Text.literal(
-                                    "Next placement: " + Registries.BLOCK.getId(placement.block())
-                                            + " at " + result.targetPos().toShortString()
-                            ));
-                            return 1;
-                        }))
                 .then(ClientCommandManager.literal("supply")
                         .then(ClientCommandManager.literal("add")
                                 .executes(context -> addSupply(context.getSource(), supplyInteractionTracker, null))
@@ -209,76 +217,9 @@ public final class MapArtCommand {
                                                         StringArgumentType.getString(context, "key"),
                                                         StringArgumentType.getString(context, "value")
                                                 ))))))
-                .then(ClientCommandManager.literal("clienttimerspeed")
-                        .then(ClientCommandManager.argument("multiplier", DoubleArgumentType.doubleArg(ClientTimerController.MIN_MULTIPLIER))
-                                .executes(context -> setClientTimerSpeed(
-                                        context.getSource(),
-                                        DoubleArgumentType.getDouble(context, "multiplier")
-                                ))))
                 .then(ClientCommandManager.literal("debug")
-                        .then(ClientCommandManager.literal("goto")
-                                .then(ClientCommandManager.argument("x", IntegerArgumentType.integer())
-                                        .then(ClientCommandManager.argument("y", IntegerArgumentType.integer())
-                                                .then(ClientCommandManager.argument("z", IntegerArgumentType.integer())
-                                                        .executes(context -> debugGoto(
-                                                                context.getSource(),
-                                                                baritoneFacade,
-                                                                IntegerArgumentType.getInteger(context, "x"),
-                                                                IntegerArgumentType.getInteger(context, "y"),
-                                                                IntegerArgumentType.getInteger(context, "z")
-                                                        ))))))
-                        .then(ClientCommandManager.literal("cancel")
-                                .executes(context -> debugCancel(context.getSource(), baritoneFacade)))
-                        .then(ClientCommandManager.literal("busy")
-                                .executes(context -> debugBusy(context.getSource(), baritoneFacade)))
-                        .then(ClientCommandManager.literal("secondlast")
-                                .executes(context -> {
-                                    Optional<String> error = planService.coordinator().debugSkipToSecondLastPlacement();
-                                    if (error.isPresent()) {
-                                        context.getSource().sendError(Text.literal(error.get()));
-                                        return 0;
-                                    }
-
-                                    context.getSource().sendFeedback(Text.literal("Debug: moved progress to the second last placement. Use /"
-                                            + commandName + " next to continue."));
-                                    return 1;
-                                }))
-                        .then(ClientCommandManager.literal("sweep-single-lane")
-                                .then(ClientCommandManager.literal("start")
-                                        .then(ClientCommandManager.argument("lane", IntegerArgumentType.integer(0))
-                                                .executes(context -> debugSweepSingleLaneStart(
-                                                        context.getSource(),
-                                                        planService,
-                                                        IntegerArgumentType.getInteger(context, "lane")
-                                                ))))
-                                .then(ClientCommandManager.literal("status")
-                                        .executes(context -> debugSweepSingleLaneStatus(context.getSource())))
-                                .then(ClientCommandManager.literal("stop")
-                                        .executes(context -> debugSweepSingleLaneStop(context.getSource()))))
-                        .then(ClientCommandManager.literal("grounded-single-lane")
-                                .then(ClientCommandManager.literal("start")
-                                        .then(ClientCommandManager.argument("lane", IntegerArgumentType.integer(0))
-                                                .executes(context -> debugGroundedSingleLaneStart(
-                                                        context.getSource(),
-                                                        planService,
-                                                        settingsStore,
-                                                        IntegerArgumentType.getInteger(context, "lane")
-                                                ))))
-                                .then(ClientCommandManager.literal("status")
-                                        .executes(context -> debugGroundedSingleLaneStatus(context.getSource())))
-                                .then(ClientCommandManager.literal("stop")
-                                        .executes(context -> debugGroundedSingleLaneStop(context.getSource()))))
-                        .then(ClientCommandManager.literal("grounded-sweep")
-                                .then(ClientCommandManager.literal("start")
-                                        .executes(context -> debugGroundedSweepStart(
-                                                context.getSource(),
-                                                planService,
-                                                settingsStore
-                                        )))
-                                .then(ClientCommandManager.literal("status")
-                                        .executes(context -> debugGroundedSingleLaneStatus(context.getSource())))
-                                .then(ClientCommandManager.literal("stop")
-                                        .executes(context -> debugGroundedSingleLaneStop(context.getSource()))))
+                        .then(ClientCommandManager.literal("status")
+                                .executes(context -> debugGroundedStatus(context.getSource())))
                         .then(ClientCommandManager.literal("grounded-trace")
                                 .then(ClientCommandManager.literal("on")
                                         .executes(context -> groundedTraceSet(context.getSource(), true)))
@@ -293,46 +234,20 @@ public final class MapArtCommand {
                                 .then(ClientCommandManager.literal("path").executes(context -> groundedDiagnosticsPath(context.getSource()))))
                         .then(ClientCommandManager.literal("grounded-recovery")
                                 .then(ClientCommandManager.literal("status")
-                                        .executes(context -> groundedRecoveryStatus(context.getSource())))
-                                .then(ClientCommandManager.literal("clear")
-                                        .executes(context -> groundedRecoveryClear(context.getSource())))
-                                .then(ClientCommandManager.literal("auto")
-                                        .then(ClientCommandManager.literal("on")
-                                                .executes(context -> groundedRecoveryAutoOn(context.getSource())))
-                                        .then(ClientCommandManager.literal("off")
-                                                .executes(context -> groundedRecoveryAutoOff(context.getSource())))))
-                        .then(ClientCommandManager.literal("grounded-refill")
-                                .then(ClientCommandManager.literal("cancel")
-                                        .executes(context -> groundedRefillCancel(context.getSource()))))
+                                        .executes(context -> groundedRecoveryStatus(context.getSource()))))
                 );
     }
 
 
-    private static int pauseBuild(FabricClientCommandSource source, BuildPlanService planService) {
-        Optional<String> error = planService.coordinator().pause();
-        if (error.isPresent()) {
-            source.sendError(Text.literal(error.get()));
-            return 0;
-        }
-
-        source.sendFeedback(Text.literal("Build session paused."));
-        return 1;
-    }
-
-    private static int resumeBuild(FabricClientCommandSource source, BuildPlanService planService) {
-        Optional<String> error = planService.coordinator().resume();
-        if (error.isPresent()) {
-            source.sendError(Text.literal(error.get()));
-            return 0;
-        }
-
-        source.sendFeedback(Text.literal("Build session resumed."));
-        return 1;
-    }
-
     public static int panic(BuildPlanService planService, FabricClientCommandSource source) {
         BuildCoordinator.PanicResult result = triggerPanic(planService);
-        if (!result.didAnything()) {
+        GroundedSingleLaneDebugRunner runner = MapArtRuntime.groundedSingleLaneDebugRunner();
+        boolean runnerWasActive = runner != null && runner.status().active();
+        if (runner != null) {
+            runner.cancelRefillAndStop();
+        }
+
+        if (!result.didAnything() && !runnerWasActive) {
             source.sendFeedback(Text.literal("Panic button pressed, but nothing was active."));
             return 0;
         }
@@ -350,134 +265,22 @@ public final class MapArtCommand {
         return planService.coordinator().panicUnload();
     }
 
-    private static int debugGoto(FabricClientCommandSource source, BaritoneFacade baritoneFacade, int x, int y, int z) {
-        BaritoneFacade.CommandResult result = baritoneFacade.goTo(new BlockPos(x, y, z));
-        if (!result.success()) {
-            source.sendError(Text.literal(result.message()));
-            return 0;
-        }
-
-        source.sendFeedback(Text.literal(result.message()));
-        return 1;
-    }
-
-    private static int debugCancel(FabricClientCommandSource source, BaritoneFacade baritoneFacade) {
-        BaritoneFacade.CommandResult result = baritoneFacade.cancel();
-        if (!result.success()) {
-            source.sendError(Text.literal(result.message()));
-            return 0;
-        }
-
-        source.sendFeedback(Text.literal(result.message()));
-        return 1;
-    }
-
-    private static int debugBusy(FabricClientCommandSource source, BaritoneFacade baritoneFacade) {
-        source.sendFeedback(Text.literal("Baritone busy: " + (baritoneFacade.isBusy() ? "yes" : "no")));
-        return 1;
-    }
-
-    private static int debugSweepSingleLaneStart(FabricClientCommandSource source, BuildPlanService planService, int laneIndex) {
-        SingleLaneSweepDebugRunner runner = MapArtRuntime.singleLaneSweepDebugRunner();
-        if (runner == null) {
-            source.sendError(Text.literal("Sweep debug runner is unavailable."));
-            return 0;
-        }
-
-        Optional<BuildSession> session = planService.currentSession();
-        if (session.isEmpty()) {
-            source.sendError(Text.literal("No build plan loaded."));
-            return 0;
-        }
-
-        Optional<String> error = runner.start(session.get(), laneIndex);
-        if (error.isPresent()) {
-            source.sendError(Text.literal(error.get()));
-            return 0;
-        }
-        source.sendFeedback(Text.literal("Started debug single-lane elytra sweep on lane " + laneIndex + "."));
-        return 1;
-    }
-
-    private static int debugSweepSingleLaneStatus(FabricClientCommandSource source) {
-        SingleLaneSweepDebugRunner runner = MapArtRuntime.singleLaneSweepDebugRunner();
-        if (runner == null) {
-            source.sendError(Text.literal("Sweep debug runner is unavailable."));
-            return 0;
-        }
-
-        Optional<SweepPassResult> result = runner.activeResult();
-        if (result.isEmpty()) {
-            result = runner.lastResult();
-        }
-        if (result.isEmpty()) {
-            source.sendFeedback(Text.literal("No single-lane debug sweep run has been started yet."));
-            return 0;
-        }
-
-        SweepPassResult sweep = result.get();
-        source.sendFeedback(Text.literal("Single-lane sweep state=" + sweep.finalState()
-                + ", ticks=" + sweep.ticksElapsed()
-                + ", success=" + sweep.successCount()
-                + ", missed=" + sweep.missedCount()
-                + ", deferred=" + sweep.deferredCount()
-                + ", leftovers=" + sweep.leftoverPlacementIndices().size()));
-        if (!sweep.flightFailureReason().isEmpty()) {
-            source.sendFeedback(Text.literal("Flight failure reason: " + sweep.flightFailureReason().get()));
-        }
-        if (!sweep.leftoverRecords().isEmpty()) {
-            LeftoverTracker.LeftoverRecord record = sweep.leftoverRecords().getFirst();
-            source.sendFeedback(Text.literal("Example leftover #" + record.placementIndex() + " reasons=" + record.reasons()));
-        }
-        return 1;
-    }
-
-    private static int debugSweepSingleLaneStop(FabricClientCommandSource source) {
-        SingleLaneSweepDebugRunner runner = MapArtRuntime.singleLaneSweepDebugRunner();
-        if (runner == null) {
-            source.sendError(Text.literal("Sweep debug runner is unavailable."));
-            return 0;
-        }
-        Optional<String> error = runner.stop();
-        if (error.isPresent()) {
-            source.sendError(Text.literal(error.get()));
-            return 0;
-        }
-        source.sendFeedback(Text.literal("Stopped debug single-lane elytra sweep."));
-        return 1;
-    }
-
-
-    private static int debugGroundedSingleLaneStart(FabricClientCommandSource source,
-                                                     BuildPlanService planService,
-                                                     MapartSettingsStore settingsStore,
-                                                     int laneIndex) {
+    private static int showGroundedStatus(FabricClientCommandSource source) {
         GroundedSingleLaneDebugRunner runner = MapArtRuntime.groundedSingleLaneDebugRunner();
-        if (runner == null) {
-            source.sendError(Text.literal("Grounded sweep debug runner is unavailable."));
+        if (runner == null || !runner.status().active()) {
+            source.sendFeedback(Text.literal("No build active."));
             return 0;
         }
-
-        Optional<BuildSession> session = planService.currentSession();
-        if (session.isEmpty()) {
-            source.sendError(Text.literal("No build plan loaded."));
-            return 0;
-        }
-
-        GroundedSweepSettings groundedSettings = groundedSettings(settingsStore.current());
-
-        runner.resetExhaustedStateForNewRun();
-        Optional<String> error = runner.start(session.get(), laneIndex, groundedSettings);
-        if (error.isPresent()) {
-            source.sendError(Text.literal(error.get()));
-            return 0;
-        }
-
-        source.sendFeedback(Text.literal("Started debug grounded single-lane sweep on lane " + laneIndex + "."));
+        GroundedSingleLaneDebugRunner.DebugStatus status = runner.status();
+        source.sendFeedback(Text.literal("Lane: " + status.laneIndex()
+                + ", phase: " + status.phase()
+                + ", pending: " + status.pendingVerification()
+                + ", refill: " + (runner.getRefillController().isActive() ? "yes" : "no")
+                + ", recovery: " + (runner.getRecoveryState().isActive() ? "yes" : "no")));
         return 1;
     }
 
-    private static int debugGroundedSingleLaneStatus(FabricClientCommandSource source) {
+    private static int debugGroundedStatus(FabricClientCommandSource source) {
         GroundedSingleLaneDebugRunner runner = MapArtRuntime.groundedSingleLaneDebugRunner();
         if (runner == null) {
             source.sendError(Text.literal("Grounded sweep debug runner is unavailable."));
@@ -486,7 +289,7 @@ public final class MapArtCommand {
 
         GroundedSingleLaneDebugRunner.DebugStatus status = runner.status();
         if (!status.active()) {
-            source.sendFeedback(Text.literal("No grounded single-lane debug run is active. "
+            source.sendFeedback(Text.literal("No grounded sweep run is active. "
                     + "Last state=" + status.walkState()
                     + ", smartResumeUsed=" + status.smartResumeUsed()
                     + ", ticks=" + status.ticksElapsed()
@@ -531,50 +334,6 @@ public final class MapArtCommand {
         return 1;
     }
 
-    private static int debugGroundedSingleLaneStop(FabricClientCommandSource source) {
-        GroundedSingleLaneDebugRunner runner = MapArtRuntime.groundedSingleLaneDebugRunner();
-        if (runner == null) {
-            source.sendError(Text.literal("Grounded sweep debug runner is unavailable."));
-            return 0;
-        }
-
-        Optional<String> error = runner.stop();
-        if (error.isPresent()) {
-            source.sendError(Text.literal(error.get()));
-            return 0;
-        }
-
-        source.sendFeedback(Text.literal("Stopped debug grounded single-lane sweep."));
-        return 1;
-    }
-
-    private static int debugGroundedSweepStart(FabricClientCommandSource source,
-                                               BuildPlanService planService,
-                                               MapartSettingsStore settingsStore) {
-        GroundedSingleLaneDebugRunner runner = MapArtRuntime.groundedSingleLaneDebugRunner();
-        if (runner == null) {
-            source.sendError(Text.literal("Grounded sweep debug runner is unavailable."));
-            return 0;
-        }
-
-        Optional<BuildSession> session = planService.currentSession();
-        if (session.isEmpty()) {
-            source.sendError(Text.literal("No build plan loaded."));
-            return 0;
-        }
-
-        GroundedSweepSettings groundedSettings = groundedSettings(settingsStore.current());
-        runner.resetExhaustedStateForNewRun();
-        Optional<String> error = runner.startFullSweep(session.get(), groundedSettings);
-        if (error.isPresent()) {
-            source.sendError(Text.literal(error.get()));
-            return 0;
-        }
-
-        source.sendFeedback(Text.literal("Started debug grounded full serpentine sweep (forward + reverse leftovers)."));
-        return 1;
-    }
-
     private static int groundedTraceSet(FabricClientCommandSource source, boolean enabled) {
         GroundedSingleLaneDebugRunner runner = MapArtRuntime.groundedSingleLaneDebugRunner();
         if (runner == null) {
@@ -595,7 +354,6 @@ public final class MapArtCommand {
         source.sendFeedback(Text.literal("Grounded trace is " + (runner.groundedTraceEnabled() ? "on" : "off") + "."));
         return 1;
     }
-
 
     private static int groundedDiagnosticsSet(FabricClientCommandSource source, boolean enabled) {
         GroundedSingleLaneDebugRunner runner = MapArtRuntime.groundedSingleLaneDebugRunner();
@@ -618,6 +376,7 @@ public final class MapArtCommand {
         source.sendFeedback(Text.literal("Grounded diagnostics path: " + runner.groundedDiagnosticsPath()));
         return 1;
     }
+
     private static int groundedRecoveryStatus(FabricClientCommandSource source) {
         GroundedSingleLaneDebugRunner runner = MapArtRuntime.groundedSingleLaneDebugRunner();
         if (runner == null) {
@@ -665,7 +424,7 @@ public final class MapArtCommand {
                         + s.pos().toShortString() + " [" + s.dimensionKey() + "]"));
             }
         }
-        com.example.mapart.plan.sweep.grounded.GroundedSingleLaneDebugRunner runner = com.example.mapart.runtime.MapArtRuntime.groundedSingleLaneDebugRunner();
+        GroundedSingleLaneDebugRunner runner = MapArtRuntime.groundedSingleLaneDebugRunner();
         if (runner != null && runner.getRefillController().isActive()) {
             GroundedRefillController ctrl = runner.getRefillController();
             source.sendFeedback(Text.literal("Refill active: state=" + ctrl.state()
@@ -675,62 +434,6 @@ public final class MapArtCommand {
         } else {
             source.sendFeedback(Text.literal("No refill currently active."));
         }
-        return 1;
-    }
-
-    private static int groundedRefillCancel(FabricClientCommandSource source) {
-        com.example.mapart.plan.sweep.grounded.GroundedSingleLaneDebugRunner runner = com.example.mapart.runtime.MapArtRuntime.groundedSingleLaneDebugRunner();
-        if (runner == null) {
-            source.sendError(Text.literal("Grounded sweep debug runner is unavailable."));
-            return 0;
-        }
-        if (!runner.getRefillController().isActive()) {
-            source.sendFeedback(Text.literal("No refill is currently active."));
-            return 0;
-        }
-        runner.cancelRefillAndStop();
-        source.sendFeedback(Text.literal("Refill cancelled and sweep stopped safely."));
-        return 1;
-    }
-
-    private static int groundedRecoveryClear(FabricClientCommandSource source) {
-        GroundedSingleLaneDebugRunner runner = MapArtRuntime.groundedSingleLaneDebugRunner();
-        if (runner == null) {
-            source.sendError(Text.literal("Grounded sweep debug runner is unavailable."));
-            return 0;
-        }
-
-        if (!runner.getRecoveryState().isActive()) {
-            source.sendFeedback(Text.literal("No recovery is active."));
-            return 0;
-        }
-
-        runner.getRecoveryState().clear();
-        source.sendFeedback(Text.literal("Recovery state cleared. You can now issue a fresh start or smart resume."));
-        return 1;
-    }
-
-    private static int groundedRecoveryAutoOn(FabricClientCommandSource source) {
-        GroundedSingleLaneDebugRunner runner = MapArtRuntime.groundedSingleLaneDebugRunner();
-        if (runner == null) {
-            source.sendError(Text.literal("Grounded sweep debug runner is unavailable."));
-            return 0;
-        }
-
-        runner.getRecoveryState().setAutoResumeEnabled(true);
-        source.sendFeedback(Text.literal("Recovery auto-resume enabled. When recovery triggers, the sweep will automatically resume after stabilization."));
-        return 1;
-    }
-
-    private static int groundedRecoveryAutoOff(FabricClientCommandSource source) {
-        GroundedSingleLaneDebugRunner runner = MapArtRuntime.groundedSingleLaneDebugRunner();
-        if (runner == null) {
-            source.sendError(Text.literal("Grounded sweep debug runner is unavailable."));
-            return 0;
-        }
-
-        runner.getRecoveryState().setAutoResumeEnabled(false);
-        source.sendFeedback(Text.literal("Recovery auto-resume disabled. You must manually resume sweep after recovery triggers."));
         return 1;
     }
 
@@ -795,52 +498,6 @@ public final class MapArtCommand {
         if (plan.materialCounts().size() > 10) {
             int remainder = plan.materialCounts().size() - 10;
             source.sendFeedback(Text.literal("... and " + remainder + " more materials."));
-        }
-
-        return 1;
-    }
-
-    private static int showStatus(BuildPlanService planService, FabricClientCommandSource source) {
-        Optional<BuildCoordinator.SessionStatus> statusOptional = planService.coordinator().sessionStatus();
-        if (statusOptional.isEmpty()) {
-            source.sendFeedback(Text.literal("State: IDLE (no plan loaded)."));
-            return 1;
-        }
-
-        BuildCoordinator.SessionStatus status = statusOptional.get();
-        source.sendFeedback(Text.literal("Plan: " + status.planId()));
-        source.sendFeedback(Text.literal("State: " + status.state()));
-        source.sendFeedback(Text.literal("Origin: " + (status.origin() == null ? "not set" : status.origin().toShortString())));
-        source.sendFeedback(Text.literal("Region: " + status.currentRegionIndex() + " / " + status.totalRegions()));
-        source.sendFeedback(Text.literal("Placement: " + status.currentPlacementIndex() + " / " + status.totalPlacements()));
-        source.sendFeedback(Text.literal("Completed placements: " + status.totalCompletedPlacements()));
-
-        if (status.refillStatus().isPresent()) {
-            RefillStatus refillStatus = status.refillStatus().get();
-            if (refillStatus.supplyPoint() == null) {
-                source.sendFeedback(Text.literal("Refill target: none in current dimension"));
-            } else {
-                source.sendFeedback(Text.literal("Refill target: #" + refillStatus.supplyPoint().id() + " @ "
-                        + refillStatus.supplyPoint().pos().toShortString()));
-            }
-            source.sendFeedback(Text.literal("Missing materials:"));
-            refillStatus.missingMaterials().entrySet().stream()
-                    .sorted(Map.Entry.<net.minecraft.util.Identifier, Integer>comparingByValue(Comparator.reverseOrder()))
-                    .limit(5)
-                    .forEach(entry -> {
-                        Item item = Registries.ITEM.get(entry.getKey());
-                        source.sendFeedback(Text.literal("- " + entry.getKey() + ": "
-                                + MaterialCountFormatter.formatCount(entry.getValue(), item)));
-                    });
-        }
-
-        if (status.nextTarget().isPresent()) {
-            BuildCoordinator.NextTarget nextTarget = status.nextTarget().get();
-            source.sendFeedback(Text.literal("Next block: " + Registries.BLOCK.getId(nextTarget.placement().block())));
-            source.sendFeedback(Text.literal("Next target: " + nextTarget.absolutePos().toShortString()));
-        } else {
-            source.sendFeedback(Text.literal("Next block: none"));
-            source.sendFeedback(Text.literal("Next target: none"));
         }
 
         return 1;
@@ -919,12 +576,6 @@ public final class MapArtCommand {
         }
 
         source.sendFeedback(Text.literal("Updated " + key + " = " + value));
-        return 1;
-    }
-
-    private static int setClientTimerSpeed(FabricClientCommandSource source, double multiplier) {
-        ClientTimerController.setMultiplier(multiplier);
-        source.sendFeedback(Text.literal("Client timer speed set to " + ClientTimerController.getMultiplier() + "x."));
         return 1;
     }
 }
