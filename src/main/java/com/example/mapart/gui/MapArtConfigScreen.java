@@ -120,7 +120,6 @@ public class MapArtConfigScreen extends Screen {
 
     @Override
     public void render(DrawContext context, int mouseX, int mouseY, float delta) {
-        renderBackground(context, mouseX, mouseY, delta);
         int cx = this.width / 2;
         context.drawCenteredTextWithShadow(this.textRenderer, this.title, cx, 8, 0xFFFFFF);
         context.drawText(this.textRenderer, "DISPLAY", cx - COL_W - 5, LABEL_Y, 0xAAAAAA, true);
