@@ -58,6 +58,7 @@ public final class GroundedSingleLaneDebugRunner {
     private static final int MAX_START_APPROACH_TICKS = 200;
     private static final int MAX_START_APPROACH_NO_PROGRESS_TICKS = 80;
     private static final double START_APPROACH_PROGRESS_EPSILON_SQ = 0.01;
+    private static final int MAX_START_APPROACH_REISSUES = 3;
     private static final int ENTRY_BURST_DURATION_TICKS = 16;
     private static final int MAX_ENTRY_ATTEMPTS_PER_TARGET = 2;
     private static final int ENTRY_BURST_ATTEMPTS_PER_TICK = 2;
@@ -119,6 +120,7 @@ public final class GroundedSingleLaneDebugRunner {
     private int startApproachTicks;
     private double startApproachBestDistanceSq = Double.POSITIVE_INFINITY;
     private int startApproachNoProgressTicks;
+    private int startApproachReissueCount;
     private long transitionSupportTicks;
     private int transitionSupportAlreadyCorrectCount;
     private int transitionSupportPlacedCount;
@@ -1216,23 +1218,61 @@ public final class GroundedSingleLaneDebugRunner {
             startApproachNoProgressTicks++;
         }
 
-        if (startApproachTicks > MAX_START_APPROACH_TICKS || startApproachNoProgressTicks > MAX_START_APPROACH_NO_PROGRESS_TICKS) {
-            failLaneStart(client, "Unable to reach valid lane start staging position");
-            return;
-        }
-        if (!isNearLaneStart(playerPosition, stagingTarget)) {
+        LaneStartReadiness readiness = evaluateLaneStartReadiness(playerPosition, activeLane, stagingTarget, activeBounds);
+
+        if (readiness.ready()) {
+            baritoneFacade.cancel();
+            traceGroundedEvent("Baritone approach reached/cancelled at " + stagingTarget.toShortString());
+            awaitingStartApproach = false;
+            clearControls(client);
+            if (!queueLaneStart(client, activeLane, LaneStartStage.AWAITING_LANE_ENTRY_STEP)) {
+                failLaneStart(client, "Unable to prepare lane entry before starting lane walk.");
+                return;
+            }
+            captureAwaitingLaneStartStatus();
             return;
         }
 
-        baritoneFacade.cancel();
-        traceGroundedEvent("Baritone approach reached/cancelled at " + stagingTarget.toShortString());
-        awaitingStartApproach = false;
-        clearControls(client);
-        if (!queueLaneStart(client, activeLane, LaneStartStage.AWAITING_LANE_ENTRY_STEP)) {
-            failLaneStart(client, "Unable to prepare lane entry before starting lane walk.");
+        // Baritone has stopped without placing the player in a ready position — reissue if budget allows.
+        if (startApproachIssued && !baritoneFacade.isBusy()) {
+            String ctx = " lane#" + (activeLane != null ? activeLane.laneIndex() : "?")
+                    + " dir=" + (activeLane != null ? activeLane.direction() : "?")
+                    + " target=" + stagingTarget.toShortString()
+                    + " playerPos=" + playerPosition
+                    + " reissueCount=" + startApproachReissueCount
+                    + " " + describeLaneStartReadiness(readiness);
+            if (startApproachReissueCount < MAX_START_APPROACH_REISSUES) {
+                traceGroundedEvent("Baritone approach stopped, player not ready — reissuing:" + ctx);
+                startApproachReissueCount++;
+                resetStartApproachProgressTracking();
+                issueStartApproachIfNeeded();
+            } else {
+                traceGroundedEvent("Start approach retry budget exhausted after Baritone stopped:" + ctx);
+                failLaneStart(client, "Unable to reach valid lane start staging position");
+            }
             return;
         }
-        captureAwaitingLaneStartStatus();
+
+        // Absolute/no-progress timeout — reissue if budget allows, otherwise hard-fail.
+        if (startApproachTicks > MAX_START_APPROACH_TICKS || startApproachNoProgressTicks > MAX_START_APPROACH_NO_PROGRESS_TICKS) {
+            String ctx = " lane#" + (activeLane != null ? activeLane.laneIndex() : "?")
+                    + " dir=" + (activeLane != null ? activeLane.direction() : "?")
+                    + " target=" + stagingTarget.toShortString()
+                    + " playerPos=" + playerPosition
+                    + " reissueCount=" + startApproachReissueCount
+                    + " " + describeLaneStartReadiness(readiness);
+            if (startApproachReissueCount < MAX_START_APPROACH_REISSUES) {
+                traceGroundedEvent("Start approach timeout — reissuing:" + ctx);
+                startApproachReissueCount++;
+                baritoneFacade.cancel();
+                resetStartApproachProgressTracking();
+                issueStartApproachIfNeeded();
+            } else {
+                traceGroundedEvent("Start approach retry budget exhausted after timeout:" + ctx);
+                failLaneStart(client, "Unable to reach valid lane start staging position");
+            }
+            return;
+        }
     }
 
 
@@ -1547,6 +1587,21 @@ public final class GroundedSingleLaneDebugRunner {
         );
     }
 
+    private void resetStartApproachProgressTracking() {
+        startApproachTicks = 0;
+        startApproachBestDistanceSq = Double.POSITIVE_INFINITY;
+        startApproachNoProgressTicks = 0;
+        startApproachIssued = false;
+    }
+
+    private String describeLaneStartReadiness(LaneStartReadiness r) {
+        return "reason=" + r.reason()
+                + " centerlineDelta=" + String.format("%.2f", r.centerlineDelta())
+                + " forwardDelta=" + String.format("%.2f", r.forwardDelta())
+                + " insideCorridor=" + r.insideCorridor()
+                + " flatDistanceSq=" + String.format("%.2f", r.flatDistanceSq());
+    }
+
     void issueStartApproachIfNeeded() {
         if (awaitingStartApproach && !startApproachIssued && activeLane != null && activeBounds != null) {
             BlockPos approachTarget = activeStartApproachTarget();
@@ -1625,6 +1680,50 @@ public final class GroundedSingleLaneDebugRunner {
 
     void forceStartApproachTimeoutForTests() {
         failLaneStart(null, "Unable to reach valid lane start staging position");
+    }
+
+    int startApproachReissueCountForTests() {
+        return startApproachReissueCount;
+    }
+
+    // Simulates Baritone stopping without placing the player in a ready position.
+    // Exercises the reissue-or-fail path without a MinecraftClient.
+    // Returns true if the approach was reissued (runner still active);
+    // false if the retry budget was exhausted and failLaneStart was called.
+    boolean simulateStartApproachBaritoneStopped(Vec3d playerPosition) {
+        if (!awaitingStartApproach || activeLane == null || activeBounds == null) return false;
+        BlockPos stagingTarget = activeStartApproachTarget();
+        LaneStartReadiness readiness = evaluateLaneStartReadiness(playerPosition, activeLane, stagingTarget, activeBounds);
+        if (readiness.ready()) return false;
+        if (startApproachReissueCount < MAX_START_APPROACH_REISSUES) {
+            String ctx = " lane#" + activeLane.laneIndex()
+                    + " dir=" + activeLane.direction()
+                    + " target=" + stagingTarget.toShortString()
+                    + " playerPos=" + playerPosition
+                    + " reissueCount=" + startApproachReissueCount
+                    + " " + describeLaneStartReadiness(readiness);
+            traceGroundedEvent("Baritone approach stopped, player not ready — reissuing:" + ctx);
+            startApproachReissueCount++;
+            resetStartApproachProgressTracking();
+            issueStartApproachIfNeeded();
+            return true;
+        }
+        failLaneStart(null, "Unable to reach valid lane start staging position");
+        return false;
+    }
+
+    // Simulates a no-progress/absolute timeout reissue check without a MinecraftClient.
+    // Returns true if the approach was reissued; false if the retry budget was exhausted.
+    boolean simulateStartApproachTimeoutReissue() {
+        if (!awaitingStartApproach) return false;
+        if (startApproachReissueCount < MAX_START_APPROACH_REISSUES) {
+            startApproachReissueCount++;
+            resetStartApproachProgressTracking();
+            issueStartApproachIfNeeded();
+            return true;
+        }
+        failLaneStart(null, "Unable to reach valid lane start staging position");
+        return false;
     }
 
     Optional<BlockPos> laneShiftTargetForTests() {
@@ -3984,6 +4083,7 @@ public final class GroundedSingleLaneDebugRunner {
         startApproachTicks = 0;
         startApproachBestDistanceSq = Double.POSITIVE_INFINITY;
         startApproachNoProgressTicks = 0;
+        startApproachReissueCount = 0;
         awaitingLaneShift = false;
         awaitingTransitionSupport = false;
         laneShiftTarget = null;
@@ -4023,6 +4123,7 @@ public final class GroundedSingleLaneDebugRunner {
         startApproachTicks = 0;
         startApproachBestDistanceSq = Double.POSITIVE_INFINITY;
         startApproachNoProgressTicks = 0;
+        startApproachReissueCount = 0;
         awaitingLaneShift = false;
         awaitingTransitionSupport = false;
         laneShiftTarget = null;
@@ -4072,6 +4173,7 @@ public final class GroundedSingleLaneDebugRunner {
         startApproachTicks = 0;
         startApproachBestDistanceSq = Double.POSITIVE_INFINITY;
         startApproachNoProgressTicks = 0;
+        startApproachReissueCount = 0;
         awaitingLaneShift = true;
         awaitingTransitionSupport = false;
         laneShiftPlan = buildLaneShiftPlan(fromLane, lane, activeBounds);
