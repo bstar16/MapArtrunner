@@ -1910,4 +1910,188 @@ class GroundedSingleLaneDebugRunnerTest {
         assertTrue(runner.runSummaryPendingForTests(), "run summary should still be pending after refill resume");
         assertEquals(1, runner.refillTripCountForTests(), "refill count must not reset on refill resume");
     }
+
+    // ─── LaneRelativeBand classification tests ───────────────────────────────
+
+    @Test
+    void westLaneLowZClassifiesAsRightTwo() {
+        // WEST lane: player faces -X, so right is -Z (lower Z). Centerline Z=80, position Z=78 → RIGHT_TWO.
+        GroundedSweepLane lane = new GroundedSweepLane(
+                0, 80, GroundedLaneDirection.WEST,
+                new BlockPos(200, 64, 80), new BlockPos(100, 64, 80),
+                new GroundedLaneCorridorBounds(100, 200, 78, 82), 1.0);
+        assertEquals(LaneRelativeBand.RIGHT_TWO, LaneRelativeBand.classify(lane, new BlockPos(150, 64, 78)));
+    }
+
+    @Test
+    void westLaneHighZClassifiesAsLeftTwo() {
+        GroundedSweepLane lane = new GroundedSweepLane(
+                0, 80, GroundedLaneDirection.WEST,
+                new BlockPos(200, 64, 80), new BlockPos(100, 64, 80),
+                new GroundedLaneCorridorBounds(100, 200, 78, 82), 1.0);
+        assertEquals(LaneRelativeBand.LEFT_TWO, LaneRelativeBand.classify(lane, new BlockPos(150, 64, 82)));
+        assertEquals(LaneRelativeBand.LEFT_ONE, LaneRelativeBand.classify(lane, new BlockPos(150, 64, 81)));
+        assertEquals(LaneRelativeBand.CENTER,   LaneRelativeBand.classify(lane, new BlockPos(150, 64, 80)));
+        assertEquals(LaneRelativeBand.RIGHT_ONE, LaneRelativeBand.classify(lane, new BlockPos(150, 64, 79)));
+    }
+
+    @Test
+    void eastLaneHighZClassifiesAsRightTwo() {
+        // EAST lane: player faces +X, right is +Z. Centerline Z=12, position Z=14 → RIGHT_TWO.
+        GroundedSweepLane lane = eastLane(); // centerline Z=12
+        assertEquals(LaneRelativeBand.RIGHT_TWO, LaneRelativeBand.classify(lane, new BlockPos(12, 64, 14)));
+        assertEquals(LaneRelativeBand.RIGHT_ONE, LaneRelativeBand.classify(lane, new BlockPos(12, 64, 13)));
+        assertEquals(LaneRelativeBand.CENTER,    LaneRelativeBand.classify(lane, new BlockPos(12, 64, 12)));
+        assertEquals(LaneRelativeBand.LEFT_ONE,  LaneRelativeBand.classify(lane, new BlockPos(12, 64, 11)));
+        assertEquals(LaneRelativeBand.LEFT_TWO,  LaneRelativeBand.classify(lane, new BlockPos(12, 64, 10)));
+    }
+
+    @Test
+    void southLaneNegativeXClassifiesAsRightTwo() {
+        // SOUTH lane: player faces +Z, right is -X. Centerline X=15, position X=13 → RIGHT_TWO.
+        GroundedSweepLane lane = new GroundedSweepLane(
+                0, 15, GroundedLaneDirection.SOUTH,
+                new BlockPos(15, 64, 10), new BlockPos(15, 64, 20),
+                new GroundedLaneCorridorBounds(13, 17, 10, 20), 1.0);
+        assertEquals(LaneRelativeBand.RIGHT_TWO, LaneRelativeBand.classify(lane, new BlockPos(13, 64, 15)));
+        assertEquals(LaneRelativeBand.LEFT_TWO,  LaneRelativeBand.classify(lane, new BlockPos(17, 64, 15)));
+    }
+
+    @Test
+    void northLanePositiveXClassifiesAsRightTwo() {
+        // NORTH lane: player faces -Z, right is +X. Centerline X=15, position X=17 → RIGHT_TWO.
+        GroundedSweepLane lane = new GroundedSweepLane(
+                0, 15, GroundedLaneDirection.NORTH,
+                new BlockPos(15, 64, 20), new BlockPos(15, 64, 10),
+                new GroundedLaneCorridorBounds(13, 17, 10, 20), 1.0);
+        assertEquals(LaneRelativeBand.RIGHT_TWO, LaneRelativeBand.classify(lane, new BlockPos(17, 64, 15)));
+        assertEquals(LaneRelativeBand.LEFT_TWO,  LaneRelativeBand.classify(lane, new BlockPos(13, 64, 15)));
+    }
+
+    // ─── findLaneForPos tests ─────────────────────────────────────────────────
+
+    @Test
+    void findLaneForPosMatchesNearestCenterlineByLateralDistance() {
+        GroundedSweepLane laneA = new GroundedSweepLane(0, 10, GroundedLaneDirection.EAST,
+                new BlockPos(0, 64, 10), new BlockPos(20, 64, 10), new GroundedLaneCorridorBounds(0, 20, 8, 12), 1.0);
+        GroundedSweepLane laneB = new GroundedSweepLane(1, 15, GroundedLaneDirection.WEST,
+                new BlockPos(20, 64, 15), new BlockPos(0, 64, 15), new GroundedLaneCorridorBounds(0, 20, 13, 17), 1.0);
+
+        // Z=11 is closer to laneA (centerline Z=10, dist=1) than laneB (dist=4)
+        assertEquals(laneA, GroundedSingleLaneDebugRunner.findLaneForPos(new BlockPos(10, 64, 11), List.of(laneA, laneB)));
+        // Z=14 is closer to laneB (dist=1) than laneA (dist=4)
+        assertEquals(laneB, GroundedSingleLaneDebugRunner.findLaneForPos(new BlockPos(10, 64, 14), List.of(laneA, laneB)));
+    }
+
+    @Test
+    void findLaneForPosReturnsNullForEmptyOrNullList() {
+        assertNull(GroundedSingleLaneDebugRunner.findLaneForPos(new BlockPos(10, 64, 10), List.of()));
+        assertNull(GroundedSingleLaneDebugRunner.findLaneForPos(new BlockPos(10, 64, 10), null));
+    }
+
+    // ─── scanRemainingMismatchDetails tests ───────────────────────────────────
+
+    @Test
+    void mismatchScannerSkipsNullBlockPlacements() {
+        BuildPlan plan = buildPlan(new Vec3i(3, 1, 5), List.of(
+                new Placement(new BlockPos(0, 0, 0), null),
+                new Placement(new BlockPos(1, 0, 0), null),
+                new Placement(new BlockPos(2, 0, 0), null)
+        ));
+        List<GroundedSingleLaneDebugRunner.MismatchRecord> records =
+                GroundedSingleLaneDebugRunner.scanRemainingMismatchDetails(
+                        plan, new BlockPos(10, 64, 10),
+                        (pos, block) -> false,
+                        pos -> "minecraft:air",
+                        List.of(), null, 100);
+        assertEquals(0, records.size(), "null-block placements should always be skipped");
+    }
+
+    @Test
+    void mismatchScannerReturnsNullInputsAsEmpty() {
+        List<GroundedSingleLaneDebugRunner.MismatchRecord> r1 =
+                GroundedSingleLaneDebugRunner.scanRemainingMismatchDetails(
+                        null, new BlockPos(0, 0, 0), (p, b) -> false, p -> "x", List.of(), null, 100);
+        assertTrue(r1.isEmpty());
+        List<GroundedSingleLaneDebugRunner.MismatchRecord> r2 =
+                GroundedSingleLaneDebugRunner.scanRemainingMismatchDetails(
+                        buildPlan(List.of()), null, (p, b) -> false, p -> "x", List.of(), null, 100);
+        assertTrue(r2.isEmpty());
+    }
+
+    @Test
+    void westLaneNearStartDistanceClassifiesCorrectly() {
+        // WEST lane: progress axis = X, startPoint.X=200, endPoint.X=100
+        // Position X=198 → distFromStart=2 ≤ 3 → NEAR_START
+        // Position X=102 → distFromEnd=2 ≤ 3 → NEAR_END
+        // Position X=150 → both ≥ 3 → MIDDLE
+        GroundedSweepLane lane = new GroundedSweepLane(
+                0, 80, GroundedLaneDirection.WEST,
+                new BlockPos(200, 64, 80), new BlockPos(100, 64, 80),
+                new GroundedLaneCorridorBounds(100, 200, 78, 82), 1.0);
+
+        double startProgress = lane.direction().progressCoordinate(lane.startPoint().getX(), lane.startPoint().getZ());
+        double endProgress   = lane.direction().progressCoordinate(lane.endPoint().getX(),   lane.endPoint().getZ());
+
+        double distFromStart198 = Math.abs(198.0 - startProgress);
+        double distFromEnd102   = Math.abs(102.0 - endProgress);
+        double distFromStart150 = Math.abs(150.0 - startProgress);
+        double distFromEnd150   = Math.abs(150.0 - endProgress);
+
+        assertTrue(distFromStart198 <= 3, "X=198 should be near start");
+        assertTrue(distFromEnd102 <= 3,   "X=102 should be near end");
+        assertTrue(distFromStart150 > 3 && distFromEnd150 > 3, "X=150 should be in the middle");
+    }
+
+    // ─── writeMismatchDetailsEvent grouped-count tests ────────────────────────
+
+    @Test
+    void mismatchDetailsEventIncludesGroupedCountsByDirectionAndBand() throws Exception {
+        java.nio.file.Path temp = java.nio.file.Files.createTempDirectory("mapart-mismatch-test");
+        java.nio.file.Path logPath = temp.resolve("diag.log");
+
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(
+                new NoOpBaritoneFacade(), null, new GroundedDiagnostics(logPath));
+
+        // Construct mismatch records manually — same package, so package-private record is accessible.
+        List<GroundedSingleLaneDebugRunner.MismatchRecord> records = List.of(
+                new GroundedSingleLaneDebugRunner.MismatchRecord(
+                        0, new BlockPos(150, 64, 78), "minecraft:stone", "minecraft:air",
+                        0, "WEST", new BlockPos(200, 64, 80), new BlockPos(100, 64, 80),
+                        LaneRelativeBand.RIGHT_TWO, 150.0, 50.0, 50.0, "MIDDLE", "FORWARD"),
+                new GroundedSingleLaneDebugRunner.MismatchRecord(
+                        1, new BlockPos(151, 64, 78), "minecraft:stone", "minecraft:air",
+                        0, "WEST", new BlockPos(200, 64, 80), new BlockPos(100, 64, 80),
+                        LaneRelativeBand.RIGHT_TWO, 151.0, 49.0, 51.0, "MIDDLE", "FORWARD"),
+                new GroundedSingleLaneDebugRunner.MismatchRecord(
+                        2, new BlockPos(155, 64, 80), "minecraft:dirt", "minecraft:air",
+                        1, "EAST", new BlockPos(100, 64, 80), new BlockPos(200, 64, 80),
+                        LaneRelativeBand.CENTER, 155.0, 55.0, 45.0, "MIDDLE", "FORWARD")
+        );
+
+        runner.writeMismatchDetailsEvent(records, GroundedSingleLaneDebugRunner.SweepPassPhase.FORWARD);
+
+        List<String> lines = java.nio.file.Files.readAllLines(logPath);
+        String detailsLine = lines.stream()
+                .filter(l -> l.contains("remaining_mismatch_details"))
+                .findFirst()
+                .orElseThrow(() -> new AssertionError("no remaining_mismatch_details event in log"));
+
+        assertTrue(detailsLine.contains("\"totalMismatches\":3"),
+                "event should record total count of 3");
+        assertTrue(detailsLine.contains("byLaneDirection"),
+                "event should contain byLaneDirection grouping");
+        assertTrue(detailsLine.contains("byLaneRelativeBand"),
+                "event should contain byLaneRelativeBand grouping");
+        assertTrue(detailsLine.contains("RIGHT_TWO"),
+                "byLaneRelativeBand should list RIGHT_TWO");
+        assertTrue(detailsLine.contains("WEST"),
+                "byLaneDirection should list WEST");
+        assertTrue(detailsLine.contains("EAST"),
+                "byLaneDirection should list EAST");
+        assertTrue(detailsLine.contains("byLaneIndex"),
+                "event should contain byLaneIndex grouping");
+        assertTrue(detailsLine.contains("\"records\""),
+                "event should contain a records array");
+    }
 }
