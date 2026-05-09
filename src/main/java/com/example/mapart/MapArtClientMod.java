@@ -55,6 +55,7 @@ public class MapArtClientMod implements ClientModInitializer {
         BuildPlanService buildPlanService = new BuildPlanService(loaderRegistry, buildCoordinator);
         SingleLaneSweepDebugRunner singleLaneSweepDebugRunner = new SingleLaneSweepDebugRunner();
         GroundedSingleLaneDebugRunner groundedSingleLaneDebugRunner = new GroundedSingleLaneDebugRunner(baritoneFacade, supplyStore);
+        groundedSingleLaneDebugRunner.resetDiagnosticsForLaunch();
         MapArtRuntime.initialize(buildPlanService, configStore, progressStore, settingsStore, supplyStore, baritoneFacade, debugReporter, singleLaneSweepDebugRunner, groundedSingleLaneDebugRunner);
         KeyBinding.Category mapartCategory = KeyBinding.Category.create(Identifier.of("mapart", "general"));
         KeyBinding panicKeyBinding = KeyBindingHelper.registerKeyBinding(new KeyBinding(

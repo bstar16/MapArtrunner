@@ -2,6 +2,8 @@ package com.example.mapart.plan.sweep.grounded;
 
 import com.google.gson.Gson;
 import net.fabricmc.loader.api.FabricLoader;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -14,6 +16,7 @@ import java.util.List;
 import java.util.Map;
 
 public final class GroundedDiagnostics {
+    private static final Logger LOGGER = LoggerFactory.getLogger(GroundedDiagnostics.class);
     private static final Gson GSON = new Gson();
     private static final int MAX_EVENTS_PER_SNAPSHOT = 50;
 
@@ -79,17 +82,37 @@ public final class GroundedDiagnostics {
         }
     }
 
+    /**
+     * Truncates the diagnostics log and writes a fresh header. Call once on mod/client init.
+     * If the file cannot be reset, a warning is logged and diagnostics continue best-effort.
+     */
+    public void resetForLaunch() {
+        try {
+            Path logPath = logPath();
+            Files.createDirectories(logPath.getParent());
+            Files.writeString(logPath, "", StandardCharsets.UTF_8,
+                    StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+            writeHeader();
+        } catch (IOException e) {
+            LOGGER.warn("mapart-diagnostics: failed to reset log on launch: {}", e.getMessage());
+        }
+    }
+
     private void ensureHeader() throws IOException {
         Path logPath = logPath();
         Files.createDirectories(logPath.getParent());
         if (!Files.exists(logPath) || Files.size(logPath) == 0) {
-            Map<String, Object> header = new LinkedHashMap<>();
-            header.put("type", "header");
-            header.put("format", "mapart-diagnostics-jsonl");
-            header.put("version", 1);
-            header.put("description", "Each following line is one grounded sweep diagnostic snapshot.");
-            appendJsonLine(header);
+            writeHeader();
         }
+    }
+
+    private void writeHeader() throws IOException {
+        Map<String, Object> header = new LinkedHashMap<>();
+        header.put("type", "header");
+        header.put("format", "mapart-diagnostics-jsonl");
+        header.put("version", 1);
+        header.put("description", "Each following line is one grounded sweep diagnostic snapshot.");
+        appendJsonLine(header);
     }
 
     private void appendJsonLine(Map<String, Object> data) throws IOException {

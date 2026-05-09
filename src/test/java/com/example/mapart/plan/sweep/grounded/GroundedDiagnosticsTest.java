@@ -49,4 +49,64 @@ class GroundedDiagnosticsTest {
         GroundedDiagnostics d = new GroundedDiagnostics(temp.resolve("n.log"));
         assertDoesNotThrow(() -> d.writeSnapshot(20, new LinkedHashMap<>(), List.of()));
     }
+
+    @Test
+    void resetForLaunchTruncatesExistingFile() throws Exception {
+        Path log = temp.resolve("reset.log");
+        Files.writeString(log, "old content that should be gone\n");
+        GroundedDiagnostics d = new GroundedDiagnostics(log);
+        d.resetForLaunch();
+        String content = Files.readString(log);
+        assertFalse(content.contains("old content"), "existing content must be erased");
+    }
+
+    @Test
+    void resetForLaunchWritesExactlyOneHeader() throws Exception {
+        Path log = temp.resolve("header.log");
+        GroundedDiagnostics d = new GroundedDiagnostics(log);
+        d.resetForLaunch();
+        List<String> lines = Files.readAllLines(log);
+        assertEquals(1, lines.size(), "exactly one header line after reset");
+        var obj = JsonParser.parseString(lines.get(0)).getAsJsonObject();
+        assertEquals("header", obj.get("type").getAsString());
+        assertEquals("mapart-diagnostics-jsonl", obj.get("format").getAsString());
+    }
+
+    @Test
+    void afterResetWriteSnapshotAppendsAfterHeader() throws Exception {
+        Path log = temp.resolve("snap.log");
+        GroundedDiagnostics d = new GroundedDiagnostics(log);
+        d.resetForLaunch();
+        d.writeSnapshot(20, new LinkedHashMap<>(), List.of("e1"));
+        List<String> lines = Files.readAllLines(log);
+        assertEquals(2, lines.size());
+        assertEquals("header", JsonParser.parseString(lines.get(0)).getAsJsonObject().get("type").getAsString());
+        assertEquals("snapshot", JsonParser.parseString(lines.get(1)).getAsJsonObject().get("type").getAsString());
+    }
+
+    @Test
+    void afterResetWriteEventAppendsAfterHeader() throws Exception {
+        Path log = temp.resolve("event.log");
+        GroundedDiagnostics d = new GroundedDiagnostics(log);
+        d.resetForLaunch();
+        d.writeEvent(new LinkedHashMap<>(java.util.Map.of("type", "run_summary")));
+        List<String> lines = Files.readAllLines(log);
+        assertEquals(2, lines.size());
+        assertEquals("header", JsonParser.parseString(lines.get(0)).getAsJsonObject().get("type").getAsString());
+        assertEquals("run_summary", JsonParser.parseString(lines.get(1)).getAsJsonObject().get("type").getAsString());
+    }
+
+    @Test
+    void normalWriteMethodsDoNotTruncateFile() throws Exception {
+        Path log = temp.resolve("notrun.log");
+        GroundedDiagnostics d = new GroundedDiagnostics(log);
+        d.writeSnapshot(20, new LinkedHashMap<>(), List.of("a"));
+        d.writeSnapshot(40, new LinkedHashMap<>(), List.of("b"));
+        List<String> lines = Files.readAllLines(log);
+        // header + 2 snapshots — nothing should be lost
+        assertEquals(3, lines.size());
+        assertEquals("header", JsonParser.parseString(lines.get(0)).getAsJsonObject().get("type").getAsString());
+        assertEquals("snapshot", JsonParser.parseString(lines.get(1)).getAsJsonObject().get("type").getAsString());
+        assertEquals("snapshot", JsonParser.parseString(lines.get(2)).getAsJsonObject().get("type").getAsString());
+    }
 }

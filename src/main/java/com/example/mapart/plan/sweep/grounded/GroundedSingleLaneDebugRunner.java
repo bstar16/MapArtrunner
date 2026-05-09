@@ -203,6 +203,10 @@ public final class GroundedSingleLaneDebugRunner {
         this.groundedDiagnostics = Objects.requireNonNull(diagnostics, "diagnostics");
     }
 
+    public void resetDiagnosticsForLaunch() {
+        groundedDiagnostics.resetForLaunch();
+    }
+
     public boolean groundedTraceEnabled() {
         return groundedTraceEnabled;
     }
