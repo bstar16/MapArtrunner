@@ -235,6 +235,11 @@ public final class MapArtCommand {
                         .then(ClientCommandManager.literal("grounded-recovery")
                                 .then(ClientCommandManager.literal("status")
                                         .executes(context -> groundedRecoveryStatus(context.getSource()))))
+                        .then(ClientCommandManager.literal("mismatches")
+                                .executes(context -> debugMismatches(context.getSource(), 100))
+                                .then(ClientCommandManager.argument("limit", IntegerArgumentType.integer(1, 10000))
+                                        .executes(context -> debugMismatches(context.getSource(),
+                                                IntegerArgumentType.getInteger(context, "limit")))))
                 );
     }
 
@@ -409,6 +414,17 @@ public final class MapArtCommand {
             source.sendFeedback(Text.literal("  Status: Ready for auto-resume"));
         }
 
+        return 1;
+    }
+
+    private static int debugMismatches(FabricClientCommandSource source, int limit) {
+        GroundedSingleLaneDebugRunner runner = MapArtRuntime.groundedSingleLaneDebugRunner();
+        if (runner == null) {
+            source.sendError(Text.literal("Grounded sweep debug runner is unavailable."));
+            return 0;
+        }
+        String result = runner.debugMismatchScan(source.getWorld(), limit);
+        source.sendFeedback(Text.literal(result));
         return 1;
     }
 

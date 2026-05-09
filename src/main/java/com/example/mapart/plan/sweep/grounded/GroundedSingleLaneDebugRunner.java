@@ -2108,10 +2108,20 @@ public final class GroundedSingleLaneDebugRunner {
         String timeStr = formatElapsedNanos(elapsedNanos);
 
         int mismatches = -1;
+        List<MismatchRecord> mismatchDetails = List.of();
         if (client != null && client.world != null && activeSession != null) {
             PlacementCompletionLookup lookup = (worldPos, expectedBlock) ->
                     expectedBlock != null && client.world.getBlockState(worldPos).isOf(expectedBlock);
             mismatches = countRemainingMismatches(activeSession.getPlan(), activeSession.getOrigin(), lookup);
+            if (mismatches > 0) {
+                java.util.function.Function<BlockPos, String> actualBlockIdProvider = worldPos -> {
+                    net.minecraft.block.BlockState state = client.world.getBlockState(worldPos);
+                    return net.minecraft.registry.Registries.BLOCK.getId(state.getBlock()).toString();
+                };
+                mismatchDetails = scanRemainingMismatchDetails(
+                        activeSession.getPlan(), activeSession.getOrigin(), lookup,
+                        actualBlockIdProvider, forwardLanes, sweepPassPhase, 100);
+            }
         }
 
         String reason = failureReason.orElse(null);
@@ -2139,6 +2149,10 @@ public final class GroundedSingleLaneDebugRunner {
 
         if (client != null && client.player != null) {
             client.player.sendMessage(net.minecraft.text.Text.literal(lastRunSummaryText), false);
+            if (mismatches > 0 && groundedDiagnostics.enabled()) {
+                client.player.sendMessage(net.minecraft.text.Text.literal(
+                        "Remaining mismatch details written to " + groundedDiagnostics.logPath().getFileName()), false);
+            }
         }
 
         if (groundedDiagnostics.enabled()) {
@@ -2157,6 +2171,9 @@ public final class GroundedSingleLaneDebugRunner {
             try {
                 groundedDiagnostics.writeEvent(payload);
             } catch (Exception ignored) {
+            }
+            if (!mismatchDetails.isEmpty()) {
+                writeMismatchDetailsEvent(mismatchDetails, sweepPassPhase);
             }
         }
     }
@@ -2183,6 +2200,160 @@ public final class GroundedSingleLaneDebugRunner {
             }
         }
         return count;
+    }
+
+    record MismatchRecord(
+            int placementIndex,
+            BlockPos worldPos,
+            String expectedBlockId,
+            String actualBlockId,
+            int laneIndex,
+            String laneDirection,
+            BlockPos laneStart,
+            BlockPos laneEnd,
+            LaneRelativeBand laneRelativeBand,
+            double progressCoordinate,
+            double distanceFromLaneStart,
+            double distanceFromLaneEnd,
+            String proximity,
+            String sweepPassPhase
+    ) {}
+
+    private static final int NEAR_LANE_END_THRESHOLD = 3;
+
+    static List<MismatchRecord> scanRemainingMismatchDetails(
+            com.example.mapart.plan.BuildPlan plan,
+            BlockPos origin,
+            PlacementCompletionLookup lookup,
+            java.util.function.Function<BlockPos, String> actualBlockIdProvider,
+            List<GroundedSweepLane> lanes,
+            SweepPassPhase sweepPassPhase,
+            int maxRecords) {
+        if (plan == null || origin == null || lookup == null) return List.of();
+        List<MismatchRecord> results = new ArrayList<>();
+        List<com.example.mapart.plan.Placement> placements = plan.placements();
+        for (int idx = 0; idx < placements.size(); idx++) {
+            if (results.size() >= maxRecords) break;
+            com.example.mapart.plan.Placement p = placements.get(idx);
+            if (p.block() == null) continue;
+            BlockPos worldPos = origin.add(p.relativePos());
+            if (lookup.isExpectedBlockPlaced(worldPos, p.block())) continue;
+
+            String expectedId = net.minecraft.registry.Registries.BLOCK.getId(p.block()).toString();
+            String actualId = actualBlockIdProvider != null ? actualBlockIdProvider.apply(worldPos) : "unknown";
+
+            GroundedSweepLane lane = findLaneForPos(worldPos, lanes);
+            int laneIndex = -1;
+            String laneDir = "UNKNOWN";
+            BlockPos laneStart = null;
+            BlockPos laneEnd = null;
+            LaneRelativeBand band = LaneRelativeBand.CENTER;
+            double progress = 0;
+            double distStart = 0;
+            double distEnd = 0;
+            String proximity = "MIDDLE";
+
+            if (lane != null) {
+                laneIndex = lane.laneIndex();
+                laneDir = lane.direction().name();
+                laneStart = lane.startPoint();
+                laneEnd = lane.endPoint();
+                band = LaneRelativeBand.classify(lane, worldPos);
+                progress = lane.direction().progressCoordinate(worldPos.getX(), worldPos.getZ());
+                double startProgress = lane.direction().progressCoordinate(laneStart.getX(), laneStart.getZ());
+                double endProgress = lane.direction().progressCoordinate(laneEnd.getX(), laneEnd.getZ());
+                distStart = Math.abs(progress - startProgress);
+                distEnd = Math.abs(progress - endProgress);
+                if (distStart <= NEAR_LANE_END_THRESHOLD) proximity = "NEAR_START";
+                else if (distEnd <= NEAR_LANE_END_THRESHOLD) proximity = "NEAR_END";
+            }
+
+            results.add(new MismatchRecord(idx, worldPos, expectedId, actualId,
+                    laneIndex, laneDir, laneStart, laneEnd, band,
+                    progress, distStart, distEnd, proximity,
+                    sweepPassPhase != null ? sweepPassPhase.name() : "UNKNOWN"));
+        }
+        return results;
+    }
+
+    static GroundedSweepLane findLaneForPos(BlockPos worldPos, List<GroundedSweepLane> lanes) {
+        if (lanes == null || lanes.isEmpty()) return null;
+        GroundedSweepLane best = null;
+        int bestDist = Integer.MAX_VALUE;
+        for (GroundedSweepLane lane : lanes) {
+            int lateralCoord = lane.direction().alongX() ? worldPos.getZ() : worldPos.getX();
+            int dist = Math.abs(lateralCoord - lane.centerlineCoordinate());
+            if (dist < bestDist) {
+                bestDist = dist;
+                best = lane;
+            }
+        }
+        return best;
+    }
+
+    private Map<String, Object> mismatchToMap(MismatchRecord r) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("placementIndex", r.placementIndex());
+        m.put("worldPos", posToString(r.worldPos()));
+        m.put("expectedBlockId", r.expectedBlockId());
+        m.put("actualBlockId", r.actualBlockId());
+        m.put("laneIndex", r.laneIndex());
+        m.put("laneDirection", r.laneDirection());
+        if (r.laneStart() != null) m.put("laneStart", posToString(r.laneStart()));
+        if (r.laneEnd() != null) m.put("laneEnd", posToString(r.laneEnd()));
+        m.put("laneRelativeBand", r.laneRelativeBand().name());
+        m.put("progressCoordinate", r.progressCoordinate());
+        m.put("distanceFromLaneStart", r.distanceFromLaneStart());
+        m.put("distanceFromLaneEnd", r.distanceFromLaneEnd());
+        m.put("proximity", r.proximity());
+        m.put("sweepPassPhase", r.sweepPassPhase());
+        return m;
+    }
+
+    private static String posToString(BlockPos pos) {
+        return pos.getX() + "," + pos.getY() + "," + pos.getZ();
+    }
+
+    void writeMismatchDetailsEvent(List<MismatchRecord> records, SweepPassPhase phase) {
+        if (!groundedDiagnostics.enabled()) return;
+        Map<String, Long> byDirection = records.stream()
+                .collect(Collectors.groupingBy(MismatchRecord::laneDirection, Collectors.counting()));
+        Map<String, Long> byBand = records.stream()
+                .collect(Collectors.groupingBy(r -> r.laneRelativeBand().name(), Collectors.counting()));
+        Map<Integer, Long> byLaneIndex = records.stream()
+                .collect(Collectors.groupingBy(MismatchRecord::laneIndex, Collectors.counting()));
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("type", "remaining_mismatch_details");
+        payload.put("totalMismatches", records.size());
+        payload.put("sweepPassPhase", phase != null ? phase.name() : "UNKNOWN");
+        payload.put("byLaneDirection", byDirection);
+        payload.put("byLaneRelativeBand", byBand);
+        payload.put("byLaneIndex", byLaneIndex);
+        payload.put("records", records.stream().map(this::mismatchToMap).collect(Collectors.toList()));
+        try {
+            groundedDiagnostics.writeEvent(payload);
+        } catch (Exception ignored) {
+        }
+    }
+
+    public String debugMismatchScan(net.minecraft.world.WorldView world, int limit) {
+        if (activeSession == null || world == null) {
+            return "No active build session.";
+        }
+        PlacementCompletionLookup lookup = (worldPos, expectedBlock) ->
+                expectedBlock != null && world.getBlockState(worldPos).isOf(expectedBlock);
+        java.util.function.Function<BlockPos, String> actualBlockIdProvider = worldPos -> {
+            net.minecraft.block.BlockState state = world.getBlockState(worldPos);
+            return net.minecraft.registry.Registries.BLOCK.getId(state.getBlock()).toString();
+        };
+        List<MismatchRecord> records = scanRemainingMismatchDetails(
+                activeSession.getPlan(), activeSession.getOrigin(), lookup, actualBlockIdProvider,
+                forwardLanes, sweepPassPhase, limit);
+        if (groundedDiagnostics.enabled()) {
+            writeMismatchDetailsEvent(records, sweepPassPhase);
+        }
+        String logFile = groundedDiagnostics.logPath().getFileName().toString();
+        return records.size() + " mismatch record(s) scanned and written to " + logFile + ".";
     }
 
     // Test accessors
