@@ -2613,9 +2613,10 @@ public final class GroundedSingleLaneDebugRunner {
             BlockPos pos = target.worldPos();
             int progress = lane.direction().alongX() ? pos.getX() : pos.getZ();
             if (!allowedProgress.contains(progress)) {
-                // Sequential stop: only the leading edge of the pending list is valid.
-                // A gap here means we've exhausted the burst window; don't jump ahead.
-                break;
+                // Pending list is band-major ordered, not progress-ordered. Valid burst targets
+                // from other lane bands appear non-contiguously. Skip out-of-window targets
+                // rather than stopping — the allowedProgress set is the spatial guard.
+                continue;
             }
             if (Math.abs(lateralDeltaFromCenterline(lane.direction(), lane.centerlineCoordinate(), pos)) > sweepHalfWidth) {
                 continue;
@@ -2630,7 +2631,15 @@ public final class GroundedSingleLaneDebugRunner {
         if (!selected.isEmpty()) {
             int minIdx = selected.get(0).placementIndex();
             int maxIdx = selected.get(selected.size() - 1).placementIndex();
-            MapArtMod.LOGGER.info("[grounded-trace:event] entry burst selected idx=" + minIdx + ".." + maxIdx + " count=" + selected.size());
+            int minProg = selected.stream()
+                    .mapToInt(t -> lane.direction().alongX() ? t.worldPos().getX() : t.worldPos().getZ())
+                    .min().orElse(-1);
+            int maxProg = selected.stream()
+                    .mapToInt(t -> lane.direction().alongX() ? t.worldPos().getX() : t.worldPos().getZ())
+                    .max().orElse(-1);
+            MapArtMod.LOGGER.info("[grounded-trace:event] entry burst selected idx=" + minIdx + ".." + maxIdx
+                    + " count=" + selected.size()
+                    + " progress=" + minProg + ".." + maxProg);
         }
         return List.copyOf(selected);
     }

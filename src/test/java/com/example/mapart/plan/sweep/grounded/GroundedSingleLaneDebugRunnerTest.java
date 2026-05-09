@@ -12,6 +12,7 @@ import net.minecraft.util.math.Vec3i;
 import org.junit.jupiter.api.Test;
 
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -725,15 +726,17 @@ class GroundedSingleLaneDebugRunnerTest {
     }
 
     @Test
-    void entryBurstTargetsStopsAtFirstOutOfReachTargetPreventingIndexJump() {
-        // Regression: old code used continue on progress miss, allowing high-index targets
-        // at burst-zone progress coordinates to be selected after a gap (index jump bug).
+    void entryBurstTargetsIncludeInWindowTargetsAcrossProgressGap() {
+        // Pending list is band-major ordered, so an out-of-window target appearing between two
+        // in-window targets does not mean the later target is invalid. The spatial guard is
+        // allowedProgress, not position in the list. Targets at burst-zone progress values are
+        // included regardless of gaps formed by other bands' out-of-window targets.
         GroundedSweepLane lane = eastLane();
         GroundedSchematicBounds bounds = eastLaneBounds();
         List<GroundedSweepPlacementExecutor.PlacementTarget> pending = List.of(
-                new GroundedSweepPlacementExecutor.PlacementTarget(1, new BlockPos(10, 64, 12)),  // progress=10, in burst
-                new GroundedSweepPlacementExecutor.PlacementTarget(2, new BlockPos(13, 64, 12)),  // progress=13, out of burst
-                new GroundedSweepPlacementExecutor.PlacementTarget(894, new BlockPos(10, 64, 11)) // progress=10, in burst but after gap
+                new GroundedSweepPlacementExecutor.PlacementTarget(1, new BlockPos(10, 64, 12)),   // progress=10, in burst
+                new GroundedSweepPlacementExecutor.PlacementTarget(2, new BlockPos(13, 64, 12)),   // progress=13, out of burst
+                new GroundedSweepPlacementExecutor.PlacementTarget(894, new BlockPos(10, 64, 11))  // progress=10, in burst (different lateral band)
         );
         List<GroundedSweepPlacementExecutor.PlacementTarget> burst = GroundedSingleLaneDebugRunner.entryBurstTargetsForTests(
                 lane,
@@ -742,8 +745,70 @@ class GroundedSingleLaneDebugRunnerTest {
                 2,
                 10
         );
-        // Must stop at idx=2 (out of reach) and never reach idx=894, preventing the index jump
-        assertEquals(List.of(1), burst.stream().map(GroundedSweepPlacementExecutor.PlacementTarget::placementIndex).toList());
+        // idx=2 is outside the progress window and is skipped.
+        // idx=894 is at progress=10 (in burst) in a different lateral band and is included.
+        assertEquals(List.of(1, 894), burst.stream().map(GroundedSweepPlacementExecutor.PlacementTarget::placementIndex).toList());
+    }
+
+    @Test
+    void entryBurstTargetsExcludeTargetsOutsideSpatialProgressWindow() {
+        // The allowedProgress spatial filter prevents selecting targets that are truly outside
+        // the entry burst zone — this is the PR #214 guard, now applied correctly as a spatial
+        // filter rather than an ordering assumption.
+        GroundedSweepLane lane = eastLane();
+        GroundedSchematicBounds bounds = eastLaneBounds();
+        List<GroundedSweepPlacementExecutor.PlacementTarget> pending = List.of(
+                new GroundedSweepPlacementExecutor.PlacementTarget(1, new BlockPos(10, 64, 12)),  // progress=10, in burst
+                new GroundedSweepPlacementExecutor.PlacementTarget(2, new BlockPos(14, 64, 12)),  // progress=14, FAR outside burst window {10,11,12}
+                new GroundedSweepPlacementExecutor.PlacementTarget(3, new BlockPos(11, 64, 12))   // progress=11, in burst
+        );
+        List<GroundedSweepPlacementExecutor.PlacementTarget> burst = GroundedSingleLaneDebugRunner.entryBurstTargetsForTests(
+                lane,
+                bounds,
+                pending,
+                2,
+                10
+        );
+        // idx=2 at progress=14 is excluded by the spatial filter; idx=1 and idx=3 are included
+        assertEquals(List.of(1, 3), burst.stream().map(GroundedSweepPlacementExecutor.PlacementTarget::placementIndex).toList());
+    }
+
+    @Test
+    void entryBurstTargetsSelectsAcrossBandGaps() {
+        // Regression for PR #214's break-on-gap: the pending list is band-major ordered,
+        // so each band's burst-zone targets are separated by that band's out-of-window targets.
+        // All spatially valid burst targets must be selected across these gaps.
+        GroundedSweepLane lane = eastLane();
+        GroundedSchematicBounds bounds = eastLaneBounds();
+        // eastLane: EAST, centerline Z=12, allowedProgress for base=10 → {10,11,12}
+        List<GroundedSweepPlacementExecutor.PlacementTarget> pending = new ArrayList<>();
+        // Band 0 (Z=12): 3 burst-zone targets, then 2 out-of-window
+        pending.add(new GroundedSweepPlacementExecutor.PlacementTarget(0, new BlockPos(10, 64, 12)));
+        pending.add(new GroundedSweepPlacementExecutor.PlacementTarget(1, new BlockPos(11, 64, 12)));
+        pending.add(new GroundedSweepPlacementExecutor.PlacementTarget(2, new BlockPos(12, 64, 12)));
+        pending.add(new GroundedSweepPlacementExecutor.PlacementTarget(3, new BlockPos(13, 64, 12)));  // out of burst
+        pending.add(new GroundedSweepPlacementExecutor.PlacementTarget(4, new BlockPos(14, 64, 12)));  // out of burst
+        // Band 1 (Z=11): 3 burst-zone targets, then 1 out-of-window
+        pending.add(new GroundedSweepPlacementExecutor.PlacementTarget(5, new BlockPos(10, 64, 11)));
+        pending.add(new GroundedSweepPlacementExecutor.PlacementTarget(6, new BlockPos(11, 64, 11)));
+        pending.add(new GroundedSweepPlacementExecutor.PlacementTarget(7, new BlockPos(12, 64, 11)));
+        pending.add(new GroundedSweepPlacementExecutor.PlacementTarget(8, new BlockPos(13, 64, 11)));  // out of burst
+        // Band 2 (Z=13): non-contiguous high indices, burst-zone targets
+        pending.add(new GroundedSweepPlacementExecutor.PlacementTarget(254, new BlockPos(10, 64, 13)));
+        pending.add(new GroundedSweepPlacementExecutor.PlacementTarget(255, new BlockPos(11, 64, 13)));
+
+        List<GroundedSweepPlacementExecutor.PlacementTarget> burst = GroundedSingleLaneDebugRunner.entryBurstTargetsForTests(
+                lane,
+                bounds,
+                pending,
+                2,
+                10
+        );
+        // Must include burst-zone targets from all bands, skipping only out-of-window items
+        assertEquals(
+                List.of(0, 1, 2, 5, 6, 7, 254, 255),
+                burst.stream().map(GroundedSweepPlacementExecutor.PlacementTarget::placementIndex).toList()
+        );
     }
 
     @Test
