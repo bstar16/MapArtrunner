@@ -217,11 +217,6 @@ public final class GroundedSingleLaneDebugRunner {
     }
 
     public Optional<String> start(BuildSession session, int laneIndex, GroundedSweepSettings settings) {
-        if (!runSummaryPending) {
-            runStartTimeNanos = System.nanoTime();
-            runSummaryPending = true;
-            refillTripCount = 0;
-        }
         Optional<String> validation = validateStart(session, settings);
         if (validation.isPresent()) {
             return validation;
@@ -240,11 +235,6 @@ public final class GroundedSingleLaneDebugRunner {
     }
 
     public Optional<String> startFullSweep(BuildSession session, GroundedSweepSettings settings) {
-        if (!runSummaryPending) {
-            runStartTimeNanos = System.nanoTime();
-            runSummaryPending = true;
-            refillTripCount = 0;
-        }
         Optional<String> validation = validateStart(session, settings);
         if (validation.isPresent()) {
             return validation;
@@ -270,6 +260,7 @@ public final class GroundedSingleLaneDebugRunner {
         skippedCompletedForwardLanes = 0;
         activateLane(forwardLanes.getFirst(), Set.of());
         traceGroundedEvent("full sweep start selected: " + describeLane(activeLane));
+        beginRunSummaryIfNeeded();
         return Optional.empty();
     }
 
@@ -367,6 +358,7 @@ public final class GroundedSingleLaneDebugRunner {
         if (preflightFailure.isPresent()) {
             return preflightFailure;
         }
+        beginRunSummaryIfNeeded();
         if (refillController.isActive()) {
             awaitingStartApproach = false;
             startApproachIssued = false;
@@ -2090,6 +2082,15 @@ public final class GroundedSingleLaneDebugRunner {
         );
     }
 
+    private void beginRunSummaryIfNeeded() {
+        if (!runSummaryPending) {
+            runStartTimeNanos = System.nanoTime();
+            refillTripCount = 0;
+            lastRunSummaryText = null;
+            runSummaryPending = true;
+        }
+    }
+
     private void printRunSummaryIfPending(MinecraftClient client, GroundedLaneWalker.GroundedLaneWalkState terminalState, Optional<String> failureReason) {
         if (!runSummaryPending) return;
         runSummaryPending = false;
@@ -2183,6 +2184,7 @@ public final class GroundedSingleLaneDebugRunner {
     // Test accessors
     String lastRunSummaryTextForTests() { return lastRunSummaryText; }
     int refillTripCountForTests() { return refillTripCount; }
+    boolean runSummaryPendingForTests() { return runSummaryPending; }
 
     private void clearActiveRunState() {
         activeSession = null;

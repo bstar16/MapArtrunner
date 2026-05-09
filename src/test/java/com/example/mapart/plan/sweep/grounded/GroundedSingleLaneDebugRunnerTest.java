@@ -1790,4 +1790,59 @@ class GroundedSingleLaneDebugRunnerTest {
         assertTrue(lines.stream().anyMatch(l -> l.contains("run_summary")),
                 "diagnostics log should contain a run_summary event");
     }
+
+    @Test
+    void failedValidationDoesNotStartRunSummaryTracking() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        // Session without origin fails validateStart("Origin must be set...")
+        BuildSession noOrigin = new BuildSession(buildPlan(List.of(new Placement(new BlockPos(0, 0, 0), null))));
+        assertTrue(runner.startFullSweep(noOrigin, GroundedSweepSettings.defaults()).isPresent());
+        assertFalse(runner.runSummaryPendingForTests(), "failed validation must not set runSummaryPending");
+        assertEquals(0, runner.refillTripCountForTests());
+    }
+
+    @Test
+    void buildCompleteSmartResumeDoesNotLeaveStaleRunSummaryState() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        // All blocks appear placed — smart resume scanner reports build complete
+        Optional<String> result = runner.startFullSweepSmart(
+                sessionWithOrigin(), GroundedSweepSettings.defaults(),
+                new net.minecraft.util.math.Vec3d(10.5, 64.0, 10.5),
+                (pos, block) -> true);
+        assertTrue(result.isPresent(), "should return build-complete message");
+        assertFalse(runner.runSummaryPendingForTests(), "build-complete early exit must not set runSummaryPending");
+        assertEquals(0, runner.refillTripCountForTests());
+    }
+
+    @Test
+    void freshSuccessfulStartAfterFailedStartResetsTimerAndRefillCount() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        // Failed start — validation rejects no-origin session
+        BuildSession noOrigin = new BuildSession(buildPlan(List.of(new Placement(new BlockPos(0, 0, 0), null))));
+        assertTrue(runner.startFullSweep(noOrigin, GroundedSweepSettings.defaults()).isPresent());
+        assertFalse(runner.runSummaryPendingForTests());
+
+        // Successful start — tracking begins now, with clean state
+        assertTrue(runner.startFullSweep(sessionWithOrigin(), GroundedSweepSettings.defaults()).isEmpty());
+        assertTrue(runner.runSummaryPendingForTests(), "run summary should be pending after successful start");
+        assertEquals(0, runner.refillTripCountForTests(), "refill count should reset to zero on fresh start");
+    }
+
+    @Test
+    void refillResumeDoesNotResetOriginalTimerOrRefillCount() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        assertTrue(runner.startFullSweep(sessionWithOrigin(), GroundedSweepSettings.defaults()).isEmpty());
+        assertTrue(runner.runSummaryPendingForTests());
+
+        com.example.mapart.supply.SupplyPoint supply =
+                new com.example.mapart.supply.SupplyPoint(1, new BlockPos(5, 64, 5), "minecraft:overworld", "chest");
+        net.minecraft.util.Identifier itemId = net.minecraft.util.Identifier.of("minecraft:stone");
+        runner.triggerRefillForTests(Map.of(itemId, 1), List.of(supply), new NoOpBaritoneFacade());
+        assertEquals(1, runner.refillTripCountForTests());
+
+        // Refill complete internally calls startFullSweep — must not reset the original timer
+        runner.simulateRefillCompleteForTests();
+        assertTrue(runner.runSummaryPendingForTests(), "run summary should still be pending after refill resume");
+        assertEquals(1, runner.refillTripCountForTests(), "refill count must not reset on refill resume");
+    }
 }
