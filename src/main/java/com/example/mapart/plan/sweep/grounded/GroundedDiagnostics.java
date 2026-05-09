@@ -67,6 +67,18 @@ public final class GroundedDiagnostics {
         return GroundedSingleLaneDebugRunner.shouldEmitGroundedSnapshotForTick(tickCounter);
     }
 
+    public void writeEvent(Map<String, Object> payload) {
+        if (!enabled) return;
+        try {
+            ensureHeader();
+            Map<String, Object> line = new LinkedHashMap<>();
+            line.put("timestamp", Instant.now().toString());
+            line.putAll(payload);
+            appendJsonLine(line);
+        } catch (IOException ignored) {
+        }
+    }
+
     private void ensureHeader() throws IOException {
         Path logPath = logPath();
         Files.createDirectories(logPath.getParent());
