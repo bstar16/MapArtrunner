@@ -1632,4 +1632,162 @@ class GroundedSingleLaneDebugRunnerTest {
             return false;
         }
     }
+
+    // ─── Run summary tests ────────────────────────────────────────────────────
+
+    @Test
+    void formatElapsedNanosFormatsMinutesAndSeconds() {
+        assertEquals("00:00", GroundedSingleLaneDebugRunner.formatElapsedNanos(0));
+        assertEquals("00:05", GroundedSingleLaneDebugRunner.formatElapsedNanos(5_000_000_000L));
+        assertEquals("01:00", GroundedSingleLaneDebugRunner.formatElapsedNanos(60_000_000_000L));
+        assertEquals("48:12", GroundedSingleLaneDebugRunner.formatElapsedNanos(2892_000_000_000L));
+    }
+
+    @Test
+    void formatElapsedNanosFormatsHoursWhenPresent() {
+        assertEquals("01:00:00", GroundedSingleLaneDebugRunner.formatElapsedNanos(3600_000_000_000L));
+        assertEquals("02:14:36", GroundedSingleLaneDebugRunner.formatElapsedNanos(8076_000_000_000L));
+    }
+
+    @Test
+    void formatElapsedNanosHandlesNegativeInputAsZero() {
+        assertEquals("00:00", GroundedSingleLaneDebugRunner.formatElapsedNanos(-1_000_000_000L));
+    }
+
+    @Test
+    void countRemainingMismatchesSkipsNullBlockPlacements() {
+        BuildPlan plan = buildPlan(new Vec3i(2, 1, 1), List.of(
+                new Placement(new BlockPos(0, 0, 0), null),
+                new Placement(new BlockPos(1, 0, 0), null)
+        ));
+        // All placements have null blocks — they are skipped regardless of the lookup result
+        int count = GroundedSingleLaneDebugRunner.countRemainingMismatches(
+                plan, new BlockPos(10, 64, 10), (pos, block) -> false);
+        assertEquals(0, count);
+    }
+
+    @Test
+    void countRemainingMismatchesReturnsNegativeOneForNullInputs() {
+        assertEquals(-1, GroundedSingleLaneDebugRunner.countRemainingMismatches(null, new BlockPos(0, 0, 0), (p, b) -> true));
+        BuildPlan plan = buildPlan(List.of());
+        assertEquals(-1, GroundedSingleLaneDebugRunner.countRemainingMismatches(plan, null, (p, b) -> true));
+        assertEquals(-1, GroundedSingleLaneDebugRunner.countRemainingMismatches(plan, new BlockPos(0, 0, 0), null));
+    }
+
+    @Test
+    void refillTripCountStartsAtZeroAndIncrementsOncePerInitiatedRefill() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        assertTrue(runner.startFullSweep(sessionWithOrigin(), GroundedSweepSettings.defaults()).isEmpty());
+        assertEquals(0, runner.refillTripCountForTests());
+
+        com.example.mapart.supply.SupplyPoint supply =
+                new com.example.mapart.supply.SupplyPoint(1, new BlockPos(5, 64, 5), "minecraft:overworld", "chest");
+        net.minecraft.util.Identifier itemId = net.minecraft.util.Identifier.of("minecraft:stone");
+        runner.triggerRefillForTests(Map.of(itemId, 1), List.of(supply), new NoOpBaritoneFacade());
+
+        assertEquals(1, runner.refillTripCountForTests());
+
+        // Completing the refill and resuming does not double-count
+        runner.simulateRefillCompleteForTests();
+        assertEquals(1, runner.refillTripCountForTests());
+    }
+
+    @Test
+    void refillTripCountResetsOnFreshFullSweepStart() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        BuildSession session = sessionWithOrigin();
+        assertTrue(runner.startFullSweep(session, GroundedSweepSettings.defaults()).isEmpty());
+
+        com.example.mapart.supply.SupplyPoint supply =
+                new com.example.mapart.supply.SupplyPoint(1, new BlockPos(5, 64, 5), "minecraft:overworld", "chest");
+        net.minecraft.util.Identifier itemId = net.minecraft.util.Identifier.of("minecraft:stone");
+        runner.triggerRefillForTests(Map.of(itemId, 1), List.of(supply), new NoOpBaritoneFacade());
+        assertEquals(1, runner.refillTripCountForTests());
+
+        // Stop ends the run (runSummaryPending = false); count resets on the next fresh start
+        runner.stop();
+
+        // Fresh start resets the counter because runSummaryPending is now false
+        assertTrue(runner.startFullSweep(session, GroundedSweepSettings.defaults()).isEmpty());
+        assertEquals(0, runner.refillTripCountForTests());
+    }
+
+    @Test
+    void runSummaryPrintsOnNormalFullSweepCompletion() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        assertTrue(runner.startFullSweep(sessionWithOrigin(), GroundedSweepSettings.defaults()).isEmpty());
+        assertNull(runner.lastRunSummaryTextForTests());
+
+        // Simulate normal full-sweep completion: sweepPassPhase must be COMPLETE
+        runner.finalizeTerminalStateForTests(GroundedLaneWalkState.COMPLETE, Optional.empty());
+        // finalizeTerminalStateForTests does not go through the summary path (test bypass)
+        assertNull(runner.lastRunSummaryTextForTests());
+
+        // Re-start and use the summary-aware terminal path
+        assertTrue(runner.startFullSweep(sessionWithOrigin(), GroundedSweepSettings.defaults()).isEmpty());
+        runner.setSweepPassPhaseCompleteForTests();
+        runner.finalizeTerminalStateWithSummaryForTests(GroundedLaneWalkState.COMPLETE, Optional.empty());
+
+        String summary = runner.lastRunSummaryTextForTests();
+        assertNotNull(summary);
+        assertTrue(summary.contains("Completed: yes"), "summary should say Completed: yes, got: " + summary);
+        assertTrue(summary.contains("Refill trips: 0"));
+        assertTrue(summary.contains("Time taken:"));
+    }
+
+    @Test
+    void runSummaryPrintsCompletedNoOnStop() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        assertTrue(runner.startFullSweep(sessionWithOrigin(), GroundedSweepSettings.defaults()).isEmpty());
+
+        runner.finalizeTerminalStateWithSummaryForTests(GroundedLaneWalkState.FAILED, Optional.of("lane timed out"));
+
+        String summary = runner.lastRunSummaryTextForTests();
+        assertNotNull(summary);
+        assertTrue(summary.contains("Completed: no"), "summary should say Completed: no");
+        assertTrue(summary.contains("Reason: lane timed out"));
+    }
+
+    @Test
+    void runSummaryNotPrintedForSingleLaneMode() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
+
+        runner.finalizeTerminalStateWithSummaryForTests(GroundedLaneWalkState.COMPLETE, Optional.empty());
+
+        // Single-lane mode: no summary printed
+        assertNull(runner.lastRunSummaryTextForTests());
+    }
+
+    @Test
+    void runSummaryIncludesExhaustedMaterialReasonWhenNoExplicitFailure() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        assertTrue(runner.startFullSweep(sessionWithOrigin(), GroundedSweepSettings.defaults()).isEmpty());
+
+        net.minecraft.util.Identifier wool = net.minecraft.util.Identifier.of("minecraft:white_wool");
+        runner.markExhaustedForTests(wool, GroundedRefillController.SupplyExhaustedReason.SUPPLY_EMPTY);
+
+        runner.finalizeTerminalStateWithSummaryForTests(GroundedLaneWalkState.FAILED, Optional.empty());
+
+        String summary = runner.lastRunSummaryTextForTests();
+        assertNotNull(summary);
+        assertTrue(summary.contains("Reason: Supply exhausted:"), "should contain supply exhausted reason, got: " + summary);
+        assertTrue(summary.contains("white_wool"));
+    }
+
+    @Test
+    void diagnosticsEventWrittenOnRunEnd() throws Exception {
+        java.nio.file.Path temp = java.nio.file.Files.createTempDirectory("mapart-summary-test");
+        java.nio.file.Path logPath = temp.resolve("diag.log");
+
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(
+                new NoOpBaritoneFacade(), null, new GroundedDiagnostics(logPath));
+        assertTrue(runner.startFullSweep(sessionWithOrigin(), GroundedSweepSettings.defaults()).isEmpty());
+        runner.setSweepPassPhaseCompleteForTests();
+        runner.finalizeTerminalStateWithSummaryForTests(GroundedLaneWalkState.COMPLETE, Optional.empty());
+
+        List<String> lines = java.nio.file.Files.readAllLines(logPath);
+        assertTrue(lines.stream().anyMatch(l -> l.contains("run_summary")),
+                "diagnostics log should contain a run_summary event");
+    }
 }

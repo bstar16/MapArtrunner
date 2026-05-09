@@ -141,7 +141,7 @@ public final class GroundedSingleLaneDebugRunner {
     private final List<Map<String, Object>> recentVerificationResults = new ArrayList<>();
 
     private boolean groundedTraceEnabled;
-    private final GroundedDiagnostics groundedDiagnostics = new GroundedDiagnostics();
+    private final GroundedDiagnostics groundedDiagnostics;
     private long lastGroundedSnapshotTick = -1;
     private long groundedTraceTickCounter;
     private boolean corridorWarningActive;
@@ -163,6 +163,12 @@ public final class GroundedSingleLaneDebugRunner {
     private int ticksSinceProgressAdvance;
     private long lastSuccessfulPlacementTick;
     private int consecutiveYawDriftTicks;
+
+    // Run summary tracking — not reset by initializeRunState/clearActiveRunState so they survive refill restarts
+    private long runStartTimeNanos = 0;
+    private int refillTripCount = 0;
+    private boolean runSummaryPending = false;
+    private String lastRunSummaryText = null;
 
     private DebugStatus lastStatus = new DebugStatus(
             false,
@@ -188,8 +194,13 @@ public final class GroundedSingleLaneDebugRunner {
     }
 
     public GroundedSingleLaneDebugRunner(BaritoneFacade baritoneFacade, SupplyStore supplyStore) {
+        this(baritoneFacade, supplyStore, new GroundedDiagnostics());
+    }
+
+    GroundedSingleLaneDebugRunner(BaritoneFacade baritoneFacade, SupplyStore supplyStore, GroundedDiagnostics diagnostics) {
         this.baritoneFacade = Objects.requireNonNull(baritoneFacade, "baritoneFacade");
         this.supplyStore = supplyStore;
+        this.groundedDiagnostics = Objects.requireNonNull(diagnostics, "diagnostics");
     }
 
     public boolean groundedTraceEnabled() {
@@ -206,6 +217,11 @@ public final class GroundedSingleLaneDebugRunner {
     }
 
     public Optional<String> start(BuildSession session, int laneIndex, GroundedSweepSettings settings) {
+        if (!runSummaryPending) {
+            runStartTimeNanos = System.nanoTime();
+            runSummaryPending = true;
+            refillTripCount = 0;
+        }
         Optional<String> validation = validateStart(session, settings);
         if (validation.isPresent()) {
             return validation;
@@ -224,6 +240,11 @@ public final class GroundedSingleLaneDebugRunner {
     }
 
     public Optional<String> startFullSweep(BuildSession session, GroundedSweepSettings settings) {
+        if (!runSummaryPending) {
+            runStartTimeNanos = System.nanoTime();
+            runSummaryPending = true;
+            refillTripCount = 0;
+        }
         Optional<String> validation = validateStart(session, settings);
         if (validation.isPresent()) {
             return validation;
@@ -781,6 +802,7 @@ public final class GroundedSingleLaneDebugRunner {
             refillController.clear();
             return false;
         }
+        refillTripCount++;
         traceGroundedEvent("refill triggered, heading to supply #"
                 + refillController.targetSupply().map(s -> String.valueOf(s.id())).orElse("?")
                 + " at " + refillController.targetSupply().map(s -> s.pos().toShortString()).orElse("?"));
@@ -1025,6 +1047,7 @@ public final class GroundedSingleLaneDebugRunner {
             refillController.clear();
             return false;
         }
+        refillTripCount++;
         return true;
     }
 
@@ -1463,6 +1486,7 @@ public final class GroundedSingleLaneDebugRunner {
             }
             // Try to advance to next lane instead of failing
             if (!tryAdvanceSweepToNextLane()) {
+                printRunSummaryIfPending(client, GroundedLaneWalker.GroundedLaneWalkState.COMPLETE, Optional.empty());
                 captureLastStatus(GroundedLaneWalker.GroundedLaneWalkState.COMPLETE, Optional.empty());
                 clearActiveRunState();
             }
@@ -1479,6 +1503,7 @@ public final class GroundedSingleLaneDebugRunner {
         entrySupportEstablished = false;
         entryAttemptsByPlacementIndex = Map.of();
         laneWalker.interrupt();
+        printRunSummaryIfPending(client, GroundedLaneWalker.GroundedLaneWalkState.FAILED, Optional.of(reason));
         captureLastStatus(GroundedLaneWalker.GroundedLaneWalkState.FAILED, Optional.of(reason));
         if (client != null) {
             clearControls(client);
@@ -1705,6 +1730,16 @@ public final class GroundedSingleLaneDebugRunner {
         clearActiveRunState();
     }
 
+    void finalizeTerminalStateWithSummaryForTests(GroundedLaneWalker.GroundedLaneWalkState terminalState, Optional<String> failureReason) {
+        printRunSummaryIfPending(null, terminalState, failureReason);
+        captureLastStatus(terminalState, failureReason);
+        clearActiveRunState();
+    }
+
+    void setSweepPassPhaseCompleteForTests() {
+        sweepPassPhase = SweepPassPhase.COMPLETE;
+    }
+
     void seedLanePlacementsForTests(List<GroundedSweepPlacementExecutor.PlacementTarget> pendingPlacements) {
         pendingPlacementTargets = List.copyOf(pendingPlacements);
         currentLeftovers = List.of();
@@ -1797,6 +1832,7 @@ public final class GroundedSingleLaneDebugRunner {
             deficits.merge(Registries.ITEM.getId(item), 1, Integer::sum);
         }
         refillController.initiateWithSuppliesForTests(supplyPoints, deficits, null, testBaritone);
+        refillTripCount++;
     }
 
     void triggerRefillForTests(Map<Identifier, Integer> deficits, java.util.List<com.example.mapart.supply.SupplyPoint> supplyPoints, BaritoneFacade testBaritone) {
@@ -1806,6 +1842,7 @@ public final class GroundedSingleLaneDebugRunner {
         }
         laneWalker.interrupt();
         refillController.initiateWithSuppliesForTests(supplyPoints, deficits, null, testBaritone);
+        refillTripCount++;
     }
 
     void simulateRefillCompleteForTests() {
@@ -1855,6 +1892,7 @@ public final class GroundedSingleLaneDebugRunner {
             traceGroundedEvent("lane walker failed: " + failureReason.orElse("unknown"));
         }
 
+        printRunSummaryIfPending(client, terminalState, failureReason);
         captureLastStatus(terminalState, failureReason);
         if (client != null) {
             clearControls(client);
@@ -2051,6 +2089,100 @@ public final class GroundedSingleLaneDebugRunner {
                 skippedCompletedForwardLanes
         );
     }
+
+    private void printRunSummaryIfPending(MinecraftClient client, GroundedLaneWalker.GroundedLaneWalkState terminalState, Optional<String> failureReason) {
+        if (!runSummaryPending) return;
+        runSummaryPending = false;
+
+        if (runMode != SweepRunMode.FULL_SWEEP) return;
+
+        boolean completed = terminalState == GroundedLaneWalker.GroundedLaneWalkState.COMPLETE
+                && sweepPassPhase == SweepPassPhase.COMPLETE;
+
+        long elapsedNanos = runStartTimeNanos > 0 ? System.nanoTime() - runStartTimeNanos : 0;
+        String timeStr = formatElapsedNanos(elapsedNanos);
+
+        int mismatches = -1;
+        if (client != null && client.world != null && activeSession != null) {
+            PlacementCompletionLookup lookup = (worldPos, expectedBlock) ->
+                    expectedBlock != null && client.world.getBlockState(worldPos).isOf(expectedBlock);
+            mismatches = countRemainingMismatches(activeSession.getPlan(), activeSession.getOrigin(), lookup);
+        }
+
+        String reason = failureReason.orElse(null);
+        if (reason == null && !exhaustedMaterials.isEmpty()) {
+            String items = exhaustedMaterials.keySet().stream()
+                    .map(Identifier::getPath)
+                    .collect(Collectors.joining(", "));
+            reason = "Supply exhausted: " + items;
+        }
+
+        StringBuilder sb = new StringBuilder("MapArtRunner summary:\n");
+        sb.append("Completed: ").append(completed ? "yes" : "no");
+        if (!completed && reason != null) {
+            sb.append("\nReason: ").append(reason);
+        }
+        if (mismatches >= 0) {
+            sb.append("\nRemaining mismatches: ").append(mismatches);
+        }
+        sb.append("\nRefill trips: ").append(refillTripCount);
+        sb.append("\nTime taken: ").append(timeStr);
+
+        lastRunSummaryText = sb.toString();
+        traceGroundedEvent("run summary: completed=" + completed + " mismatches=" + mismatches
+                + " refillTrips=" + refillTripCount + " time=" + timeStr);
+
+        if (client != null && client.player != null) {
+            client.player.sendMessage(net.minecraft.text.Text.literal(lastRunSummaryText), false);
+        }
+
+        if (groundedDiagnostics.enabled()) {
+            Map<String, Object> payload = new LinkedHashMap<>();
+            payload.put("type", "run_summary");
+            payload.put("completed", completed);
+            if (!completed && reason != null) {
+                payload.put("reason", reason);
+            }
+            if (mismatches >= 0) {
+                payload.put("remainingMismatches", mismatches);
+            }
+            payload.put("refillTrips", refillTripCount);
+            payload.put("elapsedSeconds", elapsedNanos / 1_000_000_000L);
+            payload.put("elapsedFormatted", timeStr);
+            try {
+                groundedDiagnostics.writeEvent(payload);
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
+    static String formatElapsedNanos(long nanos) {
+        long totalSeconds = Math.max(0L, nanos) / 1_000_000_000L;
+        long hours = totalSeconds / 3600;
+        long minutes = (totalSeconds % 3600) / 60;
+        long seconds = totalSeconds % 60;
+        if (hours > 0) {
+            return String.format("%02d:%02d:%02d", hours, minutes, seconds);
+        }
+        return String.format("%02d:%02d", minutes, seconds);
+    }
+
+    static int countRemainingMismatches(com.example.mapart.plan.BuildPlan plan, BlockPos origin, PlacementCompletionLookup lookup) {
+        if (plan == null || origin == null || lookup == null) return -1;
+        int count = 0;
+        for (com.example.mapart.plan.Placement p : plan.placements()) {
+            if (p.block() == null) continue;
+            BlockPos worldPos = origin.add(p.relativePos());
+            if (!lookup.isExpectedBlockPlaced(worldPos, p.block())) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    // Test accessors
+    String lastRunSummaryTextForTests() { return lastRunSummaryText; }
+    int refillTripCountForTests() { return refillTripCount; }
 
     private void clearActiveRunState() {
         activeSession = null;
@@ -2796,6 +2928,7 @@ public final class GroundedSingleLaneDebugRunner {
         laneTransitionYawLockTicks = 0;
         clearTransitionSupportState();
         laneWalker.interrupt();
+        printRunSummaryIfPending(client, GroundedLaneWalker.GroundedLaneWalkState.FAILED, Optional.of(reason));
         captureLastStatus(GroundedLaneWalker.GroundedLaneWalkState.FAILED, Optional.of(reason));
         if (client != null) {
             clearControls(client);
