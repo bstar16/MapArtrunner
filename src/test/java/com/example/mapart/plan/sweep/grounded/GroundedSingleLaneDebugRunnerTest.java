@@ -725,6 +725,28 @@ class GroundedSingleLaneDebugRunnerTest {
     }
 
     @Test
+    void entryBurstTargetsStopsAtFirstOutOfReachTargetPreventingIndexJump() {
+        // Regression: old code used continue on progress miss, allowing high-index targets
+        // at burst-zone progress coordinates to be selected after a gap (index jump bug).
+        GroundedSweepLane lane = eastLane();
+        GroundedSchematicBounds bounds = eastLaneBounds();
+        List<GroundedSweepPlacementExecutor.PlacementTarget> pending = List.of(
+                new GroundedSweepPlacementExecutor.PlacementTarget(1, new BlockPos(10, 64, 12)),  // progress=10, in burst
+                new GroundedSweepPlacementExecutor.PlacementTarget(2, new BlockPos(13, 64, 12)),  // progress=13, out of burst
+                new GroundedSweepPlacementExecutor.PlacementTarget(894, new BlockPos(10, 64, 11)) // progress=10, in burst but after gap
+        );
+        List<GroundedSweepPlacementExecutor.PlacementTarget> burst = GroundedSingleLaneDebugRunner.entryBurstTargetsForTests(
+                lane,
+                bounds,
+                pending,
+                2,
+                10
+        );
+        // Must stop at idx=2 (out of reach) and never reach idx=894, preventing the index jump
+        assertEquals(List.of(1), burst.stream().map(GroundedSweepPlacementExecutor.PlacementTarget::placementIndex).toList());
+    }
+
+    @Test
     void entryBurstTargetsAllowMultipleAttemptsPerTarget() {
         assertEquals(2, GroundedSingleLaneDebugRunner.maxEntryAttemptsPerTargetForTests());
     }

@@ -2475,7 +2475,9 @@ public final class GroundedSingleLaneDebugRunner {
             BlockPos pos = target.worldPos();
             int progress = lane.direction().alongX() ? pos.getX() : pos.getZ();
             if (!allowedProgress.contains(progress)) {
-                continue;
+                // Sequential stop: only the leading edge of the pending list is valid.
+                // A gap here means we've exhausted the burst window; don't jump ahead.
+                break;
             }
             if (Math.abs(lateralDeltaFromCenterline(lane.direction(), lane.centerlineCoordinate(), pos)) > sweepHalfWidth) {
                 continue;
@@ -2486,6 +2488,11 @@ public final class GroundedSingleLaneDebugRunner {
                 continue;
             }
             selected.add(target);
+        }
+        if (!selected.isEmpty()) {
+            int minIdx = selected.get(0).placementIndex();
+            int maxIdx = selected.get(selected.size() - 1).placementIndex();
+            MapArtMod.LOGGER.info("[grounded-trace:event] entry burst selected idx=" + minIdx + ".." + maxIdx + " count=" + selected.size());
         }
         return List.copyOf(selected);
     }
