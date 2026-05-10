@@ -2043,6 +2043,146 @@ class GroundedSingleLaneDebugRunnerTest {
         assertTrue(distFromStart150 > 3 && distFromEnd150 > 3, "X=150 should be in the middle");
     }
 
+    // ─── Start-approach reissue / retry budget tests ─────────────────────────
+
+    @Test
+    void startApproachBaritoneStopped_playerNotReady_reissuesInsteadOfFailing() {
+        RecordingBaritoneFacade baritone = new RecordingBaritoneFacade();
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(baritone);
+        assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
+        runner.issueStartApproachIfNeeded();
+        assertEquals(1, baritone.goToCalls);
+
+        // Player is far outside the lane corridor — not ready for lane start
+        Vec3d playerFarAway = new Vec3d(100.0, 64.0, 200.0);
+        boolean reissued = runner.simulateStartApproachBaritoneStopped(playerFarAway);
+
+        assertTrue(reissued);
+        assertTrue(runner.isActive());
+        assertEquals(1, runner.startApproachReissueCountForTests());
+        assertEquals(2, baritone.goToCalls);
+    }
+
+    @Test
+    void startApproachTimeout_retriesRemaining_reissuesInsteadOfFailing() {
+        RecordingBaritoneFacade baritone = new RecordingBaritoneFacade();
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(baritone);
+        assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
+        runner.issueStartApproachIfNeeded();
+        assertEquals(1, baritone.goToCalls);
+
+        boolean reissued = runner.simulateStartApproachTimeoutReissue();
+
+        assertTrue(reissued);
+        assertTrue(runner.isActive());
+        assertEquals(1, runner.startApproachReissueCountForTests());
+        assertEquals(2, baritone.goToCalls);
+    }
+
+    @Test
+    void startApproachRetryBudgetExhausted_failsWithCorrectMessage() {
+        RecordingBaritoneFacade baritone = new RecordingBaritoneFacade();
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(baritone);
+        assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
+        runner.issueStartApproachIfNeeded();
+
+        Vec3d playerFarAway = new Vec3d(100.0, 64.0, 200.0);
+        // Exhaust the full budget
+        for (int i = 0; i < 3; i++) {
+            boolean reissued = runner.simulateStartApproachBaritoneStopped(playerFarAway);
+            assertTrue(reissued, "Expected reissue on attempt " + i);
+        }
+        // Budget is now exhausted — next call must fail
+        boolean reissued = runner.simulateStartApproachBaritoneStopped(playerFarAway);
+
+        assertFalse(reissued);
+        assertFalse(runner.isActive());
+        assertEquals("Unable to reach valid lane start staging position",
+                runner.status().failureReason().orElseThrow());
+    }
+
+    @Test
+    void startApproachTimeoutBudgetExhausted_failsWithCorrectMessage() {
+        RecordingBaritoneFacade baritone = new RecordingBaritoneFacade();
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(baritone);
+        assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
+        runner.issueStartApproachIfNeeded();
+
+        // Exhaust budget via timeout path
+        for (int i = 0; i < 3; i++) {
+            boolean reissued = runner.simulateStartApproachTimeoutReissue();
+            assertTrue(reissued, "Expected reissue on attempt " + i);
+        }
+        boolean reissued = runner.simulateStartApproachTimeoutReissue();
+
+        assertFalse(reissued);
+        assertFalse(runner.isActive());
+        assertEquals("Unable to reach valid lane start staging position",
+                runner.status().failureReason().orElseThrow());
+    }
+
+    @Test
+    void startApproachReadinessDiagnosticsIncludeReasonCenterlineForwardCorridor() {
+        RecordingBaritoneFacade baritone = new RecordingBaritoneFacade();
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(baritone);
+        runner.setGroundedTraceEnabled(true);
+        assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
+        runner.issueStartApproachIfNeeded();
+
+        Vec3d playerFarAway = new Vec3d(100.0, 64.0, 200.0);
+        runner.simulateStartApproachBaritoneStopped(playerFarAway);
+
+        List<String> events = runner.groundedTraceEventsForTests();
+        String reissueEvent = events.stream()
+                .filter(e -> e.contains("reissuing") || e.contains("retry budget"))
+                .findFirst()
+                .orElse("");
+        assertFalse(reissueEvent.isEmpty(), "Expected a reissue or retry-budget trace event");
+        assertTrue(reissueEvent.contains("reason="), "Missing reason in: " + reissueEvent);
+        assertTrue(reissueEvent.contains("centerlineDelta="), "Missing centerlineDelta in: " + reissueEvent);
+        assertTrue(reissueEvent.contains("forwardDelta="), "Missing forwardDelta in: " + reissueEvent);
+        assertTrue(reissueEvent.contains("insideCorridor="), "Missing insideCorridor in: " + reissueEvent);
+    }
+
+    @Test
+    void preflightRefillStartsNormallyWhenMaterialsMissing() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        assertTrue(runner.startFullSweep(sessionWithOrigin(), GroundedSweepSettings.defaults()).isEmpty());
+        assertTrue(runner.isActive());
+
+        com.example.mapart.supply.SupplyPoint supply =
+                new com.example.mapart.supply.SupplyPoint(1, new BlockPos(5, 64, 5), "minecraft:overworld", "chest");
+        net.minecraft.util.Identifier itemId = net.minecraft.util.Identifier.of("minecraft:stone");
+        runner.triggerRefillForTests(Map.of(itemId, 1), List.of(supply), new NoOpBaritoneFacade());
+
+        // Refill in progress — runner remains active
+        assertTrue(runner.isActive());
+        assertEquals(1, runner.refillTripCountForTests());
+    }
+
+    @Test
+    void refillTripCountAndRunTimerNotResetByApproachRetries() {
+        RecordingBaritoneFacade baritone = new RecordingBaritoneFacade();
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(baritone);
+        assertTrue(runner.startFullSweep(sessionWithOrigin(), GroundedSweepSettings.defaults()).isEmpty());
+
+        // Trigger and complete a refill so the counter is non-zero
+        com.example.mapart.supply.SupplyPoint supply =
+                new com.example.mapart.supply.SupplyPoint(1, new BlockPos(5, 64, 5), "minecraft:overworld", "chest");
+        net.minecraft.util.Identifier itemId = net.minecraft.util.Identifier.of("minecraft:stone");
+        runner.triggerRefillForTests(Map.of(itemId, 1), List.of(supply), baritone);
+        runner.simulateRefillCompleteForTests();
+        assertEquals(1, runner.refillTripCountForTests());
+
+        // Simulate approach reissues after resume — refill count must not change
+        Vec3d playerFarAway = new Vec3d(100.0, 64.0, 200.0);
+        runner.simulateStartApproachBaritoneStopped(playerFarAway);
+        runner.simulateStartApproachBaritoneStopped(playerFarAway);
+
+        assertEquals(1, runner.refillTripCountForTests());
+        assertTrue(runner.isActive());
+    }
+
     // ─── writeMismatchDetailsEvent grouped-count tests ────────────────────────
 
     @Test
