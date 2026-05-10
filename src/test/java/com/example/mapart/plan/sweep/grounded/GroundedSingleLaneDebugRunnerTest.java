@@ -159,7 +159,10 @@ class GroundedSingleLaneDebugRunnerTest {
     }
 
     @Test
-    void readyForLaneStartRequiresInsideCorridorEvenWhenNearTarget() {
+    void playerBeyondFlatDistanceToleranceIsRejectedDespiteNearLaneStart() {
+        // isNearLaneStart uses a lenient proximity check; isReadyForLaneStart is stricter.
+        // Player at (10.55, 13.55) is ~2.2 units² from staging center (9.5, 12.5), which exceeds
+        // the flat-distance tolerance (1.0 unit²) — rejected for that reason, not for insideCorridor.
         GroundedSweepLane lane = eastLane();
         GroundedSchematicBounds bounds = eastLaneBounds();
         BlockPos standing = new BlockPos(9, 65, 12);
@@ -169,6 +172,84 @@ class GroundedSingleLaneDebugRunnerTest {
                 new Vec3d(10.55, 64.0, 13.55),
                 lane,
                 standing,
+                bounds
+        ));
+    }
+
+    @Test
+    void eastLaneStagingPositionOutsideCorridorIsAccepted() {
+        // The staging/approach target for an EAST lane is one block west of the lane start (x=9
+        // when the lane starts at x=10). A player at the staging center (x=9.5) is outside the
+        // active corridor (minX=10), but insideCorridor must not be a hard gate — the flat-distance,
+        // centerline, and forward checks confirm the player is correctly positioned.
+        // This is the exact scenario that PR #220 broke.
+        GroundedSweepLane lane = eastLane(); // startPoint x=10, corridor minX=10
+        GroundedSchematicBounds bounds = eastLaneBounds();
+        BlockPos stagingTarget = new BlockPos(9, 65, 12); // one block west of lane start
+
+        assertTrue(GroundedSingleLaneDebugRunner.isReadyForLaneStart(
+                new Vec3d(9.5, 64.0, 12.5), // at staging center; x=9.5 < minX=10 → insideCorridor=false
+                lane,
+                stagingTarget,
+                bounds
+        ));
+    }
+
+    @Test
+    void westLaneStagingPositionOutsideCorridorIsAccepted() {
+        // The staging target for a WEST lane is one block east of the lane start (x=15 when
+        // the lane starts at x=14). A player at x=15.4 is outside the corridor (maxX+1=15),
+        // but must be accepted — same reasoning as the EAST case.
+        GroundedSweepLane lane = new GroundedSweepLane(
+                1, 12, GroundedLaneDirection.WEST,
+                new BlockPos(14, 64, 12), new BlockPos(10, 64, 12),
+                new GroundedLaneCorridorBounds(10, 14, 10, 14),
+                1.0
+        );
+        GroundedSchematicBounds bounds = new GroundedSchematicBounds(
+                new BlockPos(10, 64, 10),
+                new BlockPos(10, 64, 10),
+                new BlockPos(14, 64, 14)
+        );
+        BlockPos stagingTarget = new BlockPos(15, 65, 12); // one block east of WEST lane start
+
+        assertTrue(GroundedSingleLaneDebugRunner.isReadyForLaneStart(
+                new Vec3d(15.4, 64.0, 12.5), // x=15.4 > maxX(14)+1=15 → insideCorridor=false
+                lane,
+                stagingTarget,
+                bounds
+        ));
+    }
+
+    @Test
+    void playerFarFromCenterlineIsRejectedEvenAtStagingForwardPosition() {
+        // Player is at the correct staging X but far off-centerline (z-delta=1.9, limit=0.8).
+        // The flat-distance check catches this before the centerline check, but either way
+        // the player must not be considered ready.
+        GroundedSweepLane lane = eastLane(); // centerline z=12
+        GroundedSchematicBounds bounds = eastLaneBounds();
+        BlockPos stagingTarget = new BlockPos(9, 65, 12);
+
+        assertFalse(GroundedSingleLaneDebugRunner.isReadyForLaneStart(
+                new Vec3d(9.5, 64.0, 14.4), // z=14.4, centerlineDelta=1.9 → far lateral miss
+                lane,
+                stagingTarget,
+                bounds
+        ));
+    }
+
+    @Test
+    void playerFarBehindStagingIsRejected() {
+        // Player is on the correct centerline but 3 blocks behind the staging target.
+        // Must not be considered ready regardless of corridor membership.
+        GroundedSweepLane lane = eastLane();
+        GroundedSchematicBounds bounds = eastLaneBounds();
+        BlockPos stagingTarget = new BlockPos(9, 65, 12);
+
+        assertFalse(GroundedSingleLaneDebugRunner.isReadyForLaneStart(
+                new Vec3d(6.5, 64.0, 12.5), // x=6.5, far behind staging center x=9.5
+                lane,
+                stagingTarget,
                 bounds
         ));
     }

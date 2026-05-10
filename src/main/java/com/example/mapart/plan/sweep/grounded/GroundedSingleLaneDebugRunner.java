@@ -3562,9 +3562,10 @@ public final class GroundedSingleLaneDebugRunner {
         if (flatDistanceSq > START_APPROACH_FLAT_DISTANCE_TOLERANCE * START_APPROACH_FLAT_DISTANCE_TOLERANCE) {
             return LaneStartReadiness.notReady("outside standing target distance tolerance", centerlineDelta, forwardDeltaToStanding, insideCorridor, flatDistanceSq);
         }
-        if (!insideCorridor) {
-            return LaneStartReadiness.notReady("outside lane corridor", centerlineDelta, forwardDeltaToStanding, insideCorridor, flatDistanceSq);
-        }
+        // insideCorridor is intentionally not a hard gate here: the staging/approach target sits
+        // one block behind the lane start, which is outside the active corridor bounds. A player
+        // correctly positioned at that staging block must be accepted. The flat-distance,
+        // centerline, and forward checks below are sufficient to confirm correct positioning.
         if (Math.abs(centerlineDelta) > START_APPROACH_CENTERLINE_TOLERANCE) {
             return LaneStartReadiness.notReady("outside centerline tolerance", centerlineDelta, forwardDeltaToStanding, insideCorridor, flatDistanceSq);
         }
