@@ -59,6 +59,7 @@ public final class GroundedSingleLaneDebugRunner {
     private static final int MAX_START_APPROACH_NO_PROGRESS_TICKS = 80;
     private static final double START_APPROACH_PROGRESS_EPSILON_SQ = 0.01;
     private static final int MAX_START_APPROACH_REISSUES = 3;
+    private static final int START_APPROACH_STOPPED_GRACE_TICKS = 20;
     private static final int ENTRY_BURST_DURATION_TICKS = 16;
     private static final int MAX_ENTRY_ATTEMPTS_PER_TARGET = 2;
     private static final int ENTRY_BURST_ATTEMPTS_PER_TICK = 2;
@@ -121,6 +122,7 @@ public final class GroundedSingleLaneDebugRunner {
     private double startApproachBestDistanceSq = Double.POSITIVE_INFINITY;
     private int startApproachNoProgressTicks;
     private int startApproachReissueCount;
+    private int startApproachGraceTicks;
     private long transitionSupportTicks;
     private int transitionSupportAlreadyCorrectCount;
     private int transitionSupportPlacedCount;
@@ -1210,6 +1212,7 @@ public final class GroundedSingleLaneDebugRunner {
         BlockPos stagingTarget = activeStartApproachTarget();
         Vec3d playerPosition = client.player.getEntityPos();
         startApproachTicks++;
+        startApproachGraceTicks++;
         double flatDistanceSq = flatDistanceToStandingTargetSq(playerPosition, stagingTarget);
         if (flatDistanceSq + START_APPROACH_PROGRESS_EPSILON_SQ < startApproachBestDistanceSq) {
             startApproachBestDistanceSq = flatDistanceSq;
@@ -1234,11 +1237,20 @@ public final class GroundedSingleLaneDebugRunner {
         }
 
         // Baritone has stopped without placing the player in a ready position — reissue if budget allows.
+        // Guard with a grace period so we don't consume retry budget before Baritone has had a
+        // fair chance to start moving (isBusy() may briefly return false right after goTo is issued).
         if (startApproachIssued && !baritoneFacade.isBusy()) {
+            if (startApproachGraceTicks < START_APPROACH_STOPPED_GRACE_TICKS) {
+                traceGroundedEvent("Baritone approach may have stopped early — within grace period"
+                        + " graceTicks=" + startApproachGraceTicks
+                        + " startApproachTicks=" + startApproachTicks);
+                return;
+            }
             String ctx = " lane#" + (activeLane != null ? activeLane.laneIndex() : "?")
                     + " dir=" + (activeLane != null ? activeLane.direction() : "?")
                     + " target=" + stagingTarget.toShortString()
                     + " playerPos=" + playerPosition
+                    + " startApproachTicks=" + startApproachTicks
                     + " reissueCount=" + startApproachReissueCount
                     + " " + describeLaneStartReadiness(readiness);
             if (startApproachReissueCount < MAX_START_APPROACH_REISSUES) {
@@ -1259,6 +1271,7 @@ public final class GroundedSingleLaneDebugRunner {
                     + " dir=" + (activeLane != null ? activeLane.direction() : "?")
                     + " target=" + stagingTarget.toShortString()
                     + " playerPos=" + playerPosition
+                    + " startApproachTicks=" + startApproachTicks
                     + " reissueCount=" + startApproachReissueCount
                     + " " + describeLaneStartReadiness(readiness);
             if (startApproachReissueCount < MAX_START_APPROACH_REISSUES) {
@@ -1589,6 +1602,7 @@ public final class GroundedSingleLaneDebugRunner {
 
     private void resetStartApproachProgressTracking() {
         startApproachTicks = 0;
+        startApproachGraceTicks = 0;
         startApproachBestDistanceSq = Double.POSITIVE_INFINITY;
         startApproachNoProgressTicks = 0;
         startApproachIssued = false;
@@ -1619,6 +1633,7 @@ public final class GroundedSingleLaneDebugRunner {
                 baritoneFacade.goTo(clamped);
             }
             startApproachIssued = true;
+            startApproachGraceTicks = 0;
         }
     }
 
@@ -1724,6 +1739,27 @@ public final class GroundedSingleLaneDebugRunner {
         }
         failLaneStart(null, "Unable to reach valid lane start staging position");
         return false;
+    }
+
+    int startApproachGraceTicksForTests() {
+        return startApproachGraceTicks;
+    }
+
+    void advanceStartApproachGraceTicksForTests(int ticks) {
+        startApproachGraceTicks += ticks;
+    }
+
+    // Simulates the Baritone-stopped path including the grace-period guard.
+    // Returns 0 if still within grace (no action), 1 if reissued, -1 if budget exhausted.
+    int simulateStartApproachBaritoneStoppedRespectingGrace(Vec3d playerPosition) {
+        if (!awaitingStartApproach || activeLane == null || activeBounds == null) return 0;
+        if (startApproachGraceTicks < START_APPROACH_STOPPED_GRACE_TICKS) {
+            traceGroundedEvent("Baritone approach may have stopped early — within grace period"
+                    + " graceTicks=" + startApproachGraceTicks
+                    + " startApproachTicks=" + startApproachTicks);
+            return 0;
+        }
+        return simulateStartApproachBaritoneStopped(playerPosition) ? 1 : -1;
     }
 
     Optional<BlockPos> laneShiftTargetForTests() {
@@ -3551,26 +3587,22 @@ public final class GroundedSingleLaneDebugRunner {
         Vec3d standingCenter = new Vec3d(standingStartTarget.getX() + 0.5, standingStartTarget.getY(), standingStartTarget.getZ() + 0.5);
         double playerForward = lane.direction().alongX() ? playerPosition.x : playerPosition.z;
         double standingForward = lane.direction().alongX() ? standingCenter.x : standingCenter.z;
-        double laneStartForward = lane.direction().alongX() ? lane.startPoint().getX() + 0.5 : lane.startPoint().getZ() + 0.5;
         double centerlineTarget = lane.centerlineCoordinate() + 0.5;
         double playerLateral = lane.direction().alongX() ? playerPosition.z : playerPosition.x;
         double centerlineDelta = playerLateral - centerlineTarget;
         double forwardDeltaToStanding = (playerForward - standingForward) * lane.direction().forwardSign();
-        double forwardDeltaFromLaneStart = (playerForward - laneStartForward) * lane.direction().forwardSign();
         boolean insideCorridor = insideCorridor(playerPosition, lane, bounds);
 
         if (flatDistanceSq > START_APPROACH_FLAT_DISTANCE_TOLERANCE * START_APPROACH_FLAT_DISTANCE_TOLERANCE) {
             return LaneStartReadiness.notReady("outside standing target distance tolerance", centerlineDelta, forwardDeltaToStanding, insideCorridor, flatDistanceSq);
         }
-        // insideCorridor is intentionally not a hard gate here: the staging/approach target sits
-        // one block behind the lane start, which is outside the active corridor bounds. A player
-        // correctly positioned at that staging block must be accepted. The flat-distance,
-        // centerline, and forward checks below are sufficient to confirm correct positioning.
+        // insideCorridor is intentionally not a hard gate here: the staging target is one block
+        // behind the lane start (outside active corridor bounds) by design. Similarly, a lane-start-
+        // edge check (player forward vs. laneStart) was removed — it incorrectly rejected players
+        // standing at the staging block because the staging block IS behind the lane start. The
+        // flat-distance, centerline, and forward-to-staging-target checks below are sufficient.
         if (Math.abs(centerlineDelta) > START_APPROACH_CENTERLINE_TOLERANCE) {
             return LaneStartReadiness.notReady("outside centerline tolerance", centerlineDelta, forwardDeltaToStanding, insideCorridor, flatDistanceSq);
-        }
-        if (forwardDeltaFromLaneStart < -START_APPROACH_FORWARD_TOLERANCE) {
-            return LaneStartReadiness.notReady("outside lane start edge", centerlineDelta, forwardDeltaToStanding, insideCorridor, flatDistanceSq);
         }
         if (Math.abs(forwardDeltaToStanding) > START_APPROACH_FORWARD_TOLERANCE) {
             return LaneStartReadiness.notReady("outside forward staging tolerance", centerlineDelta, forwardDeltaToStanding, insideCorridor, flatDistanceSq);

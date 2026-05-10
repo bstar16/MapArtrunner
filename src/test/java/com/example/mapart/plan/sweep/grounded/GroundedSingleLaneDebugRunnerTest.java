@@ -2225,6 +2225,127 @@ class GroundedSingleLaneDebugRunnerTest {
         assertTrue(reissueEvent.contains("insideCorridor="), "Missing insideCorridor in: " + reissueEvent);
     }
 
+    // ─── Staging-readiness tests (post-#221 regression fix) ──────────────────
+
+    // Regression test: player at the staging target (one block behind lane start) must be
+    // accepted as ready. Before this fix the "outside lane start edge" check rejected the
+    // position because forwardDeltaFromLaneStart ≈ −1.2, breaching the −1.0 tolerance.
+    @Test
+    void stagingPositionOutsideLaneStartEdge_validStagingAccepted() {
+        // EAST lane, centerline z=65, startPoint.x=10, stagingTarget.x=9
+        GroundedSweepLane lane = new GroundedSweepLane(
+                0, 65, GroundedLaneDirection.EAST,
+                new BlockPos(10, 64, 65), new BlockPos(20, 64, 65),
+                new GroundedLaneCorridorBounds(10, 20, 63, 67), 1.0);
+        BlockPos stagingTarget = new BlockPos(9, 65, 65);
+        GroundedSchematicBounds bounds = new GroundedSchematicBounds(
+                new BlockPos(10, 64, 63), new BlockPos(10, 64, 63), new BlockPos(20, 64, 67));
+
+        // Player is at the staging target position — close to center (9.5, 65.5)
+        // centerlineDelta ≈ 0.09, forwardDeltaToStanding ≈ −0.20, flatDistanceSq ≈ 0.05
+        Vec3d player = new Vec3d(9.3, 65.0, 65.59);
+        assertTrue(GroundedSingleLaneDebugRunner.isReadyForLaneStart(player, lane, stagingTarget, bounds),
+                "Player at staging target (behind lane start edge) must be accepted as ready");
+    }
+
+    // Player has moved slightly forward from staging toward the lane start — still staging-ready.
+    @Test
+    void stagingPositionBetweenTargetAndLaneStart_validStagingAccepted() {
+        GroundedSweepLane lane = new GroundedSweepLane(
+                0, 65, GroundedLaneDirection.EAST,
+                new BlockPos(10, 64, 65), new BlockPos(20, 64, 65),
+                new GroundedLaneCorridorBounds(10, 20, 63, 67), 1.0);
+        BlockPos stagingTarget = new BlockPos(9, 65, 65);
+        GroundedSchematicBounds bounds = new GroundedSchematicBounds(
+                new BlockPos(10, 64, 63), new BlockPos(10, 64, 63), new BlockPos(20, 64, 67));
+
+        // Player is slightly forward of the staging target center (9.5) but still within tolerance.
+        // Not yet inside the lane corridor (corridor starts at x=10).
+        Vec3d player = new Vec3d(9.7, 65.0, 65.5);
+        assertTrue(GroundedSingleLaneDebugRunner.isReadyForLaneStart(player, lane, stagingTarget, bounds),
+                "Player between staging target and lane start must be accepted as ready");
+    }
+
+    // Player is many blocks behind the staging target — flat-distance check must reject it.
+    @Test
+    void stagingPositionFarBehindStagingTarget_rejected() {
+        GroundedSweepLane lane = new GroundedSweepLane(
+                0, 65, GroundedLaneDirection.EAST,
+                new BlockPos(10, 64, 65), new BlockPos(20, 64, 65),
+                new GroundedLaneCorridorBounds(10, 20, 63, 67), 1.0);
+        BlockPos stagingTarget = new BlockPos(9, 65, 65);
+        GroundedSchematicBounds bounds = new GroundedSchematicBounds(
+                new BlockPos(10, 64, 63), new BlockPos(10, 64, 63), new BlockPos(20, 64, 67));
+
+        // Player is 5+ blocks behind staging — well outside flat-distance tolerance of 1.0
+        Vec3d player = new Vec3d(4.0, 65.0, 65.5);
+        assertFalse(GroundedSingleLaneDebugRunner.isReadyForLaneStart(player, lane, stagingTarget, bounds),
+                "Player far behind staging target must be rejected");
+    }
+
+    // Player is laterally far from centerline — centerline check must reject it.
+    @Test
+    void stagingPositionFarLaterallyFromCenterline_rejected() {
+        GroundedSweepLane lane = new GroundedSweepLane(
+                0, 65, GroundedLaneDirection.EAST,
+                new BlockPos(10, 64, 65), new BlockPos(20, 64, 65),
+                new GroundedLaneCorridorBounds(10, 20, 63, 67), 1.0);
+        BlockPos stagingTarget = new BlockPos(9, 65, 65);
+        GroundedSchematicBounds bounds = new GroundedSchematicBounds(
+                new BlockPos(10, 64, 63), new BlockPos(10, 64, 63), new BlockPos(20, 64, 67));
+
+        // Player is at the correct staging X but 4 blocks off in Z (centerlineDelta ≈ 4)
+        Vec3d player = new Vec3d(9.3, 65.0, 70.0);
+        assertFalse(GroundedSingleLaneDebugRunner.isReadyForLaneStart(player, lane, stagingTarget, bounds),
+                "Player far off centerline must be rejected");
+    }
+
+    // Baritone stopped branch must not consume a retry within the grace period.
+    @Test
+    void baritoneStopped_withinGracePeriod_noRetryConsumed() {
+        RecordingBaritoneFacade baritone = new RecordingBaritoneFacade();
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(baritone);
+        runner.setGroundedTraceEnabled(true);
+        assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
+        runner.issueStartApproachIfNeeded();
+        assertEquals(1, baritone.goToCalls);
+        // Grace ticks start at 0 after issue
+        assertEquals(0, runner.startApproachGraceTicksForTests());
+
+        Vec3d playerFarAway = new Vec3d(100.0, 64.0, 200.0);
+        // Within grace period — no retry should be consumed
+        int result = runner.simulateStartApproachBaritoneStoppedRespectingGrace(playerFarAway);
+
+        assertEquals(0, result, "Grace period still active — should not reissue or fail");
+        assertEquals(0, runner.startApproachReissueCountForTests());
+        assertEquals(1, baritone.goToCalls);
+        assertTrue(runner.isActive());
+        List<String> events = runner.groundedTraceEventsForTests();
+        assertTrue(events.stream().anyMatch(e -> e.contains("grace period")),
+                "Expected grace period trace event");
+    }
+
+    // Baritone stopped branch must reissue normally once grace period has expired.
+    @Test
+    void baritoneStopped_afterGracePeriod_retriesNormally() {
+        RecordingBaritoneFacade baritone = new RecordingBaritoneFacade();
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(baritone);
+        assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
+        runner.issueStartApproachIfNeeded();
+        assertEquals(1, baritone.goToCalls);
+
+        // Advance past the grace threshold
+        runner.advanceStartApproachGraceTicksForTests(20);
+
+        Vec3d playerFarAway = new Vec3d(100.0, 64.0, 200.0);
+        int result = runner.simulateStartApproachBaritoneStoppedRespectingGrace(playerFarAway);
+
+        assertEquals(1, result, "After grace period, Baritone-stopped path should reissue");
+        assertEquals(1, runner.startApproachReissueCountForTests());
+        assertEquals(2, baritone.goToCalls);
+        assertTrue(runner.isActive());
+    }
+
     @Test
     void preflightRefillStartsNormallyWhenMaterialsMissing() {
         GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
