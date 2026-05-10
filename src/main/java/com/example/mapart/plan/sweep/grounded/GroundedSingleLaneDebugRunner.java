@@ -1085,6 +1085,15 @@ public final class GroundedSingleLaneDebugRunner {
         BuildSession session = activeSession;
         GroundedSweepSettings settings = activeSettings;
         refillController.clear();
+
+        // Snapshot current forwardLeftoverPlacements and any pending targets that would be
+        // dropped by the minimumForwardProgress filter on resume. clearActiveRunState() below
+        // wipes forwardLeftoverPlacements, so we must capture before and restore after.
+        // Without this, NEAR_START blocks (e.g. EAST RIGHT_TWO at lane start X) that were
+        // DEFERRED during the lane walk are silently excluded by buildLanePlacementTargets
+        // and never show up as leftovers — causing them to remain air after the build.
+        Set<Integer> savedLeftovers = snapshotAndExtendLeftoversBeforeRefillResume();
+
         clearActiveRunState();
         traceGroundedEvent("refill hint after clearActiveRunState: laneCursor=" + refillLaneCursorHint + " progress=" + refillLaneProgressHint);
 
@@ -1109,11 +1118,44 @@ public final class GroundedSingleLaneDebugRunner {
         }
         traceGroundedEvent("smart resume after refill");
         Optional<String> err = startFullSweep(session, settings);
+        // Restore saved leftovers AFTER startFullSweep — initializeRunState (called inside
+        // startFullSweep) clears forwardLeftoverPlacements, so this must come last.
+        forwardLeftoverPlacements.addAll(savedLeftovers);
         if (err.isPresent() && client != null && client.player != null) {
             client.player.sendMessage(
                     Text.literal("[Mapart grounded] Resume after refill failed: " + err.get()),
                     false);
         }
+    }
+
+    private Set<Integer> snapshotAndExtendLeftoversBeforeRefillResume() {
+        // Preserve all forwardLeftoverPlacements captured from lanes that already completed.
+        Set<Integer> saved = new LinkedHashSet<>(forwardLeftoverPlacements);
+
+        // Also capture any pending targets from the current lane that are behind the refill
+        // resume progress hint. These will be excluded by the minimumForwardProgress filter
+        // in buildLanePlacementTargets and would otherwise disappear from all tracking.
+        if (refillLaneProgressHint != null && activeLane != null && sweepPassPhase == SweepPassPhase.FORWARD) {
+            int resumeProgress = refillLaneProgressHint;
+            int forwardSign = activeLane.direction().forwardSign();
+            int captured = 0;
+            for (GroundedSweepPlacementExecutor.PlacementTarget target : pendingPlacementTargets) {
+                int prog = activeLane.direction().alongX() ? target.worldPos().getX() : target.worldPos().getZ();
+                if ((prog - resumeProgress) * forwardSign < 0) {
+                    saved.add(target.placementIndex());
+                    captured++;
+                }
+            }
+            if (captured > 0) {
+                traceGroundedEvent("refill: captured " + captured
+                        + " behind-resume-point pending targets as forward leftovers"
+                        + " (NEAR_START_LEFTOVER_CAPTURED)"
+                        + " resumeProgress=" + resumeProgress
+                        + " lane=" + activeLane.laneIndex()
+                        + " dir=" + activeLane.direction());
+            }
+        }
+        return saved;
     }
 
     private BlockPos selectRefillReturnTarget(MinecraftClient client) {
@@ -1382,6 +1424,11 @@ public final class GroundedSingleLaneDebugRunner {
                 failLaneStart(client, "Unable to confirm lane yaw/body/head lock before starting lane walk.");
                 return;
             }
+            // World-truth scan of the entry window before handing off to the lane walker.
+            // Any start-window block still missing that is DEFERRED (too far behind the player
+            // to be reached by the lane walker) is recorded as a forward leftover here so
+            // reverse cleanup can find it.
+            checkStartWindowBeforeWalker(client, pendingLaneStart, entryAnchor);
             laneWalker.start(activeLane, activeBounds, constantSprint);
             traceGroundedEvent("lane walker started");
             laneStartStage = LaneStartStage.NONE;
@@ -1458,6 +1505,10 @@ public final class GroundedSingleLaneDebugRunner {
             }
             int usedAttempts = entryAttemptsByPlacementIndex.getOrDefault(target.placementIndex(), 0);
             if (usedAttempts >= MAX_ENTRY_ATTEMPTS_PER_TARGET) {
+                traceGroundedEvent("entry burst: attempt budget exhausted idx=" + target.placementIndex()
+                        + " pos=" + target.worldPos().toShortString()
+                        + " attempts=" + usedAttempts
+                        + " reason=ENTRY_BURST_EXHAUSTED");
                 continue;
             }
             BlockPos pos = target.worldPos();
@@ -1484,6 +1535,74 @@ public final class GroundedSingleLaneDebugRunner {
             attempts++;
         }
         processDuePlacementVerifications(client, laneTicksElapsed, true);
+    }
+
+    private void checkStartWindowBeforeWalker(MinecraftClient client, GroundedSweepLane lane, GroundedLaneEntryAnchor entryAnchor) {
+        if (client == null || client.world == null || lane == null || entryAnchor == null || activeSettings == null) {
+            return;
+        }
+        int baseProgress = entryAnchor.progressCoordinate();
+        int forwardSign = lane.direction().forwardSign();
+        Set<Integer> windowProgress = new LinkedHashSet<>();
+        windowProgress.add(baseProgress);
+        windowProgress.add(baseProgress + forwardSign);
+        windowProgress.add(baseProgress + 2 * forwardSign);
+
+        int playerProgress = baseProgress;
+        if (client.player != null) {
+            BlockPos bp = client.player.getBlockPos();
+            playerProgress = lane.direction().alongX() ? bp.getX() : bp.getZ();
+        }
+        final int playerProg = playerProgress;
+
+        int misses = 0;
+        for (GroundedSweepPlacementExecutor.PlacementTarget target : pendingPlacementTargets) {
+            BlockPos pos = target.worldPos();
+            int prog = lane.direction().alongX() ? pos.getX() : pos.getZ();
+            if (!windowProgress.contains(prog)) {
+                continue;
+            }
+            if (Math.abs(lateralDeltaFromCenterline(lane.direction(), lane.centerlineCoordinate(), pos)) > activeSettings.sweepHalfWidth()) {
+                continue;
+            }
+            Placement placement = lanePlacementsByIndex.get(target.placementIndex());
+            if (placement == null || placement.block() == null) {
+                continue;
+            }
+            boolean placed = client.world.getBlockState(pos).isOf(placement.block());
+            if (!placed) {
+                int signedDelta = (prog - playerProg) * forwardSign;
+                GroundedSweepPlacementExecutor.LaneRelativeBand band = GroundedSweepPlacementExecutor.laneRelativeBand(lane, pos);
+                boolean deferred = signedDelta < -activeSettings.trivialBehindCleanupSteps();
+                int attempts = entryAttemptsByPlacementIndex.getOrDefault(target.placementIndex(), 0);
+                String reason = deferred ? "START_WINDOW_STILL_MISSING_DEFERRED" : "START_WINDOW_STILL_MISSING";
+                traceGroundedEvent("start-window miss before walker start:"
+                        + " laneIndex=" + lane.laneIndex()
+                        + " laneDirection=" + lane.direction()
+                        + " placementIndex=" + target.placementIndex()
+                        + " worldPos=" + pos.toShortString()
+                        + " laneRelativeBand=" + band
+                        + " progressCoordinate=" + prog
+                        + " playerProgress=" + playerProg
+                        + " signedDelta=" + signedDelta
+                        + " attempts=" + attempts
+                        + " reason=" + reason);
+                misses++;
+                // Blocks DEFERRED at walker start will not be reached by the lane walker
+                // (signedDelta beyond trivialBehindCleanupSteps). Record them now so
+                // captureLaneLeftoversForPass has a safety net even without a refill.
+                if (deferred && sweepPassPhase == SweepPassPhase.FORWARD) {
+                    forwardLeftoverPlacements.add(target.placementIndex());
+                    traceGroundedEvent("start-window DEFERRED miss recorded as forward leftover:"
+                            + " idx=" + target.placementIndex()
+                            + " reason=START_WINDOW_LEFTOVER_RECORDED");
+                }
+            }
+        }
+        if (misses > 0) {
+            traceGroundedEvent("start-window check: " + misses + " missing target(s) before walker start"
+                    + " lane=" + lane.laneIndex() + " dir=" + lane.direction());
+        }
     }
 
     private boolean stepToLaneEntryTarget(MinecraftClient client, GroundedSweepLane lane, GroundedLaneEntryAnchor entryAnchor) {
@@ -1978,6 +2097,15 @@ public final class GroundedSingleLaneDebugRunner {
 
     void simulateRefillCompleteForTests() {
         handleRefillDone(null);
+    }
+
+    Set<Integer> forwardLeftoverPlacementsForTests() {
+        return Set.copyOf(forwardLeftoverPlacements);
+    }
+
+    void setRefillHintForTests(int progressHint, int cursorHint) {
+        refillLaneProgressHint = progressHint;
+        refillLaneCursorHint = cursorHint;
     }
 
     void markExhaustedForTests(Identifier id, GroundedRefillController.SupplyExhaustedReason reason) {

@@ -2385,6 +2385,114 @@ class GroundedSingleLaneDebugRunnerTest {
         assertTrue(runner.isActive());
     }
 
+    // ─── Near-start leftover capture / refill-resume tests ───────────────────
+
+    // Core regression: EAST RIGHT_TWO block at the lane start X that sits in
+    // pendingPlacementTargets must be captured into forwardLeftoverPlacements
+    // when a refill fires while the player is deeper in the lane (i.e. the
+    // block ends up behind the refill resume progress hint).
+    @Test
+    void nearStartRightTwoPendingTargetCapturedAsForwardLeftoverWhenRefillFiresMidLane() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        BuildSession session = sessionWithOrigin(); // EAST lane 0: centerlineZ=12, startX=10
+        assertTrue(runner.startFullSweep(session, GroundedSweepSettings.defaults()).isEmpty());
+
+        // RIGHT_TWO for EAST: lateralDelta = Z−12 = +2  →  Z=14.  Progress = X=10 (lane start).
+        runner.seedLanePlacementsForTests(List.of(
+                new GroundedSweepPlacementExecutor.PlacementTarget(99, new BlockPos(10, 64, 14))
+        ));
+
+        // Refill fires while player is at X=15 — the block at X=10 is now behind the resume hint.
+        runner.setRefillHintForTests(15, 0);
+        runner.simulateRefillCompleteForTests();
+
+        assertTrue(runner.forwardLeftoverPlacementsForTests().contains(99),
+                "RIGHT_TWO NEAR_START block behind refill hint must be captured as a forward leftover");
+    }
+
+    // A pending target that is AHEAD of the refill resume hint will be included in
+    // the rebuilt pending list on resume and must NOT be pre-recorded as a leftover.
+    @Test
+    void pendingTargetAheadOfRefillHintNotCapturedAsForwardLeftover() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        BuildSession session = sessionWithOrigin(); // EAST lane 0: startX=10
+        assertTrue(runner.startFullSweep(session, GroundedSweepSettings.defaults()).isEmpty());
+
+        // Target at X=15, hint at X=10: (15−10)*1 = +5 > 0 → not behind hint.
+        runner.seedLanePlacementsForTests(List.of(
+                new GroundedSweepPlacementExecutor.PlacementTarget(55, new BlockPos(15, 64, 12))
+        ));
+
+        runner.setRefillHintForTests(10, 0);
+        runner.simulateRefillCompleteForTests();
+
+        assertFalse(runner.forwardLeftoverPlacementsForTests().contains(55),
+                "Target ahead of refill hint must not be pre-captured as a forward leftover");
+    }
+
+    // forwardLeftoverPlacements accumulated from lanes that completed before
+    // the refill must survive the refill+resume cycle intact.
+    @Test
+    void forwardLeftoverPlacementsFromPriorLaneSurviveRefillResume() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        // 2-lane session: lane 0 EAST (centerlineZ=12, startX=10),
+        //                 lane 1 WEST (centerlineZ=17, startX=20).
+        BuildSession session = rectangularSessionWithOrigin(new Vec3i(11, 1, 11));
+        assertTrue(runner.startFullSweep(session, GroundedSweepSettings.defaults()).isEmpty());
+
+        // Seed a pending target on lane 0 that will become a leftover when lane ends.
+        runner.seedLanePlacementsForTests(List.of(
+                new GroundedSweepPlacementExecutor.PlacementTarget(77, new BlockPos(10, 64, 12))
+        ));
+
+        // Advance to lane 1 — captures idx=77 into forwardLeftoverPlacements,
+        // then sets activeLane = lane 1 WEST.
+        runner.advanceSweepToNextLaneForTests();
+        assertTrue(runner.forwardLeftoverPlacementsForTests().contains(77),
+                "lane-0 leftover should be in forwardLeftoverPlacements before refill");
+
+        // Seed a lane-1 target at its start (WEST start X=20).
+        // WEST forwardSign=-1: (20−18)*(−1) = −2 < 0 → behind refill hint X=18.
+        runner.seedLanePlacementsForTests(List.of(
+                new GroundedSweepPlacementExecutor.PlacementTarget(99, new BlockPos(20, 64, 17))
+        ));
+
+        runner.setRefillHintForTests(18, 1);
+        runner.simulateRefillCompleteForTests();
+
+        Set<Integer> leftovers = runner.forwardLeftoverPlacementsForTests();
+        assertTrue(leftovers.contains(77),
+                "lane-0 leftover idx=77 must survive refill resume");
+        assertTrue(leftovers.contains(99),
+                "lane-1 behind-hint target idx=99 must be captured during refill resume");
+    }
+
+    // Verifies that the pending-target list still contains an exhausted-burst
+    // entry before the refill fires (i.e. exhausting the entry burst budget does
+    // not silently remove the target from pendingPlacementTargets).
+    @Test
+    void nearStartPendingTargetRemainsInPendingBeforeRefillCaptures() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        BuildSession session = sessionWithOrigin();
+        assertTrue(runner.startFullSweep(session, GroundedSweepSettings.defaults()).isEmpty());
+
+        // Seed a NEAR_START block (RIGHT_TWO position at lane start X=10).
+        runner.seedLanePlacementsForTests(List.of(
+                new GroundedSweepPlacementExecutor.PlacementTarget(88, new BlockPos(10, 64, 14))
+        ));
+
+        // Before refill fires: target must still be in pendingPlacementTargets.
+        assertTrue(runner.pendingPlacementIndicesForTests().contains(88),
+                "NEAR_START target must remain in pendingPlacementTargets before any refill");
+
+        // After refill fires with hint ahead: target is captured as leftover.
+        runner.setRefillHintForTests(14, 0);
+        runner.simulateRefillCompleteForTests();
+
+        assertTrue(runner.forwardLeftoverPlacementsForTests().contains(88),
+                "NEAR_START target must be captured as forward leftover when refill fires");
+    }
+
     // ─── writeMismatchDetailsEvent grouped-count tests ────────────────────────
 
     @Test
