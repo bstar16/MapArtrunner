@@ -6,6 +6,7 @@ import com.example.mapart.plan.BuildPlan;
 import com.example.mapart.plan.Placement;
 import com.example.mapart.plan.sweep.grounded.GroundedLaneWalker.GroundedLaneWalkState;
 import com.example.mapart.plan.state.BuildSession;
+import com.example.mapart.runtime.ClientTickHealthMonitor;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.util.math.Vec3i;
@@ -2600,6 +2601,140 @@ class GroundedSingleLaneDebugRunnerTest {
                 "lane-0 leftover must survive the refill resume");
         assertTrue(leftovers.contains(88),
                 "MISSED lane-1 block must be captured from tracker on refill resume");
+    }
+
+    // ─── Tick-stall / background-safety tests ────────────────────────────────
+
+    @Test
+    void tickStallDetectedWhenLargeWallClockGapOccurs() {
+        long[] time = {0L};
+        ClientTickHealthMonitor monitor = new ClientTickHealthMonitor(() -> time[0], 2_000);
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(
+                new NoOpBaritoneFacade(), null, new GroundedDiagnostics(Path.of("run/logs/test-stall.log")), monitor);
+
+        assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
+
+        // Normal tick — not stalled
+        monitor.tick(); // seed the first tick time
+        time[0] = 50_000_000L; // 50 ms later
+        runner.tick(null, null);
+        assertFalse(runner.clientTickStallActiveForTests(), "50 ms gap must not trigger stall");
+
+        // Simulate a 5-second gap
+        time[0] = 5_050_000_000L;
+        runner.tick(null, null);
+        assertTrue(runner.clientTickStallActiveForTests(), "5 s gap must trigger stall");
+
+        // Next normal tick clears the stall
+        time[0] = 5_100_000_000L; // 50 ms later
+        runner.tick(null, null);
+        assertFalse(runner.clientTickStallActiveForTests(), "stall must clear after normal tick");
+    }
+
+    @Test
+    void refillTimeoutsSuppressedOnRefillControllerDuringStall() {
+        // Verify that the runner propagates stall state to the refill controller via setSuppressTimeouts.
+        // The controller's nav counter behaviour under suppression is tested separately in
+        // GroundedRefillControllerTest.navTimeoutDoesNotDecrementWhenSuppressed.
+        long[] time = {0L};
+        ClientTickHealthMonitor monitor = new ClientTickHealthMonitor(() -> time[0], 2_000);
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(
+                new NoOpBaritoneFacade(), null, new GroundedDiagnostics(Path.of("run/logs/test-refill-stall.log")), monitor);
+
+        assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
+
+        // Seed refill using a recording facade so goNear succeeds and state enters NAVIGATING.
+        com.example.mapart.supply.SupplyPoint supply =
+                new com.example.mapart.supply.SupplyPoint(1, new BlockPos(500, 64, 500), "minecraft:overworld", "chest");
+        RecordingBaritoneFacade refillBaritone = new RecordingBaritoneFacade();
+        runner.triggerRefillForTests(
+                Map.of(net.minecraft.util.Identifier.of("minecraft", "dirt"), 1),
+                List.of(supply),
+                refillBaritone);
+        assertEquals(GroundedRefillController.RefillState.NAVIGATING, runner.getRefillController().state(),
+                "refill controller must enter NAVIGATING after trigger");
+
+        // Normal tick — suppression off
+        monitor.tick();
+        time[0] = 50_000_000L; // 50 ms
+        runner.tick(null, null);
+        assertFalse(runner.getRefillController().isTimeoutsSuppressed(),
+                "timeout suppression must be off during normal tick");
+
+        // Stall tick — suppression on
+        time[0] = 5_050_000_000L; // 5-second gap
+        runner.tick(null, null);
+        assertTrue(runner.clientTickStallActiveForTests(), "5 s gap must activate stall");
+        assertTrue(runner.getRefillController().isTimeoutsSuppressed(),
+                "timeout suppression must be set on the refill controller during stall");
+
+        // Resume normal — suppression off again
+        time[0] = 5_100_000_000L; // 50 ms
+        runner.tick(null, null);
+        assertFalse(runner.clientTickStallActiveForTests(), "stall must clear on normal tick");
+        assertFalse(runner.getRefillController().isTimeoutsSuppressed(),
+                "timeout suppression must be cleared after stall resolves");
+    }
+
+    @Test
+    void stallFlagClearedOnStop() {
+        long[] time = {0L};
+        ClientTickHealthMonitor monitor = new ClientTickHealthMonitor(() -> time[0], 2_000);
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(
+                new NoOpBaritoneFacade(), null, new GroundedDiagnostics(Path.of("run/logs/test-stop-stall.log")), monitor);
+
+        assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
+
+        // Trigger a stall
+        monitor.tick();
+        time[0] = 5_000_000_000L;
+        runner.tick(null, null);
+        assertTrue(runner.clientTickStallActiveForTests());
+
+        runner.stop();
+        assertFalse(runner.clientTickStallActiveForTests(), "stall flag must be cleared on stop");
+        assertFalse(runner.getRefillController().isTimeoutsSuppressed(),
+                "refill timeout suppression must be cleared on stop");
+    }
+
+    @Test
+    void stallFlagClearedOnNewStart() {
+        long[] time = {0L};
+        ClientTickHealthMonitor monitor = new ClientTickHealthMonitor(() -> time[0], 2_000);
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(
+                new NoOpBaritoneFacade(), null, new GroundedDiagnostics(Path.of("run/logs/test-restart-stall.log")), monitor);
+
+        assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
+        monitor.tick();
+        time[0] = 5_000_000_000L;
+        runner.tick(null, null);
+        assertTrue(runner.clientTickStallActiveForTests());
+
+        // Stop then restart — stall state should reset on initializeRunState
+        runner.stop();
+        assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
+        assertFalse(runner.clientTickStallActiveForTests(), "stall flag must reset on new start");
+        assertFalse(runner.getRefillController().isTimeoutsSuppressed(),
+                "refill timeout suppression must reset on new start");
+    }
+
+    @Test
+    void normalTicksNotAffectedByStallLogic() {
+        long[] time = {0L};
+        ClientTickHealthMonitor monitor = new ClientTickHealthMonitor(() -> time[0], 2_000);
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(
+                new NoOpBaritoneFacade(), null, new GroundedDiagnostics(Path.of("run/logs/test-normal-stall.log")), monitor);
+
+        assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
+
+        monitor.tick();
+        // 20 normal ticks at 50 ms each (10 seconds of game time at 20 tps)
+        for (int i = 0; i < 20; i++) {
+            time[0] += 50_000_000L;
+            runner.tick(null, null);
+            assertFalse(runner.clientTickStallActiveForTests(),
+                    "normal 50 ms ticks must never trigger stall (tick " + i + ")");
+        }
     }
 
     // ─── writeMismatchDetailsEvent grouped-count tests ────────────────────────

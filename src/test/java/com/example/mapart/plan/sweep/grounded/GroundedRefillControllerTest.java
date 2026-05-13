@@ -249,6 +249,62 @@ class GroundedRefillControllerTest {
         );
     }
 
+    // ---- Tick-stall timeout suppression ----
+
+    @Test
+    void navTimeoutDoesNotDecrementWhenSuppressed() {
+        RecordingBaritoneFacade baritone = new RecordingBaritoneFacade();
+        GroundedRefillController controller = new GroundedRefillController();
+        SupplyPoint supply = new SupplyPoint(1, new BlockPos(500, 64, 500), "minecraft:overworld", "chest");
+        controller.initiateWithSuppliesForTests(List.of(supply), Map.of(Identifier.of("minecraft", "dirt"), 1), baritone);
+        assertEquals(GroundedRefillController.RefillState.NAVIGATING, controller.state());
+
+        // Drain navTicksRemaining to 1 under normal conditions
+        for (int i = 0; i < GroundedRefillController.NAV_TIMEOUT_TICKS - 1; i++) {
+            controller.tick(null, baritone);
+        }
+        assertEquals(GroundedRefillController.RefillState.NAVIGATING, controller.state(),
+                "should still be navigating after " + (GroundedRefillController.NAV_TIMEOUT_TICKS - 1) + " ticks");
+
+        // Enable suppression — the next tick must not push the counter to 0 and fail
+        controller.setSuppressTimeouts(true);
+        for (int i = 0; i < 20; i++) {
+            controller.tick(null, baritone);
+        }
+
+        assertEquals(GroundedRefillController.RefillState.NAVIGATING, controller.state(),
+                "nav timeout must not fire while suppressTimeouts=true");
+        assertFalse(controller.failureMessage().isPresent());
+    }
+
+    @Test
+    void navTimeoutStillFiresWithoutSuppression() {
+        RecordingBaritoneFacade baritone = new RecordingBaritoneFacade();
+        GroundedRefillController controller = new GroundedRefillController();
+        SupplyPoint supply = new SupplyPoint(1, new BlockPos(500, 64, 500), "minecraft:overworld", "chest");
+        controller.initiateWithSuppliesForTests(List.of(supply), Map.of(Identifier.of("minecraft", "dirt"), 1), baritone);
+        assertEquals(GroundedRefillController.RefillState.NAVIGATING, controller.state());
+
+        // Drain all nav ticks — should fail
+        for (int i = 0; i < GroundedRefillController.NAV_TIMEOUT_TICKS + 1; i++) {
+            controller.tick(null, baritone);
+        }
+
+        assertEquals(GroundedRefillController.RefillState.FAILED, controller.state(),
+                "nav timeout should fire normally when suppression is off");
+        assertTrue(controller.failureMessage().isPresent());
+    }
+
+    @Test
+    void suppressionStateIsReadable() {
+        GroundedRefillController controller = new GroundedRefillController();
+        assertFalse(controller.isTimeoutsSuppressed());
+        controller.setSuppressTimeouts(true);
+        assertTrue(controller.isTimeoutsSuppressed());
+        controller.setSuppressTimeouts(false);
+        assertFalse(controller.isTimeoutsSuppressed());
+    }
+
     // ---- Helpers ----
 
     private static BuildSession sessionWithOrigin() {

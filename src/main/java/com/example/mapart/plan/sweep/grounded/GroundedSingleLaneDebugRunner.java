@@ -2,6 +2,7 @@ package com.example.mapart.plan.sweep.grounded;
 
 import com.example.mapart.MapArtMod;
 import com.example.mapart.baritone.BaritoneFacade;
+import com.example.mapart.runtime.ClientTickHealthMonitor;
 import com.example.mapart.settings.MapartSettings;
 import com.example.mapart.plan.BuildPlan;
 import com.example.mapart.plan.Placement;
@@ -148,6 +149,8 @@ public final class GroundedSingleLaneDebugRunner {
     private final GroundedDiagnostics groundedDiagnostics;
     private long lastGroundedSnapshotTick = -1;
     private long groundedTraceTickCounter;
+    private final ClientTickHealthMonitor tickHealthMonitor;
+    private boolean clientTickStallActive = false;
     private boolean corridorWarningActive;
     private GroundedLaneDirection lastTransitionDirection;
     private float lastTransitionYaw;
@@ -202,9 +205,14 @@ public final class GroundedSingleLaneDebugRunner {
     }
 
     GroundedSingleLaneDebugRunner(BaritoneFacade baritoneFacade, SupplyStore supplyStore, GroundedDiagnostics diagnostics) {
+        this(baritoneFacade, supplyStore, diagnostics, new ClientTickHealthMonitor());
+    }
+
+    GroundedSingleLaneDebugRunner(BaritoneFacade baritoneFacade, SupplyStore supplyStore, GroundedDiagnostics diagnostics, ClientTickHealthMonitor tickHealthMonitor) {
         this.baritoneFacade = Objects.requireNonNull(baritoneFacade, "baritoneFacade");
         this.supplyStore = supplyStore;
         this.groundedDiagnostics = Objects.requireNonNull(diagnostics, "diagnostics");
+        this.tickHealthMonitor = Objects.requireNonNull(tickHealthMonitor, "tickHealthMonitor");
     }
 
     public void resetDiagnosticsForLaunch() {
@@ -414,6 +422,17 @@ public final class GroundedSingleLaneDebugRunner {
         refillController.setInventoryClickDelayTicks(this.currentSettings.inventoryClickDelayTicks());
         boolean constantSprint = this.currentSettings.groundedSweepConstantSprint();
         groundedTraceTickCounter++;
+        tickHealthMonitor.tick();
+        boolean wasStalled = clientTickStallActive;
+        clientTickStallActive = activeSession != null && tickHealthMonitor.isStallActive();
+        if (clientTickStallActive) {
+            refillController.setSuppressTimeouts(true);
+            if (!wasStalled) {
+                traceGroundedEvent("CLIENT_TICK_STALL_DETECTED deltaMs=" + tickHealthMonitor.lastDeltaMs());
+            }
+        } else {
+            refillController.setSuppressTimeouts(false);
+        }
         if (client == null || client.player == null || activeLane == null || activeBounds == null || activeSession == null) {
             return;
         }
@@ -551,6 +570,9 @@ public final class GroundedSingleLaneDebugRunner {
         exhaustedMaterials.clear();
         exhaustedWarningSent.clear();
         placementDelayCooldown = 0;
+        tickHealthMonitor.reset();
+        clientTickStallActive = false;
+        refillController.setSuppressTimeouts(false);
         return Optional.empty();
     }
 
@@ -638,7 +660,9 @@ public final class GroundedSingleLaneDebugRunner {
 
         // Phase 1: Stabilization period
         if (recoveryState.isStabilizing()) {
-            recoveryState.tickStabilization();
+            if (!clientTickStallActive) {
+                recoveryState.tickStabilization();
+            }
             if (!recoveryState.isStabilizing()) {
                 // Stabilization complete
                 if (recoveryState.isAutoResumeEnabled()) {
@@ -688,7 +712,9 @@ public final class GroundedSingleLaneDebugRunner {
                 }
             } else {
                 // Player not in sane state, retry
-                recoveryState.tickRetry();
+                if (!clientTickStallActive) {
+                    recoveryState.tickRetry();
+                }
                 if (!recoveryState.hasRetriesRemaining()) {
                     // Out of retries
                     traceGroundedEvent("recovery auto-resume failed: player not in sane state after 10 seconds");
@@ -1290,13 +1316,15 @@ public final class GroundedSingleLaneDebugRunner {
 
         BlockPos stagingTarget = activeStartApproachTarget();
         Vec3d playerPosition = client.player.getEntityPos();
-        startApproachTicks++;
-        startApproachGraceTicks++;
+        if (!clientTickStallActive) {
+            startApproachTicks++;
+            startApproachGraceTicks++;
+        }
         double flatDistanceSq = flatDistanceToStandingTargetSq(playerPosition, stagingTarget);
         if (flatDistanceSq + START_APPROACH_PROGRESS_EPSILON_SQ < startApproachBestDistanceSq) {
             startApproachBestDistanceSq = flatDistanceSq;
             startApproachNoProgressTicks = 0;
-        } else {
+        } else if (!clientTickStallActive) {
             startApproachNoProgressTicks++;
         }
 
@@ -2172,6 +2200,10 @@ public final class GroundedSingleLaneDebugRunner {
 
     Set<Identifier> exhaustedWarningSentForTests() {
         return Set.copyOf(exhaustedWarningSent);
+    }
+
+    boolean clientTickStallActiveForTests() {
+        return clientTickStallActive;
     }
 
     static boolean shouldAttemptPlacementAfterWalkerTick(GroundedLaneWalker.GroundedLaneWalkState state) {
@@ -3220,7 +3252,9 @@ public final class GroundedSingleLaneDebugRunner {
         if (client == null || client.player == null || !hasActiveLaneTransitionState()) {
             return;
         }
-        laneTransitionTicks++;
+        if (!clientTickStallActive) {
+            laneTransitionTicks++;
+        }
         if (laneTransitionTicks > MAX_LANE_TRANSITION_TICKS) {
             traceGroundedEvent("lane failed: transition timeout");
             failLaneTransition(client, "Lane transition failed to reach next lane start");
@@ -4107,6 +4141,19 @@ public final class GroundedSingleLaneDebugRunner {
         baritone.put("lastIssuedGoalRange", baritoneFacade.diagnosticsLastIssuedGoalRange().orElse(null));
         baritone.put("constraintsApplied", baritoneFacade.diagnosticsConstraintsApplied().map(Object::toString).orElse("unknown"));
         payload.put("baritone", baritone);
+
+        Map<String, Object> background = new LinkedHashMap<>();
+        background.put("lastTickWallClockDeltaMs", tickHealthMonitor.lastDeltaMs());
+        background.put("tickStallDetected", tickHealthMonitor.isStallActive());
+        background.put("sensitiveCountersSuppressed", clientTickStallActive);
+        if (client != null) {
+            background.put("currentScreenType", client.currentScreen == null ? "none"
+                    : client.currentScreen.getClass().getSimpleName());
+            // cursorLocked is true when the game has focus and no screen is open.
+            // False when a container/menu is open or the window has lost OS focus.
+            background.put("cursorLocked", client.mouse.isCursorLocked());
+        }
+        payload.put("background", background);
         return payload;
     }
 
@@ -4373,6 +4420,9 @@ public final class GroundedSingleLaneDebugRunner {
         lastTransitionYaw = 0.0f;
         lastTransitionSprint = false;
         lastTransitionOvershootCorrected = false;
+        tickHealthMonitor.reset();
+        clientTickStallActive = false;
+        refillController.setSuppressTimeouts(false);
     }
 
     private void activateLane(GroundedSweepLane lane, Set<Integer> placementFilter) {
