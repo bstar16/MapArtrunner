@@ -92,6 +92,18 @@ public final class GroundedRefillController {
     private boolean chestWasScanned = false;
     private boolean inventoryWasFullDuringRefill = false;
     private int configuredClickDelayTicks = 0;
+    // When true, navigation and container-open timeout counters do not advance.
+    // Set by the runner when a client tick-stall is detected to avoid burning timeouts
+    // while the client is paused or throttled.
+    private boolean timeoutsSuppressed = false;
+
+    void setSuppressTimeouts(boolean suppress) {
+        this.timeoutsSuppressed = suppress;
+    }
+
+    boolean isTimeoutsSuppressed() {
+        return timeoutsSuppressed;
+    }
 
     public void setInventoryClickDelayTicks(int ticks) {
         this.configuredClickDelayTicks = Math.max(0, ticks);
@@ -238,7 +250,9 @@ public final class GroundedRefillController {
         }
 
         if (client == null || client.player == null) {
-            navTicksRemaining--;
+            if (!timeoutsSuppressed) {
+                navTicksRemaining--;
+            }
             if (navTicksRemaining <= 0) {
                 fail("Navigation to supply #" + targetSupply.id() + " at " + targetSupply.pos().toShortString() + " failed.");
                 return TickResult.FAILED;
@@ -258,7 +272,9 @@ public final class GroundedRefillController {
             return TickResult.ACTIVE;
         }
 
-        ticksSinceLastProgressCheck++;
+        if (!timeoutsSuppressed) {
+            ticksSinceLastProgressCheck++;
+        }
         if (ticksSinceLastProgressCheck >= NO_PROGRESS_CHECK_INTERVAL_TICKS) {
             double currentDistance = playerPos.getSquaredDistance(targetSupply.pos());
 
@@ -299,7 +315,9 @@ public final class GroundedRefillController {
         }
         if (awaitingContainerScreen) {
             if (containerOpenWaitPollsRemaining > 0) {
-                containerOpenWaitPollsRemaining--;
+                if (!timeoutsSuppressed) {
+                    containerOpenWaitPollsRemaining--;
+                }
                 return TickResult.ACTIVE;
             }
             return tryNextSupply("Timed out waiting for supply container to open at " + targetSupply.pos().toShortString() + ".", baritone);
