@@ -1155,6 +1155,43 @@ public final class GroundedSingleLaneDebugRunner {
                         + " dir=" + activeLane.direction());
             }
         }
+
+        // FIX: also capture blocks that were removed from pendingPlacementTargets via MISSED
+        // (RETRY/MOVE_REQUIRED during tickPlacementExecutor) before refill fired. These blocks
+        // are gone from pendingPlacementTargets but still live in the leftover tracker with a
+        // MISSED mark. Without this, a block that receives RETRY in the same executor tick as a
+        // MISSING_ITEM trigger silently disappears — it is not behind-hint (already removed from
+        // pending), not in forwardLeftoverPlacements yet (captureLaneLeftoversForPass never ran),
+        // and not caught by the behind-resume scan above.
+        // refreshCurrentLeftovers() issues a fresh select() that includes leftoverTracker.snapshot(),
+        // which returns all tracker entries regardless of whether they are still in pending.
+        if (placementSelector != null && activeLane != null && activeBounds != null && sweepPassPhase == SweepPassPhase.FORWARD) {
+            refreshCurrentLeftovers();
+            int trackerCaptured = 0;
+            for (GroundedSweepLeftoverTracker.GroundedLeftoverRecord record : currentLeftovers) {
+                if (!saved.contains(record.placementIndex())) {
+                    saved.add(record.placementIndex());
+                    trackerCaptured++;
+                    if (lanePlacementsByIndex != null && activeSession != null) {
+                        Placement tp = lanePlacementsByIndex.get(record.placementIndex());
+                        if (tp != null) {
+                            BlockPos tPos = activeSession.getOrigin().add(tp.relativePos());
+                            if (isWatchedNearStartTarget(activeLane, tPos)) {
+                                traceWatchTarget("WATCH_TARGET_REFILL_SNAPSHOT_CAPTURED", activeLane, tPos, record.placementIndex(), "reasons=" + record.reasons());
+                            }
+                        }
+                    }
+                }
+            }
+            if (trackerCaptured > 0) {
+                traceGroundedEvent("refill: captured " + trackerCaptured
+                        + " tracker-only leftovers (MISSED/DEFERRED removed from pending before refill)"
+                        + " (TRACKER_LEFTOVER_CAPTURED)"
+                        + " lane=" + activeLane.laneIndex()
+                        + " dir=" + activeLane.direction());
+            }
+        }
+
         return saved;
     }
 
@@ -1505,6 +1542,9 @@ public final class GroundedSingleLaneDebugRunner {
             }
             int usedAttempts = entryAttemptsByPlacementIndex.getOrDefault(target.placementIndex(), 0);
             if (usedAttempts >= MAX_ENTRY_ATTEMPTS_PER_TARGET) {
+                if (isWatchedNearStartTarget(lane, target.worldPos())) {
+                    traceWatchTarget("WATCH_TARGET_ENTRY_BURST_EXHAUSTED", lane, target.worldPos(), target.placementIndex(), "usedAttempts=" + usedAttempts);
+                }
                 traceGroundedEvent("entry burst: attempt budget exhausted idx=" + target.placementIndex()
                         + " pos=" + target.worldPos().toShortString()
                         + " attempts=" + usedAttempts
@@ -1517,19 +1557,33 @@ public final class GroundedSingleLaneDebugRunner {
                 continue;
             }
             entryAttemptsByPlacementIndex.put(target.placementIndex(), usedAttempts + 1);
+            if (isWatchedNearStartTarget(lane, pos)) {
+                traceWatchTarget("WATCH_TARGET_ENTRY_BURST_SELECTED", lane, pos, target.placementIndex(), "attempt=" + (usedAttempts + 1));
+            }
             PlacementResult result = placementExecutor.execute(client, activeSession, placement, pos);
             switch (result.status()) {
                 case PLACED -> {
                     entrySupportEstablished = true;
                     onPlacementPlaced(target.placementIndex(), placement, pos, laneTicksElapsed);
                     traceGroundedEvent("entry burst attempt result=PLACED idx=" + target.placementIndex() + " attempts=" + (usedAttempts + 1));
+                    if (isWatchedNearStartTarget(lane, pos)) {
+                        traceWatchTarget("WATCH_TARGET_ENTRY_BURST_RESULT", lane, pos, target.placementIndex(), "result=PLACED");
+                    }
                 }
                 case ALREADY_CORRECT -> {
                     entrySupportEstablished = true;
                     onPlacementResult(target.placementIndex(), GroundedSweepPlacementExecutor.PlacementResult.SUCCESS, laneTicksElapsed);
                     traceGroundedEvent("entry burst attempt result=ALREADY_CORRECT idx=" + target.placementIndex() + " attempts=" + (usedAttempts + 1));
+                    if (isWatchedNearStartTarget(lane, pos)) {
+                        traceWatchTarget("WATCH_TARGET_ENTRY_BURST_RESULT", lane, pos, target.placementIndex(), "result=ALREADY_CORRECT");
+                    }
                 }
-                case RETRY, MOVE_REQUIRED -> traceGroundedEvent("entry burst attempt result=" + result.status() + " idx=" + target.placementIndex() + " attempts=" + (usedAttempts + 1));
+                case RETRY, MOVE_REQUIRED -> {
+                    traceGroundedEvent("entry burst attempt result=" + result.status() + " idx=" + target.placementIndex() + " attempts=" + (usedAttempts + 1));
+                    if (isWatchedNearStartTarget(lane, pos)) {
+                        traceWatchTarget("WATCH_TARGET_ENTRY_BURST_RESULT", lane, pos, target.placementIndex(), "result=" + result.status());
+                    }
+                }
                 case MISSING_ITEM, ERROR -> onFinalFailure(target.placementIndex());
             }
             attempts++;
@@ -2211,6 +2265,17 @@ public final class GroundedSingleLaneDebugRunner {
             for (PendingPlacementVerification pending : pendingVerificationsByPlacement.values()) {
                 forwardLeftoverPlacements.add(pending.placementIndex());
             }
+            if (lanePlacementsByIndex != null && activeSession != null) {
+                for (int idx : forwardLeftoverPlacements) {
+                    Placement cp = lanePlacementsByIndex.get(idx);
+                    if (cp != null) {
+                        BlockPos cPos = activeSession.getOrigin().add(cp.relativePos());
+                        if (isWatchedNearStartTarget(activeLane, cPos)) {
+                            traceWatchTarget("WATCH_TARGET_FORWARD_LEFTOVER_PRESENT_AT_LANE_END", activeLane, cPos, idx, "");
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -2702,6 +2767,9 @@ public final class GroundedSingleLaneDebugRunner {
             }
 
             PlacementResult result = placementExecutor.execute(client, activeSession, placement, candidate.worldPos());
+            if (sweepPassPhase == SweepPassPhase.REVERSE && isWatchedNearStartTarget(activeLane, candidate.worldPos())) {
+                traceWatchTarget("WATCH_TARGET_REVERSE_ATTEMPT_RESULT", activeLane, candidate.worldPos(), candidate.placementIndex(), "result=" + result.status());
+            }
             switch (result.status()) {
                 case PLACED -> {
                     onPlacementPlaced(candidate.placementIndex(), placement, candidate.worldPos(), laneTicksElapsed);
@@ -2768,6 +2836,15 @@ public final class GroundedSingleLaneDebugRunner {
         }
         if (groundedResult == GroundedSweepPlacementExecutor.PlacementResult.MISSED) {
             missedPlacements++;
+            if (activeLane != null && lanePlacementsByIndex != null && activeSession != null) {
+                Placement wp = lanePlacementsByIndex.get(placementIndex);
+                if (wp != null) {
+                    BlockPos missedPos = activeSession.getOrigin().add(wp.relativePos());
+                    if (isWatchedNearStartTarget(activeLane, missedPos)) {
+                        traceWatchTarget("WATCH_TARGET_LEFTOVER_ADDED", activeLane, missedPos, placementIndex, "reason=MISSED");
+                    }
+                }
+            }
             removePendingPlacement(placementIndex);
             return;
         }
@@ -3897,6 +3974,32 @@ public final class GroundedSingleLaneDebugRunner {
         // Trace events go to the log only; only user-facing messages use sendMessage/sendGroundedTraceChat.
     }
 
+    // Returns true for EAST RIGHT_TWO targets at the lane's start progress coordinate.
+    // These are the specific blocks that have shown a recurring miss pattern across multiple runs.
+    private static boolean isWatchedNearStartTarget(GroundedSweepLane lane, BlockPos worldPos) {
+        if (lane == null || worldPos == null) return false;
+        if (lane.direction() != GroundedLaneDirection.EAST) return false;
+        // RIGHT_TWO for EAST: lateralStrafeSign=1, so rightwardOffset = (Z - centerline) * 1 = 2
+        int lateralOffset = worldPos.getZ() - lane.centerlineCoordinate();
+        if (lateralOffset != 2) return false;
+        // At lane start progress (X == lane.startPoint().getX() for EAST)
+        return worldPos.getX() == lane.startPoint().getX();
+    }
+
+    // Logs a watch-target lifecycle event. Always written to the structured logger so it
+    // appears in the log regardless of whether groundedTraceEnabled is set.
+    private void traceWatchTarget(String event, GroundedSweepLane lane, BlockPos worldPos, int placementIndex, String extra) {
+        String msg = "[WATCH_TARGET] " + event
+                + " idx=" + placementIndex
+                + " worldPos=" + (worldPos != null ? worldPos.toShortString() : "?")
+                + " lane=" + (lane != null ? lane.laneIndex() : "?")
+                + " dir=" + (lane != null ? lane.direction() : "?")
+                + " sweepPassPhase=" + sweepPassPhase
+                + (extra != null && !extra.isEmpty() ? " " + extra : "");
+        MapArtMod.LOGGER.info("[grounded-trace:event] " + msg);
+        traceGroundedEvent(msg);
+    }
+
 
     public boolean groundedDiagnosticsEnabled() { return groundedDiagnostics.enabled(); }
 
@@ -4389,6 +4492,16 @@ public final class GroundedSingleLaneDebugRunner {
         traceGroundedEvent("activateLaneData: pendingPlacementTargets initialized with " + pendingPlacementTargets.size() + " targets");
         pendingVerificationsByPlacement = new LinkedHashMap<>();
         currentLeftovers = List.of();
+        for (GroundedSweepPlacementExecutor.PlacementTarget target : pendingPlacementTargets) {
+            if (isWatchedNearStartTarget(activeLane, target.worldPos())) {
+                if (sweepPassPhase == SweepPassPhase.REVERSE) {
+                    traceWatchTarget("WATCH_TARGET_REVERSE_TARGET_CREATED", activeLane, target.worldPos(), target.placementIndex(), "");
+                } else {
+                    traceWatchTarget("WATCH_TARGET_CREATED", activeLane, target.worldPos(), target.placementIndex(), "");
+                    traceWatchTarget("WATCH_TARGET_PENDING_ON_LANE_ACTIVATE", activeLane, target.worldPos(), target.placementIndex(), "");
+                }
+            }
+        }
     }
 
     private void initializeTransitionSupportPhase(GroundedSweepLane fromLane, GroundedSweepLane toLane) {
