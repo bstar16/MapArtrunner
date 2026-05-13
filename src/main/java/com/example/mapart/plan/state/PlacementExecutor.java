@@ -156,10 +156,17 @@ public class PlacementExecutor {
             }
 
             Direction interactionSide = face.getOpposite();
-            Vec3d hitPos = Vec3d.ofCenter(targetPos).add(
+            // hitPos must be on the clicked face of the support block, not on the far side of targetPos.
+            // center(neighborPos) + interactionSide*0.5 lands exactly on that face.
+            Vec3d hitPos = Vec3d.ofCenter(neighborPos).add(
                     interactionSide.getOffsetX() * 0.5,
                     interactionSide.getOffsetY() * 0.5,
                     interactionSide.getOffsetZ() * 0.5
+            );
+            MapArtMod.LOGGER.debug(
+                    "BlockHitResult: targetPos={} supportPos={} side={} hitVec={} support.offset(side)==target:{}",
+                    targetPos.toShortString(), neighborPos.toShortString(), interactionSide,
+                    hitPos, neighborPos.offset(interactionSide).equals(targetPos)
             );
             return Optional.of(new BlockHitResult(hitPos, interactionSide, neighborPos, false));
         }

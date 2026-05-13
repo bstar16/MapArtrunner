@@ -122,7 +122,8 @@ public final class AirPlacementEngine {
             }
 
             Direction interactionSide = face.getOpposite();
-            Vec3d hitPos = Vec3d.ofCenter(targetPos).add(
+            // hitPos must lie on the clicked face of the support block, not beyond targetPos.
+            Vec3d hitPos = Vec3d.ofCenter(neighborPos).add(
                     interactionSide.getOffsetX() * 0.5,
                     interactionSide.getOffsetY() * 0.5,
                     interactionSide.getOffsetZ() * 0.5
