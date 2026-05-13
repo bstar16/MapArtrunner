@@ -36,6 +36,33 @@ class SettingsAndSupplyStoreTest {
     }
 
     @Test
+    void clientTimerSpeedClampsAtBounds() {
+        Path settingsPath = tempDir.resolve("settings-timer.json");
+        MapartSettingsStore store = new MapartSettingsStore(settingsPath);
+
+        assertTrue(store.set("clientTimerSpeed", "1").isEmpty());
+        assertEquals(1, store.current().clientTimerSpeed());
+
+        assertTrue(store.set("clientTimerSpeed", "20").isEmpty());
+        assertEquals(20, store.current().clientTimerSpeed());
+
+        assertTrue(store.set("clientTimerSpeed", "0").isPresent(), "speed 0 should be rejected");
+        assertTrue(store.set("clientTimerSpeed", "21").isPresent(), "speed 21 should be rejected");
+    }
+
+    @Test
+    void clientTimerEnabledPersistsAcrossReload() {
+        Path settingsPath = tempDir.resolve("settings-timer-enabled.json");
+        MapartSettingsStore store = new MapartSettingsStore(settingsPath);
+        assertTrue(store.set("clientTimerEnabled", "false").isEmpty());
+        assertTrue(store.set("clientTimerSpeed", "8").isEmpty());
+
+        MapartSettingsStore restored = new MapartSettingsStore(settingsPath);
+        assertFalse(restored.current().clientTimerEnabled());
+        assertEquals(8, restored.current().clientTimerSpeed());
+    }
+
+    @Test
     void settingsStoreMalformedJsonFallsBackToDefaults() throws Exception {
         Path settingsPath = tempDir.resolve("settings-bad.json");
         Files.writeString(settingsPath, "{bad json");

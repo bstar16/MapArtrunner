@@ -16,6 +16,7 @@ import com.example.mapart.plan.state.BuildPlanService;
 import com.example.mapart.plan.state.WorldPlacementResolver;
 import com.example.mapart.render.HudRenderer;
 import com.example.mapart.render.SchematicOverlayRenderer;
+import com.example.mapart.runtime.ClientTimerController;
 import com.example.mapart.runtime.DebugReporter;
 import com.example.mapart.runtime.MapArtRuntime;
 import com.example.mapart.settings.MapartSettings;
@@ -98,11 +99,23 @@ public class MapArtClientMod implements ClientModInitializer {
             }
 
             MapartSettings settings = settingsStore.current();
-            int clientTimerSpeed = settings.clientTimerEnabled() ? settings.clientTimerSpeed() : 1;
-            for (int iteration = 0; iteration < clientTimerSpeed; iteration++) {
-                singleLaneSweepDebugRunner.tick(client);
-                groundedSingleLaneDebugRunner.tick(client, settings);
+
+            // Sync the real RenderTickCounter mixin from settings. When enabled,
+            // dynamicDeltaTicks is scaled up each frame so Minecraft fires more ticks
+            // per second naturally — world/server/Baritone/network all advance together.
+            // The old loop that called the runners N times per normal tick was NOT real
+            // timer acceleration and has been removed.
+            if (ClientTimerController.applySettings(settings.clientTimerEnabled(), settings.clientTimerSpeed())) {
+                MapArtMod.LOGGER.info(
+                        "MapArt client timer: {} speed={} mode={}",
+                        settings.clientTimerEnabled() ? "ENABLED" : "DISABLED",
+                        settings.clientTimerEnabled() ? settings.clientTimerSpeed() : 1,
+                        ClientTimerController.MODE
+                );
             }
+
+            singleLaneSweepDebugRunner.tick(client);
+            groundedSingleLaneDebugRunner.tick(client, settings);
         });
 
         PlacementStatusResolver resolver = new PlacementStatusResolver();
