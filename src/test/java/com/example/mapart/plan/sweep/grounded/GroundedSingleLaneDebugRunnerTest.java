@@ -1746,6 +1746,11 @@ class GroundedSingleLaneDebugRunnerTest {
     private static final class RecordingBaritoneFacade implements BaritoneFacade {
         private BlockPos lastGoToTarget;
         private int goToCalls;
+        private boolean busy = false;
+
+        void setBusy(boolean busy) {
+            this.busy = busy;
+        }
 
         @Override
         public CommandResult goTo(BlockPos target) {
@@ -1776,7 +1781,7 @@ class GroundedSingleLaneDebugRunnerTest {
 
         @Override
         public boolean isBusy() {
-            return false;
+            return busy;
         }
     }
 
@@ -2345,6 +2350,116 @@ class GroundedSingleLaneDebugRunnerTest {
         assertEquals(1, runner.startApproachReissueCountForTests());
         assertEquals(2, baritone.goToCalls);
         assertTrue(runner.isActive());
+    }
+
+    // ─── Baritone-busy start-approach tests ──────────────────────────────────
+
+    // While Baritone is busy navigating, no retry must be consumed and runner must stay active.
+    @Test
+    void baritoneBusy_playerNotReady_noRetryConsumedAndNoFailure() {
+        RecordingBaritoneFacade baritone = new RecordingBaritoneFacade();
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(baritone);
+        assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
+        runner.issueStartApproachIfNeeded();
+        assertEquals(1, baritone.goToCalls);
+
+        Vec3d playerFarAway = new Vec3d(100.0, 64.0, 200.0);
+        int result = runner.simulateStartApproachTickWhileBaritoneBusy(playerFarAway);
+
+        assertEquals(0, result, "Baritone busy — no action expected");
+        assertEquals(0, runner.startApproachReissueCountForTests(), "No retry must be consumed while Baritone is busy");
+        assertTrue(runner.isActive(), "Runner must remain active while Baritone is busy");
+        assertEquals(1, baritone.goToCalls, "No additional goTo call expected");
+    }
+
+    // While Baritone is busy and the player moves closer, noProgressTicks must reset.
+    @Test
+    void baritoneBusy_distanceImproving_noProgressTicksReset() {
+        RecordingBaritoneFacade baritone = new RecordingBaritoneFacade();
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(baritone);
+        runner.setGroundedTraceEnabled(true);
+        assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
+        runner.issueStartApproachIfNeeded();
+
+        // First tick — far away, establishes best distance (noProgressTicks stays 0 due to initial INFINITY)
+        Vec3d playerFar = new Vec3d(100.0, 64.0, 200.0);
+        runner.simulateStartApproachTickWhileBaritoneBusy(playerFar);
+        assertEquals(0, runner.startApproachNoProgressTicksForTests(), "First tick always sets best distance");
+
+        // Second tick — same far position, no improvement: noProgressTicks must now increment
+        runner.simulateStartApproachTickWhileBaritoneBusy(playerFar);
+        int noProgressAfterStall = runner.startApproachNoProgressTicksForTests();
+        assertTrue(noProgressAfterStall > 0, "noProgressTicks should have incremented when no progress");
+
+        // Third tick — player is closer, progress improved
+        Vec3d playerCloser = new Vec3d(20.0, 64.0, 100.0);
+        runner.simulateStartApproachTickWhileBaritoneBusy(playerCloser);
+
+        assertEquals(0, runner.startApproachNoProgressTicksForTests(),
+                "noProgressTicks must reset when distance to target improves");
+        List<String> events = runner.groundedTraceEventsForTests();
+        assertTrue(events.stream().anyMatch(e -> e.contains("noProgressTicks reset")),
+                "Expected progress-reset trace event");
+    }
+
+    // While Baritone is busy but no progress observed for the full timeout window,
+    // a reissue is allowed (but retry budget is consumed, not the absolute tick limit).
+    @Test
+    void baritoneBusy_noProgressForTimeout_reissueAllowed() {
+        RecordingBaritoneFacade baritone = new RecordingBaritoneFacade();
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(baritone);
+        assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
+        runner.issueStartApproachIfNeeded();
+        assertEquals(1, baritone.goToCalls);
+
+        // The first tick at this position sets best distance (noProgressTicks stays 0).
+        // We need 81 additional ticks of no-progress to exceed MAX_START_APPROACH_NO_PROGRESS_TICKS (80).
+        // Total ticks: 1 (establish) + 81 (stall) = 82.
+        Vec3d playerFarAway = new Vec3d(100.0, 64.0, 200.0);
+        for (int i = 0; i < 82; i++) {
+            runner.simulateStartApproachTickWhileBaritoneBusy(playerFarAway);
+        }
+
+        // The no-progress timeout must have fired a reissue
+        assertEquals(1, runner.startApproachReissueCountForTests(), "Busy/no-progress timeout must trigger one reissue");
+        assertTrue(runner.isActive(), "Runner must remain active after reissue");
+        assertEquals(2, baritone.goToCalls, "Reissue must re-issue goTo");
+    }
+
+    // When Baritone is not busy after the grace period and player is not ready,
+    // the existing bounded retry behavior must still work (regression guard).
+    @Test
+    void baritoneNotBusy_afterGrace_notReady_boundedRetryBehaviorPreserved() {
+        RecordingBaritoneFacade baritone = new RecordingBaritoneFacade();
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(baritone);
+        assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
+        runner.issueStartApproachIfNeeded();
+
+        runner.advanceStartApproachGraceTicksForTests(20);
+        Vec3d playerFarAway = new Vec3d(100.0, 64.0, 200.0);
+        int result = runner.simulateStartApproachBaritoneStoppedRespectingGrace(playerFarAway);
+
+        assertEquals(1, result, "Not-busy path after grace must still reissue");
+        assertEquals(1, runner.startApproachReissueCountForTests());
+        assertTrue(runner.isActive());
+    }
+
+    // The absolute startApproachTicks counter must not advance while Baritone is busy.
+    @Test
+    void absoluteTickLimit_doesNotAdvanceWhileBaritoneBusy() {
+        RecordingBaritoneFacade baritone = new RecordingBaritoneFacade();
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(baritone);
+        assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
+        runner.issueStartApproachIfNeeded();
+
+        // 10 ticks while "busy" (simulated via simulateStartApproachTickWhileBaritoneBusy)
+        Vec3d playerFarAway = new Vec3d(100.0, 64.0, 200.0);
+        for (int i = 0; i < 10; i++) {
+            runner.simulateStartApproachTickWhileBaritoneBusy(playerFarAway);
+        }
+
+        assertEquals(0, runner.startApproachTicksForTests(),
+                "startApproachTicks must not advance while Baritone is busy");
     }
 
     @Test

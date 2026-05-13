@@ -1313,17 +1313,29 @@ public final class GroundedSingleLaneDebugRunner {
 
     private void tickStartApproach(MinecraftClient client, boolean constantSprint) {
         issueStartApproachIfNeeded();
+        boolean baritoneBusy = startApproachIssued && baritoneFacade.isBusy();
 
         BlockPos stagingTarget = activeStartApproachTarget();
         Vec3d playerPosition = client.player.getEntityPos();
-        if (!clientTickStallActive) {
+        // Only advance the absolute tick counter when Baritone is not actively navigating.
+        // startApproachGraceTicks advances regardless so the grace period is not affected.
+        if (!baritoneBusy && !clientTickStallActive) {
             startApproachTicks++;
+        }
+        if (!clientTickStallActive) {
             startApproachGraceTicks++;
         }
         double flatDistanceSq = flatDistanceToStandingTargetSq(playerPosition, stagingTarget);
         if (flatDistanceSq + START_APPROACH_PROGRESS_EPSILON_SQ < startApproachBestDistanceSq) {
             startApproachBestDistanceSq = flatDistanceSq;
             startApproachNoProgressTicks = 0;
+            if (baritoneBusy) {
+                traceGroundedEvent("START_APPROACH_WAITING_FOR_BARITONE progress: distance improved, noProgressTicks reset"
+                        + " lane#" + (activeLane != null ? activeLane.laneIndex() : "?")
+                        + " noProgressTicks=" + startApproachNoProgressTicks
+                        + " bestDistanceSq=" + String.format("%.3f", startApproachBestDistanceSq)
+                        + " currentDistanceSq=" + String.format("%.3f", flatDistanceSq));
+            }
         } else if (!clientTickStallActive) {
             startApproachNoProgressTicks++;
         }
@@ -1343,10 +1355,48 @@ public final class GroundedSingleLaneDebugRunner {
             return;
         }
 
+        // While Baritone is actively navigating toward the staging point, do not consume retry
+        // budget or fire the absolute tick timeout — the player simply hasn't arrived yet.
+        // Only the no-progress timeout applies here (in case Baritone is stuck/looping).
+        if (baritoneBusy) {
+            traceGroundedEvent("START_APPROACH_WAITING_FOR_BARITONE"
+                    + " lane#" + (activeLane != null ? activeLane.laneIndex() : "?")
+                    + " dir=" + (activeLane != null ? activeLane.direction() : "?")
+                    + " target=" + stagingTarget.toShortString()
+                    + " playerPos=" + playerPosition
+                    + " startApproachTicks=" + startApproachTicks
+                    + " noProgressTicks=" + startApproachNoProgressTicks
+                    + " baritoneBusy=true"
+                    + " bestDistanceSq=" + String.format("%.3f", startApproachBestDistanceSq)
+                    + " currentDistanceSq=" + String.format("%.3f", flatDistanceSq));
+            if (startApproachNoProgressTicks > MAX_START_APPROACH_NO_PROGRESS_TICKS) {
+                String ctx = " lane#" + (activeLane != null ? activeLane.laneIndex() : "?")
+                        + " dir=" + (activeLane != null ? activeLane.direction() : "?")
+                        + " target=" + stagingTarget.toShortString()
+                        + " playerPos=" + playerPosition
+                        + " startApproachTicks=" + startApproachTicks
+                        + " noProgressTicks=" + startApproachNoProgressTicks
+                        + " reissueCount=" + startApproachReissueCount
+                        + " " + describeLaneStartReadiness(readiness);
+                if (startApproachReissueCount < MAX_START_APPROACH_REISSUES) {
+                    traceGroundedEvent("Start approach busy/no-progress timeout — reissuing:" + ctx);
+                    startApproachReissueCount++;
+                    baritoneFacade.cancel();
+                    resetStartApproachProgressTracking();
+                    issueStartApproachIfNeeded();
+                } else {
+                    traceGroundedEvent("Start approach retry budget exhausted after busy/no-progress timeout:" + ctx);
+                    failLaneStart(client, "Unable to reach valid lane start staging position");
+                }
+            }
+            return;
+        }
+
         // Baritone has stopped without placing the player in a ready position — reissue if budget allows.
         // Guard with a grace period so we don't consume retry budget before Baritone has had a
         // fair chance to start moving (isBusy() may briefly return false right after goTo is issued).
-        if (startApproachIssued && !baritoneFacade.isBusy()) {
+        // baritoneBusy is false at this point, so the check simplifies to just startApproachIssued.
+        if (startApproachIssued) {
             if (startApproachGraceTicks < START_APPROACH_STOPPED_GRACE_TICKS) {
                 traceGroundedEvent("Baritone approach may have stopped early — within grace period"
                         + " graceTicks=" + startApproachGraceTicks
@@ -1373,6 +1423,7 @@ public final class GroundedSingleLaneDebugRunner {
         }
 
         // Absolute/no-progress timeout — reissue if budget allows, otherwise hard-fail.
+        // Only reachable when Baritone is not busy — startApproachTicks is not advanced while Baritone is actively navigating.
         if (startApproachTicks > MAX_START_APPROACH_TICKS || startApproachNoProgressTicks > MAX_START_APPROACH_NO_PROGRESS_TICKS) {
             String ctx = " lane#" + (activeLane != null ? activeLane.laneIndex() : "?")
                     + " dir=" + (activeLane != null ? activeLane.direction() : "?")
@@ -1940,6 +1991,59 @@ public final class GroundedSingleLaneDebugRunner {
         }
         failLaneStart(null, "Unable to reach valid lane start staging position");
         return false;
+    }
+
+    int startApproachNoProgressTicksForTests() {
+        return startApproachNoProgressTicks;
+    }
+
+    int startApproachTicksForTests() {
+        return startApproachTicks;
+    }
+
+    // Simulates a tick where Baritone is actively busy and player is not ready.
+    // Does NOT consume retry budget (busy path). Updates progress tracking with playerPosition.
+    // Returns: 0 = waiting (no action), 1 = reissued (no-progress timeout), -1 = budget exhausted,
+    //          2 = readiness met (player is already in position).
+    int simulateStartApproachTickWhileBaritoneBusy(Vec3d playerPosition) {
+        if (!awaitingStartApproach || activeLane == null || activeBounds == null) return 0;
+        BlockPos stagingTarget = activeStartApproachTarget();
+        double flatDistanceSq = flatDistanceToStandingTargetSq(playerPosition, stagingTarget);
+        if (flatDistanceSq + START_APPROACH_PROGRESS_EPSILON_SQ < startApproachBestDistanceSq) {
+            startApproachBestDistanceSq = flatDistanceSq;
+            startApproachNoProgressTicks = 0;
+            traceGroundedEvent("START_APPROACH_WAITING_FOR_BARITONE progress: distance improved, noProgressTicks reset"
+                    + " lane#" + activeLane.laneIndex()
+                    + " noProgressTicks=" + startApproachNoProgressTicks
+                    + " bestDistanceSq=" + String.format("%.3f", startApproachBestDistanceSq)
+                    + " currentDistanceSq=" + String.format("%.3f", flatDistanceSq));
+        } else {
+            startApproachNoProgressTicks++;
+        }
+        LaneStartReadiness readiness = evaluateLaneStartReadiness(playerPosition, activeLane, stagingTarget, activeBounds);
+        if (readiness.ready()) return 2;
+        if (startApproachNoProgressTicks > MAX_START_APPROACH_NO_PROGRESS_TICKS) {
+            String ctx = " lane#" + activeLane.laneIndex()
+                    + " dir=" + activeLane.direction()
+                    + " target=" + stagingTarget.toShortString()
+                    + " playerPos=" + playerPosition
+                    + " noProgressTicks=" + startApproachNoProgressTicks
+                    + " reissueCount=" + startApproachReissueCount
+                    + " " + describeLaneStartReadiness(readiness);
+            if (startApproachReissueCount < MAX_START_APPROACH_REISSUES) {
+                traceGroundedEvent("Start approach busy/no-progress timeout — reissuing:" + ctx);
+                startApproachReissueCount++;
+                baritoneFacade.cancel();
+                resetStartApproachProgressTracking();
+                issueStartApproachIfNeeded();
+                return 1;
+            } else {
+                traceGroundedEvent("Start approach retry budget exhausted after busy/no-progress timeout:" + ctx);
+                failLaneStart(null, "Unable to reach valid lane start staging position");
+                return -1;
+            }
+        }
+        return 0;
     }
 
     int startApproachGraceTicksForTests() {
