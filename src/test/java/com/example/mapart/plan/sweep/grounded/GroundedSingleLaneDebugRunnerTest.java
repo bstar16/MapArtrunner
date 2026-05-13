@@ -2493,6 +2493,115 @@ class GroundedSingleLaneDebugRunnerTest {
                 "NEAR_START target must be captured as forward leftover when refill fires");
     }
 
+    // ─── EAST RIGHT_TWO NEAR_START MISSED-then-refill tracker-snapshot tests ────
+
+    // Core regression: EAST RIGHT_TWO block is MISSED (RETRY → removed from pending,
+    // marked in leftoverTracker) in the same executor tick that a MISSING_ITEM triggers
+    // a refill. The behind-hint scan sees nothing (block is gone from pending), but the
+    // new tracker-snapshot path in snapshotAndExtendLeftoversBeforeRefillResume must still
+    // capture it via leftoverTracker.snapshot().
+    @Test
+    void missedNearStartRightTwoCapturedFromTrackerSnapshotWhenRefillFiresAfterMiss() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        // EAST lane 0: centerlineZ=12, startX=10. RIGHT_TWO: Z=14, X=10.
+        BuildSession session = sessionWithOrigin();
+        assertTrue(runner.startFullSweep(session, GroundedSweepSettings.defaults()).isEmpty());
+
+        runner.seedLanePlacementsForTests(List.of(
+                new GroundedSweepPlacementExecutor.PlacementTarget(99, new BlockPos(10, 64, 14))
+        ));
+
+        // Simulate the RETRY path: block marked MISSED in tracker and removed from pending.
+        runner.recordPlacementOutcomeForTests(99, GroundedSweepPlacementExecutor.PlacementResult.MISSED, 1);
+        assertFalse(runner.pendingPlacementIndicesForTests().contains(99),
+                "MISSED block must be removed from pendingPlacementTargets");
+
+        // Refill fires — no behind-hint pending targets, so old code would miss this index.
+        runner.setRefillHintForTests(12, 0);
+        runner.simulateRefillCompleteForTests();
+
+        assertTrue(runner.forwardLeftoverPlacementsForTests().contains(99),
+                "MISSED EAST RIGHT_TWO NEAR_START block must be captured from leftover tracker on refill resume");
+    }
+
+    // Same regression with no refill-hint at all: the tracker snapshot must still capture
+    // the MISSED block even when refillLaneProgressHint is null (hint scan is skipped).
+    @Test
+    void missedNearStartRightTwoCapturedFromTrackerSnapshotEvenWithNoRefillHint() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        BuildSession session = sessionWithOrigin();
+        assertTrue(runner.startFullSweep(session, GroundedSweepSettings.defaults()).isEmpty());
+
+        runner.seedLanePlacementsForTests(List.of(
+                new GroundedSweepPlacementExecutor.PlacementTarget(77, new BlockPos(10, 64, 14))
+        ));
+
+        runner.recordPlacementOutcomeForTests(77, GroundedSweepPlacementExecutor.PlacementResult.MISSED, 1);
+        // No hint set — behind-hint scan is skipped entirely.
+        runner.simulateRefillCompleteForTests();
+
+        assertTrue(runner.forwardLeftoverPlacementsForTests().contains(77),
+                "MISSED NEAR_START block must reach forwardLeftoverPlacements even when refill hint is absent");
+    }
+
+    // Multiple blocks: one MISSED before refill fires, one still pending behind the hint.
+    // Both must appear in forwardLeftoverPlacements after refill resume.
+    @Test
+    void bothMissedAndBehindHintPendingBlocksCapturedOnRefillResume() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        BuildSession session = sessionWithOrigin();
+        assertTrue(runner.startFullSweep(session, GroundedSweepSettings.defaults()).isEmpty());
+
+        // Seed two blocks: idx=11 is the MISSED one, idx=22 stays pending behind the hint.
+        runner.seedLanePlacementsForTests(List.of(
+                new GroundedSweepPlacementExecutor.PlacementTarget(11, new BlockPos(10, 64, 14)),
+                new GroundedSweepPlacementExecutor.PlacementTarget(22, new BlockPos(10, 64, 13))
+        ));
+
+        // idx=11 gets MISSED — removed from pending, lives only in the tracker now.
+        runner.recordPlacementOutcomeForTests(11, GroundedSweepPlacementExecutor.PlacementResult.MISSED, 1);
+
+        // Refill fires at X=14 — idx=22 at X=10 is behind hint, idx=11 is already gone from pending.
+        runner.setRefillHintForTests(14, 0);
+        runner.simulateRefillCompleteForTests();
+
+        Set<Integer> leftovers = runner.forwardLeftoverPlacementsForTests();
+        assertTrue(leftovers.contains(11),
+                "MISSED block (tracker-only) must be captured on refill resume");
+        assertTrue(leftovers.contains(22),
+                "Behind-hint pending block must also be captured on refill resume");
+    }
+
+    // Prior-lane leftovers must not be disturbed when the tracker-snapshot path captures
+    // a freshly MISSED block during refill resume.
+    @Test
+    void priorLaneLeftoversPreservedWhenMissedTrackerBlockCapturedOnRefill() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        BuildSession session = rectangularSessionWithOrigin(new Vec3i(11, 1, 11));
+        assertTrue(runner.startFullSweep(session, GroundedSweepSettings.defaults()).isEmpty());
+
+        // Seed a leftover on lane 0 and advance — it lands in forwardLeftoverPlacements.
+        runner.seedLanePlacementsForTests(List.of(
+                new GroundedSweepPlacementExecutor.PlacementTarget(5, new BlockPos(10, 64, 12))
+        ));
+        runner.advanceSweepToNextLaneForTests();
+        assertTrue(runner.forwardLeftoverPlacementsForTests().contains(5),
+                "lane-0 leftover must be in forwardLeftoverPlacements before refill");
+
+        // Now on lane 1 WEST: seed a RIGHT_TWO NEAR_START block, mark it MISSED, trigger refill.
+        runner.seedLanePlacementsForTests(List.of(
+                new GroundedSweepPlacementExecutor.PlacementTarget(88, new BlockPos(20, 64, 19))
+        ));
+        runner.recordPlacementOutcomeForTests(88, GroundedSweepPlacementExecutor.PlacementResult.MISSED, 1);
+        runner.simulateRefillCompleteForTests();
+
+        Set<Integer> leftovers = runner.forwardLeftoverPlacementsForTests();
+        assertTrue(leftovers.contains(5),
+                "lane-0 leftover must survive the refill resume");
+        assertTrue(leftovers.contains(88),
+                "MISSED lane-1 block must be captured from tracker on refill resume");
+    }
+
     // ─── writeMismatchDetailsEvent grouped-count tests ────────────────────────
 
     @Test
