@@ -2398,8 +2398,8 @@ class GroundedSingleLaneDebugRunnerTest {
         assertEquals(0, runner.startApproachNoProgressTicksForTests(),
                 "noProgressTicks must reset when distance to target improves");
         List<String> events = runner.groundedTraceEventsForTests();
-        assertTrue(events.stream().anyMatch(e -> e.contains("noProgressTicks reset")),
-                "Expected progress-reset trace event");
+        assertTrue(events.stream().anyMatch(e -> e.contains("START_APPROACH_BUSY_MOVING")),
+                "Expected START_APPROACH_BUSY_MOVING trace event when distance improves");
     }
 
     // While Baritone is busy but no progress observed for the full timeout window,
@@ -2460,6 +2460,118 @@ class GroundedSingleLaneDebugRunnerTest {
 
         assertEquals(0, runner.startApproachTicksForTests(),
                 "startApproachTicks must not advance while Baritone is busy");
+    }
+
+    // Player physically moves each tick but away from the staging target (Baritone detouring).
+    // noProgressTicks must remain 0 and no retry budget consumed for the entire detour.
+    @Test
+    void baritoneBusy_playerMovingAwayFromTarget_doesNotConsumeNoProgressTicks() {
+        RecordingBaritoneFacade baritone = new RecordingBaritoneFacade();
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(baritone);
+        runner.setGroundedTraceEnabled(true);
+        assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
+        runner.issueStartApproachIfNeeded();
+        assertEquals(1, baritone.goToCalls);
+
+        // First tick: establishes best distance from infinity, noProgressTicks stays 0.
+        runner.simulateStartApproachTickWhileBaritoneBusy(new Vec3d(100.0, 64.0, 200.0));
+        assertEquals(0, runner.startApproachNoProgressTicksForTests());
+
+        // Subsequent ticks: player moves each tick (physically moving) but further from target.
+        // Each tick has a different position so displacementSq > epsilon — not stuck.
+        for (int i = 1; i <= 100; i++) {
+            Vec3d movingPos = new Vec3d(100.0 + i * 0.5, 64.0, 200.0 + i * 0.5);
+            runner.simulateStartApproachTickWhileBaritoneBusy(movingPos);
+        }
+
+        assertEquals(0, runner.startApproachNoProgressTicksForTests(),
+                "noProgressTicks must stay 0 while player is physically moving each tick");
+        assertEquals(0, runner.startApproachReissueCountForTests(),
+                "No retry consumed while player is physically moving");
+        assertTrue(runner.isActive(), "Runner must remain active");
+
+        List<String> events = runner.groundedTraceEventsForTests();
+        assertTrue(events.stream().anyMatch(e -> e.contains("START_APPROACH_BUSY_DISTANCE_WORSENING")),
+                "Expected START_APPROACH_BUSY_DISTANCE_WORSENING diagnostic event");
+    }
+
+    // Player is stationary (same position every tick): noProgressTicks increments normally.
+    @Test
+    void baritoneBusy_playerStationary_noProgressTicksIncrement() {
+        RecordingBaritoneFacade baritone = new RecordingBaritoneFacade();
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(baritone);
+        runner.setGroundedTraceEnabled(true);
+        assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
+        runner.issueStartApproachIfNeeded();
+
+        Vec3d stationaryPos = new Vec3d(100.0, 64.0, 200.0);
+        // First tick: best distance established from infinity, noProgressTicks stays 0.
+        runner.simulateStartApproachTickWhileBaritoneBusy(stationaryPos);
+        assertEquals(0, runner.startApproachNoProgressTicksForTests());
+
+        // Second tick: same position, displacementSq=0 — must count as stuck.
+        runner.simulateStartApproachTickWhileBaritoneBusy(stationaryPos);
+        assertEquals(1, runner.startApproachNoProgressTicksForTests(),
+                "Stationary player must increment noProgressTicks");
+
+        List<String> events = runner.groundedTraceEventsForTests();
+        assertTrue(events.stream().anyMatch(e -> e.contains("START_APPROACH_BUSY_STUCK")),
+                "Expected START_APPROACH_BUSY_STUCK diagnostic event");
+    }
+
+    // While Baritone is busy, if the player arrives at the staging position the readiness check
+    // must fire before any stuck-counting logic is evaluated.
+    @Test
+    void baritoneBusy_playerBecomesReady_readinessDetectedBeforeStuckCounting() {
+        RecordingBaritoneFacade baritone = new RecordingBaritoneFacade();
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(baritone);
+        assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
+        runner.issueStartApproachIfNeeded();
+        assertEquals(1, baritone.goToCalls);
+
+        // First tick: player far away, establishes best distance.
+        runner.simulateStartApproachTickWhileBaritoneBusy(new Vec3d(50.0, 64.0, 50.0));
+
+        // Player arrives at the staging target.
+        // Lane 0 EAST: origin (10,64,10), centerline z=12, staging target at (9,64,12).
+        // Position (9.3,64,12.5) passes the flat-distance, centerline, and forward checks.
+        int result = runner.simulateStartApproachTickWhileBaritoneBusy(new Vec3d(9.3, 64.0, 12.5));
+
+        assertEquals(2, result, "Player at staging target must return readiness code 2");
+        // Readiness was detected — no retry consumed.
+        assertEquals(0, runner.startApproachReissueCountForTests(),
+                "No retry must be consumed when readiness is detected");
+    }
+
+    // While Baritone is busy, if the player walks far outside the build envelope the runner must
+    // reissue the approach (not wait for the no-progress timeout) and emit the safe-envelope event.
+    @Test
+    void baritoneBusy_playerLeaveSafeEnvelope_emitsUnsafePathDiagnosticAndReissues() {
+        RecordingBaritoneFacade baritone = new RecordingBaritoneFacade();
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(baritone);
+        runner.setGroundedTraceEnabled(true);
+        assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
+        runner.issueStartApproachIfNeeded();
+        assertEquals(1, baritone.goToCalls);
+
+        // sessionWithOrigin() bounds: minX=10, maxX=14, minZ=10, maxZ=14.
+        // Safe envelope margin is 400 blocks → threshold at x < -390.
+        // Player at x=-500 is 510 blocks outside minX=10, well past the margin.
+        Vec3d outsideEnvelope = new Vec3d(-500.0, 64.0, 12.0);
+        int result = runner.simulateStartApproachTickWhileBaritoneBusy(outsideEnvelope);
+
+        assertEquals(1, result, "Leaving safe envelope must trigger a reissue (return code 1)");
+        assertEquals(1, runner.startApproachReissueCountForTests(), "Reissue count must increment");
+        assertEquals(2, baritone.goToCalls, "goTo must be re-issued after safe-envelope breach");
+        assertTrue(runner.isActive(), "Runner must remain active after safe-envelope reissue");
+
+        List<String> events = runner.groundedTraceEventsForTests();
+        assertTrue(events.stream().anyMatch(e -> e.contains("START_APPROACH_LEFT_SAFE_ENVELOPE")),
+                "Expected START_APPROACH_LEFT_SAFE_ENVELOPE diagnostic event");
+        assertTrue(
+                events.stream().anyMatch(e -> e.contains("START_APPROACH_BUSY_REISSUE_REASON")
+                        && e.contains("left_safe_envelope")),
+                "Expected START_APPROACH_BUSY_REISSUE_REASON event with reason=left_safe_envelope");
     }
 
     @Test

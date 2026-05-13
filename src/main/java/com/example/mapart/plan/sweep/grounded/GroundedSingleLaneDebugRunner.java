@@ -61,6 +61,12 @@ public final class GroundedSingleLaneDebugRunner {
     private static final double START_APPROACH_PROGRESS_EPSILON_SQ = 0.01;
     private static final int MAX_START_APPROACH_REISSUES = 3;
     private static final int START_APPROACH_STOPPED_GRACE_TICKS = 20;
+    // Player must move at least sqrt(0.01) ≈ 0.1 blocks (XZ) per tick to be classified as moving.
+    private static final double START_APPROACH_PHYSICAL_MOVEMENT_EPSILON_SQ = 0.01;
+    // Player is this many blocks outside activeBounds on any axis → left safe approach envelope.
+    // Large enough to allow normal Baritone routing detours (e.g., supply chests 50+ blocks away)
+    // while still catching cases where Baritone walks completely off the build platform.
+    private static final double START_APPROACH_SAFE_ENVELOPE_MARGIN = 400.0;
     private static final int ENTRY_BURST_DURATION_TICKS = 16;
     private static final int MAX_ENTRY_ATTEMPTS_PER_TARGET = 2;
     private static final int ENTRY_BURST_ATTEMPTS_PER_TICK = 2;
@@ -124,6 +130,7 @@ public final class GroundedSingleLaneDebugRunner {
     private int startApproachNoProgressTicks;
     private int startApproachReissueCount;
     private int startApproachGraceTicks;
+    private Vec3d startApproachLastPlayerPos;
     private long transitionSupportTicks;
     private int transitionSupportAlreadyCorrectCount;
     private int transitionSupportPlacedCount;
@@ -1326,18 +1333,53 @@ public final class GroundedSingleLaneDebugRunner {
             startApproachGraceTicks++;
         }
         double flatDistanceSq = flatDistanceToStandingTargetSq(playerPosition, stagingTarget);
+        double displacementSq = startApproachLastPlayerPos == null ? Double.MAX_VALUE
+                : (playerPosition.x - startApproachLastPlayerPos.x) * (playerPosition.x - startApproachLastPlayerPos.x)
+                  + (playerPosition.z - startApproachLastPlayerPos.z) * (playerPosition.z - startApproachLastPlayerPos.z);
+        startApproachLastPlayerPos = playerPosition;
+
         if (flatDistanceSq + START_APPROACH_PROGRESS_EPSILON_SQ < startApproachBestDistanceSq) {
             startApproachBestDistanceSq = flatDistanceSq;
             startApproachNoProgressTicks = 0;
             if (baritoneBusy) {
-                traceGroundedEvent("START_APPROACH_WAITING_FOR_BARITONE progress: distance improved, noProgressTicks reset"
+                traceGroundedEvent("START_APPROACH_BUSY_MOVING distance improved"
                         + " lane#" + (activeLane != null ? activeLane.laneIndex() : "?")
                         + " noProgressTicks=" + startApproachNoProgressTicks
                         + " bestDistanceSq=" + String.format("%.3f", startApproachBestDistanceSq)
-                        + " currentDistanceSq=" + String.format("%.3f", flatDistanceSq));
+                        + " currentDistanceSq=" + String.format("%.3f", flatDistanceSq)
+                        + " displacementSq=" + String.format("%.4f", displacementSq));
             }
         } else if (!clientTickStallActive) {
-            startApproachNoProgressTicks++;
+            if (baritoneBusy && displacementSq > START_APPROACH_PHYSICAL_MOVEMENT_EPSILON_SQ) {
+                // Baritone is detouring — player is physically moving but not yet reducing distance
+                // to the staging target. Do not classify as stuck; only count no-progress when
+                // the player is truly stationary or oscillating in place.
+                startApproachNoProgressTicks = 0;
+                traceGroundedEvent("START_APPROACH_BUSY_DISTANCE_WORSENING player moving, noProgressTicks reset"
+                        + " lane#" + (activeLane != null ? activeLane.laneIndex() : "?")
+                        + " dir=" + (activeLane != null ? activeLane.direction() : "?")
+                        + " target=" + stagingTarget.toShortString()
+                        + " playerPos=" + playerPosition
+                        + " currentDistanceSq=" + String.format("%.3f", flatDistanceSq)
+                        + " bestDistanceSq=" + String.format("%.3f", startApproachBestDistanceSq)
+                        + " displacementSq=" + String.format("%.4f", displacementSq)
+                        + " noProgressTicks=" + startApproachNoProgressTicks
+                        + " startApproachReissueCount=" + startApproachReissueCount);
+            } else {
+                startApproachNoProgressTicks++;
+                if (baritoneBusy) {
+                    traceGroundedEvent("START_APPROACH_BUSY_STUCK player stationary"
+                            + " lane#" + (activeLane != null ? activeLane.laneIndex() : "?")
+                            + " dir=" + (activeLane != null ? activeLane.direction() : "?")
+                            + " target=" + stagingTarget.toShortString()
+                            + " playerPos=" + playerPosition
+                            + " currentDistanceSq=" + String.format("%.3f", flatDistanceSq)
+                            + " bestDistanceSq=" + String.format("%.3f", startApproachBestDistanceSq)
+                            + " displacementSq=" + String.format("%.4f", displacementSq)
+                            + " noProgressTicks=" + startApproachNoProgressTicks
+                            + " startApproachReissueCount=" + startApproachReissueCount);
+                }
+            }
         }
 
         LaneStartReadiness readiness = evaluateLaneStartReadiness(playerPosition, activeLane, stagingTarget, activeBounds);
@@ -1357,7 +1399,7 @@ public final class GroundedSingleLaneDebugRunner {
 
         // While Baritone is actively navigating toward the staging point, do not consume retry
         // budget or fire the absolute tick timeout — the player simply hasn't arrived yet.
-        // Only the no-progress timeout applies here (in case Baritone is stuck/looping).
+        // No-progress timeout only fires when the player is truly stationary (not detouring).
         if (baritoneBusy) {
             traceGroundedEvent("START_APPROACH_WAITING_FOR_BARITONE"
                     + " lane#" + (activeLane != null ? activeLane.laneIndex() : "?")
@@ -1369,6 +1411,33 @@ public final class GroundedSingleLaneDebugRunner {
                     + " baritoneBusy=true"
                     + " bestDistanceSq=" + String.format("%.3f", startApproachBestDistanceSq)
                     + " currentDistanceSq=" + String.format("%.3f", flatDistanceSq));
+            // Unsafe-path guard: if Baritone has walked far outside the build/approach envelope,
+            // reissue immediately rather than waiting for the no-progress timeout.
+            if (activeBounds != null && playerOutsideSafeEnvelope(playerPosition, activeBounds)) {
+                String envCtx = " lane#" + (activeLane != null ? activeLane.laneIndex() : "?")
+                        + " dir=" + (activeLane != null ? activeLane.direction() : "?")
+                        + " target=" + stagingTarget.toShortString()
+                        + " playerPos=" + playerPosition
+                        + " currentDistanceSq=" + String.format("%.3f", flatDistanceSq)
+                        + " bestDistanceSq=" + String.format("%.3f", startApproachBestDistanceSq)
+                        + " noProgressTicks=" + startApproachNoProgressTicks
+                        + " startApproachReissueCount=" + startApproachReissueCount
+                        + " insideCorridor=" + readiness.insideCorridor()
+                        + " centerlineDelta=" + String.format("%.2f", readiness.centerlineDelta())
+                        + " forwardDelta=" + String.format("%.2f", readiness.forwardDelta());
+                traceGroundedEvent("START_APPROACH_LEFT_SAFE_ENVELOPE" + envCtx);
+                if (startApproachReissueCount < MAX_START_APPROACH_REISSUES) {
+                    traceGroundedEvent("START_APPROACH_BUSY_REISSUE_REASON reason=left_safe_envelope" + envCtx);
+                    startApproachReissueCount++;
+                    baritoneFacade.cancel();
+                    resetStartApproachProgressTracking();
+                    issueStartApproachIfNeeded();
+                } else {
+                    traceGroundedEvent("Start approach retry budget exhausted after leaving safe envelope:" + envCtx);
+                    failLaneStart(client, "Unable to reach valid lane start staging position");
+                }
+                return;
+            }
             if (startApproachNoProgressTicks > MAX_START_APPROACH_NO_PROGRESS_TICKS) {
                 String ctx = " lane#" + (activeLane != null ? activeLane.laneIndex() : "?")
                         + " dir=" + (activeLane != null ? activeLane.direction() : "?")
@@ -1379,6 +1448,7 @@ public final class GroundedSingleLaneDebugRunner {
                         + " reissueCount=" + startApproachReissueCount
                         + " " + describeLaneStartReadiness(readiness);
                 if (startApproachReissueCount < MAX_START_APPROACH_REISSUES) {
+                    traceGroundedEvent("START_APPROACH_BUSY_REISSUE_REASON reason=busy_stuck" + ctx);
                     traceGroundedEvent("Start approach busy/no-progress timeout — reissuing:" + ctx);
                     startApproachReissueCount++;
                     baritoneFacade.cancel();
@@ -1858,6 +1928,7 @@ public final class GroundedSingleLaneDebugRunner {
         startApproachBestDistanceSq = Double.POSITIVE_INFINITY;
         startApproachNoProgressTicks = 0;
         startApproachIssued = false;
+        startApproachLastPlayerPos = null;
     }
 
     private String describeLaneStartReadiness(LaneStartReadiness r) {
@@ -1866,6 +1937,13 @@ public final class GroundedSingleLaneDebugRunner {
                 + " forwardDelta=" + String.format("%.2f", r.forwardDelta())
                 + " insideCorridor=" + r.insideCorridor()
                 + " flatDistanceSq=" + String.format("%.2f", r.flatDistanceSq());
+    }
+
+    private static boolean playerOutsideSafeEnvelope(Vec3d pos, GroundedSchematicBounds bounds) {
+        return pos.x < bounds.minX() - START_APPROACH_SAFE_ENVELOPE_MARGIN
+            || pos.x > bounds.maxX() + START_APPROACH_SAFE_ENVELOPE_MARGIN
+            || pos.z < bounds.minZ() - START_APPROACH_SAFE_ENVELOPE_MARGIN
+            || pos.z > bounds.maxZ() + START_APPROACH_SAFE_ENVELOPE_MARGIN;
     }
 
     void issueStartApproachIfNeeded() {
@@ -2003,25 +2081,84 @@ public final class GroundedSingleLaneDebugRunner {
 
     // Simulates a tick where Baritone is actively busy and player is not ready.
     // Does NOT consume retry budget (busy path). Updates progress tracking with playerPosition.
-    // Returns: 0 = waiting (no action), 1 = reissued (no-progress timeout), -1 = budget exhausted,
+    // Returns: 0 = waiting (no action), 1 = reissued (no-progress/unsafe-envelope), -1 = budget exhausted,
     //          2 = readiness met (player is already in position).
     int simulateStartApproachTickWhileBaritoneBusy(Vec3d playerPosition) {
         if (!awaitingStartApproach || activeLane == null || activeBounds == null) return 0;
         BlockPos stagingTarget = activeStartApproachTarget();
         double flatDistanceSq = flatDistanceToStandingTargetSq(playerPosition, stagingTarget);
+        double displacementSq = startApproachLastPlayerPos == null ? Double.MAX_VALUE
+                : (playerPosition.x - startApproachLastPlayerPos.x) * (playerPosition.x - startApproachLastPlayerPos.x)
+                  + (playerPosition.z - startApproachLastPlayerPos.z) * (playerPosition.z - startApproachLastPlayerPos.z);
+        startApproachLastPlayerPos = playerPosition;
+
         if (flatDistanceSq + START_APPROACH_PROGRESS_EPSILON_SQ < startApproachBestDistanceSq) {
             startApproachBestDistanceSq = flatDistanceSq;
             startApproachNoProgressTicks = 0;
-            traceGroundedEvent("START_APPROACH_WAITING_FOR_BARITONE progress: distance improved, noProgressTicks reset"
+            traceGroundedEvent("START_APPROACH_BUSY_MOVING distance improved"
                     + " lane#" + activeLane.laneIndex()
                     + " noProgressTicks=" + startApproachNoProgressTicks
                     + " bestDistanceSq=" + String.format("%.3f", startApproachBestDistanceSq)
-                    + " currentDistanceSq=" + String.format("%.3f", flatDistanceSq));
+                    + " currentDistanceSq=" + String.format("%.3f", flatDistanceSq)
+                    + " displacementSq=" + String.format("%.4f", displacementSq));
+        } else if (displacementSq > START_APPROACH_PHYSICAL_MOVEMENT_EPSILON_SQ) {
+            // Player physically moving but distance to target worsening — detouring, not stuck.
+            startApproachNoProgressTicks = 0;
+            traceGroundedEvent("START_APPROACH_BUSY_DISTANCE_WORSENING player moving, noProgressTicks reset"
+                    + " lane#" + activeLane.laneIndex()
+                    + " dir=" + activeLane.direction()
+                    + " target=" + stagingTarget.toShortString()
+                    + " playerPos=" + playerPosition
+                    + " currentDistanceSq=" + String.format("%.3f", flatDistanceSq)
+                    + " bestDistanceSq=" + String.format("%.3f", startApproachBestDistanceSq)
+                    + " displacementSq=" + String.format("%.4f", displacementSq)
+                    + " noProgressTicks=" + startApproachNoProgressTicks
+                    + " startApproachReissueCount=" + startApproachReissueCount);
         } else {
             startApproachNoProgressTicks++;
+            traceGroundedEvent("START_APPROACH_BUSY_STUCK player stationary"
+                    + " lane#" + activeLane.laneIndex()
+                    + " dir=" + activeLane.direction()
+                    + " target=" + stagingTarget.toShortString()
+                    + " playerPos=" + playerPosition
+                    + " currentDistanceSq=" + String.format("%.3f", flatDistanceSq)
+                    + " bestDistanceSq=" + String.format("%.3f", startApproachBestDistanceSq)
+                    + " displacementSq=" + String.format("%.4f", displacementSq)
+                    + " noProgressTicks=" + startApproachNoProgressTicks
+                    + " startApproachReissueCount=" + startApproachReissueCount);
         }
+
         LaneStartReadiness readiness = evaluateLaneStartReadiness(playerPosition, activeLane, stagingTarget, activeBounds);
         if (readiness.ready()) return 2;
+
+        // Unsafe-path guard mirrors tickStartApproach.
+        if (playerOutsideSafeEnvelope(playerPosition, activeBounds)) {
+            String envCtx = " lane#" + activeLane.laneIndex()
+                    + " dir=" + activeLane.direction()
+                    + " target=" + stagingTarget.toShortString()
+                    + " playerPos=" + playerPosition
+                    + " currentDistanceSq=" + String.format("%.3f", flatDistanceSq)
+                    + " bestDistanceSq=" + String.format("%.3f", startApproachBestDistanceSq)
+                    + " noProgressTicks=" + startApproachNoProgressTicks
+                    + " startApproachReissueCount=" + startApproachReissueCount
+                    + " insideCorridor=" + readiness.insideCorridor()
+                    + " centerlineDelta=" + String.format("%.2f", readiness.centerlineDelta())
+                    + " forwardDelta=" + String.format("%.2f", readiness.forwardDelta());
+            traceGroundedEvent("START_APPROACH_LEFT_SAFE_ENVELOPE" + envCtx);
+            if (startApproachReissueCount < MAX_START_APPROACH_REISSUES) {
+                traceGroundedEvent("START_APPROACH_BUSY_REISSUE_REASON reason=left_safe_envelope" + envCtx);
+                startApproachReissueCount++;
+                baritoneFacade.cancel();
+                resetStartApproachProgressTracking();
+                issueStartApproachIfNeeded();
+                return 1;
+            } else {
+                traceGroundedEvent("Start approach retry budget exhausted after leaving safe envelope:" + envCtx);
+                failLaneStart(null, "Unable to reach valid lane start staging position");
+                return -1;
+            }
+        }
+
         if (startApproachNoProgressTicks > MAX_START_APPROACH_NO_PROGRESS_TICKS) {
             String ctx = " lane#" + activeLane.laneIndex()
                     + " dir=" + activeLane.direction()
@@ -2031,6 +2168,7 @@ public final class GroundedSingleLaneDebugRunner {
                     + " reissueCount=" + startApproachReissueCount
                     + " " + describeLaneStartReadiness(readiness);
             if (startApproachReissueCount < MAX_START_APPROACH_REISSUES) {
+                traceGroundedEvent("START_APPROACH_BUSY_REISSUE_REASON reason=busy_stuck" + ctx);
                 traceGroundedEvent("Start approach busy/no-progress timeout — reissuing:" + ctx);
                 startApproachReissueCount++;
                 baritoneFacade.cancel();
@@ -4499,6 +4637,7 @@ public final class GroundedSingleLaneDebugRunner {
         startApproachBestDistanceSq = Double.POSITIVE_INFINITY;
         startApproachNoProgressTicks = 0;
         startApproachReissueCount = 0;
+        startApproachLastPlayerPos = null;
         awaitingLaneShift = false;
         awaitingTransitionSupport = false;
         laneShiftTarget = null;
@@ -4542,6 +4681,7 @@ public final class GroundedSingleLaneDebugRunner {
         startApproachBestDistanceSq = Double.POSITIVE_INFINITY;
         startApproachNoProgressTicks = 0;
         startApproachReissueCount = 0;
+        startApproachLastPlayerPos = null;
         awaitingLaneShift = false;
         awaitingTransitionSupport = false;
         laneShiftTarget = null;
@@ -4592,6 +4732,7 @@ public final class GroundedSingleLaneDebugRunner {
         startApproachBestDistanceSq = Double.POSITIVE_INFINITY;
         startApproachNoProgressTicks = 0;
         startApproachReissueCount = 0;
+        startApproachLastPlayerPos = null;
         awaitingLaneShift = true;
         awaitingTransitionSupport = false;
         laneShiftPlan = buildLaneShiftPlan(fromLane, lane, activeBounds);
