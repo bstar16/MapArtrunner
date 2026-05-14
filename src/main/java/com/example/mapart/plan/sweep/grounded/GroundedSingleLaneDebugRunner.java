@@ -488,7 +488,30 @@ public final class GroundedSingleLaneDebugRunner {
             return;
         }
 
-        laneWalker.tick(playerPosition);
+        // Build support-guard sets for this tick.
+        // footprintPendingPlacements: world positions of blocks in the pending-placement queue
+        //   (scheduled but not yet placed). Used to classify EXPECTED_PENDING_PLACEMENT and
+        //   distinguish it from EXPECTED_MISSING_UNTRACKED.
+        // footprintPendingVerifications: world positions of blocks placed but not yet server-
+        //   confirmed. Walker holds on EXPECTED_PENDING_VERIFICATION.
+        java.util.Set<BlockPos> footprintPendingPlacements = new java.util.HashSet<>();
+        for (GroundedSweepPlacementExecutor.PlacementTarget t : pendingPlacementTargets) {
+            footprintPendingPlacements.add(t.worldPos());
+        }
+        java.util.Set<BlockPos> footprintPendingVerifications = new java.util.HashSet<>();
+        for (PendingPlacementVerification pv : pendingVerificationsByPlacement.values()) {
+            footprintPendingVerifications.add(pv.worldPos());
+        }
+
+        // Build a SchematicTargetLookup from the live world state and lane placements.
+        // Returns null when running in tests (no world available) — guard disabled.
+        GroundedLaneWalker.SchematicTargetLookup targetLookup = buildSchematicTargetLookup(client);
+
+        laneWalker.tick(playerPosition, targetLookup, footprintPendingPlacements, footprintPendingVerifications);
+
+        // Emit diagnostics for the support-guard check result.
+        emitSupportCheckDiagnostics(playerPosition, laneWalker.lastSupportCheckPos(), laneWalker.lastSupportCheck());
+
         laneTicksElapsed++;
 
         // Track progress coordinate for NO_PROGRESS detection
@@ -711,6 +734,13 @@ public final class GroundedSingleLaneDebugRunner {
                             false);
                 }
 
+                // Clear stale active-run state so validateStart() does not reject the call with
+                // "already active". clearActiveRunState() nulls activeLane (the guard in
+                // validateStart), but does NOT clear recoveryState (already cleared above) or the
+                // run-summary tracking fields. The session and settings were captured before
+                // this point and are still valid local variables.
+                clearActiveRunState();
+
                 Optional<String> err = startFullSweep(session, settings);
                 if (err.isPresent() && client.player != null) {
                     client.player.sendMessage(
@@ -758,6 +788,166 @@ public final class GroundedSingleLaneDebugRunner {
         boolean stableVertically = Math.abs(client.player.getVelocity().y) < 0.1;
 
         return onGround || stableVertically;
+    }
+
+    /**
+     * Builds a {@link GroundedLaneWalker.SchematicTargetLookup} that combines the lane's
+     * schematic placement map with live world state.
+     *
+     * <p>Contract: returns {@code false} for a given worldPos if either:
+     * <ul>
+     *   <li>No placement is required at that position (not in the active lane's schematic).</li>
+     *   <li>The required block is already confirmed present in the world.</li>
+     * </ul>
+     * Returns {@code true} if a placement is required at that position and the block is NOT yet
+     * confirmed in the world (i.e., the walker should hold).
+     *
+     * <p>Returns {@code null} for the entire lookup when running in tests (no world available),
+     * which disables the support guard.
+     */
+    private GroundedLaneWalker.SchematicTargetLookup buildSchematicTargetLookup(MinecraftClient client) {
+        if (client == null || client.world == null) {
+            return null;
+        }
+        net.minecraft.world.World world = client.world;
+        // Build worldPos → Block map for all placements in the active lane.
+        // lanePlacementsByIndex maps placement-index → Placement, and pendingPlacementTargets
+        // contains the remaining targets with worldPos. We include ALL active-lane targets
+        // (not just pending) so we can tell the walker "no block expected here" for positions
+        // that have already been placed in a previous pass.
+        //
+        // For footprint positions that are outside the active lane's placement map entirely,
+        // the lookup returns false → NOT_EXPECTED_AIR_OK (safe to walk).
+        Map<BlockPos, net.minecraft.block.Block> laneExpectedBlocks = new HashMap<>();
+        for (GroundedSweepPlacementExecutor.PlacementTarget t : pendingPlacementTargets) {
+            Placement lp = lanePlacementsByIndex.get(t.placementIndex());
+            if (lp != null && lp.block() != null) {
+                laneExpectedBlocks.put(t.worldPos(), lp.block());
+            }
+        }
+        // Also include pending-verification positions — they are no longer in pendingPlacementTargets
+        // but are still "expected and in flight".
+        for (PendingPlacementVerification pv : pendingVerificationsByPlacement.values()) {
+            if (pv.expectedBlock() != null) {
+                laneExpectedBlocks.putIfAbsent(pv.worldPos(), pv.expectedBlock());
+            }
+        }
+
+        return worldPos -> {
+            net.minecraft.block.Block expectedBlock = laneExpectedBlocks.get(worldPos);
+            if (expectedBlock == null) {
+                // No placement required at this footprint position — safe.
+                return false;
+            }
+            // Block is required. Check if already confirmed in world.
+            net.minecraft.block.BlockState bs = world.getBlockState(worldPos);
+            if (bs.isOf(expectedBlock)) {
+                // Already confirmed — safe.
+                return false;
+            }
+            // Block is required but not yet confirmed in world — needs tracking.
+            return true;
+        };
+    }
+
+    /**
+     * Emits trace and diagnostics events based on the walker's per-tick support check result.
+     * This covers the WALKER_SUPPORT_CHECK, WALKER_HELD_FOR_MISSING_SUPPORT,
+     * WALKER_SUPPORT_PENDING_VERIFICATION, WALKER_SUPPORT_MISSING_UNTRACKED, and
+     * WEST_NEAR_END_TARGET_TRACE diagnostic tags.
+     */
+    private void emitSupportCheckDiagnostics(Vec3d playerPosition, BlockPos footprintPos, GroundedLaneWalker.SupportCheckResult check) {
+        if (activeLane == null || activeBounds == null || footprintPos == null) {
+            return;
+        }
+
+        double progressCoord = activeLane.direction().progressCoordinate(playerPosition.x, playerPosition.z);
+        double endProgress = activeLane.direction().progressCoordinate(
+                activeLane.endPoint().getX() + 0.5, activeLane.endPoint().getZ() + 0.5);
+        double laneEndDistance = (endProgress - progressCoord) * activeLane.direction().forwardSign();
+
+        String checkBase = GroundedDiagnostics.WALKER_SUPPORT_CHECK
+                + " lane=" + activeLane.laneIndex()
+                + " dir=" + activeLane.direction()
+                + " playerPos=" + playerPosition
+                + " footprintPos=" + footprintPos.toShortString()
+                + " supportState=" + (check != null ? check.name() : "UNKNOWN")
+                + " laneEndDist=" + String.format("%.2f", laneEndDistance)
+                + " progressCoord=" + String.format("%.2f", progressCoord);
+
+        traceGroundedEvent(checkBase);
+
+        if (check == GroundedLaneWalker.SupportCheckResult.EXPECTED_PENDING_VERIFICATION) {
+            traceGroundedEvent(GroundedDiagnostics.WALKER_SUPPORT_PENDING_VERIFICATION
+                    + " lane=" + activeLane.laneIndex()
+                    + " dir=" + activeLane.direction()
+                    + " footprintPos=" + footprintPos.toShortString()
+                    + " progressCoord=" + String.format("%.2f", progressCoord)
+                    + " holdTicks=" + laneWalker.supportHoldTicks());
+            traceGroundedEvent(GroundedDiagnostics.WALKER_HELD_FOR_MISSING_SUPPORT
+                    + " lane=" + activeLane.laneIndex()
+                    + " dir=" + activeLane.direction()
+                    + " reason=EXPECTED_PENDING_VERIFICATION"
+                    + " footprintPos=" + footprintPos.toShortString()
+                    + " laneEndDist=" + String.format("%.2f", laneEndDistance)
+                    + " holdTicks=" + laneWalker.supportHoldTicks());
+        } else if (check == GroundedLaneWalker.SupportCheckResult.EXPECTED_PENDING_PLACEMENT) {
+            traceGroundedEvent(GroundedDiagnostics.WALKER_HELD_FOR_MISSING_SUPPORT
+                    + " lane=" + activeLane.laneIndex()
+                    + " dir=" + activeLane.direction()
+                    + " reason=EXPECTED_PENDING_PLACEMENT"
+                    + " footprintPos=" + footprintPos.toShortString()
+                    + " laneEndDist=" + String.format("%.2f", laneEndDistance)
+                    + " holdTicks=" + laneWalker.supportHoldTicks());
+        } else if (check == GroundedLaneWalker.SupportCheckResult.EXPECTED_MISSING_UNTRACKED) {
+            traceGroundedEvent(GroundedDiagnostics.WALKER_SUPPORT_MISSING_UNTRACKED
+                    + " lane=" + activeLane.laneIndex()
+                    + " dir=" + activeLane.direction()
+                    + " footprintPos=" + footprintPos.toShortString()
+                    + " progressCoord=" + String.format("%.2f", progressCoord)
+                    + " laneEndDist=" + String.format("%.2f", laneEndDistance)
+                    + " holdTicks=" + laneWalker.supportHoldTicks());
+            traceGroundedEvent(GroundedDiagnostics.WALKER_HELD_FOR_MISSING_SUPPORT
+                    + " lane=" + activeLane.laneIndex()
+                    + " dir=" + activeLane.direction()
+                    + " reason=EXPECTED_MISSING_UNTRACKED"
+                    + " footprintPos=" + footprintPos.toShortString()
+                    + " laneEndDist=" + String.format("%.2f", laneEndDistance)
+                    + " holdTicks=" + laneWalker.supportHoldTicks());
+        } else if (check == GroundedLaneWalker.SupportCheckResult.EXPECTED_AND_CONFIRMED
+                || check == GroundedLaneWalker.SupportCheckResult.NOT_EXPECTED_AIR_OK) {
+            traceGroundedEvent(GroundedDiagnostics.WALKER_SUPPORT_CONFIRMED
+                    + " lane=" + activeLane.laneIndex()
+                    + " dir=" + activeLane.direction()
+                    + " footprintPos=" + footprintPos.toShortString()
+                    + " progressCoord=" + String.format("%.2f", progressCoord)
+                    + " supportState=" + (check != null ? check.name() : "UNKNOWN"));
+        }
+
+        // WEST near-end target trace: emitted for WEST lanes when within 8 blocks of end
+        if (activeLane.direction() == GroundedLaneDirection.WEST && laneEndDistance <= 8.0) {
+            int footprintProgress = activeLane.direction().alongX() ? footprintPos.getX() : footprintPos.getZ();
+            // Find any pending placement at the footprint progress coordinate near lane end
+            for (GroundedSweepPlacementExecutor.PlacementTarget target : pendingPlacementTargets) {
+                int targetProgress = activeLane.direction().alongX()
+                        ? target.worldPos().getX() : target.worldPos().getZ();
+                if (Math.abs(targetProgress - footprintProgress) <= 1) {
+                    String targetState = pendingVerificationsByPlacement.containsKey(target.placementIndex())
+                            ? "PENDING_VERIFICATION"
+                            : "PENDING_PLACEMENT";
+                    traceGroundedEvent(GroundedDiagnostics.WEST_NEAR_END_TARGET_TRACE
+                            + " lane=" + activeLane.laneIndex()
+                            + " dir=" + activeLane.direction()
+                            + " playerPos=" + playerPosition
+                            + " footprintPos=" + footprintPos.toShortString()
+                            + " progressCoord=" + String.format("%.2f", progressCoord)
+                            + " laneEndDist=" + String.format("%.2f", laneEndDistance)
+                            + " targetWorldPos=" + target.worldPos().toShortString()
+                            + " placementIndex=" + target.placementIndex()
+                            + " targetState=" + targetState);
+                }
+            }
+        }
     }
 
     private boolean triggerRefill(MinecraftClient client, Item requiredItem) {
@@ -5092,6 +5282,77 @@ public final class GroundedSingleLaneDebugRunner {
         float yaw() {
             return yaw;
         }
+    }
+
+    // ── Walker support-guard test helpers ─────────────────────────────────────
+
+    /**
+     * Ticks the lane walker with explicit support guard sets.
+     * Used by tests to inject specific pending-placement and pending-verification state.
+     *
+     * @param playerPosition       simulated player position
+     * @param pendingPlacements    world positions of blocks not yet placed
+     * @param pendingVerifications world positions of placed-but-unconfirmed blocks
+     * @param targetLookup         schematic target lookup (returns expected Block or null if safe)
+     */
+    void tickLaneWalkerForTests(
+            Vec3d playerPosition,
+            java.util.Set<BlockPos> pendingPlacements,
+            java.util.Set<BlockPos> pendingVerifications,
+            GroundedLaneWalker.SchematicTargetLookup targetLookup
+    ) {
+        laneWalker.tick(playerPosition, targetLookup, pendingPlacements, pendingVerifications);
+    }
+
+    /** Returns the support-check result recorded on the last walker tick, or null. */
+    GroundedLaneWalker.SupportCheckResult lastWalkerSupportCheckForTests() {
+        return laneWalker.lastSupportCheck();
+    }
+
+    /** Returns the footprint block position checked on the last walker tick, or null. */
+    BlockPos lastWalkerSupportCheckPosForTests() {
+        return laneWalker.lastSupportCheckPos();
+    }
+
+    /** Returns the current support hold tick count from the walker. */
+    int walkerSupportHoldTicksForTests() {
+        return laneWalker.supportHoldTicks();
+    }
+
+    /**
+     * Simulates recovery stabilization completing and triggers auto-resume.
+     * Exercises the tickRecovery() → clearActiveRunState() → startFullSweep() path
+     * without a live MinecraftClient.
+     *
+     * @return the error from startFullSweep, or empty on success
+     */
+    Optional<String> simulateRecoveryAutoResumeForTests(BuildSession session, GroundedSweepSettings settings) {
+        if (!recoveryState.isActive()) {
+            return Optional.of("Recovery is not active");
+        }
+        BuildSession capturedSession = session != null ? session : activeSession;
+        GroundedSweepSettings capturedSettings = settings != null ? settings : activeSettings;
+        recoveryState.clear();
+        if (capturedSession == null || capturedSettings == null) {
+            return Optional.of("Session or settings not available for auto-resume");
+        }
+        clearActiveRunState();
+        return startFullSweep(capturedSession, capturedSettings);
+    }
+
+    /**
+     * Activates recovery state with a minimal snapshot for testing purposes.
+     */
+    void activateRecoveryForTests(GroundedSweepLane lane, GroundedRecoveryReason reason) {
+        GroundedRecoverySnapshot snapshot = new GroundedRecoverySnapshot(
+                lane,
+                sweepPassPhase,
+                lane.direction(),
+                lastKnownProgressCoordinate,
+                new Vec3d(0, 64, 0),
+                reason
+        );
+        recoveryState.activate(snapshot);
     }
 
 
