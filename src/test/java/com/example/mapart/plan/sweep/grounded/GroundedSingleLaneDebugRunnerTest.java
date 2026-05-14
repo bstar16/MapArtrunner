@@ -3185,6 +3185,20 @@ class GroundedSingleLaneDebugRunnerTest {
     // ─── Walker support guard tests ───────────────────────────────────────────
 
     /**
+     * Helper: builds a SchematicTargetLookup that says "block required here, not yet confirmed"
+     * for the given positions. Returns true (required/unconfirmed) for any position in the set.
+     */
+    private static GroundedLaneWalker.SchematicTargetLookup targetLookupRequiringBlock(
+            java.util.Set<BlockPos> required) {
+        return pos -> required.contains(pos);
+    }
+
+    // Helper: SchematicTargetLookup that says all positions are safe (no block required or all confirmed).
+    private static GroundedLaneWalker.SchematicTargetLookup targetLookupAllSafe() {
+        return pos -> false;
+    }
+
+    /**
      * WEST lane, near end: if the next footprint block is in the pending-placement set
      * (not yet placed), the walker must hold (forwardPressed=false).
      */
@@ -3212,12 +3226,12 @@ class GroundedSingleLaneDebugRunnerTest {
         // Next footprint for a WEST lane at playerX=-184: floor(-184.5)=-185, forwardSign=-1 → nextX=-186.
         BlockPos expectedFootprint = new BlockPos(-186, 64, -59);
 
-        // Mark that footprint block as pending placement (not yet placed).
-        java.util.Set<BlockPos> pendingPlacements = java.util.Set.of(expectedFootprint);
+        // Mark that footprint block as pending placement (required but not yet placed).
+        java.util.Set<BlockPos> pendingPlacements = Set.of(expectedFootprint);
         java.util.Set<BlockPos> pendingVerifications = java.util.Set.of();
 
-        // Lookup: block is NOT in world.
-        PlacementCompletionLookup lookup = (pos, block) -> false;
+        // TargetLookup: block is required at that position (returns true).
+        GroundedLaneWalker.SchematicTargetLookup lookup = targetLookupRequiringBlock(Set.of(expectedFootprint));
 
         walker.tick(playerPos, lookup, pendingPlacements, pendingVerifications);
 
@@ -3225,12 +3239,13 @@ class GroundedSingleLaneDebugRunnerTest {
         assertTrue(walker.currentCommand().isPresent(), "Walker must still be ACTIVE");
         assertFalse(walker.currentCommand().get().forwardPressed(),
                 "Walker must hold when next footprint is in pending-placement set");
-        assertEquals(GroundedLaneWalker.SupportCheckResult.MISSING_UNTRACKED, walker.lastSupportCheck(),
-                "Support check result must be MISSING_UNTRACKED when block is in pending-placement set");
+        assertEquals(GroundedLaneWalker.SupportCheckResult.EXPECTED_PENDING_PLACEMENT, walker.lastSupportCheck(),
+                "Support check result must be EXPECTED_PENDING_PLACEMENT when block is in pending-placement map");
     }
 
     /**
-     * Walker must hold forward movement when the next footprint support block is not placed.
+     * Walker must hold forward movement when the next footprint support block is expected by
+     * schematic but absent from world and not in any tracked queue (EXPECTED_MISSING_UNTRACKED).
      */
     @Test
     void walkerHoldsWhenNextFootprintSupportMissing() {
@@ -3251,19 +3266,19 @@ class GroundedSingleLaneDebugRunnerTest {
         // Next footprint: floor(12.5)=12, EAST forwardSign=+1 → nextX=13, Z=centerline=12
         BlockPos nextFootprint = new BlockPos(13, 64, 12);
 
-        // Mark it as a pending placement (in the placement queue but not yet placed).
-        java.util.Set<BlockPos> pendingPlacements = java.util.Set.of(nextFootprint);
+        // Block is expected by schematic but NOT in pending queues (untracked).
+        java.util.Set<BlockPos> pendingPlacements = Set.of(); // not in queue
         java.util.Set<BlockPos> pendingVerifications = java.util.Set.of();
 
-        // Lookup: block is absent from world.
-        PlacementCompletionLookup lookup = (pos, block) -> false;
+        // TargetLookup: block is required here (returns true) but not in world.
+        GroundedLaneWalker.SchematicTargetLookup lookup = targetLookupRequiringBlock(Set.of(nextFootprint));
 
         walker.tick(playerPos, lookup, pendingPlacements, pendingVerifications);
 
         assertTrue(walker.currentCommand().isPresent(), "Walker must be ACTIVE");
         assertFalse(walker.currentCommand().get().forwardPressed(),
-                "Walker must hold when next footprint support block is missing");
-        assertEquals(GroundedLaneWalker.SupportCheckResult.MISSING_UNTRACKED, walker.lastSupportCheck());
+                "Walker must hold when next footprint support block is expected but untracked");
+        assertEquals(GroundedLaneWalker.SupportCheckResult.EXPECTED_MISSING_UNTRACKED, walker.lastSupportCheck());
         assertEquals(nextFootprint, walker.lastSupportCheckPos());
     }
 
@@ -3289,23 +3304,24 @@ class GroundedSingleLaneDebugRunnerTest {
         BlockPos nextFootprint = new BlockPos(13, 64, 12);
 
         // Block is in pending verification set (placed, awaiting server confirmation).
-        java.util.Set<BlockPos> pendingPlacements = java.util.Set.of();
+        java.util.Set<BlockPos> pendingPlacements = Set.of();
         java.util.Set<BlockPos> pendingVerifications = java.util.Set.of(nextFootprint);
 
-        // Lookup: block is NOT confirmed in world yet (verification still pending).
-        PlacementCompletionLookup lookup = (pos, block) -> false;
+        // TargetLookup: block is required at this position (returns true) — not yet confirmed.
+        GroundedLaneWalker.SchematicTargetLookup lookup = targetLookupRequiringBlock(Set.of(nextFootprint));
 
         walker.tick(playerPos, lookup, pendingPlacements, pendingVerifications);
 
         assertTrue(walker.currentCommand().isPresent(), "Walker must be ACTIVE");
         assertFalse(walker.currentCommand().get().forwardPressed(),
                 "Walker must hold when support is pending server verification");
-        assertEquals(GroundedLaneWalker.SupportCheckResult.PENDING_VERIFICATION, walker.lastSupportCheck());
+        assertEquals(GroundedLaneWalker.SupportCheckResult.EXPECTED_PENDING_VERIFICATION, walker.lastSupportCheck());
         assertEquals(nextFootprint, walker.lastSupportCheckPos());
     }
 
     /**
-     * Walker must resume normal forward movement once the support block is confirmed in the world.
+     * Walker must resume normal forward movement once the support block is confirmed in the world
+     * (schematicTargetLookup returns null = confirmed/safe).
      */
     @Test
     void walkerResumesOnceSupportConfirmed() {
@@ -3325,20 +3341,20 @@ class GroundedSingleLaneDebugRunnerTest {
         Vec3d playerPos = new Vec3d(12.5, 64.0, 12.5);
         BlockPos nextFootprint = new BlockPos(13, 64, 12);
 
-        // Tick 1: support is pending verification — walker should hold.
-        PlacementCompletionLookup notYetConfirmed = (pos, block) -> false;
+        // Tick 1: block is required and pending verification — walker should hold.
+        GroundedLaneWalker.SchematicTargetLookup notYetConfirmed = targetLookupRequiringBlock(Set.of(nextFootprint));
         walker.tick(playerPos, notYetConfirmed,
-                java.util.Set.of(), java.util.Set.of(nextFootprint));
+                Set.of(), java.util.Set.of(nextFootprint));
         assertFalse(walker.currentCommand().get().forwardPressed(),
                 "Walker should hold while support is pending verification");
 
-        // Tick 2: block is now confirmed in the world (lookup returns true, not in pending sets).
-        PlacementCompletionLookup confirmed = (pos, block) -> true;
+        // Tick 2: block is now confirmed (lookup returns false = safe), not in pending sets.
+        GroundedLaneWalker.SchematicTargetLookup confirmed = targetLookupAllSafe();
         walker.tick(playerPos, confirmed,
-                java.util.Set.of(), java.util.Set.of());
+                Set.of(), java.util.Set.of());
         assertTrue(walker.currentCommand().get().forwardPressed(),
                 "Walker must resume forward movement once support block is confirmed");
-        assertEquals(GroundedLaneWalker.SupportCheckResult.ALREADY_CORRECT, walker.lastSupportCheck());
+        assertEquals(GroundedLaneWalker.SupportCheckResult.NOT_EXPECTED_AIR_OK, walker.lastSupportCheck());
     }
 
     /**
@@ -3371,5 +3387,257 @@ class GroundedSingleLaneDebugRunnerTest {
         assertTrue(runner.isActive(), "Runner must be active after successful recovery auto-resume");
         assertFalse(runner.getRecoveryState().isActive(),
                 "Recovery state must be cleared after auto-resume");
+    }
+
+    // ─── New support-guard tests (amendments to PR #231) ─────────────────────
+
+    /**
+     * 1. EXPECTED_MISSING_UNTRACKED causes hold, not silent proceed.
+     * When a block is required by the schematic but not in any tracking queue,
+     * the walker must hold (not silently advance).
+     */
+    @Test
+    void expectedMissingUntrackedSupportDoesNotProceedSilently() {
+        GroundedSweepLane eastLane = new GroundedSweepLane(
+                0, 12, GroundedLaneDirection.EAST,
+                new BlockPos(10, 64, 12), new BlockPos(20, 64, 12),
+                new GroundedLaneCorridorBounds(10, 20, 10, 14),
+                1.0
+        );
+        GroundedSchematicBounds bounds = new GroundedSchematicBounds(
+                new BlockPos(10, 64, 10), new BlockPos(10, 64, 10), new BlockPos(20, 64, 14)
+        );
+
+        GroundedLaneWalker walker = new GroundedLaneWalker();
+        walker.start(eastLane, bounds, true);
+
+        Vec3d playerPos = new Vec3d(12.5, 64.0, 12.5);
+        BlockPos nextFootprint = new BlockPos(13, 64, 12);
+
+        // Block is expected by schematic (lookup returns true) but NOT in any queue.
+        GroundedLaneWalker.SchematicTargetLookup lookup = targetLookupRequiringBlock(Set.of(nextFootprint));
+        java.util.Set<BlockPos> pendingPlacements = Set.of();
+        java.util.Set<BlockPos> pendingVerifications = java.util.Set.of();
+
+        walker.tick(playerPos, lookup, pendingPlacements, pendingVerifications);
+
+        // Must hold — not proceed silently.
+        assertTrue(walker.currentCommand().isPresent());
+        assertFalse(walker.currentCommand().get().forwardPressed(),
+                "EXPECTED_MISSING_UNTRACKED must NOT silently proceed — walker must hold");
+        assertEquals(GroundedLaneWalker.SupportCheckResult.EXPECTED_MISSING_UNTRACKED, walker.lastSupportCheck());
+        assertEquals(1, walker.supportHoldTicks(), "Hold tick counter must be 1 after first hold tick");
+    }
+
+    /**
+     * 2. NOT_EXPECTED_AIR_OK does not hold.
+     * When the schematic has no block at the footprint position, walking is safe.
+     */
+    @Test
+    void nonExpectedAirProceedsNormally() {
+        GroundedSweepLane eastLane = new GroundedSweepLane(
+                0, 12, GroundedLaneDirection.EAST,
+                new BlockPos(10, 64, 12), new BlockPos(20, 64, 12),
+                new GroundedLaneCorridorBounds(10, 20, 10, 14),
+                1.0
+        );
+        GroundedSchematicBounds bounds = new GroundedSchematicBounds(
+                new BlockPos(10, 64, 10), new BlockPos(10, 64, 10), new BlockPos(20, 64, 14)
+        );
+
+        GroundedLaneWalker walker = new GroundedLaneWalker();
+        walker.start(eastLane, bounds, true);
+
+        Vec3d playerPos = new Vec3d(12.5, 64.0, 12.5);
+
+        // TargetLookup returns null for all positions (no block required = air is fine).
+        GroundedLaneWalker.SchematicTargetLookup allAirOk = targetLookupAllSafe();
+
+        walker.tick(playerPos, allAirOk, Set.of(), java.util.Set.of());
+
+        // Must not hold — forward movement is allowed.
+        assertTrue(walker.currentCommand().isPresent());
+        assertTrue(walker.currentCommand().get().forwardPressed(),
+                "NOT_EXPECTED_AIR_OK must allow normal forward movement");
+        assertEquals(GroundedLaneWalker.SupportCheckResult.NOT_EXPECTED_AIR_OK, walker.lastSupportCheck());
+        assertEquals(0, walker.supportHoldTicks(), "Hold tick counter must be 0 when movement is not held");
+    }
+
+    /**
+     * 3. EXPECTED_PENDING_VERIFICATION holds, then resumes when confirmed.
+     */
+    @Test
+    void pendingVerificationHoldsThenResumes() {
+        GroundedSweepLane eastLane = new GroundedSweepLane(
+                0, 12, GroundedLaneDirection.EAST,
+                new BlockPos(10, 64, 12), new BlockPos(20, 64, 12),
+                new GroundedLaneCorridorBounds(10, 20, 10, 14),
+                1.0
+        );
+        GroundedSchematicBounds bounds = new GroundedSchematicBounds(
+                new BlockPos(10, 64, 10), new BlockPos(10, 64, 10), new BlockPos(20, 64, 14)
+        );
+
+        GroundedLaneWalker walker = new GroundedLaneWalker();
+        walker.start(eastLane, bounds, true);
+
+        Vec3d playerPos = new Vec3d(12.5, 64.0, 12.5);
+        BlockPos nextFootprint = new BlockPos(13, 64, 12);
+
+        GroundedLaneWalker.SchematicTargetLookup required = targetLookupRequiringBlock(Set.of(nextFootprint));
+
+        // Hold tick 1: pending verification.
+        walker.tick(playerPos, required, Set.of(), Set.of(nextFootprint));
+        assertFalse(walker.currentCommand().get().forwardPressed(), "Should hold tick 1");
+        assertEquals(GroundedLaneWalker.SupportCheckResult.EXPECTED_PENDING_VERIFICATION, walker.lastSupportCheck());
+        assertEquals(1, walker.supportHoldTicks());
+
+        // Hold tick 2: still pending.
+        walker.tick(playerPos, required, Set.of(), Set.of(nextFootprint));
+        assertFalse(walker.currentCommand().get().forwardPressed(), "Should hold tick 2");
+        assertEquals(2, walker.supportHoldTicks());
+
+        // Tick 3: block is now confirmed (lookup returns false = safe, removed from verification).
+        walker.tick(playerPos, targetLookupAllSafe(), Set.of(), Set.of());
+        assertTrue(walker.currentCommand().get().forwardPressed(), "Must resume when confirmed");
+        assertEquals(0, walker.supportHoldTicks(), "Hold counter resets when movement resumes");
+    }
+
+    /**
+     * 4. EXPECTED_PENDING_PLACEMENT holds, then resumes when placed.
+     */
+    @Test
+    void pendingPlacementHoldsThenResumes() {
+        GroundedSweepLane eastLane = new GroundedSweepLane(
+                0, 12, GroundedLaneDirection.EAST,
+                new BlockPos(10, 64, 12), new BlockPos(20, 64, 12),
+                new GroundedLaneCorridorBounds(10, 20, 10, 14),
+                1.0
+        );
+        GroundedSchematicBounds bounds = new GroundedSchematicBounds(
+                new BlockPos(10, 64, 10), new BlockPos(10, 64, 10), new BlockPos(20, 64, 14)
+        );
+
+        GroundedLaneWalker walker = new GroundedLaneWalker();
+        walker.start(eastLane, bounds, true);
+
+        Vec3d playerPos = new Vec3d(12.5, 64.0, 12.5);
+        BlockPos nextFootprint = new BlockPos(13, 64, 12);
+        java.util.Set<BlockPos> inQueue = Set.of(nextFootprint);
+        GroundedLaneWalker.SchematicTargetLookup required = targetLookupRequiringBlock(Set.of(nextFootprint));
+
+        // Hold: block in pending-placement queue.
+        walker.tick(playerPos, required, inQueue, Set.of());
+        assertFalse(walker.currentCommand().get().forwardPressed(), "Must hold while in pending-placement queue");
+        assertEquals(GroundedLaneWalker.SupportCheckResult.EXPECTED_PENDING_PLACEMENT, walker.lastSupportCheck());
+        assertEquals(1, walker.supportHoldTicks());
+
+        // Resume: block is now placed and confirmed (lookup returns false = safe).
+        walker.tick(playerPos, targetLookupAllSafe(), Set.of(), Set.of());
+        assertTrue(walker.currentCommand().get().forwardPressed(), "Must resume when placed and confirmed");
+        assertEquals(0, walker.supportHoldTicks(), "Hold counter resets when movement resumes");
+    }
+
+    /**
+     * 5. Hold timeout exceeded with EXPECTED_PENDING_PLACEMENT → enters fail state with
+     * diagnostic reason string.
+     */
+    @Test
+    void pendingPlacementTimesOut() {
+        GroundedSweepLane eastLane = new GroundedSweepLane(
+                0, 12, GroundedLaneDirection.EAST,
+                new BlockPos(10, 64, 12), new BlockPos(20, 64, 12),
+                new GroundedLaneCorridorBounds(10, 20, 10, 14),
+                1.0
+        );
+        GroundedSchematicBounds bounds = new GroundedSchematicBounds(
+                new BlockPos(10, 64, 10), new BlockPos(10, 64, 10), new BlockPos(20, 64, 14)
+        );
+
+        GroundedLaneWalker walker = new GroundedLaneWalker();
+        walker.start(eastLane, bounds, true);
+
+        Vec3d playerPos = new Vec3d(12.5, 64.0, 12.5);
+        BlockPos nextFootprint = new BlockPos(13, 64, 12);
+        java.util.Set<BlockPos> inQueue = Set.of(nextFootprint);
+        GroundedLaneWalker.SchematicTargetLookup required = targetLookupRequiringBlock(Set.of(nextFootprint));
+
+        // Tick MAX_SUPPORT_HOLD_TICKS_PENDING times — each tick the block is still pending.
+        int maxTicks = GroundedLaneWalker.MAX_SUPPORT_HOLD_TICKS_PENDING;
+        for (int i = 0; i < maxTicks - 1; i++) {
+            walker.tick(playerPos, required, inQueue, Set.of());
+            assertEquals(GroundedLaneWalkState.ACTIVE, walker.state(),
+                    "Walker should still be ACTIVE before timeout (tick " + (i + 1) + ")");
+        }
+
+        // The timeout tick: walker should fail.
+        walker.tick(playerPos, required, inQueue, Set.of());
+        assertEquals(GroundedLaneWalkState.FAILED, walker.state(),
+                "Walker must FAIL after hold timeout exceeded for EXPECTED_PENDING_PLACEMENT");
+        assertTrue(walker.failureReason().isPresent(), "Failure reason must be set");
+        assertTrue(walker.failureReason().get().contains("EXPECTED_PENDING_PLACEMENT"),
+                "Failure reason must mention the check state; got: " + walker.failureReason().get());
+        assertTrue(walker.failureReason().get().contains("ticks hold"),
+                "Failure reason must mention the hold duration; got: " + walker.failureReason().get());
+    }
+
+    /**
+     * 6. RIGHT_TWO/RIGHT_ONE column missing on WEST lane triggers hold.
+     * The failure holes were on RIGHT_TWO / RIGHT_ONE bands, not just centerline.
+     * This test verifies that the full walking footprint (lateral offset column) is checked.
+     */
+    @Test
+    void lateralFootprintMissingOnWestLaneIsDetected() {
+        // WEST lane: centerline Z=-59. Player at Z=-57 (RIGHT_TWO for WEST lane).
+        // For a WEST lane (facing -X), lateralStrafeSign = 1 * -1 = -1.
+        // lateralOffset for Z=-57 = -57 - (-59) = 2 → rightwardOffset = 2 * -1 = -2 → LEFT_TWO.
+        // Let's use Z=-61: offset = -61 - (-59) = -2 → rightwardOffset = -2 * -1 = 2 → RIGHT_TWO.
+        GroundedSweepLane westLane = new GroundedSweepLane(
+                5, -59, GroundedLaneDirection.WEST,
+                new BlockPos(-65, 64, -59), new BlockPos(-192, 64, -59),
+                new GroundedLaneCorridorBounds(-192, -65, -61, -57),
+                1.0
+        );
+        GroundedSchematicBounds bounds = new GroundedSchematicBounds(
+                new BlockPos(-192, 64, -61),
+                new BlockPos(-192, 64, -61),
+                new BlockPos(-65, 64, -57)
+        );
+
+        GroundedLaneWalker walker = new GroundedLaneWalker();
+        walker.start(westLane, bounds, true);
+
+        // Player is at Z=-61 (RIGHT_TWO offset), near the lane end.
+        // For WEST (along X), lateral axis is Z.
+        // playerZ = -61.3, so floor(-61.3) = -62. The player's lateral column is Z=-62
+        // (outside corridor, would trigger corridor check). Use Z=-60.3 instead:
+        // floor(-60.3) = -61 → player lateral column = Z=-61 (centerline is -59, so ≠ center).
+        Vec3d playerPos = new Vec3d(-180.5, 64.0, -60.3);
+
+        // Next footprint for WEST lane: floor(-180.5) = -181, forwardSign=-1 → nextX=-182.
+        // Lateral column: floor(-60.3) = -61 (not centerline -59).
+        BlockPos lateralFootprint = new BlockPos(-182, 64, -61);
+        BlockPos centerlineFootprint = new BlockPos(-182, 64, -59);
+
+        // Only the lateral offset block is required (centerline is fine/air).
+        // targetLookupRequiringBlock returns true (required/unconfirmed) for lateralFootprint only.
+        GroundedLaneWalker.SchematicTargetLookup lookup = targetLookupRequiringBlock(Set.of(lateralFootprint));
+
+        // Lateral block is in pending-placement queue.
+        java.util.Set<BlockPos> pendingPlacements = Set.of(lateralFootprint);
+
+        walker.tick(playerPos, lookup, pendingPlacements, Set.of());
+
+        // Walker must hold because the lateral footprint column is EXPECTED_PENDING_PLACEMENT.
+        assertTrue(walker.currentCommand().isPresent());
+        assertFalse(walker.currentCommand().get().forwardPressed(),
+                "Walker must hold when a non-centerline footprint column has a pending block");
+        // lastSupportCheckPos might be the lateral column or the centerline — the worst result wins.
+        assertTrue(
+                walker.lastSupportCheck() == GroundedLaneWalker.SupportCheckResult.EXPECTED_PENDING_PLACEMENT
+                || walker.lastSupportCheck() == GroundedLaneWalker.SupportCheckResult.EXPECTED_MISSING_UNTRACKED,
+                "Support check must be EXPECTED_PENDING_PLACEMENT or EXPECTED_MISSING_UNTRACKED when lateral footprint is blocked; got: "
+                        + walker.lastSupportCheck()
+        );
     }
 }
