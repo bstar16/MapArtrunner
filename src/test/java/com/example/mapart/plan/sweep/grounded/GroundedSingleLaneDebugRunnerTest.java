@@ -804,7 +804,9 @@ class GroundedSingleLaneDebugRunnerTest {
                 2,
                 10
         );
-        assertEquals(List.of(1, 2, 3, 4), burst.stream().map(GroundedSweepPlacementExecutor.PlacementTarget::placementIndex).toList());
+        // Sorted by progress-batch then band: batch-0 has LEFT_ONE(idx2) then CENTER(idx1);
+        // batch-1 has RIGHT_ONE(idx3); batch-2 has CENTER(idx4).
+        assertEquals(List.of(2, 1, 3, 4), burst.stream().map(GroundedSweepPlacementExecutor.PlacementTarget::placementIndex).toList());
     }
 
     @Test
@@ -829,7 +831,8 @@ class GroundedSingleLaneDebugRunnerTest {
         );
         // idx=2 is outside the progress window and is skipped.
         // idx=894 is at progress=10 (in burst) in a different lateral band and is included.
-        assertEquals(List.of(1, 894), burst.stream().map(GroundedSweepPlacementExecutor.PlacementTarget::placementIndex).toList());
+        // Sorted by progress-batch then band: LEFT_ONE(idx894) comes before CENTER(idx1).
+        assertEquals(List.of(894, 1), burst.stream().map(GroundedSweepPlacementExecutor.PlacementTarget::placementIndex).toList());
     }
 
     @Test
@@ -886,9 +889,12 @@ class GroundedSingleLaneDebugRunnerTest {
                 2,
                 10
         );
-        // Must include burst-zone targets from all bands, skipping only out-of-window items
+        // Sorted by progress-batch then band. Within each batch: L1 < C < R1.
+        // batch-0(X=10): L1(idx5), C(idx0), R1(idx254)
+        // batch-1(X=11): L1(idx6), C(idx1), R1(idx255)
+        // batch-2(X=12): L1(idx7), C(idx2)
         assertEquals(
-                List.of(0, 1, 2, 5, 6, 7, 254, 255),
+                List.of(5, 0, 254, 6, 1, 255, 7, 2),
                 burst.stream().map(GroundedSweepPlacementExecutor.PlacementTarget::placementIndex).toList()
         );
     }
@@ -896,6 +902,166 @@ class GroundedSingleLaneDebugRunnerTest {
     @Test
     void entryBurstTargetsAllowMultipleAttemptsPerTarget() {
         assertEquals(2, GroundedSingleLaneDebugRunner.maxEntryAttemptsPerTargetForTests());
+    }
+
+    @Test
+    void entryBurstTargetsEastFiveWideLaneRightTwoAtBaseProgressBeforeLaterProgress() {
+        // Regression: with band-major plan ordering (LEFT_TWO all indices first, then LEFT_ONE,
+        // etc.), RIGHT_TWO targets have the highest placement indices. The burst must sort by
+        // progress-batch then band so RIGHT_TWO at baseProgress comes before any target at
+        // baseProgress+1, regardless of placement index.
+        //
+        // eastLane: EAST, centerline Z=12, startX=10, bounds X∈[10,14] Z∈[10,14].
+        // Simulate band-major ordering: all Z=10 (LEFT_TWO) first (low indices),
+        // then Z=14 (RIGHT_TWO) last (high indices).
+        GroundedSweepLane lane = eastLane();
+        GroundedSchematicBounds bounds = eastLaneBounds();
+        List<GroundedSweepPlacementExecutor.PlacementTarget> pending = new ArrayList<>();
+        // LEFT_TWO (Z=10): indices 0..2 for X=10,11,12
+        pending.add(new GroundedSweepPlacementExecutor.PlacementTarget(0, new BlockPos(10, 64, 10)));
+        pending.add(new GroundedSweepPlacementExecutor.PlacementTarget(1, new BlockPos(11, 64, 10)));
+        pending.add(new GroundedSweepPlacementExecutor.PlacementTarget(2, new BlockPos(12, 64, 10)));
+        // LEFT_ONE (Z=11): indices 10..12
+        pending.add(new GroundedSweepPlacementExecutor.PlacementTarget(10, new BlockPos(10, 64, 11)));
+        pending.add(new GroundedSweepPlacementExecutor.PlacementTarget(11, new BlockPos(11, 64, 11)));
+        pending.add(new GroundedSweepPlacementExecutor.PlacementTarget(12, new BlockPos(12, 64, 11)));
+        // CENTER (Z=12): indices 20..22
+        pending.add(new GroundedSweepPlacementExecutor.PlacementTarget(20, new BlockPos(10, 64, 12)));
+        pending.add(new GroundedSweepPlacementExecutor.PlacementTarget(21, new BlockPos(11, 64, 12)));
+        pending.add(new GroundedSweepPlacementExecutor.PlacementTarget(22, new BlockPos(12, 64, 12)));
+        // RIGHT_ONE (Z=13): indices 30..32
+        pending.add(new GroundedSweepPlacementExecutor.PlacementTarget(30, new BlockPos(10, 64, 13)));
+        pending.add(new GroundedSweepPlacementExecutor.PlacementTarget(31, new BlockPos(11, 64, 13)));
+        pending.add(new GroundedSweepPlacementExecutor.PlacementTarget(32, new BlockPos(12, 64, 13)));
+        // RIGHT_TWO (Z=14): indices 40..42 (highest — the "starved" band without the fix)
+        pending.add(new GroundedSweepPlacementExecutor.PlacementTarget(40, new BlockPos(10, 64, 14)));
+        pending.add(new GroundedSweepPlacementExecutor.PlacementTarget(41, new BlockPos(11, 64, 14)));
+        pending.add(new GroundedSweepPlacementExecutor.PlacementTarget(42, new BlockPos(12, 64, 14)));
+
+        List<GroundedSweepPlacementExecutor.PlacementTarget> burst = GroundedSingleLaneDebugRunner.entryBurstTargetsForTests(
+                lane, bounds, pending, 2, 10);
+
+        List<Integer> indices = burst.stream().map(GroundedSweepPlacementExecutor.PlacementTarget::placementIndex).toList();
+
+        // All 5 bands at X=10 (batch-0) must appear before any X=11 or X=12 target.
+        // Sorted order: L2(0), L1(10), C(20), R1(30), R2(40), then batch-1, then batch-2.
+        assertEquals(List.of(0, 10, 20, 30, 40, 1, 11, 21, 31, 41, 2, 12, 22, 32, 42), indices);
+
+        // RIGHT_TWO at baseProgress (idx=40) must be at position 4 (before any later-progress target).
+        int rightTwoBaseIdx = indices.indexOf(40);
+        assertTrue(rightTwoBaseIdx >= 0, "RIGHT_TWO at baseProgress must be in burst list");
+        // All targets before it must be at X=10 (batch-0).
+        for (int i = 0; i < rightTwoBaseIdx; i++) {
+            BlockPos pos = burst.get(i).worldPos();
+            assertEquals(10, pos.getX(), "All targets before RIGHT_TWO@baseProgress must be at X=10");
+        }
+    }
+
+    @Test
+    void entryBurstTargetsWestLaneRightTwoAtBaseProgressBeforeLaterProgress() {
+        // WEST lane: direction=-X, forwardSign=-1. Right of travel is -Z.
+        // RIGHT_TWO at baseProgress (high X start, low Z) must appear before any target at X=start-1.
+        // Centerline Z=80, start X=200, going west. RIGHT_TWO = Z=78.
+        GroundedSweepLane lane = new GroundedSweepLane(
+                0, 80, GroundedLaneDirection.WEST,
+                new BlockPos(200, 64, 80), new BlockPos(196, 64, 80),
+                new GroundedLaneCorridorBounds(196, 200, 78, 82), 1.0);
+        GroundedSchematicBounds bounds = new GroundedSchematicBounds(
+                new BlockPos(196, 64, 78),
+                new BlockPos(196, 64, 78),
+                new BlockPos(200, 64, 82));
+
+        // Band-major ordering: LEFT_TWO (Z=82) first, RIGHT_TWO (Z=78) last.
+        // For WEST: left is +Z, so LEFT_TWO = Z=82.  right is -Z, RIGHT_TWO = Z=78.
+        List<GroundedSweepPlacementExecutor.PlacementTarget> pending = new ArrayList<>();
+        // LEFT_TWO (Z=82): indices 0..2 for X=200,199,198
+        pending.add(new GroundedSweepPlacementExecutor.PlacementTarget(0, new BlockPos(200, 64, 82)));
+        pending.add(new GroundedSweepPlacementExecutor.PlacementTarget(1, new BlockPos(199, 64, 82)));
+        pending.add(new GroundedSweepPlacementExecutor.PlacementTarget(2, new BlockPos(198, 64, 82)));
+        // CENTER (Z=80): indices 10..12
+        pending.add(new GroundedSweepPlacementExecutor.PlacementTarget(10, new BlockPos(200, 64, 80)));
+        pending.add(new GroundedSweepPlacementExecutor.PlacementTarget(11, new BlockPos(199, 64, 80)));
+        pending.add(new GroundedSweepPlacementExecutor.PlacementTarget(12, new BlockPos(198, 64, 80)));
+        // RIGHT_TWO (Z=78): indices 20..22 (last band, highest indices)
+        pending.add(new GroundedSweepPlacementExecutor.PlacementTarget(20, new BlockPos(200, 64, 78)));
+        pending.add(new GroundedSweepPlacementExecutor.PlacementTarget(21, new BlockPos(199, 64, 78)));
+        pending.add(new GroundedSweepPlacementExecutor.PlacementTarget(22, new BlockPos(198, 64, 78)));
+
+        // baseProgress=200 (WEST start), allowedProgress={200,199,198}
+        List<GroundedSweepPlacementExecutor.PlacementTarget> burst = GroundedSingleLaneDebugRunner.entryBurstTargetsForTests(
+                lane, bounds, pending, 2, 200);
+
+        List<Integer> indices = burst.stream().map(GroundedSweepPlacementExecutor.PlacementTarget::placementIndex).toList();
+
+        // batch-0 (X=200): L2(0), C(10), R2(20) — must all come before batch-1 (X=199).
+        // Sorted: L2(0), C(10), R2(20), L2(1), C(11), R2(21), L2(2), C(12), R2(22)
+        assertEquals(List.of(0, 10, 20, 1, 11, 21, 2, 12, 22), indices);
+
+        // RIGHT_TWO at X=200 (idx=20) must appear before any X=199 target.
+        int r2Pos = indices.indexOf(20);
+        assertTrue(r2Pos >= 0, "RIGHT_TWO at baseProgress must be selected");
+        for (int i = 0; i < r2Pos; i++) {
+            assertEquals(200, burst.get(i).worldPos().getX(), "All targets before RIGHT_TWO@baseProgress must be at X=200");
+        }
+    }
+
+    @Test
+    void entryBurstNonContiguousIndexJumpDoesNotSkipBaseProgressBands() {
+        // Regression for index-ordered burst: when RIGHT_TWO (highest placement index) would only
+        // be reached on tick 13+ in a 16-tick burst, the sort fix must bring it to position 4
+        // in the burst list so it is always reached on tick 3 regardless of index order.
+        GroundedSweepLane lane = eastLane();
+        GroundedSchematicBounds bounds = eastLaneBounds();
+        // Simulate real plan: 5 bands, baseProgress=10, EAST. Indices are band-major (high for R2).
+        List<GroundedSweepPlacementExecutor.PlacementTarget> pending = new ArrayList<>();
+        pending.add(new GroundedSweepPlacementExecutor.PlacementTarget(0,   new BlockPos(10, 64, 10)));  // L2 X=10
+        pending.add(new GroundedSweepPlacementExecutor.PlacementTarget(1,   new BlockPos(11, 64, 10)));  // L2 X=11 (out of window)
+        pending.add(new GroundedSweepPlacementExecutor.PlacementTarget(128, new BlockPos(10, 64, 11)));  // L1 X=10
+        pending.add(new GroundedSweepPlacementExecutor.PlacementTarget(256, new BlockPos(10, 64, 12)));  // C  X=10
+        pending.add(new GroundedSweepPlacementExecutor.PlacementTarget(384, new BlockPos(10, 64, 13)));  // R1 X=10
+        pending.add(new GroundedSweepPlacementExecutor.PlacementTarget(512, new BlockPos(10, 64, 14)));  // R2 X=10 ← far-side, high index
+
+        List<GroundedSweepPlacementExecutor.PlacementTarget> burst = GroundedSingleLaneDebugRunner.entryBurstTargetsForTests(
+                lane, bounds, pending, 2, 10);
+
+        List<Integer> indices = burst.stream().map(GroundedSweepPlacementExecutor.PlacementTarget::placementIndex).toList();
+
+        // Only X=10 targets are in window {10,11,12}... but X=11 (L2) is also in window.
+        // In window: idx0(L2,X=10), idx1(L2,X=11), idx128(L1,X=10), idx256(C,X=10), idx384(R1,X=10), idx512(R2,X=10)
+        // Sorted: batch-0(X=10): L2(0),L1(128),C(256),R1(384),R2(512) then batch-1(X=11): L2(1)
+        assertEquals(List.of(0, 128, 256, 384, 512, 1), indices);
+
+        // RIGHT_TWO at X=10 (idx=512) is at position 4 — reached on tick 3, not tick 13.
+        assertEquals(4, indices.indexOf(512));
+    }
+
+    @Test
+    void allBaseProgressTargetsAttemptedReturnsFalseWhenFarSideBandUnstated() {
+        // Walker-start guard: if RIGHT_TWO at baseProgress has not been attempted, the guard
+        // must hold the walker until the burst covers it.
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
+
+        GroundedSweepLane lane = eastLane();
+        // 5 pending targets at X=10 (baseProgress): L2, L1, C, R1, R2
+        runner.seedLanePlacementsForTests(List.of(
+                new GroundedSweepPlacementExecutor.PlacementTarget(0, new BlockPos(10, 64, 10)),   // L2
+                new GroundedSweepPlacementExecutor.PlacementTarget(1, new BlockPos(10, 64, 11)),   // L1
+                new GroundedSweepPlacementExecutor.PlacementTarget(2, new BlockPos(10, 64, 12)),   // C
+                new GroundedSweepPlacementExecutor.PlacementTarget(3, new BlockPos(10, 64, 13)),   // R1
+                new GroundedSweepPlacementExecutor.PlacementTarget(4, new BlockPos(10, 64, 14))    // R2 ← must be covered
+        ));
+
+        // No attempts yet → guard should block walker start.
+        assertFalse(runner.allBaseProgressTargetsAttemptedForTests(lane, 10));
+
+        // Attempt all except RIGHT_TWO → still blocked.
+        runner.seedEntryAttemptsForTests(Map.of(0, 1, 1, 1, 2, 1, 3, 1));
+        assertFalse(runner.allBaseProgressTargetsAttemptedForTests(lane, 10));
+
+        // Attempt RIGHT_TWO too → guard released.
+        runner.seedEntryAttemptsForTests(Map.of(0, 1, 1, 1, 2, 1, 3, 1, 4, 1));
+        assertTrue(runner.allBaseProgressTargetsAttemptedForTests(lane, 10));
     }
 
     @Test
