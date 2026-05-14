@@ -1610,6 +1610,20 @@ public final class GroundedSingleLaneDebugRunner {
                 failLaneStart(client, "Unable to confirm lane yaw/body/head lock before starting lane walk.");
                 return;
             }
+            // Hold walker start until the entry burst has attempted every pending target at
+            // baseProgress (all 5 bands). This prevents RIGHT_TWO and other far-side start-window
+            // targets from being silently skipped when the yaw-lock completes faster than the
+            // burst can cover the full first-column cross-section.
+            // The burst continues running from the top of tickPendingLaneStart each tick.
+            // Once the burst times out (entryBurstTicks >= ENTRY_BURST_DURATION_TICKS) the hold
+            // is released regardless, and checkStartWindowBeforeWalker records any remaining misses.
+            if (entryBurstTicks < ENTRY_BURST_DURATION_TICKS
+                    && !allBaseProgressTargetsAttempted(pendingLaneStart, entryAnchor)) {
+                traceGroundedEvent("START_WALKER held: waiting for base-progress entry burst"
+                        + " baseProgress=" + entryAnchor.progressCoordinate()
+                        + " burstTicks=" + entryBurstTicks);
+                return;
+            }
             // World-truth scan of the entry window before handing off to the lane walker.
             // Any start-window block still missing that is DEFERRED (too far behind the player
             // to be reached by the lane walker) is recorded as a forward leftover here so
@@ -1684,6 +1698,29 @@ public final class GroundedSingleLaneDebugRunner {
         entryBurstTicks++;
         List<GroundedSweepPlacementExecutor.PlacementTarget> burstTargets = entryBurstTargets(lane, bounds, entryAnchor, pendingPlacementTargets, activeSettings.sweepHalfWidth());
         traceGroundedEvent("entry burst target count=" + burstTargets.size() + " tick=" + entryBurstTicks);
+        // On the first burst tick, log which watched targets are in the burst list (ELIGIBLE)
+        // and which are pending but absent from it (SKIPPED with reason).
+        if (entryBurstTicks == 1) {
+            Set<Integer> burstIndexSet = new java.util.HashSet<>();
+            for (GroundedSweepPlacementExecutor.PlacementTarget t : burstTargets) {
+                burstIndexSet.add(t.placementIndex());
+            }
+            for (GroundedSweepPlacementExecutor.PlacementTarget target : pendingPlacementTargets) {
+                if (!isWatchedNearStartTarget(lane, target.worldPos())) continue;
+                if (burstIndexSet.contains(target.placementIndex())) {
+                    traceWatchTarget("WATCH_TARGET_ENTRY_BURST_ELIGIBLE", lane, target.worldPos(), target.placementIndex(),
+                            "burstPosition=" + burstTargets.indexOf(target) + "/" + burstTargets.size());
+                } else {
+                    int prog = lane.direction().alongX() ? target.worldPos().getX() : target.worldPos().getZ();
+                    int baseProgress = entryAnchor.progressCoordinate();
+                    int progressDelta = (prog - baseProgress) * lane.direction().forwardSign();
+                    String skipReason = progressDelta < 0 ? "BEFORE_BASE_PROGRESS"
+                            : (progressDelta > 2 ? "BEYOND_BURST_WINDOW" : "BOUNDS_FAIL");
+                    traceWatchTarget("WATCH_TARGET_ENTRY_BURST_SKIPPED", lane, target.worldPos(), target.placementIndex(),
+                            "reason=" + skipReason + " progressDelta=" + progressDelta);
+                }
+            }
+        }
         int attempts = 0;
         for (GroundedSweepPlacementExecutor.PlacementTarget target : burstTargets) {
             if (attempts >= ENTRY_BURST_ATTEMPTS_PER_TICK) {
@@ -1806,6 +1843,28 @@ public final class GroundedSingleLaneDebugRunner {
             traceGroundedEvent("start-window check: " + misses + " missing target(s) before walker start"
                     + " lane=" + lane.laneIndex() + " dir=" + lane.direction());
         }
+    }
+
+    /**
+     * Returns true when every pending target at the entry anchor's base-progress coordinate has
+     * been attempted at least once by the entry burst (or is no longer in pendingPlacementTargets
+     * because it was already placed/resolved). Used to hold walker start until the entry burst
+     * has covered all start-window bands — including far-side RIGHT_TWO — before handing off.
+     */
+    private boolean allBaseProgressTargetsAttempted(GroundedSweepLane lane, GroundedLaneEntryAnchor entryAnchor) {
+        if (lane == null || entryAnchor == null || activeSettings == null) return true;
+        int baseProgress = entryAnchor.progressCoordinate();
+        int halfWidth = activeSettings.sweepHalfWidth();
+        for (GroundedSweepPlacementExecutor.PlacementTarget target : pendingPlacementTargets) {
+            BlockPos pos = target.worldPos();
+            int progress = lane.direction().alongX() ? pos.getX() : pos.getZ();
+            if (progress != baseProgress) continue;
+            if (Math.abs(lateralDeltaFromCenterline(lane.direction(), lane.centerlineCoordinate(), pos)) > halfWidth) continue;
+            if (entryAttemptsByPlacementIndex.getOrDefault(target.placementIndex(), 0) < 1) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private boolean stepToLaneEntryTarget(MinecraftClient client, GroundedSweepLane lane, GroundedLaneEntryAnchor entryAnchor) {
@@ -3413,18 +3472,41 @@ public final class GroundedSingleLaneDebugRunner {
             }
             selected.add(target);
         }
+        // Sort by progress batch (base first, then base+1, base+2), then by band within each
+        // batch, then by placement index. This guarantees all bands at baseProgress — including
+        // far-side bands like RIGHT_TWO — are attempted before any target at a later progress
+        // coordinate, so they are never starved by the per-tick attempt cap.
+        selected.sort(Comparator
+                .<GroundedSweepPlacementExecutor.PlacementTarget>comparingInt(t -> {
+                    int prog = lane.direction().alongX() ? t.worldPos().getX() : t.worldPos().getZ();
+                    return (prog - baseProgress) * forwardSign;
+                })
+                .thenComparingInt(t -> GroundedSweepPlacementExecutor.laneRelativeBand(lane, t.worldPos()).ordinal())
+                .thenComparingInt(GroundedSweepPlacementExecutor.PlacementTarget::placementIndex));
         if (!selected.isEmpty()) {
-            int minIdx = selected.get(0).placementIndex();
-            int maxIdx = selected.get(selected.size() - 1).placementIndex();
-            int minProg = selected.stream()
-                    .mapToInt(t -> lane.direction().alongX() ? t.worldPos().getX() : t.worldPos().getZ())
-                    .min().orElse(-1);
-            int maxProg = selected.stream()
-                    .mapToInt(t -> lane.direction().alongX() ? t.worldPos().getX() : t.worldPos().getZ())
-                    .max().orElse(-1);
-            MapArtMod.LOGGER.info("[grounded-trace:event] entry burst selected idx=" + minIdx + ".." + maxIdx
+            int minIdx = selected.stream().mapToInt(GroundedSweepPlacementExecutor.PlacementTarget::placementIndex).min().orElse(-1);
+            int maxIdx = selected.stream().mapToInt(GroundedSweepPlacementExecutor.PlacementTarget::placementIndex).max().orElse(-1);
+            Set<Integer> progressCoords = new LinkedHashSet<>();
+            Set<String> bandNames = new LinkedHashSet<>();
+            boolean rightTwoAtBase = false;
+            for (GroundedSweepPlacementExecutor.PlacementTarget t : selected) {
+                int prog = lane.direction().alongX() ? t.worldPos().getX() : t.worldPos().getZ();
+                progressCoords.add(prog);
+                GroundedSweepPlacementExecutor.LaneRelativeBand band = GroundedSweepPlacementExecutor.laneRelativeBand(lane, t.worldPos());
+                bandNames.add(band.name());
+                if (prog == baseProgress && band == GroundedSweepPlacementExecutor.LaneRelativeBand.RIGHT_TWO) {
+                    rightTwoAtBase = true;
+                }
+            }
+            MapArtMod.LOGGER.info("[grounded-trace:event] entry burst"
+                    + " lane=" + lane.laneIndex()
+                    + " dir=" + lane.direction()
+                    + " baseProgress=" + baseProgress
                     + " count=" + selected.size()
-                    + " progress=" + minProg + ".." + maxProg);
+                    + " idx=" + minIdx + ".." + maxIdx
+                    + " progress=" + progressCoords
+                    + " bands=" + bandNames
+                    + " rightTwoAtBase=" + rightTwoAtBase);
         }
         return List.copyOf(selected);
     }
@@ -4950,6 +5032,23 @@ public final class GroundedSingleLaneDebugRunner {
 
     static int maxEntryAttemptsPerTargetForTests() {
         return MAX_ENTRY_ATTEMPTS_PER_TARGET;
+    }
+
+    void seedEntryAttemptsForTests(Map<Integer, Integer> attemptsByIndex) {
+        entryAttemptsByPlacementIndex = new HashMap<>(attemptsByIndex);
+    }
+
+    boolean allBaseProgressTargetsAttemptedForTests(GroundedSweepLane lane, int baseProgress) {
+        if (lane == null || activeSettings == null) return true;
+        int halfWidth = activeSettings.sweepHalfWidth();
+        for (GroundedSweepPlacementExecutor.PlacementTarget target : pendingPlacementTargets) {
+            BlockPos pos = target.worldPos();
+            int prog = lane.direction().alongX() ? pos.getX() : pos.getZ();
+            if (prog != baseProgress) continue;
+            if (Math.abs(lateralDeltaFromCenterline(lane.direction(), lane.centerlineCoordinate(), pos)) > halfWidth) continue;
+            if (entryAttemptsByPlacementIndex.getOrDefault(target.placementIndex(), 0) < 1) return false;
+        }
+        return true;
     }
 
 
