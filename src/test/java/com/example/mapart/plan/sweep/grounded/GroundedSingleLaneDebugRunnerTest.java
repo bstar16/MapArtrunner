@@ -3181,4 +3181,195 @@ class GroundedSingleLaneDebugRunnerTest {
         assertTrue(detailsLine.contains("\"records\""),
                 "event should contain a records array");
     }
+
+    // ─── Walker support guard tests ───────────────────────────────────────────
+
+    /**
+     * WEST lane, near end: if the next footprint block is in the pending-placement set
+     * (not yet placed), the walker must hold (forwardPressed=false).
+     */
+    @Test
+    void westLaneNearEndSupportBlocksRequiredBeforeWalking() {
+        // Build a WEST lane that runs from X=-65 to X=-192, centerline Z=-59.
+        GroundedSweepLane westLane = new GroundedSweepLane(
+                5, -59, GroundedLaneDirection.WEST,
+                new BlockPos(-65, 64, -59), new BlockPos(-192, 64, -59),
+                new GroundedLaneCorridorBounds(-192, -65, -61, -57),
+                1.0
+        );
+        GroundedSchematicBounds bounds = new GroundedSchematicBounds(
+                new BlockPos(-192, 64, -61),
+                new BlockPos(-192, 64, -61),
+                new BlockPos(-65, 64, -57)
+        );
+
+        GroundedLaneWalker walker = new GroundedLaneWalker();
+        walker.start(westLane, bounds, true);
+
+        // Player is near the lane end (X=-184, 8 blocks from end at X=-192).
+        Vec3d playerPos = new Vec3d(-184.5, 64.0, -59.5);
+
+        // Next footprint for a WEST lane at playerX=-184: floor(-184.5)=-185, forwardSign=-1 → nextX=-186.
+        BlockPos expectedFootprint = new BlockPos(-186, 64, -59);
+
+        // Mark that footprint block as pending placement (not yet placed).
+        java.util.Set<BlockPos> pendingPlacements = java.util.Set.of(expectedFootprint);
+        java.util.Set<BlockPos> pendingVerifications = java.util.Set.of();
+
+        // Lookup: block is NOT in world.
+        PlacementCompletionLookup lookup = (pos, block) -> false;
+
+        walker.tick(playerPos, lookup, pendingPlacements, pendingVerifications);
+
+        // Walker must hold (forwardPressed = false).
+        assertTrue(walker.currentCommand().isPresent(), "Walker must still be ACTIVE");
+        assertFalse(walker.currentCommand().get().forwardPressed(),
+                "Walker must hold when next footprint is in pending-placement set");
+        assertEquals(GroundedLaneWalker.SupportCheckResult.MISSING_UNTRACKED, walker.lastSupportCheck(),
+                "Support check result must be MISSING_UNTRACKED when block is in pending-placement set");
+    }
+
+    /**
+     * Walker must hold forward movement when the next footprint support block is not placed.
+     */
+    @Test
+    void walkerHoldsWhenNextFootprintSupportMissing() {
+        GroundedSweepLane eastLane = new GroundedSweepLane(
+                0, 12, GroundedLaneDirection.EAST,
+                new BlockPos(10, 64, 12), new BlockPos(20, 64, 12),
+                new GroundedLaneCorridorBounds(10, 20, 10, 14),
+                1.0
+        );
+        GroundedSchematicBounds bounds = new GroundedSchematicBounds(
+                new BlockPos(10, 64, 10), new BlockPos(10, 64, 10), new BlockPos(20, 64, 14)
+        );
+
+        GroundedLaneWalker walker = new GroundedLaneWalker();
+        walker.start(eastLane, bounds, true);
+
+        Vec3d playerPos = new Vec3d(12.5, 64.0, 12.5);
+        // Next footprint: floor(12.5)=12, EAST forwardSign=+1 → nextX=13, Z=centerline=12
+        BlockPos nextFootprint = new BlockPos(13, 64, 12);
+
+        // Mark it as a pending placement (in the placement queue but not yet placed).
+        java.util.Set<BlockPos> pendingPlacements = java.util.Set.of(nextFootprint);
+        java.util.Set<BlockPos> pendingVerifications = java.util.Set.of();
+
+        // Lookup: block is absent from world.
+        PlacementCompletionLookup lookup = (pos, block) -> false;
+
+        walker.tick(playerPos, lookup, pendingPlacements, pendingVerifications);
+
+        assertTrue(walker.currentCommand().isPresent(), "Walker must be ACTIVE");
+        assertFalse(walker.currentCommand().get().forwardPressed(),
+                "Walker must hold when next footprint support block is missing");
+        assertEquals(GroundedLaneWalker.SupportCheckResult.MISSING_UNTRACKED, walker.lastSupportCheck());
+        assertEquals(nextFootprint, walker.lastSupportCheckPos());
+    }
+
+    /**
+     * Walker must hold when the support block placement was sent but not yet server-confirmed.
+     */
+    @Test
+    void walkerHoldsWhenSupportPendingVerification() {
+        GroundedSweepLane eastLane = new GroundedSweepLane(
+                0, 12, GroundedLaneDirection.EAST,
+                new BlockPos(10, 64, 12), new BlockPos(20, 64, 12),
+                new GroundedLaneCorridorBounds(10, 20, 10, 14),
+                1.0
+        );
+        GroundedSchematicBounds bounds = new GroundedSchematicBounds(
+                new BlockPos(10, 64, 10), new BlockPos(10, 64, 10), new BlockPos(20, 64, 14)
+        );
+
+        GroundedLaneWalker walker = new GroundedLaneWalker();
+        walker.start(eastLane, bounds, true);
+
+        Vec3d playerPos = new Vec3d(12.5, 64.0, 12.5);
+        BlockPos nextFootprint = new BlockPos(13, 64, 12);
+
+        // Block is in pending verification set (placed, awaiting server confirmation).
+        java.util.Set<BlockPos> pendingPlacements = java.util.Set.of();
+        java.util.Set<BlockPos> pendingVerifications = java.util.Set.of(nextFootprint);
+
+        // Lookup: block is NOT confirmed in world yet (verification still pending).
+        PlacementCompletionLookup lookup = (pos, block) -> false;
+
+        walker.tick(playerPos, lookup, pendingPlacements, pendingVerifications);
+
+        assertTrue(walker.currentCommand().isPresent(), "Walker must be ACTIVE");
+        assertFalse(walker.currentCommand().get().forwardPressed(),
+                "Walker must hold when support is pending server verification");
+        assertEquals(GroundedLaneWalker.SupportCheckResult.PENDING_VERIFICATION, walker.lastSupportCheck());
+        assertEquals(nextFootprint, walker.lastSupportCheckPos());
+    }
+
+    /**
+     * Walker must resume normal forward movement once the support block is confirmed in the world.
+     */
+    @Test
+    void walkerResumesOnceSupportConfirmed() {
+        GroundedSweepLane eastLane = new GroundedSweepLane(
+                0, 12, GroundedLaneDirection.EAST,
+                new BlockPos(10, 64, 12), new BlockPos(20, 64, 12),
+                new GroundedLaneCorridorBounds(10, 20, 10, 14),
+                1.0
+        );
+        GroundedSchematicBounds bounds = new GroundedSchematicBounds(
+                new BlockPos(10, 64, 10), new BlockPos(10, 64, 10), new BlockPos(20, 64, 14)
+        );
+
+        GroundedLaneWalker walker = new GroundedLaneWalker();
+        walker.start(eastLane, bounds, true);
+
+        Vec3d playerPos = new Vec3d(12.5, 64.0, 12.5);
+        BlockPos nextFootprint = new BlockPos(13, 64, 12);
+
+        // Tick 1: support is pending verification — walker should hold.
+        PlacementCompletionLookup notYetConfirmed = (pos, block) -> false;
+        walker.tick(playerPos, notYetConfirmed,
+                java.util.Set.of(), java.util.Set.of(nextFootprint));
+        assertFalse(walker.currentCommand().get().forwardPressed(),
+                "Walker should hold while support is pending verification");
+
+        // Tick 2: block is now confirmed in the world (lookup returns true, not in pending sets).
+        PlacementCompletionLookup confirmed = (pos, block) -> true;
+        walker.tick(playerPos, confirmed,
+                java.util.Set.of(), java.util.Set.of());
+        assertTrue(walker.currentCommand().get().forwardPressed(),
+                "Walker must resume forward movement once support block is confirmed");
+        assertEquals(GroundedLaneWalker.SupportCheckResult.ALREADY_CORRECT, walker.lastSupportCheck());
+    }
+
+    /**
+     * Recovery auto-resume from an interrupted/active state must NOT fail with "already active".
+     * The fix: clearActiveRunState() is called before startFullSweep() during recovery auto-resume.
+     */
+    @Test
+    void recoveryAutoResumeFromInterruptedStateDoesNotFailWithAlreadyActive() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        BuildSession session = sessionWithOrigin(new Vec3i(11, 1, 11));
+        GroundedSweepSettings settings = GroundedSweepSettings.defaults();
+
+        // Start a full sweep — runner becomes active.
+        assertTrue(runner.startFullSweep(session, settings).isEmpty());
+        assertTrue(runner.isActive(), "Runner must be active after startFullSweep");
+
+        // Activate recovery (simulates player falling below build plane mid-lane).
+        GroundedSweepLane lane = laneForIndex(session, settings, 0);
+        runner.activateRecoveryForTests(lane, GroundedRecoveryReason.BELOW_BUILD_PLANE);
+        assertTrue(runner.getRecoveryState().isActive(), "Recovery must be active");
+
+        // Simulate recovery stabilization completing and auto-resume firing.
+        // Before the fix, this returned "Grounded single-lane debug run is already active."
+        // because activeLane was still non-null when startFullSweep ran validateStart.
+        Optional<String> err = runner.simulateRecoveryAutoResumeForTests(session, settings);
+
+        // The auto-resume must succeed (no "already active" error).
+        assertTrue(err.isEmpty(),
+                "Recovery auto-resume must not fail with 'already active'; got: " + err.orElse(""));
+        assertTrue(runner.isActive(), "Runner must be active after successful recovery auto-resume");
+        assertFalse(runner.getRecoveryState().isActive(),
+                "Recovery state must be cleared after auto-resume");
+    }
 }

@@ -20,6 +20,45 @@ public final class GroundedDiagnostics {
     private static final Gson GSON = new Gson();
     private static final int MAX_EVENTS_PER_SNAPSHOT = 50;
 
+    // ── Walker support-guard diagnostic tags ─────────────────────────────────
+    /**
+     * Emitted each tick while the walker is ACTIVE.
+     * Fields: lane, dir, playerPos, footprintPos, supportState, laneEndDistance.
+     */
+    public static final String WALKER_SUPPORT_CHECK = "WALKER_SUPPORT_CHECK";
+
+    /**
+     * Emitted when forward movement is held because the next footprint block has not been placed
+     * or is still awaiting server verification.
+     * Fields: same as WALKER_SUPPORT_CHECK plus lastPlacementResult if available.
+     */
+    public static final String WALKER_HELD_FOR_MISSING_SUPPORT = "WALKER_HELD_FOR_MISSING_SUPPORT";
+
+    /**
+     * Emitted when the support block at the next footprint was placed and sent to the server
+     * but the verification tick has not yet confirmed it.
+     */
+    public static final String WALKER_SUPPORT_PENDING_VERIFICATION = "WALKER_SUPPORT_PENDING_VERIFICATION";
+
+    /**
+     * Emitted when a pending verification for a footprint block resolves successfully.
+     */
+    public static final String WALKER_SUPPORT_CONFIRMED = "WALKER_SUPPORT_CONFIRMED";
+
+    /**
+     * Emitted when the footprint block is absent from both the world and all pending queues.
+     * The walker proceeds (since it cannot stall indefinitely for an untracked block) but the
+     * event is recorded so it shows up in diagnostics for post-mortem analysis.
+     */
+    public static final String WALKER_SUPPORT_MISSING_UNTRACKED = "WALKER_SUPPORT_MISSING_UNTRACKED";
+
+    /**
+     * Emitted on every tick for WEST lanes when the player is within 8 blocks of the lane end.
+     * Fields: laneIndex, laneDirection, playerPos, footprintPos, progressCoord, laneEndDistance,
+     *         targetWorldPos, placementIndex (if known), targetState.
+     */
+    public static final String WEST_NEAR_END_TARGET_TRACE = "WEST_NEAR_END_TARGET_TRACE";
+
     private boolean enabled = true;
     private final Path overrideLogPath;
 
