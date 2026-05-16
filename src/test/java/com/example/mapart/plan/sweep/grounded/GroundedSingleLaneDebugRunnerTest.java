@@ -442,6 +442,7 @@ class GroundedSingleLaneDebugRunnerTest {
     @Test
     void placedResultCreatesPendingVerificationInsteadOfImmediateSuccess() {
         GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        runner.setGroundedTraceEnabled(true);
         assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
         runner.seedLanePlacementsForTests(List.of(new GroundedSweepPlacementExecutor.PlacementTarget(4, new BlockPos(11, 64, 12))));
 
@@ -452,6 +453,74 @@ class GroundedSingleLaneDebugRunnerTest {
         assertEquals(1, status.pendingVerification());
         assertTrue(runner.hasPendingVerificationForTests(4));
         assertTrue(runner.pendingPlacementIndicesForTests().isEmpty());
+    }
+
+    @Test
+    void acceptedPendingPlacementDoesNotImmediatelyCountAsMissed() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        runner.setGroundedTraceEnabled(true);
+        assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
+        runner.seedLanePlacementsForTests(List.of(new GroundedSweepPlacementExecutor.PlacementTarget(40, new BlockPos(11, 64, 12))));
+
+        runner.recordPlacementAcceptedPendingForTests(40, new BlockPos(11, 64, 12), 10);
+
+        GroundedSingleLaneDebugRunner.DebugStatus status = runner.status();
+        assertEquals(0, status.missedPlacements());
+        assertEquals(1, status.pendingVerification());
+        assertTrue(runner.pendingPlacementIndicesForTests().isEmpty());
+        assertTrue(runner.groundedTraceEventsForTests().stream()
+                .anyMatch(event -> event.contains("PLACEMENT_ACCEPTED_PENDING_VERIFICATION")
+                        && event.contains("placementIndex=40")));
+    }
+
+    @Test
+    void acceptedPendingVerificationSuccessRecordsConfirmedSuccess() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
+        runner.seedLanePlacementsForTests(List.of(new GroundedSweepPlacementExecutor.PlacementTarget(41, new BlockPos(11, 64, 12))));
+        runner.recordPlacementAcceptedPendingForTests(41, new BlockPos(11, 64, 12), 10);
+
+        runner.processPendingVerificationsForTests(Map.of(41, true), 13);
+
+        GroundedSingleLaneDebugRunner.DebugStatus status = runner.status();
+        assertEquals(1, status.successfulPlacements());
+        assertEquals(0, status.missedPlacements());
+        assertEquals(0, status.pendingVerification());
+    }
+
+    @Test
+    void acceptedPendingVerificationTimeoutEventuallyBecomesMissedLeftover() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
+        runner.seedLanePlacementsForTests(List.of(new GroundedSweepPlacementExecutor.PlacementTarget(42, new BlockPos(11, 64, 12))));
+        runner.recordPlacementAcceptedPendingForTests(42, new BlockPos(11, 64, 12), 10);
+
+        runner.processPendingVerificationsForTests(Map.of(42, false), 13);
+
+        GroundedSingleLaneDebugRunner.DebugStatus status = runner.status();
+        assertEquals(1, status.missedPlacements());
+        assertEquals(0, status.pendingVerification());
+        assertTrue(status.leftovers().stream().anyMatch(record -> record.placementIndex() == 42));
+    }
+
+    @Test
+    void transientRetryIsBoundedWhileTargetRemainsPending() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        runner.setGroundedTraceEnabled(true);
+        assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
+        BlockPos pos = new BlockPos(11, 64, 12);
+        runner.seedLanePlacementsForTests(List.of(new GroundedSweepPlacementExecutor.PlacementTarget(43, pos)));
+
+        assertTrue(runner.recordTransientPlacementRetryForTests(43, pos, com.example.mapart.plan.state.PlacementResult.Status.RETRY, 1, true));
+        assertTrue(runner.recordTransientPlacementRetryForTests(43, pos, com.example.mapart.plan.state.PlacementResult.Status.MOVE_REQUIRED, 2, true));
+        assertTrue(runner.recordTransientPlacementRetryForTests(43, pos, com.example.mapart.plan.state.PlacementResult.Status.RETRY, 3, true));
+        assertFalse(runner.recordTransientPlacementRetryForTests(43, pos, com.example.mapart.plan.state.PlacementResult.Status.RETRY, 4, true));
+
+        assertEquals(0, runner.transientPlacementRetryCountForTests(43));
+        assertTrue(runner.pendingPlacementIndicesForTests().contains(43));
+        assertTrue(runner.groundedTraceEventsForTests().stream()
+                .anyMatch(event -> event.contains("PLACEMENT_TRANSIENT_RETRY_EXHAUSTED")
+                        && event.contains("placementIndex=43")));
     }
 
     @Test
@@ -1570,18 +1639,25 @@ class GroundedSingleLaneDebugRunnerTest {
     }
 
     @Test
-    void transitionSupportFailureTraceIncludesFailureDetails() {
+    void transitionSupportVerificationTimeoutRequeuesInsteadOfFailingImmediately() {
         GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
         runner.setGroundedTraceEnabled(true);
         assertTrue(runner.startFullSweep(sessionWithBridgeSupport(), GroundedSweepSettings.defaults()).isEmpty());
         runner.advanceSweepToNextLaneForTests();
         GroundedSweepPlacementExecutor.PlacementTarget target = runner.transitionSupportTargetsForTests().getFirst();
         runner.keepOnlyTransitionSupportTargetForTests(target.placementIndex());
-        runner.recordTransitionSupportPlacedForTests(target.placementIndex(), target.worldPos(), 0);
+        runner.recordTransitionSupportAcceptedPendingForTests(target.placementIndex(), target.worldPos(), 0);
 
         runner.processTransitionSupportVerificationsForTests(Map.of(target.placementIndex(), false), 999);
 
-        assertTrue(runner.groundedTraceEventsForTests().stream().anyMatch(event -> event.contains("transition support failed:")));
+        assertTrue(runner.awaitingTransitionSupportForTests());
+        assertEquals(0, runner.pendingTransitionSupportVerificationCountForTests());
+        assertEquals(List.of(target.placementIndex()), runner.transitionSupportTargetsForTests().stream()
+                .map(GroundedSweepPlacementExecutor.PlacementTarget::placementIndex)
+                .toList());
+        assertTrue(runner.groundedTraceEventsForTests().stream()
+                .anyMatch(event -> event.contains("PLACEMENT_PENDING_VERIFICATION_TIMEOUT")
+                        && event.contains("path=transition support")));
     }
 
     @Test

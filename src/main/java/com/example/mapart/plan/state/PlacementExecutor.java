@@ -109,7 +109,7 @@ public class PlacementExecutor {
             return PlacementResult.placed("Placed " + Registries.BLOCK.getId(placement.block()) + " at " + targetPos.toShortString() + ".");
         }
 
-        return PlacementResult.retry("Placement interaction succeeded but the world still shows "
+        return PlacementResult.acceptedPendingVerification("Placement interaction succeeded but the world still shows "
                 + Registries.BLOCK.getId(placedState.getBlock()) + " at " + targetPos.toShortString() + ".");
     }
 
@@ -170,7 +170,7 @@ public class PlacementExecutor {
         if (placedState.isOf(expectedBlock)) {
             return PlacementResult.placed("Placed utility block " + Registries.BLOCK.getId(expectedBlock) + " at " + targetPos.toShortString() + ".");
         }
-        return PlacementResult.retry("Utility placement interaction succeeded but the world still shows "
+        return PlacementResult.acceptedPendingVerification("Utility placement interaction succeeded but the world still shows "
                 + Registries.BLOCK.getId(placedState.getBlock()) + " at " + targetPos.toShortString() + ".");
     }
 

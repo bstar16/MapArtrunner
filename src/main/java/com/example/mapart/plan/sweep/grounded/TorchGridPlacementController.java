@@ -127,7 +127,7 @@ public final class TorchGridPlacementController {
                     warnMissingTorchesOnce(client);
                     return;
                 }
-                case RETRY, MOVE_REQUIRED, ERROR -> skippedNotReadyCount++;
+                case ACCEPTED_PENDING_VERIFICATION, RETRY, MOVE_REQUIRED, ERROR -> skippedNotReadyCount++;
             }
             attempts++;
         }
