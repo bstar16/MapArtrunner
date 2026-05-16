@@ -9,8 +9,6 @@ import net.minecraft.client.gui.widget.SliderWidget;
 import net.minecraft.client.gui.widget.TextFieldWidget;
 import net.minecraft.text.Text;
 
-import java.util.Locale;
-import java.util.function.DoubleConsumer;
 import java.util.function.IntConsumer;
 
 public class MapArtConfigScreen extends Screen {
@@ -35,11 +33,6 @@ public class MapArtConfigScreen extends Screen {
     private int clientTimerSpeed;
     private boolean clientTimerEnabled;
     private boolean manualAirPlaceEnabled;
-    private boolean manualAirPlaceRender;
-    private boolean manualAirPlaceUseCustomRange;
-    private double manualAirPlaceCustomRange;
-    private boolean manualAirPlaceRequireSneak;
-    private boolean manualAirPlaceDisableWhileRunnerActive;
 
     private TextFieldWidget timerSpeedField;
     private ButtonWidget clientTimerBtn;
@@ -61,11 +54,6 @@ public class MapArtConfigScreen extends Screen {
         this.clientTimerSpeed = s.clientTimerSpeed();
         this.clientTimerEnabled = s.clientTimerEnabled();
         this.manualAirPlaceEnabled = s.manualAirPlaceEnabled();
-        this.manualAirPlaceRender = s.manualAirPlaceRender();
-        this.manualAirPlaceUseCustomRange = s.manualAirPlaceUseCustomRange();
-        this.manualAirPlaceCustomRange = s.manualAirPlaceCustomRange();
-        this.manualAirPlaceRequireSneak = s.manualAirPlaceRequireSneak();
-        this.manualAirPlaceDisableWhileRunnerActive = s.manualAirPlaceDisableWhileRunnerActive();
     }
 
     @Override
@@ -88,19 +76,7 @@ public class MapArtConfigScreen extends Screen {
         addToggle(leftX, y, "Incorrect Only", overlayShowOnlyIncorrect, v -> overlayShowOnlyIncorrect = v);
         y += ROW_STRIDE * 2;
 
-        addToggle(leftX, y, "Manual Air Place", manualAirPlaceEnabled, v -> manualAirPlaceEnabled = v);
-        y += ROW_STRIDE;
-        addToggle(leftX, y, "Air Place Overlay", manualAirPlaceRender, v -> manualAirPlaceRender = v);
-        y += ROW_STRIDE;
-        addToggle(leftX, y, "Custom Range", manualAirPlaceUseCustomRange, v -> manualAirPlaceUseCustomRange = v);
-        y += ROW_STRIDE;
-        addDrawableChild(new DoubleSlider(leftX, y, COL_W, BTN_H, 0.0, 6.0, manualAirPlaceCustomRange,
-                "Air Place Range", v -> manualAirPlaceCustomRange = v));
-        y += ROW_STRIDE;
-        addToggle(leftX, y, "Require Sneak", manualAirPlaceRequireSneak, v -> manualAirPlaceRequireSneak = v);
-        y += ROW_STRIDE;
-        addToggle(leftX, y, "Disable During Runner", manualAirPlaceDisableWhileRunnerActive,
-                v -> manualAirPlaceDisableWhileRunnerActive = v);
+        addManualAirPlaceRow(leftX, y);
 
         // --- SWEEP column ---
         y = SECTION_TOP;
@@ -187,15 +163,32 @@ public class MapArtConfigScreen extends Screen {
         settingsStore.set("clientTimerEnabled", String.valueOf(clientTimerEnabled));
         settingsStore.set("clientTimerSpeed", String.valueOf(clientTimerSpeed));
         settingsStore.set("manualAirPlaceEnabled", String.valueOf(manualAirPlaceEnabled));
-        settingsStore.set("manualAirPlaceRender", String.valueOf(manualAirPlaceRender));
-        settingsStore.set("manualAirPlaceUseCustomRange", String.valueOf(manualAirPlaceUseCustomRange));
-        settingsStore.set("manualAirPlaceCustomRange", String.format(Locale.ROOT, "%.2f", manualAirPlaceCustomRange));
-        settingsStore.set("manualAirPlaceRequireSneak", String.valueOf(manualAirPlaceRequireSneak));
-        settingsStore.set("manualAirPlaceDisableWhileRunnerActive", String.valueOf(manualAirPlaceDisableWhileRunnerActive));
         this.client.setScreen(parent);
     }
 
+    void refreshAirPlaceFromStore() {
+        this.manualAirPlaceEnabled = settingsStore.current().manualAirPlaceEnabled();
+    }
+
+    private void openAirPlaceSettings() {
+        this.client.setScreen(new AirPlaceConfigScreen(settingsStore, this));
+    }
+
+    private void addManualAirPlaceRow(int x, int y) {
+        int gearWidth = 28;
+        int gap = 4;
+        addToggle(x, y, COL_W - gearWidth - gap, "Manual Air Place", manualAirPlaceEnabled,
+                v -> manualAirPlaceEnabled = v);
+        addDrawableChild(ButtonWidget.builder(Text.literal("\u2699"), b -> openAirPlaceSettings())
+                .dimensions(x + COL_W - gearWidth, y, gearWidth, BTN_H)
+                .build());
+    }
+
     private void addToggle(int x, int y, String label, boolean initial, java.util.function.Consumer<Boolean> onChange) {
+        addToggle(x, y, COL_W, label, initial, onChange);
+    }
+
+    private void addToggle(int x, int y, int width, String label, boolean initial, java.util.function.Consumer<Boolean> onChange) {
         // Store current value in array so lambda can capture mutable reference
         boolean[] state = {initial};
         ButtonWidget btn = ButtonWidget.builder(
@@ -205,7 +198,7 @@ public class MapArtConfigScreen extends Screen {
                     onChange.accept(state[0]);
                     b.setMessage(Text.literal(label + ": " + onOff(state[0])));
                 })
-                .dimensions(x, y, COL_W, BTN_H)
+                .dimensions(x, y, width, BTN_H)
                 .build();
         addDrawableChild(btn);
     }
@@ -242,33 +235,4 @@ public class MapArtConfigScreen extends Screen {
         }
     }
 
-    private static final class DoubleSlider extends SliderWidget {
-        private final double min;
-        private final double max;
-        private final String label;
-        private final DoubleConsumer onChange;
-
-        DoubleSlider(int x, int y, int width, int height, double min, double max, double initial, String label, DoubleConsumer onChange) {
-            super(x, y, width, height, Text.empty(), (initial - min) / (max - min));
-            this.min = min;
-            this.max = max;
-            this.label = label;
-            this.onChange = onChange;
-            updateMessage();
-        }
-
-        @Override
-        protected void updateMessage() {
-            setMessage(Text.literal(label + ": " + String.format(Locale.ROOT, "%.1f", value())));
-        }
-
-        @Override
-        protected void applyValue() {
-            onChange.accept(value());
-        }
-
-        private double value() {
-            return min + (this.value * (max - min));
-        }
-    }
 }

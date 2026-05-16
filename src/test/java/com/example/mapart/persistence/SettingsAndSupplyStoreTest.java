@@ -64,6 +64,21 @@ class SettingsAndSupplyStoreTest {
     }
 
     @Test
+    void manualAirPlaceCustomRangeBounds() {
+        Path settingsPath = tempDir.resolve("settings-air-place-range.json");
+        MapartSettingsStore store = new MapartSettingsStore(settingsPath);
+
+        assertTrue(store.set("manualAirPlaceCustomRange", "0.0").isEmpty());
+        assertEquals(0.0, store.current().manualAirPlaceCustomRange());
+
+        assertTrue(store.set("manualAirPlaceCustomRange", "6.0").isEmpty());
+        assertEquals(6.0, store.current().manualAirPlaceCustomRange());
+
+        assertTrue(store.set("manualAirPlaceCustomRange", "-0.1").isPresent());
+        assertTrue(store.set("manualAirPlaceCustomRange", "6.1").isPresent());
+    }
+
+    @Test
     void reservedHotbarSlotsAcceptsBoundsAndRejectsOutsideRange() {
         Path settingsPath = tempDir.resolve("settings-reserved-hotbar.json");
         MapartSettingsStore store = new MapartSettingsStore(settingsPath);
