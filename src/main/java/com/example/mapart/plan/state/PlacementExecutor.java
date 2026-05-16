@@ -1,6 +1,7 @@
 package com.example.mapart.plan.state;
 
 import com.example.mapart.MapArtMod;
+import com.example.mapart.inventory.HotbarSlotReservations;
 import com.example.mapart.plan.Placement;
 import net.minecraft.block.BlockState;
 import net.minecraft.client.MinecraftClient;
@@ -34,6 +35,11 @@ public class PlacementExecutor {
     };
 
     public PlacementResult execute(MinecraftClient client, BuildSession session, Placement placement, BlockPos targetPos) {
+        return execute(client, session, placement, targetPos, 0);
+    }
+
+    public PlacementResult execute(MinecraftClient client, BuildSession session, Placement placement, BlockPos targetPos, int reservedHotbarSlots) {
+        HotbarSlotReservations.validateReservedHotbarSlots(reservedHotbarSlots);
         if (client == null || client.player == null || client.world == null || client.interactionManager == null) {
             return PlacementResult.error("Client context is unavailable for placement.");
         }
@@ -69,7 +75,7 @@ public class PlacementExecutor {
             return PlacementResult.error("Expected block " + Registries.BLOCK.getId(placement.block()) + " does not have a placeable block item.");
         }
 
-        InventorySelection selection = ensureSelectedItem(client, player, expectedItem);
+        InventorySelection selection = ensureSelectedItem(client, player, expectedItem, reservedHotbarSlots);
         if (!selection.available()) {
             return PlacementResult.missingItem("Missing required item " + Registries.ITEM.getId(expectedItem) + " for "
                     + Registries.BLOCK.getId(placement.block()) + ".");
@@ -106,13 +112,15 @@ public class PlacementExecutor {
                 + Registries.BLOCK.getId(placedState.getBlock()) + " at " + targetPos.toShortString() + ".");
     }
 
-    private InventorySelection ensureSelectedItem(MinecraftClient client, ClientPlayerEntity player, Item expectedItem) {
+    private InventorySelection ensureSelectedItem(MinecraftClient client, ClientPlayerEntity player, Item expectedItem, int reservedHotbarSlots) {
         PlayerInventory inventory = player.getInventory();
-        if (player.getMainHandStack().isOf(expectedItem)) {
+        int selectedSlot = inventory.getSelectedSlot();
+        if (player.getMainHandStack().isOf(expectedItem)
+                && HotbarSlotReservations.isAutomatedHotbarSlot(selectedSlot, reservedHotbarSlots)) {
             return InventorySelection.selected(inventory.getSelectedSlot(), false);
         }
 
-        for (int hotbarSlot = 0; hotbarSlot < PlayerInventory.getHotbarSize(); hotbarSlot++) {
+        for (int hotbarSlot = reservedHotbarSlots; hotbarSlot < PlayerInventory.getHotbarSize(); hotbarSlot++) {
             if (inventory.getStack(hotbarSlot).isOf(expectedItem)) {
                 inventory.setSelectedSlot(hotbarSlot);
                 syncSelectedSlotWithServer(player, hotbarSlot);
@@ -120,7 +128,10 @@ public class PlacementExecutor {
             }
         }
 
-        int swapHotbarSlot = inventory.getSelectedSlot();
+        int swapHotbarSlot = firstPreferredSwapHotbarSlot(inventory, reservedHotbarSlots);
+        if (swapHotbarSlot < 0) {
+            return InventorySelection.missing();
+        }
         for (int slot = PlayerInventory.getHotbarSize(); slot < PlayerInventory.MAIN_SIZE; slot++) {
             if (!inventory.getStack(slot).isOf(expectedItem)) {
                 continue;
@@ -134,6 +145,36 @@ public class PlacementExecutor {
         }
 
         return InventorySelection.missing();
+    }
+
+    static int firstPreferredSwapHotbarSlotForTests(int selectedSlot, boolean[] emptySlots, int reservedHotbarSlots) {
+        HotbarSlotReservations.validateReservedHotbarSlots(reservedHotbarSlots);
+        if (HotbarSlotReservations.isAutomatedHotbarSlot(selectedSlot, reservedHotbarSlots)
+                && selectedSlot >= 0
+                && selectedSlot < emptySlots.length
+                && emptySlots[selectedSlot]) {
+            return selectedSlot;
+        }
+        for (int hotbarSlot = reservedHotbarSlots; hotbarSlot < Math.min(PlayerInventory.getHotbarSize(), emptySlots.length); hotbarSlot++) {
+            if (emptySlots[hotbarSlot]) {
+                return hotbarSlot;
+            }
+        }
+        return HotbarSlotReservations.firstAutomatedHotbarSlot(reservedHotbarSlots).orElse(-1);
+    }
+
+    private int firstPreferredSwapHotbarSlot(PlayerInventory inventory, int reservedHotbarSlots) {
+        int selectedSlot = inventory.getSelectedSlot();
+        if (HotbarSlotReservations.isAutomatedHotbarSlot(selectedSlot, reservedHotbarSlots)
+                && inventory.getStack(selectedSlot).isEmpty()) {
+            return selectedSlot;
+        }
+        for (int hotbarSlot = reservedHotbarSlots; hotbarSlot < PlayerInventory.getHotbarSize(); hotbarSlot++) {
+            if (inventory.getStack(hotbarSlot).isEmpty()) {
+                return hotbarSlot;
+            }
+        }
+        return HotbarSlotReservations.firstAutomatedHotbarSlot(reservedHotbarSlots).orElse(-1);
     }
 
     private void syncSelectedSlotWithServer(ClientPlayerEntity player, int selectedSlot) {

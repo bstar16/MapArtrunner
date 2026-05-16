@@ -1,6 +1,7 @@
 package com.example.mapart.settings;
 
 import com.example.mapart.MapArtMod;
+import com.example.mapart.inventory.HotbarSlotReservations;
 import com.google.gson.Gson;
 import net.fabricmc.loader.api.FabricLoader;
 
@@ -55,6 +56,7 @@ public class MapartSettingsStore {
                 case "groundedsweepconstantsprint" -> settings = with(groundedSweepConstantSprint(parseBoolean(value)));
                 case "placementdelayticks" -> settings = with(placementDelayTicks(parseBoundedInt(value, "placementDelayTicks", 0, 10)));
                 case "inventoryclickdelayticks" -> settings = with(inventoryClickDelayTicks(parseBoundedInt(value, "inventoryClickDelayTicks", 0, 10)));
+                case "reservedhotbarslots" -> settings = with(reservedHotbarSlots(parseBoundedInt(value, "reservedHotbarSlots", 0, 8)));
                 case "manualairplaceenabled" -> settings = with(manualAirPlaceEnabled(parseBoolean(value)));
                 case "manualairplacerender" -> settings = with(manualAirPlaceRender(parseBoolean(value)));
                 case "manualairplaceusecustomrange" -> settings = with(manualAirPlaceUseCustomRange(parseBoolean(value)));
@@ -93,6 +95,7 @@ public class MapartSettingsStore {
                 mutator.groundedSweepConstantSprint != null ? mutator.groundedSweepConstantSprint : current.groundedSweepConstantSprint(),
                 mutator.placementDelayTicks != null ? mutator.placementDelayTicks : current.placementDelayTicks(),
                 mutator.inventoryClickDelayTicks != null ? mutator.inventoryClickDelayTicks : current.inventoryClickDelayTicks(),
+                mutator.reservedHotbarSlots != null ? mutator.reservedHotbarSlots : current.reservedHotbarSlots(),
                 mutator.manualAirPlaceEnabled != null ? mutator.manualAirPlaceEnabled : current.manualAirPlaceEnabled(),
                 mutator.manualAirPlaceRender != null ? mutator.manualAirPlaceRender : current.manualAirPlaceRender(),
                 mutator.manualAirPlaceUseCustomRange != null ? mutator.manualAirPlaceUseCustomRange : current.manualAirPlaceUseCustomRange(),
@@ -122,6 +125,7 @@ public class MapartSettingsStore {
     private static SettingsMutator groundedSweepConstantSprint(boolean value) { return new SettingsMutator().groundedSweepConstantSprint(value); }
     private static SettingsMutator placementDelayTicks(int value) { return new SettingsMutator().placementDelayTicks(value); }
     private static SettingsMutator inventoryClickDelayTicks(int value) { return new SettingsMutator().inventoryClickDelayTicks(value); }
+    private static SettingsMutator reservedHotbarSlots(int value) { return new SettingsMutator().reservedHotbarSlots(value); }
     private static SettingsMutator manualAirPlaceEnabled(boolean value) { return new SettingsMutator().manualAirPlaceEnabled(value); }
     private static SettingsMutator manualAirPlaceRender(boolean value) { return new SettingsMutator().manualAirPlaceRender(value); }
     private static SettingsMutator manualAirPlaceUseCustomRange(boolean value) { return new SettingsMutator().manualAirPlaceUseCustomRange(value); }
@@ -233,6 +237,7 @@ public class MapartSettingsStore {
                     stored.groundedSweepConstantSprint == null ? defaults.groundedSweepConstantSprint() : stored.groundedSweepConstantSprint,
                     stored.placementDelayTicks == null ? defaults.placementDelayTicks() : parseBoundedInt(Integer.toString(stored.placementDelayTicks), "placementDelayTicks", 0, 10),
                     stored.inventoryClickDelayTicks == null ? defaults.inventoryClickDelayTicks() : parseBoundedInt(Integer.toString(stored.inventoryClickDelayTicks), "inventoryClickDelayTicks", 0, 10),
+                    stored.reservedHotbarSlots == null ? defaults.reservedHotbarSlots() : HotbarSlotReservations.validateReservedHotbarSlots(stored.reservedHotbarSlots),
                     stored.manualAirPlaceEnabled == null ? defaults.manualAirPlaceEnabled() : stored.manualAirPlaceEnabled,
                     stored.manualAirPlaceRender == null ? defaults.manualAirPlaceRender() : stored.manualAirPlaceRender,
                     stored.manualAirPlaceUseCustomRange == null ? defaults.manualAirPlaceUseCustomRange() : stored.manualAirPlaceUseCustomRange,
@@ -293,6 +298,7 @@ public class MapartSettingsStore {
         private Boolean groundedSweepConstantSprint;
         private Integer placementDelayTicks;
         private Integer inventoryClickDelayTicks;
+        private Integer reservedHotbarSlots;
         private Boolean manualAirPlaceEnabled;
         private Boolean manualAirPlaceRender;
         private Boolean manualAirPlaceUseCustomRange;
@@ -317,6 +323,7 @@ public class MapartSettingsStore {
         SettingsMutator groundedSweepConstantSprint(boolean value) { this.groundedSweepConstantSprint = value; return this; }
         SettingsMutator placementDelayTicks(int value) { this.placementDelayTicks = value; return this; }
         SettingsMutator inventoryClickDelayTicks(int value) { this.inventoryClickDelayTicks = value; return this; }
+        SettingsMutator reservedHotbarSlots(int value) { this.reservedHotbarSlots = value; return this; }
         SettingsMutator manualAirPlaceEnabled(boolean value) { this.manualAirPlaceEnabled = value; return this; }
         SettingsMutator manualAirPlaceRender(boolean value) { this.manualAirPlaceRender = value; return this; }
         SettingsMutator manualAirPlaceUseCustomRange(boolean value) { this.manualAirPlaceUseCustomRange = value; return this; }
@@ -343,6 +350,7 @@ public class MapartSettingsStore {
         Boolean groundedSweepConstantSprint;
         Integer placementDelayTicks;
         Integer inventoryClickDelayTicks;
+        Integer reservedHotbarSlots;
         Boolean manualAirPlaceEnabled;
         Boolean manualAirPlaceRender;
         Boolean manualAirPlaceUseCustomRange;
@@ -371,6 +379,7 @@ public class MapartSettingsStore {
             this.groundedSweepConstantSprint = settings.groundedSweepConstantSprint();
             this.placementDelayTicks = settings.placementDelayTicks();
             this.inventoryClickDelayTicks = settings.inventoryClickDelayTicks();
+            this.reservedHotbarSlots = settings.reservedHotbarSlots();
             this.manualAirPlaceEnabled = settings.manualAirPlaceEnabled();
             this.manualAirPlaceRender = settings.manualAirPlaceRender();
             this.manualAirPlaceUseCustomRange = settings.manualAirPlaceUseCustomRange();

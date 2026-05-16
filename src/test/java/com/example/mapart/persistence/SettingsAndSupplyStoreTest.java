@@ -22,6 +22,7 @@ class SettingsAndSupplyStoreTest {
         Path settingsPath = tempDir.resolve("settings-defaults.json");
         MapartSettingsStore store = new MapartSettingsStore(settingsPath);
 
+        assertEquals(0, store.current().reservedHotbarSlots());
         assertFalse(store.current().manualAirPlaceEnabled());
         assertTrue(store.current().manualAirPlaceRender());
         assertFalse(store.current().manualAirPlaceUseCustomRange());
@@ -38,6 +39,7 @@ class SettingsAndSupplyStoreTest {
         assertTrue(store.set("hudX", "42").isEmpty());
         assertTrue(store.set("placementDelayTicks", "5").isEmpty());
         assertTrue(store.set("inventoryClickDelayTicks", "3").isEmpty());
+        assertTrue(store.set("reservedHotbarSlots", "5").isEmpty());
         assertTrue(store.set("clientTimerEnabled", "false").isEmpty());
         assertTrue(store.set("manualAirPlaceEnabled", "true").isEmpty());
         assertTrue(store.set("manualAirPlaceRender", "false").isEmpty());
@@ -51,6 +53,7 @@ class SettingsAndSupplyStoreTest {
         assertEquals(42, restored.current().hudX());
         assertEquals(5, restored.current().placementDelayTicks());
         assertEquals(3, restored.current().inventoryClickDelayTicks());
+        assertEquals(5, restored.current().reservedHotbarSlots());
         assertFalse(restored.current().clientTimerEnabled());
         assertTrue(restored.current().manualAirPlaceEnabled());
         assertFalse(restored.current().manualAirPlaceRender());
@@ -73,6 +76,22 @@ class SettingsAndSupplyStoreTest {
 
         assertTrue(store.set("manualAirPlaceCustomRange", "-0.1").isPresent());
         assertTrue(store.set("manualAirPlaceCustomRange", "6.1").isPresent());
+    }
+
+    @Test
+    void reservedHotbarSlotsAcceptsBoundsAndRejectsOutsideRange() {
+        Path settingsPath = tempDir.resolve("settings-reserved-hotbar.json");
+        MapartSettingsStore store = new MapartSettingsStore(settingsPath);
+
+        assertTrue(store.set("reservedHotbarSlots", "0").isEmpty());
+        assertEquals(0, store.current().reservedHotbarSlots());
+
+        assertTrue(store.set("reservedHotbarSlots", "8").isEmpty());
+        assertEquals(8, store.current().reservedHotbarSlots());
+
+        assertTrue(store.set("reservedHotbarSlots", "-1").isPresent());
+        assertTrue(store.set("reservedHotbarSlots", "9").isPresent());
+        assertEquals(8, store.current().reservedHotbarSlots());
     }
 
     @Test
