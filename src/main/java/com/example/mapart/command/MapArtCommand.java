@@ -581,6 +581,12 @@ public final class MapArtCommand {
         source.sendFeedback(Text.literal("inventoryClickDelayTicks=" + settings.inventoryClickDelayTicks()));
         source.sendFeedback(Text.literal("clientTimerSpeed=" + settings.clientTimerSpeed()));
         source.sendFeedback(Text.literal("clientTimerEnabled=" + settings.clientTimerEnabled()));
+        source.sendFeedback(Text.literal("manualAirPlaceEnabled=" + settings.manualAirPlaceEnabled()));
+        source.sendFeedback(Text.literal("manualAirPlaceRender=" + settings.manualAirPlaceRender()));
+        source.sendFeedback(Text.literal("manualAirPlaceUseCustomRange=" + settings.manualAirPlaceUseCustomRange()));
+        source.sendFeedback(Text.literal("manualAirPlaceCustomRange=" + settings.manualAirPlaceCustomRange()));
+        source.sendFeedback(Text.literal("manualAirPlaceRequireSneak=" + settings.manualAirPlaceRequireSneak()));
+        source.sendFeedback(Text.literal("manualAirPlaceDisableWhileRunnerActive=" + settings.manualAirPlaceDisableWhileRunnerActive()));
         return 1;
     }
 

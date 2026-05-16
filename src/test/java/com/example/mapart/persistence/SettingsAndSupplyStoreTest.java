@@ -18,6 +18,19 @@ class SettingsAndSupplyStoreTest {
     Path tempDir;
 
     @Test
+    void manualAirPlaceDefaults() {
+        Path settingsPath = tempDir.resolve("settings-defaults.json");
+        MapartSettingsStore store = new MapartSettingsStore(settingsPath);
+
+        assertFalse(store.current().manualAirPlaceEnabled());
+        assertTrue(store.current().manualAirPlaceRender());
+        assertFalse(store.current().manualAirPlaceUseCustomRange());
+        assertEquals(5.0, store.current().manualAirPlaceCustomRange());
+        assertFalse(store.current().manualAirPlaceRequireSneak());
+        assertTrue(store.current().manualAirPlaceDisableWhileRunnerActive());
+    }
+
+    @Test
     void settingsStorePersistsValues() {
         Path settingsPath = tempDir.resolve("settings.json");
         MapartSettingsStore store = new MapartSettingsStore(settingsPath);
@@ -26,6 +39,12 @@ class SettingsAndSupplyStoreTest {
         assertTrue(store.set("placementDelayTicks", "5").isEmpty());
         assertTrue(store.set("inventoryClickDelayTicks", "3").isEmpty());
         assertTrue(store.set("clientTimerEnabled", "false").isEmpty());
+        assertTrue(store.set("manualAirPlaceEnabled", "true").isEmpty());
+        assertTrue(store.set("manualAirPlaceRender", "false").isEmpty());
+        assertTrue(store.set("manualAirPlaceUseCustomRange", "true").isEmpty());
+        assertTrue(store.set("manualAirPlaceCustomRange", "4.5").isEmpty());
+        assertTrue(store.set("manualAirPlaceRequireSneak", "true").isEmpty());
+        assertTrue(store.set("manualAirPlaceDisableWhileRunnerActive", "false").isEmpty());
 
         MapartSettingsStore restored = new MapartSettingsStore(settingsPath);
         assertFalse(restored.current().showHud());
@@ -33,6 +52,12 @@ class SettingsAndSupplyStoreTest {
         assertEquals(5, restored.current().placementDelayTicks());
         assertEquals(3, restored.current().inventoryClickDelayTicks());
         assertFalse(restored.current().clientTimerEnabled());
+        assertTrue(restored.current().manualAirPlaceEnabled());
+        assertFalse(restored.current().manualAirPlaceRender());
+        assertTrue(restored.current().manualAirPlaceUseCustomRange());
+        assertEquals(4.5, restored.current().manualAirPlaceCustomRange());
+        assertTrue(restored.current().manualAirPlaceRequireSneak());
+        assertFalse(restored.current().manualAirPlaceDisableWhileRunnerActive());
     }
 
     @Test

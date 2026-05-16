@@ -9,6 +9,8 @@ import net.minecraft.client.gui.widget.SliderWidget;
 import net.minecraft.client.gui.widget.TextFieldWidget;
 import net.minecraft.text.Text;
 
+import java.util.Locale;
+import java.util.function.DoubleConsumer;
 import java.util.function.IntConsumer;
 
 public class MapArtConfigScreen extends Screen {
@@ -31,6 +33,12 @@ public class MapArtConfigScreen extends Screen {
     private int inventoryClickDelayTicks;
     private int clientTimerSpeed;
     private boolean clientTimerEnabled;
+    private boolean manualAirPlaceEnabled;
+    private boolean manualAirPlaceRender;
+    private boolean manualAirPlaceUseCustomRange;
+    private double manualAirPlaceCustomRange;
+    private boolean manualAirPlaceRequireSneak;
+    private boolean manualAirPlaceDisableWhileRunnerActive;
 
     private TextFieldWidget timerSpeedField;
     private ButtonWidget clientTimerBtn;
@@ -50,6 +58,12 @@ public class MapArtConfigScreen extends Screen {
         this.inventoryClickDelayTicks = s.inventoryClickDelayTicks();
         this.clientTimerSpeed = s.clientTimerSpeed();
         this.clientTimerEnabled = s.clientTimerEnabled();
+        this.manualAirPlaceEnabled = s.manualAirPlaceEnabled();
+        this.manualAirPlaceRender = s.manualAirPlaceRender();
+        this.manualAirPlaceUseCustomRange = s.manualAirPlaceUseCustomRange();
+        this.manualAirPlaceCustomRange = s.manualAirPlaceCustomRange();
+        this.manualAirPlaceRequireSneak = s.manualAirPlaceRequireSneak();
+        this.manualAirPlaceDisableWhileRunnerActive = s.manualAirPlaceDisableWhileRunnerActive();
     }
 
     @Override
@@ -70,6 +84,21 @@ public class MapArtConfigScreen extends Screen {
         addToggle(leftX, y, "Current Region Only", overlayCurrentRegionOnly, v -> overlayCurrentRegionOnly = v);
         y += ROW_STRIDE;
         addToggle(leftX, y, "Incorrect Only", overlayShowOnlyIncorrect, v -> overlayShowOnlyIncorrect = v);
+        y += ROW_STRIDE * 2;
+
+        addToggle(leftX, y, "Manual Air Place", manualAirPlaceEnabled, v -> manualAirPlaceEnabled = v);
+        y += ROW_STRIDE;
+        addToggle(leftX, y, "Air Place Overlay", manualAirPlaceRender, v -> manualAirPlaceRender = v);
+        y += ROW_STRIDE;
+        addToggle(leftX, y, "Custom Range", manualAirPlaceUseCustomRange, v -> manualAirPlaceUseCustomRange = v);
+        y += ROW_STRIDE;
+        addDrawableChild(new DoubleSlider(leftX, y, COL_W, BTN_H, 0.0, 6.0, manualAirPlaceCustomRange,
+                "Air Place Range", v -> manualAirPlaceCustomRange = v));
+        y += ROW_STRIDE;
+        addToggle(leftX, y, "Require Sneak", manualAirPlaceRequireSneak, v -> manualAirPlaceRequireSneak = v);
+        y += ROW_STRIDE;
+        addToggle(leftX, y, "Disable During Runner", manualAirPlaceDisableWhileRunnerActive,
+                v -> manualAirPlaceDisableWhileRunnerActive = v);
 
         // --- SWEEP column ---
         y = SECTION_TOP;
@@ -124,6 +153,7 @@ public class MapArtConfigScreen extends Screen {
         context.drawCenteredTextWithShadow(this.textRenderer, this.title, cx, 8, 0xFFFFFF);
         context.drawText(this.textRenderer, "DISPLAY", cx - COL_W - 5, LABEL_Y, 0xAAAAAA, true);
         context.drawText(this.textRenderer, "SWEEP", cx + 5, LABEL_Y, 0xAAAAAA, true);
+        context.drawText(this.textRenderer, "PLAYER", cx - COL_W - 5, SECTION_TOP + ROW_STRIDE * 6 - 10, 0xAAAAAA, true);
         // Label above timer speed field
         int timerLabelY = SECTION_TOP + ROW_STRIDE * 3;
         context.drawText(this.textRenderer, "Speed (1-20):", cx + 5, timerLabelY - 10, 0xAAAAAA, false);
@@ -146,6 +176,12 @@ public class MapArtConfigScreen extends Screen {
         settingsStore.set("inventoryClickDelayTicks", String.valueOf(inventoryClickDelayTicks));
         settingsStore.set("clientTimerEnabled", String.valueOf(clientTimerEnabled));
         settingsStore.set("clientTimerSpeed", String.valueOf(clientTimerSpeed));
+        settingsStore.set("manualAirPlaceEnabled", String.valueOf(manualAirPlaceEnabled));
+        settingsStore.set("manualAirPlaceRender", String.valueOf(manualAirPlaceRender));
+        settingsStore.set("manualAirPlaceUseCustomRange", String.valueOf(manualAirPlaceUseCustomRange));
+        settingsStore.set("manualAirPlaceCustomRange", String.format(Locale.ROOT, "%.2f", manualAirPlaceCustomRange));
+        settingsStore.set("manualAirPlaceRequireSneak", String.valueOf(manualAirPlaceRequireSneak));
+        settingsStore.set("manualAirPlaceDisableWhileRunnerActive", String.valueOf(manualAirPlaceDisableWhileRunnerActive));
         this.client.setScreen(parent);
     }
 
@@ -193,6 +229,36 @@ public class MapArtConfigScreen extends Screen {
         protected void applyValue() {
             int val = min + (int) Math.round(this.value * (max - min));
             onChange.accept(val);
+        }
+    }
+
+    private static final class DoubleSlider extends SliderWidget {
+        private final double min;
+        private final double max;
+        private final String label;
+        private final DoubleConsumer onChange;
+
+        DoubleSlider(int x, int y, int width, int height, double min, double max, double initial, String label, DoubleConsumer onChange) {
+            super(x, y, width, height, Text.empty(), (initial - min) / (max - min));
+            this.min = min;
+            this.max = max;
+            this.label = label;
+            this.onChange = onChange;
+            updateMessage();
+        }
+
+        @Override
+        protected void updateMessage() {
+            setMessage(Text.literal(label + ": " + String.format(Locale.ROOT, "%.1f", value())));
+        }
+
+        @Override
+        protected void applyValue() {
+            onChange.accept(value());
+        }
+
+        private double value() {
+            return min + (this.value * (max - min));
         }
     }
 }

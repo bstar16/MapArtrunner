@@ -15,6 +15,7 @@ import com.example.mapart.plan.state.BuildCoordinator;
 import com.example.mapart.plan.state.BuildPlanService;
 import com.example.mapart.plan.state.WorldPlacementResolver;
 import com.example.mapart.render.HudRenderer;
+import com.example.mapart.render.ManualAirPlaceOverlayRenderer;
 import com.example.mapart.render.SchematicOverlayRenderer;
 import com.example.mapart.runtime.ClientTimerController;
 import com.example.mapart.runtime.DebugReporter;
@@ -121,6 +122,7 @@ public class MapArtClientMod implements ClientModInitializer {
         PlacementStatusResolver resolver = new PlacementStatusResolver();
         HudRenderCallback.EVENT.register(new HudRenderer(resolver));
         WorldRenderEvents.BEFORE_TRANSLUCENT.register(new SchematicOverlayRenderer(resolver));
+        WorldRenderEvents.BEFORE_TRANSLUCENT.register(new ManualAirPlaceOverlayRenderer());
 
         debugReporter.logToFile("Debug log file: " + debugReporter.logPath().toAbsolutePath());
         MapArtMod.LOGGER.info("Initialized mapart client command pipeline with /mapart, /maprunner, and /mapartrunner");
