@@ -45,6 +45,7 @@ public final class GroundedSingleLaneDebugRunner {
     private static final int MAX_PLACEMENT_ATTEMPTS_PER_TICK = 2;
     private static final int PLACEMENT_VERIFICATION_DELAY_TICKS = 3;
     private static final int MAX_TRANSIENT_PLACEMENT_RETRIES = 3;
+    private static final int MAX_HOTBAR_SWAP_STABILIZATION_RETRIES = 3;
     private static final int TRANSIENT_RETRY_NEAR_BLOCK_DISTANCE = 5;
     private static final double LANE_SHIFT_REACH_DISTANCE_SQ = 1.5 * 1.5;
     private static final double LANE_TRANSITION_AXIS_TOLERANCE = 0.6;
@@ -104,9 +105,11 @@ public final class GroundedSingleLaneDebugRunner {
     private List<GroundedSweepPlacementExecutor.PlacementTarget> pendingPlacementTargets = List.of();
     private Map<Integer, PendingPlacementVerification> pendingVerificationsByPlacement = Map.of();
     private Map<Integer, Integer> transientPlacementRetriesByPlacement = Map.of();
+    private Map<Integer, Integer> hotbarSwapStabilizationByPlacement = Map.of();
     private List<GroundedSweepPlacementExecutor.PlacementTarget> pendingTransitionSupportTargets = List.of();
     private Map<Integer, PendingPlacementVerification> pendingTransitionSupportVerifications = Map.of();
     private Map<Integer, Integer> transientTransitionSupportRetriesByPlacement = Map.of();
+    private Map<Integer, Integer> hotbarSwapTransitionSupportByPlacement = Map.of();
     private List<GroundedSweepLeftoverTracker.GroundedLeftoverRecord> currentLeftovers = List.of();
     private int successfulPlacements;
     private int failedPlacements;
@@ -1948,13 +1951,15 @@ public final class GroundedSingleLaneDebugRunner {
             if (placement == null || placement.block() == null) {
                 continue;
             }
-            entryAttemptsByPlacementIndex.put(target.placementIndex(), usedAttempts + 1);
             if (isWatchedNearStartTarget(lane, pos)) {
                 traceWatchTarget("WATCH_TARGET_ENTRY_BURST_SELECTED", lane, pos, target.placementIndex(), "attempt=" + (usedAttempts + 1));
             }
+            traceHotbarSwapRetryReadyIfNeeded(target.placementIndex(), placement, pos, laneTicksElapsed, "entry burst", false);
             PlacementResult result = placementExecutor.execute(client, activeSession, placement, pos, reservedHotbarSlots());
             switch (result.status()) {
                 case PLACED -> {
+                    entryAttemptsByPlacementIndex.put(target.placementIndex(), usedAttempts + 1);
+                    clearHotbarSwapStabilization(target.placementIndex(), false);
                     entrySupportEstablished = true;
                     onPlacementPlaced(target.placementIndex(), placement, pos, laneTicksElapsed);
                     traceGroundedEvent("entry burst attempt result=PLACED idx=" + target.placementIndex() + " attempts=" + (usedAttempts + 1));
@@ -1963,6 +1968,8 @@ public final class GroundedSingleLaneDebugRunner {
                     }
                 }
                 case ACCEPTED_PENDING_VERIFICATION -> {
+                    entryAttemptsByPlacementIndex.put(target.placementIndex(), usedAttempts + 1);
+                    clearHotbarSwapStabilization(target.placementIndex(), false);
                     entrySupportEstablished = true;
                     onPlacementAcceptedPendingVerification(target.placementIndex(), placement, pos, laneTicksElapsed);
                     traceGroundedEvent("entry burst attempt result=ACCEPTED_PENDING_VERIFICATION idx=" + target.placementIndex() + " attempts=" + (usedAttempts + 1));
@@ -1971,6 +1978,8 @@ public final class GroundedSingleLaneDebugRunner {
                     }
                 }
                 case ALREADY_CORRECT -> {
+                    entryAttemptsByPlacementIndex.put(target.placementIndex(), usedAttempts + 1);
+                    clearHotbarSwapStabilization(target.placementIndex(), false);
                     entrySupportEstablished = true;
                     onPlacementResult(target.placementIndex(), GroundedSweepPlacementExecutor.PlacementResult.SUCCESS, laneTicksElapsed);
                     traceGroundedEvent("entry burst attempt result=ALREADY_CORRECT idx=" + target.placementIndex() + " attempts=" + (usedAttempts + 1));
@@ -1978,14 +1987,27 @@ public final class GroundedSingleLaneDebugRunner {
                         traceWatchTarget("WATCH_TARGET_ENTRY_BURST_RESULT", lane, pos, target.placementIndex(), "result=ALREADY_CORRECT");
                     }
                 }
+                case HOTBAR_SWAP_PENDING -> {
+                    if (!recordHotbarSwapPending(target.placementIndex(), placement, pos, laneTicksElapsed, "entry burst", false, result)) {
+                        entryAttemptsByPlacementIndex.put(target.placementIndex(), usedAttempts + 1);
+                        onPlacementResult(target.placementIndex(), GroundedSweepPlacementExecutor.PlacementResult.MISSED, laneTicksElapsed);
+                    }
+                    return;
+                }
                 case RETRY, MOVE_REQUIRED -> {
+                    entryAttemptsByPlacementIndex.put(target.placementIndex(), usedAttempts + 1);
+                    clearHotbarSwapStabilization(target.placementIndex(), false);
                     scheduleTransientPlacementRetry(client, target.placementIndex(), pos, result.status(), laneTicksElapsed, "entry burst");
                     traceGroundedEvent("entry burst attempt result=" + result.status() + " idx=" + target.placementIndex() + " attempts=" + (usedAttempts + 1));
                     if (isWatchedNearStartTarget(lane, pos)) {
                         traceWatchTarget("WATCH_TARGET_ENTRY_BURST_RESULT", lane, pos, target.placementIndex(), "result=" + result.status());
                     }
                 }
-                case MISSING_ITEM, ERROR -> onFinalFailure(target.placementIndex());
+                case MISSING_ITEM, ERROR -> {
+                    entryAttemptsByPlacementIndex.put(target.placementIndex(), usedAttempts + 1);
+                    clearHotbarSwapStabilization(target.placementIndex(), false);
+                    onFinalFailure(target.placementIndex());
+                }
             }
             attempts++;
         }
@@ -2670,8 +2692,30 @@ public final class GroundedSingleLaneDebugRunner {
         return scheduleTransientPlacementRetry(placementIndex, worldPos, status, tick, "test", nearTarget);
     }
 
+    boolean recordHotbarSwapPendingForTests(int placementIndex, Placement placement, BlockPos worldPos, long tick) {
+        return recordHotbarSwapPending(placementIndex, placement, worldPos, tick, "test", false,
+                new PlacementResult(PlacementResult.Status.HOTBAR_SWAP_PENDING, "test"));
+    }
+
+    boolean recordTransitionSupportHotbarSwapPendingForTests(int placementIndex, Placement placement, BlockPos worldPos, long tick) {
+        return recordHotbarSwapPending(placementIndex, placement, worldPos, tick, "transition support", true,
+                new PlacementResult(PlacementResult.Status.HOTBAR_SWAP_PENDING, "test"));
+    }
+
+    void traceHotbarSwapRetryReadyForTests(int placementIndex, Placement placement, BlockPos worldPos, long tick) {
+        traceHotbarSwapRetryReadyIfNeeded(placementIndex, placement, worldPos, tick, "test", false);
+    }
+
     int transientPlacementRetryCountForTests(int placementIndex) {
         return transientPlacementRetriesByPlacement.getOrDefault(placementIndex, 0);
+    }
+
+    int hotbarSwapStabilizationCountForTests(int placementIndex) {
+        return hotbarSwapStabilizationByPlacement.getOrDefault(placementIndex, 0);
+    }
+
+    int transitionSupportHotbarSwapStabilizationCountForTests(int placementIndex) {
+        return hotbarSwapTransitionSupportByPlacement.getOrDefault(placementIndex, 0);
     }
 
     int pendingVerificationCountForTests() {
@@ -2814,17 +2858,37 @@ public final class GroundedSingleLaneDebugRunner {
                 onFinalFailure(candidate.placementIndex());
                 continue;
             }
+            traceHotbarSwapRetryReadyIfNeeded(candidate.placementIndex(), placement, candidate.worldPos(), laneTicksElapsed, "terminal lane", false);
             PlacementResult result = placementExecutor.execute(client, activeSession, placement, candidate.worldPos(), reservedHotbarSlots());
             switch (result.status()) {
-                case PLACED -> onPlacementPlaced(candidate.placementIndex(), placement, candidate.worldPos(), laneTicksElapsed);
-                case ACCEPTED_PENDING_VERIFICATION -> onPlacementAcceptedPendingVerification(candidate.placementIndex(), placement, candidate.worldPos(), laneTicksElapsed);
-                case ALREADY_CORRECT -> onPlacementResult(candidate.placementIndex(), GroundedSweepPlacementExecutor.PlacementResult.SUCCESS, laneTicksElapsed);
+                case PLACED -> {
+                    clearHotbarSwapStabilization(candidate.placementIndex(), false);
+                    onPlacementPlaced(candidate.placementIndex(), placement, candidate.worldPos(), laneTicksElapsed);
+                }
+                case ACCEPTED_PENDING_VERIFICATION -> {
+                    clearHotbarSwapStabilization(candidate.placementIndex(), false);
+                    onPlacementAcceptedPendingVerification(candidate.placementIndex(), placement, candidate.worldPos(), laneTicksElapsed);
+                }
+                case ALREADY_CORRECT -> {
+                    clearHotbarSwapStabilization(candidate.placementIndex(), false);
+                    onPlacementResult(candidate.placementIndex(), GroundedSweepPlacementExecutor.PlacementResult.SUCCESS, laneTicksElapsed);
+                }
+                case HOTBAR_SWAP_PENDING -> {
+                    if (!recordHotbarSwapPending(candidate.placementIndex(), placement, candidate.worldPos(), laneTicksElapsed, "terminal lane", false, result)) {
+                        onPlacementResult(candidate.placementIndex(), GroundedSweepPlacementExecutor.PlacementResult.MISSED, laneTicksElapsed);
+                    }
+                    return;
+                }
                 case RETRY, MOVE_REQUIRED -> {
+                    clearHotbarSwapStabilization(candidate.placementIndex(), false);
                     if (!scheduleTransientPlacementRetry(client, candidate.placementIndex(), candidate.worldPos(), result.status(), laneTicksElapsed, "terminal lane")) {
                         onPlacementResult(candidate.placementIndex(), GroundedSweepPlacementExecutor.PlacementResult.MISSED, laneTicksElapsed);
                     }
                 }
-                case MISSING_ITEM, ERROR -> onFinalFailure(candidate.placementIndex());
+                case MISSING_ITEM, ERROR -> {
+                    clearHotbarSwapStabilization(candidate.placementIndex(), false);
+                    onFinalFailure(candidate.placementIndex());
+                }
             }
             attempts++;
         }
@@ -3291,6 +3355,7 @@ public final class GroundedSingleLaneDebugRunner {
         pendingPlacementTargets = List.of();
         pendingVerificationsByPlacement = Map.of();
         transientPlacementRetriesByPlacement = Map.of();
+        hotbarSwapStabilizationByPlacement = Map.of();
         currentLeftovers = List.of();
         awaitingStartApproach = false;
         startApproachIssued = false;
@@ -3359,12 +3424,14 @@ public final class GroundedSingleLaneDebugRunner {
                 continue;
             }
 
+            traceHotbarSwapRetryReadyIfNeeded(candidate.placementIndex(), placement, candidate.worldPos(), laneTicksElapsed, "normal lane", false);
             PlacementResult result = placementExecutor.execute(client, activeSession, placement, candidate.worldPos(), reservedHotbarSlots());
             if (sweepPassPhase == SweepPassPhase.REVERSE && isWatchedNearStartTarget(activeLane, candidate.worldPos())) {
                 traceWatchTarget("WATCH_TARGET_REVERSE_ATTEMPT_RESULT", activeLane, candidate.worldPos(), candidate.placementIndex(), "result=" + result.status());
             }
             switch (result.status()) {
                 case PLACED -> {
+                    clearHotbarSwapStabilization(candidate.placementIndex(), false);
                     onPlacementPlaced(candidate.placementIndex(), placement, candidate.worldPos(), laneTicksElapsed);
                     if (currentSettings.placementDelayTicks() > 0) {
                         placementDelayCooldown = currentSettings.placementDelayTicks();
@@ -3372,19 +3439,31 @@ public final class GroundedSingleLaneDebugRunner {
                     }
                 }
                 case ACCEPTED_PENDING_VERIFICATION -> {
+                    clearHotbarSwapStabilization(candidate.placementIndex(), false);
                     onPlacementAcceptedPendingVerification(candidate.placementIndex(), placement, candidate.worldPos(), laneTicksElapsed);
                     if (currentSettings.placementDelayTicks() > 0) {
                         placementDelayCooldown = currentSettings.placementDelayTicks();
                         return;
                     }
                 }
-                case ALREADY_CORRECT -> onPlacementResult(candidate.placementIndex(), GroundedSweepPlacementExecutor.PlacementResult.SUCCESS, laneTicksElapsed);
+                case ALREADY_CORRECT -> {
+                    clearHotbarSwapStabilization(candidate.placementIndex(), false);
+                    onPlacementResult(candidate.placementIndex(), GroundedSweepPlacementExecutor.PlacementResult.SUCCESS, laneTicksElapsed);
+                }
+                case HOTBAR_SWAP_PENDING -> {
+                    if (!recordHotbarSwapPending(candidate.placementIndex(), placement, candidate.worldPos(), laneTicksElapsed, "normal lane", false, result)) {
+                        onPlacementResult(candidate.placementIndex(), GroundedSweepPlacementExecutor.PlacementResult.MISSED, laneTicksElapsed);
+                    }
+                    return;
+                }
                 case RETRY, MOVE_REQUIRED -> {
+                    clearHotbarSwapStabilization(candidate.placementIndex(), false);
                     if (!scheduleTransientPlacementRetry(client, candidate.placementIndex(), candidate.worldPos(), result.status(), laneTicksElapsed, "normal lane")) {
                         onPlacementResult(candidate.placementIndex(), GroundedSweepPlacementExecutor.PlacementResult.MISSED, laneTicksElapsed);
                     }
                 }
                 case MISSING_ITEM -> {
+                    clearHotbarSwapStabilization(candidate.placementIndex(), false);
                     Identifier itemId = placement.block() == null ? null : Registries.ITEM.getId(placement.block().asItem());
                     int heldCount = countItemInInventory(client.player, itemId);
                     if (itemId != null && exhaustedMaterials.containsKey(itemId) && heldCount > 0) {
@@ -3406,7 +3485,10 @@ public final class GroundedSingleLaneDebugRunner {
                     }
                     onFinalFailure(candidate.placementIndex());
                 }
-                case ERROR -> onFinalFailure(candidate.placementIndex());
+                case ERROR -> {
+                    clearHotbarSwapStabilization(candidate.placementIndex(), false);
+                    onFinalFailure(candidate.placementIndex());
+                }
             }
             attempts++;
         }
@@ -3455,6 +3537,7 @@ public final class GroundedSingleLaneDebugRunner {
             reversePlacementFilter.remove(placementIndex);
             transientPlacementRetriesByPlacement = mutableTransientPlacementRetries();
             transientPlacementRetriesByPlacement.remove(placementIndex);
+            clearHotbarSwapStabilization(placementIndex, false);
             removePendingPlacement(placementIndex);
             return;
         }
@@ -3462,6 +3545,7 @@ public final class GroundedSingleLaneDebugRunner {
             missedPlacements++;
             transientPlacementRetriesByPlacement = mutableTransientPlacementRetries();
             transientPlacementRetriesByPlacement.remove(placementIndex);
+            clearHotbarSwapStabilization(placementIndex, false);
             if (activeLane != null && lanePlacementsByIndex != null && activeSession != null) {
                 Placement wp = lanePlacementsByIndex.get(placementIndex);
                 if (wp != null) {
@@ -3477,6 +3561,7 @@ public final class GroundedSingleLaneDebugRunner {
         failedPlacements++;
         transientPlacementRetriesByPlacement = mutableTransientPlacementRetries();
         transientPlacementRetriesByPlacement.remove(placementIndex);
+        clearHotbarSwapStabilization(placementIndex, false);
         removePendingPlacement(placementIndex);
     }
 
@@ -3486,6 +3571,7 @@ public final class GroundedSingleLaneDebugRunner {
         removePendingVerification(placementIndex);
         transientPlacementRetriesByPlacement = mutableTransientPlacementRetries();
         transientPlacementRetriesByPlacement.remove(placementIndex);
+        clearHotbarSwapStabilization(placementIndex, false);
         removePendingPlacement(placementIndex);
     }
 
@@ -3525,6 +3611,14 @@ public final class GroundedSingleLaneDebugRunner {
             return linkedHashMap;
         }
         return new LinkedHashMap<>(transientPlacementRetriesByPlacement);
+    }
+
+    private Map<Integer, Integer> mutableHotbarSwapStabilization(boolean transitionSupport) {
+        Map<Integer, Integer> source = transitionSupport ? hotbarSwapTransitionSupportByPlacement : hotbarSwapStabilizationByPlacement;
+        if (source instanceof LinkedHashMap<Integer, Integer> linkedHashMap) {
+            return linkedHashMap;
+        }
+        return new LinkedHashMap<>(source);
     }
 
     private void processTerminalPendingVerifications(MinecraftClient client) {
@@ -3581,6 +3675,94 @@ public final class GroundedSingleLaneDebugRunner {
         }
         BlockState worldState = client.world.getBlockState(pending.worldPos());
         return worldState.isOf(pending.expectedBlock());
+    }
+
+    private boolean recordHotbarSwapPending(
+            int placementIndex,
+            Placement placement,
+            BlockPos worldPos,
+            long tick,
+            String path,
+            boolean transitionSupport,
+            PlacementResult result
+    ) {
+        Map<Integer, Integer> stabilization = mutableHotbarSwapStabilization(transitionSupport);
+        int attempts = stabilization.getOrDefault(placementIndex, 0) + 1;
+        if (attempts > MAX_HOTBAR_SWAP_STABILIZATION_RETRIES) {
+            stabilization.remove(placementIndex);
+            setHotbarSwapStabilizationMap(transitionSupport, stabilization);
+            traceHotbarSwapEvent("PLACEMENT_HOTBAR_SWAP_RETRY_EXHAUSTED", placementIndex, placement, worldPos, tick, path, attempts - 1, result);
+            return false;
+        }
+
+        stabilization.put(placementIndex, attempts);
+        setHotbarSwapStabilizationMap(transitionSupport, stabilization);
+        traceHotbarSwapEvent("PLACEMENT_HOTBAR_SWAP_PENDING", placementIndex, placement, worldPos, tick, path, attempts, result);
+        return true;
+    }
+
+    private void traceHotbarSwapRetryReadyIfNeeded(
+            int placementIndex,
+            Placement placement,
+            BlockPos worldPos,
+            long tick,
+            String path,
+            boolean transitionSupport
+    ) {
+        Map<Integer, Integer> stabilization = transitionSupport ? hotbarSwapTransitionSupportByPlacement : hotbarSwapStabilizationByPlacement;
+        int attemptCount = stabilization.getOrDefault(placementIndex, 0);
+        if (attemptCount <= 0) {
+            return;
+        }
+        traceHotbarSwapEvent("PLACEMENT_HOTBAR_SWAP_RETRY_READY", placementIndex, placement, worldPos, tick, path, attemptCount, null);
+    }
+
+    private void clearHotbarSwapStabilization(int placementIndex, boolean transitionSupport) {
+        Map<Integer, Integer> stabilization = mutableHotbarSwapStabilization(transitionSupport);
+        if (!stabilization.containsKey(placementIndex)) {
+            return;
+        }
+        stabilization.remove(placementIndex);
+        setHotbarSwapStabilizationMap(transitionSupport, stabilization);
+    }
+
+    private void setHotbarSwapStabilizationMap(boolean transitionSupport, Map<Integer, Integer> stabilization) {
+        Map<Integer, Integer> normalized = stabilization.isEmpty() ? Map.of() : stabilization;
+        if (transitionSupport) {
+            hotbarSwapTransitionSupportByPlacement = normalized;
+        } else {
+            hotbarSwapStabilizationByPlacement = normalized;
+        }
+    }
+
+    private void traceHotbarSwapEvent(
+            String eventName,
+            int placementIndex,
+            Placement placement,
+            BlockPos worldPos,
+            long tick,
+            String path,
+            int attemptCount,
+            PlacementResult result
+    ) {
+        StringBuilder message = new StringBuilder(eventName)
+                .append(" path=").append(path)
+                .append(" placementIndex=").append(placementIndex)
+                .append(" worldPos=").append(worldPos == null ? "unknown" : worldPos.toShortString())
+                .append(" expected=").append(placement == null ? "unknown" : blockIdForDiagnostics(placement.block()))
+                .append(" tick=").append(tick)
+                .append(" attemptCount=").append(attemptCount);
+        if (activeLane != null) {
+            message.append(" laneIndex=").append(activeLane.laneIndex())
+                    .append(" laneDirection=").append(activeLane.direction());
+            if (worldPos != null) {
+                message.append(" laneRelativeBand=").append(GroundedSweepPlacementExecutor.laneRelativeBand(activeLane, worldPos));
+            }
+        }
+        if (result != null && result.message() != null && !result.message().isBlank()) {
+            message.append(" detail=\"").append(result.message()).append("\"");
+        }
+        traceGroundedEvent(message.toString());
     }
 
     private boolean scheduleTransientPlacementRetry(
@@ -4101,26 +4283,40 @@ public final class GroundedSingleLaneDebugRunner {
             if (transientTransitionSupportRetriesByPlacement.getOrDefault(target.placementIndex(), 0) > MAX_TRANSIENT_PLACEMENT_RETRIES) {
                 continue;
             }
+            traceHotbarSwapRetryReadyIfNeeded(target.placementIndex(), placement, target.worldPos(), transitionSupportTicks, "transition support", true);
             PlacementResult result = placementExecutor.execute(client, activeSession, placement, target.worldPos(), reservedHotbarSlots());
             switch (result.status()) {
                 case PLACED -> {
+                    clearHotbarSwapStabilization(target.placementIndex(), true);
                     transitionSupportPlacedCount++;
                     onTransitionSupportPendingVerification(target.placementIndex(), placement, target.worldPos(), transitionSupportTicks, "PLACEMENT_PENDING_VERIFICATION_SCHEDULED");
                 }
                 case ACCEPTED_PENDING_VERIFICATION -> {
+                    clearHotbarSwapStabilization(target.placementIndex(), true);
                     transitionSupportPlacedCount++;
                     onTransitionSupportPendingVerification(target.placementIndex(), placement, target.worldPos(), transitionSupportTicks, "PLACEMENT_ACCEPTED_PENDING_VERIFICATION");
                 }
                 case ALREADY_CORRECT -> {
+                    clearHotbarSwapStabilization(target.placementIndex(), true);
                     transitionSupportAlreadyCorrectCount++;
                     transientTransitionSupportRetriesByPlacement = mutableTransientTransitionSupportRetries();
                     transientTransitionSupportRetriesByPlacement.remove(target.placementIndex());
                     removePendingTransitionSupportTarget(target.placementIndex());
                 }
+                case HOTBAR_SWAP_PENDING -> {
+                    if (!recordHotbarSwapPending(target.placementIndex(), placement, target.worldPos(), transitionSupportTicks, "transition support", true, result)) {
+                        transitionSupportFailedCount++;
+                        traceGroundedEvent("transition support block skipped: idx=" + target.placementIndex() + " reason=HOTBAR_SWAP_RETRY_EXHAUSTED");
+                        removePendingTransitionSupportTarget(target.placementIndex());
+                    }
+                    return;
+                }
                 case RETRY, MOVE_REQUIRED -> {
+                    clearHotbarSwapStabilization(target.placementIndex(), true);
                     scheduleTransientTransitionSupportRetry(client, target, result.status(), transitionSupportTicks);
                 }
                 case MISSING_ITEM, ERROR -> {
+                    clearHotbarSwapStabilization(target.placementIndex(), true);
                     transitionSupportFailedCount++;
                     traceGroundedEvent("transition support block skipped: idx=" + target.placementIndex() + " reason=" + result.status().name());
                     removePendingTransitionSupportTarget(target.placementIndex());
@@ -5108,6 +5304,7 @@ public final class GroundedSingleLaneDebugRunner {
         reversePlacementFilter.clear();
 
         pendingVerificationsByPlacement = new LinkedHashMap<>();
+        hotbarSwapStabilizationByPlacement = Map.of();
         currentLeftovers = List.of();
         awaitingStartApproach = false;
         startApproachIssued = false;
@@ -5264,6 +5461,8 @@ public final class GroundedSingleLaneDebugRunner {
         );
         traceGroundedEvent("activateLaneData: pendingPlacementTargets initialized with " + pendingPlacementTargets.size() + " targets");
         pendingVerificationsByPlacement = new LinkedHashMap<>();
+        hotbarSwapStabilizationByPlacement = Map.of();
+        hotbarSwapTransitionSupportByPlacement = Map.of();
         currentLeftovers = List.of();
         for (GroundedSweepPlacementExecutor.PlacementTarget target : pendingPlacementTargets) {
             if (isWatchedNearStartTarget(activeLane, target.worldPos())) {
@@ -5293,6 +5492,7 @@ public final class GroundedSingleLaneDebugRunner {
                 transitionSupportPlacementsByIndex
         );
         pendingTransitionSupportVerifications = new LinkedHashMap<>();
+        hotbarSwapTransitionSupportByPlacement = Map.of();
         transitionSupportTicks = 0;
         transitionSupportAlreadyCorrectCount = 0;
         transitionSupportPlacedCount = 0;
@@ -5339,6 +5539,7 @@ public final class GroundedSingleLaneDebugRunner {
         );
         transientTransitionSupportRetriesByPlacement = mutableTransientTransitionSupportRetries();
         transientTransitionSupportRetriesByPlacement.remove(placementIndex);
+        clearHotbarSwapStabilization(placementIndex, true);
         removePendingTransitionSupportTarget(placementIndex);
         traceTransitionSupportVerificationEvent(eventName, placementIndex, worldPos, placement.block(), tick, 0);
     }
@@ -5466,6 +5667,7 @@ public final class GroundedSingleLaneDebugRunner {
         pendingTransitionSupportTargets = List.of();
         pendingTransitionSupportVerifications = Map.of();
         transientTransitionSupportRetriesByPlacement = Map.of();
+        hotbarSwapTransitionSupportByPlacement = Map.of();
         transitionSupportTicks = 0;
         transitionSupportAlreadyCorrectCount = 0;
         transitionSupportPlacedCount = 0;
