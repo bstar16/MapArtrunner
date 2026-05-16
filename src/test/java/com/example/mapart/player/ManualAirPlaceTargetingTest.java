@@ -70,6 +70,17 @@ class ManualAirPlaceTargetingTest {
     }
 
     @Test
+    void reservedHotbarSettingDoesNotDisableManualAirPlaceTargeting() {
+        ManualAirPlacePlan plan = ManualAirPlaceTargeting.resolve(
+                context(true, true, false, false, TARGET, 4.0, 5.0),
+                world(Set.of(TARGET))
+        );
+
+        assertEquals(ManualAirPlaceState.VALID, plan.state());
+        assertTrue(plan.valid());
+    }
+
+    @Test
     void noAdjacentSupportStillAllowsManualAirPlace() {
         ManualAirPlacePlan plan = ManualAirPlaceTargeting.resolve(
                 context(true, true, false, false, TARGET, 4.0, 5.0),

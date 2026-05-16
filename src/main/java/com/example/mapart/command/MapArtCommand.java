@@ -461,6 +461,7 @@ public final class MapArtCommand {
                 settings.forwardLookaheadSteps(),
                 settings.trivialBehindCleanupSteps(),
                 settings.groundedSweepConstantSprint(),
+                settings.reservedHotbarSlots(),
                 1.0
         );
     }
@@ -579,6 +580,11 @@ public final class MapArtCommand {
         source.sendFeedback(Text.literal("groundedSweepConstantSprint=" + settings.groundedSweepConstantSprint()));
         source.sendFeedback(Text.literal("placementDelayTicks=" + settings.placementDelayTicks()));
         source.sendFeedback(Text.literal("inventoryClickDelayTicks=" + settings.inventoryClickDelayTicks()));
+        source.sendFeedback(Text.literal("reservedHotbarSlots=" + settings.reservedHotbarSlots()
+                + (settings.reservedHotbarSlots() == 0
+                ? " (no automated hotbar protection)"
+                : " (protects user hotbar slots 1-" + settings.reservedHotbarSlots()
+                + " for tools, food, pearls, rockets, pickaxe, ender chest, or future shulker slots)")));
         source.sendFeedback(Text.literal("clientTimerSpeed=" + settings.clientTimerSpeed()));
         source.sendFeedback(Text.literal("clientTimerEnabled=" + settings.clientTimerEnabled()));
         source.sendFeedback(Text.literal("manualAirPlaceEnabled=" + settings.manualAirPlaceEnabled()));

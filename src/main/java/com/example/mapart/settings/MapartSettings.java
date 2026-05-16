@@ -1,5 +1,7 @@
 package com.example.mapart.settings;
 
+import com.example.mapart.inventory.HotbarSlotReservations;
+
 public record MapartSettings(
         boolean showHud,
         boolean showSchematicOverlay,
@@ -18,6 +20,7 @@ public record MapartSettings(
         boolean groundedSweepConstantSprint,
         int placementDelayTicks,
         int inventoryClickDelayTicks,
+        int reservedHotbarSlots,
         boolean manualAirPlaceEnabled,
         boolean manualAirPlaceRender,
         boolean manualAirPlaceUseCustomRange,
@@ -25,6 +28,10 @@ public record MapartSettings(
         boolean manualAirPlaceRequireSneak,
         boolean manualAirPlaceDisableWhileRunnerActive
 ) {
+    public MapartSettings {
+        HotbarSlotReservations.validateReservedHotbarSlots(reservedHotbarSlots);
+    }
+
     public static MapartSettings defaults() {
         return new MapartSettings(
                 true,
@@ -42,6 +49,7 @@ public record MapartSettings(
                 1,
                 1,
                 true,
+                0,
                 0,
                 0,
                 false,

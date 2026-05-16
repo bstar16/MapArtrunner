@@ -16,6 +16,7 @@ package com.example.mapart.plan.sweep.grounded;
 
 import com.example.mapart.MapArtMod;
 import com.example.mapart.baritone.BaritoneFacade;
+import com.example.mapart.inventory.HotbarSlotReservations;
 import com.example.mapart.supply.SupplyPoint;
 import com.example.mapart.supply.SupplyStore;
 import net.minecraft.block.entity.BlockEntity;
@@ -27,6 +28,7 @@ import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
 import net.minecraft.registry.Registries;
 import net.minecraft.screen.ScreenHandler;
+import net.minecraft.screen.slot.Slot;
 import net.minecraft.screen.slot.SlotActionType;
 import net.minecraft.util.Identifier;
 import net.minecraft.util.ActionResult;
@@ -92,6 +94,7 @@ public final class GroundedRefillController {
     private boolean chestWasScanned = false;
     private boolean inventoryWasFullDuringRefill = false;
     private int configuredClickDelayTicks = 0;
+    private int reservedHotbarSlots = 0;
     // When true, navigation and container-open timeout counters do not advance.
     // Set by the runner when a client tick-stall is detected to avoid burning timeouts
     // while the client is paused or throttled.
@@ -107,6 +110,10 @@ public final class GroundedRefillController {
 
     public void setInventoryClickDelayTicks(int ticks) {
         this.configuredClickDelayTicks = Math.max(0, ticks);
+    }
+
+    public void setReservedHotbarSlots(int reservedHotbarSlots) {
+        this.reservedHotbarSlots = HotbarSlotReservations.validateReservedHotbarSlots(reservedHotbarSlots);
     }
 
     private int effectiveClickDelay() {
@@ -356,7 +363,7 @@ public final class GroundedRefillController {
             return TickResult.ACTIVE;
         }
 
-        Map<Identifier, Integer> remaining = computeRemainingDeficits(client.player, deficits);
+        Map<Identifier, Integer> remaining = computeRemainingDeficits(client.player, deficits, reservedHotbarSlots);
         MapArtMod.LOGGER.info("[grounded-trace:refill] tickRefilling: deficits={}, remaining={}, screenOpen={}",
                 deficits, remaining, currentSupplyScreen(client) != null);
         if (remaining.isEmpty()) {
@@ -397,6 +404,9 @@ public final class GroundedRefillController {
         PlayerInventory inventory = client.player.getInventory();
         int freeSlots = 0;
         for (int slot = 0; slot < PlayerInventory.MAIN_SIZE; slot++) {
+            if (!HotbarSlotReservations.isAutomatedInventorySlot(slot, reservedHotbarSlots)) {
+                continue;
+            }
             ItemStack stack = inventory.getStack(slot);
             if (stack.isEmpty()) {
                 freeSlots++;
@@ -439,9 +449,22 @@ public final class GroundedRefillController {
                 MapArtMod.LOGGER.info("[grounded-trace:refill] scan slot={} item={} count={} seeking={} matched={}",
                         slotIndex, slotItemId, stack.getCount(), needed, matched);
                 if (matched) {
-                    MapArtMod.LOGGER.info("[grounded-trace:refill] pulling {} x{} from slot {}",
-                            needed, stack.getCount(), slotIndex);
-                    client.interactionManager.clickSlot(handler.syncId, slotIndex, 0, SlotActionType.QUICK_MOVE, client.player);
+                    Optional<RefillTransferTarget> transferTarget = chooseRefillTransferTarget(handler, containerSlotCount, inventory, stack);
+                    if (transferTarget.isEmpty()) {
+                        inventoryWasFullDuringRefill = true;
+                        MapArtMod.LOGGER.info("[grounded-trace:refill] no automated refill storage slot available, ending refill with remaining={}", remaining);
+                        closeScreen(client);
+                        if (returnTarget != null && baritone != null) {
+                            baritone.goNear(returnTarget, CONTAINER_REACH_FLAT);
+                            state = RefillState.RETURNING;
+                        } else {
+                            state = RefillState.DONE;
+                        }
+                        return TickResult.ACTIVE;
+                    }
+                    MapArtMod.LOGGER.info("[grounded-trace:refill] pulling {} x{} from container slot {} into player inventory slot {}",
+                            needed, stack.getCount(), slotIndex, transferTarget.get().playerInventorySlot());
+                    transferFromContainerSlot(client, handler, slotIndex, transferTarget.get());
                     actionCooldown = effectiveClickDelay();
                     anyUseful = true;
                     return TickResult.ACTIVE;
@@ -473,7 +496,7 @@ public final class GroundedRefillController {
         if (!anyUseful) {
             // Before hard-failing, check whether the player already carries some of the needed
             // materials. If so, continue with available inventory rather than stopping entirely.
-            Map<Identifier, Integer> playerInventory = buildInventoryMap(client.player);
+            Map<Identifier, Integer> playerInventory = buildInventoryMap(client.player, reservedHotbarSlots);
             boolean playerHasAnyNeeded = deficits.keySet().stream()
                     .anyMatch(id -> playerInventory.getOrDefault(id, 0) > 0);
             if (playerHasAnyNeeded) {
@@ -653,7 +676,7 @@ public final class GroundedRefillController {
     public Map<String, Integer> diagnosticsRemaining() {
         MinecraftClient c = MinecraftClient.getInstance();
         if (c == null || c.player == null) return Map.of();
-        Map<Identifier,Integer> rem = computeRemainingDeficits(c.player, deficits);
+        Map<Identifier,Integer> rem = computeRemainingDeficits(c.player, deficits, reservedHotbarSlots);
         Map<String,Integer> out = new LinkedHashMap<>();
         for (Map.Entry<Identifier,Integer> e: rem.entrySet()) out.put(e.getKey().toString(), e.getValue());
         return out;
@@ -731,6 +754,9 @@ public final class GroundedRefillController {
         PlayerInventory inventory = player.getInventory();
         Set<Item> held = new HashSet<>();
         for (int slot = 0; slot < PlayerInventory.MAIN_SIZE; slot++) {
+            if (!HotbarSlotReservations.isAutomatedInventorySlot(slot, 0)) {
+                continue;
+            }
             ItemStack stack = inventory.getStack(slot);
             if (!stack.isEmpty()) {
                 held.add(stack.getItem());
@@ -745,10 +771,132 @@ public final class GroundedRefillController {
      * @param targetTotals Map of item ID to TOTAL count required (NOT deficit)
      * @return Map of item ID to remaining deficit (how many more needed)
      */
-    private static Map<Identifier, Integer> buildInventoryMap(ClientPlayerEntity player) {
+    private Optional<RefillTransferTarget> chooseRefillTransferTarget(
+            ScreenHandler handler,
+            int containerSlotCount,
+            PlayerInventory inventory,
+            ItemStack incomingStack
+    ) {
+        Optional<Integer> playerInventorySlot = chooseRefillTransferInventorySlot(inventory, incomingStack, reservedHotbarSlots);
+        if (playerInventorySlot.isEmpty()) {
+            return Optional.empty();
+        }
+        Optional<Integer> handlerSlot = handlerSlotForPlayerInventorySlot(handler, containerSlotCount, inventory, playerInventorySlot.get());
+        return handlerSlot.map(slot -> new RefillTransferTarget(playerInventorySlot.get(), slot));
+    }
+
+    private static Optional<Integer> chooseRefillTransferInventorySlot(PlayerInventory inventory, ItemStack incomingStack, int reservedHotbarSlots) {
+        if (inventory == null || incomingStack == null || incomingStack.isEmpty()) {
+            return Optional.empty();
+        }
+        HotbarSlotReservations.validateReservedHotbarSlots(reservedHotbarSlots);
+        Optional<Integer> emptyMain = firstEmptySlotInRange(inventory, PlayerInventory.getHotbarSize(), PlayerInventory.MAIN_SIZE);
+        if (emptyMain.isPresent()) {
+            return emptyMain;
+        }
+        Optional<Integer> emptyHotbar = firstEmptySlotInRange(inventory, reservedHotbarSlots, PlayerInventory.getHotbarSize());
+        if (emptyHotbar.isPresent()) {
+            return emptyHotbar;
+        }
+        Optional<Integer> partialMain = firstMergeableSlotInRange(inventory, incomingStack, PlayerInventory.getHotbarSize(), PlayerInventory.MAIN_SIZE);
+        if (partialMain.isPresent()) {
+            return partialMain;
+        }
+        return firstMergeableSlotInRange(inventory, incomingStack, reservedHotbarSlots, PlayerInventory.getHotbarSize());
+    }
+
+    private static Optional<Integer> firstEmptySlotInRange(PlayerInventory inventory, int startInclusive, int endExclusive) {
+        for (int slot = startInclusive; slot < endExclusive; slot++) {
+            if (inventory.getStack(slot).isEmpty()) {
+                return Optional.of(slot);
+            }
+        }
+        return Optional.empty();
+    }
+
+    private static Optional<Integer> firstMergeableSlotInRange(PlayerInventory inventory, ItemStack incomingStack, int startInclusive, int endExclusive) {
+        for (int slot = startInclusive; slot < endExclusive; slot++) {
+            ItemStack stack = inventory.getStack(slot);
+            if (!stack.isEmpty()
+                    && ItemStack.areItemsAndComponentsEqual(stack, incomingStack)
+                    && stack.getCount() < stack.getMaxCount()) {
+                return Optional.of(slot);
+            }
+        }
+        return Optional.empty();
+    }
+
+    static Optional<Integer> chooseRefillTransferInventorySlotForTests(
+            int reservedHotbarSlots,
+            Set<Integer> emptySlots,
+            Map<Integer, Boolean> matchingStackWithSpace
+    ) {
+        HotbarSlotReservations.validateReservedHotbarSlots(reservedHotbarSlots);
+        for (int slot = PlayerInventory.getHotbarSize(); slot < PlayerInventory.MAIN_SIZE; slot++) {
+            if (emptySlots.contains(slot)) {
+                return Optional.of(slot);
+            }
+        }
+        for (int slot = reservedHotbarSlots; slot < PlayerInventory.getHotbarSize(); slot++) {
+            if (emptySlots.contains(slot)) {
+                return Optional.of(slot);
+            }
+        }
+        for (int slot = PlayerInventory.getHotbarSize(); slot < PlayerInventory.MAIN_SIZE; slot++) {
+            if (matchingStackWithSpace.getOrDefault(slot, false)) {
+                return Optional.of(slot);
+            }
+        }
+        for (int slot = reservedHotbarSlots; slot < PlayerInventory.getHotbarSize(); slot++) {
+            if (matchingStackWithSpace.getOrDefault(slot, false)) {
+                return Optional.of(slot);
+            }
+        }
+        return Optional.empty();
+    }
+
+    private static Optional<Integer> handlerSlotForPlayerInventorySlot(
+            ScreenHandler handler,
+            int containerSlotCount,
+            PlayerInventory inventory,
+            int playerInventorySlot
+    ) {
+        if (handler == null || inventory == null) {
+            return Optional.empty();
+        }
+        for (int handlerSlot = containerSlotCount; handlerSlot < handler.slots.size(); handlerSlot++) {
+            Slot slot = handler.slots.get(handlerSlot);
+            if (slot.inventory == inventory && slot.getIndex() == playerInventorySlot) {
+                return Optional.of(handlerSlot);
+            }
+        }
+        return Optional.empty();
+    }
+
+    private static void transferFromContainerSlot(
+            MinecraftClient client,
+            ScreenHandler handler,
+            int containerSlot,
+            RefillTransferTarget transferTarget
+    ) {
+        client.interactionManager.clickSlot(handler.syncId, containerSlot, 0, SlotActionType.PICKUP, client.player);
+        client.interactionManager.clickSlot(handler.syncId, transferTarget.handlerSlot(), 0, SlotActionType.PICKUP, client.player);
+        if (!handler.getCursorStack().isEmpty()) {
+            client.interactionManager.clickSlot(handler.syncId, containerSlot, 0, SlotActionType.PICKUP, client.player);
+        }
+    }
+
+    private record RefillTransferTarget(int playerInventorySlot, int handlerSlot) {
+    }
+
+    private static Map<Identifier, Integer> buildInventoryMap(ClientPlayerEntity player, int reservedHotbarSlots) {
         Map<Identifier, Integer> inventory = new LinkedHashMap<>();
         if (player == null) return inventory;
+        HotbarSlotReservations.validateReservedHotbarSlots(reservedHotbarSlots);
         for (int slot = 0; slot < PlayerInventory.MAIN_SIZE; slot++) {
+            if (!HotbarSlotReservations.isAutomatedInventorySlot(slot, reservedHotbarSlots)) {
+                continue;
+            }
             ItemStack stack = player.getInventory().getStack(slot);
             if (!stack.isEmpty()) {
                 inventory.merge(Registries.ITEM.getId(stack.getItem()), stack.getCount(), Integer::sum);
@@ -757,9 +905,13 @@ public final class GroundedRefillController {
         return inventory;
     }
 
-    private static Map<Identifier, Integer> computeRemainingDeficits(ClientPlayerEntity player, Map<Identifier, Integer> targetTotals) {
+    private static Map<Identifier, Integer> computeRemainingDeficits(ClientPlayerEntity player, Map<Identifier, Integer> targetTotals, int reservedHotbarSlots) {
         Map<Identifier, Integer> inventory = new LinkedHashMap<>();
+        HotbarSlotReservations.validateReservedHotbarSlots(reservedHotbarSlots);
         for (int slot = 0; slot < PlayerInventory.MAIN_SIZE; slot++) {
+            if (!HotbarSlotReservations.isAutomatedInventorySlot(slot, reservedHotbarSlots)) {
+                continue;
+            }
             ItemStack stack = player.getInventory().getStack(slot);
             if (!stack.isEmpty()) {
                 inventory.merge(Registries.ITEM.getId(stack.getItem()), stack.getCount(), Integer::sum);

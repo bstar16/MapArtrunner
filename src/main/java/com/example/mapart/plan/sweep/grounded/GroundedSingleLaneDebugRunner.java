@@ -2,6 +2,7 @@ package com.example.mapart.plan.sweep.grounded;
 
 import com.example.mapart.MapArtMod;
 import com.example.mapart.baritone.BaritoneFacade;
+import com.example.mapart.inventory.HotbarSlotReservations;
 import com.example.mapart.runtime.ClientTickHealthMonitor;
 import com.example.mapart.settings.MapartSettings;
 import com.example.mapart.plan.BuildPlan;
@@ -427,6 +428,7 @@ public final class GroundedSingleLaneDebugRunner {
     public void tick(MinecraftClient client, MapartSettings settings) {
         this.currentSettings = settings != null ? settings : MapartSettings.defaults();
         refillController.setInventoryClickDelayTicks(this.currentSettings.inventoryClickDelayTicks());
+        refillController.setReservedHotbarSlots(reservedHotbarSlots());
         boolean constantSprint = this.currentSettings.groundedSweepConstantSprint();
         groundedTraceTickCounter++;
         tickHealthMonitor.tick();
@@ -989,7 +991,7 @@ public final class GroundedSingleLaneDebugRunner {
         }
 
         Map<Item, Integer> heldCounts = (client != null && client.player != null)
-                ? countItemsInInventory(client.player)
+                ? countItemsInInventory(client.player, reservedHotbarSlots())
                 : Map.of();
 
         Map<Item, Integer> neededItems = neededCounts.entrySet().stream()
@@ -1089,7 +1091,7 @@ public final class GroundedSingleLaneDebugRunner {
         if (client != null && client.player != null && client.player.getAbilities().creativeMode) {
             return new PreflightMaterialCheckResult(true, 0, 0, List.of(), List.of(), Map.of(), List.of());
         }
-        Map<Item, Integer> heldCounts = countItemsInInventory(client.player);
+        Map<Item, Integer> heldCounts = countItemsInInventory(client.player, reservedHotbarSlots());
         List<GroundedSweepPlacementExecutor.PlacementTarget> preflightTargets = pendingPlacementTargets.stream()
                 .limit(PREFLIGHT_LOOKAHEAD_TARGETS)
                 .toList();
@@ -1204,7 +1206,7 @@ public final class GroundedSingleLaneDebugRunner {
         }
 
         Map<Item, Integer> heldCounts = (client != null && client.player != null)
-                ? countItemsInInventory(client.player)
+                ? countItemsInInventory(client.player, reservedHotbarSlots())
                 : Map.of();
 
         Map<Item, Integer> neededItems = neededCounts.entrySet().stream()
@@ -1281,10 +1283,14 @@ public final class GroundedSingleLaneDebugRunner {
         return activeStartApproachTarget();
     }
 
-    private static Map<Item, Integer> countItemsInInventory(ClientPlayerEntity player) {
+    private static Map<Item, Integer> countItemsInInventory(ClientPlayerEntity player, int reservedHotbarSlots) {
+        HotbarSlotReservations.validateReservedHotbarSlots(reservedHotbarSlots);
         PlayerInventory inventory = player.getInventory();
         Map<Item, Integer> counts = new HashMap<>();
         for (int slot = 0; slot < PlayerInventory.MAIN_SIZE; slot++) {
+            if (!HotbarSlotReservations.isAutomatedInventorySlot(slot, reservedHotbarSlots)) {
+                continue;
+            }
             ItemStack stack = inventory.getStack(slot);
             if (!stack.isEmpty()) {
                 counts.merge(stack.getItem(), stack.getCount(), Integer::sum);
@@ -1488,10 +1494,14 @@ public final class GroundedSingleLaneDebugRunner {
 
     private int countItemInInventory(ClientPlayerEntity player, Identifier id) {
         if (player == null || id == null) return 0;
-        return countItemsInInventory(player).entrySet().stream()
+        return countItemsInInventory(player, reservedHotbarSlots()).entrySet().stream()
                 .filter(e -> id.equals(Registries.ITEM.getId(e.getKey())))
                 .mapToInt(Map.Entry::getValue)
                 .sum();
+    }
+
+    private int reservedHotbarSlots() {
+        return activeSettings == null ? 0 : activeSettings.reservedHotbarSlots();
     }
 
     private void hardStopForExhaustedItem(MinecraftClient client, Identifier itemId) {
@@ -1936,7 +1946,7 @@ public final class GroundedSingleLaneDebugRunner {
             if (isWatchedNearStartTarget(lane, pos)) {
                 traceWatchTarget("WATCH_TARGET_ENTRY_BURST_SELECTED", lane, pos, target.placementIndex(), "attempt=" + (usedAttempts + 1));
             }
-            PlacementResult result = placementExecutor.execute(client, activeSession, placement, pos);
+            PlacementResult result = placementExecutor.execute(client, activeSession, placement, pos, reservedHotbarSlots());
             switch (result.status()) {
                 case PLACED -> {
                     entrySupportEstablished = true;
@@ -2761,7 +2771,7 @@ public final class GroundedSingleLaneDebugRunner {
                 onFinalFailure(candidate.placementIndex());
                 continue;
             }
-            PlacementResult result = placementExecutor.execute(client, activeSession, placement, candidate.worldPos());
+            PlacementResult result = placementExecutor.execute(client, activeSession, placement, candidate.worldPos(), reservedHotbarSlots());
             switch (result.status()) {
                 case PLACED -> onPlacementPlaced(candidate.placementIndex(), placement, candidate.worldPos(), laneTicksElapsed);
                 case ALREADY_CORRECT -> onPlacementResult(candidate.placementIndex(), GroundedSweepPlacementExecutor.PlacementResult.SUCCESS, laneTicksElapsed);
@@ -3289,7 +3299,7 @@ public final class GroundedSingleLaneDebugRunner {
                 continue;
             }
 
-            PlacementResult result = placementExecutor.execute(client, activeSession, placement, candidate.worldPos());
+            PlacementResult result = placementExecutor.execute(client, activeSession, placement, candidate.worldPos(), reservedHotbarSlots());
             if (sweepPassPhase == SweepPassPhase.REVERSE && isWatchedNearStartTarget(activeLane, candidate.worldPos())) {
                 traceWatchTarget("WATCH_TARGET_REVERSE_ATTEMPT_RESULT", activeLane, candidate.worldPos(), candidate.placementIndex(), "result=" + result.status());
             }
@@ -3907,7 +3917,7 @@ public final class GroundedSingleLaneDebugRunner {
                 failTransitionSupport(client, "ERROR", target, placement, (PlacementResult) null);
                 return;
             }
-            PlacementResult result = placementExecutor.execute(client, activeSession, placement, target.worldPos());
+            PlacementResult result = placementExecutor.execute(client, activeSession, placement, target.worldPos(), reservedHotbarSlots());
             switch (result.status()) {
                 case PLACED -> {
                     transitionSupportPlacedCount++;
@@ -4888,6 +4898,7 @@ public final class GroundedSingleLaneDebugRunner {
         activeSession = session;
         activeBounds = bounds;
         activeSettings = settings;
+        refillController.setReservedHotbarSlots(reservedHotbarSlots());
         runMode = mode;
         forwardLanes = List.copyOf(plannedForwardLanes);
         reverseLanes = List.copyOf(plannedReverseLanes);

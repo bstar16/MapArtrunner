@@ -1,5 +1,7 @@
 package com.example.mapart.plan.sweep.grounded;
 
+import com.example.mapart.inventory.HotbarSlotReservations;
+
 public record GroundedSweepSettings(
         int sweepHalfWidth,
         int sweepTotalWidth,
@@ -7,8 +9,30 @@ public record GroundedSweepSettings(
         int forwardLookaheadSteps,
         int trivialBehindCleanupSteps,
         boolean groundedSweepConstantSprint,
+        int reservedHotbarSlots,
         double endpointTolerance
 ) {
+    public GroundedSweepSettings(
+            int sweepHalfWidth,
+            int sweepTotalWidth,
+            int laneStride,
+            int forwardLookaheadSteps,
+            int trivialBehindCleanupSteps,
+            boolean groundedSweepConstantSprint,
+            double endpointTolerance
+    ) {
+        this(
+                sweepHalfWidth,
+                sweepTotalWidth,
+                laneStride,
+                forwardLookaheadSteps,
+                trivialBehindCleanupSteps,
+                groundedSweepConstantSprint,
+                0,
+                endpointTolerance
+        );
+    }
+
     public GroundedSweepSettings {
         if (sweepHalfWidth < 0) {
             throw new IllegalArgumentException("sweepHalfWidth must be >= 0");
@@ -31,6 +55,7 @@ public record GroundedSweepSettings(
         if (endpointTolerance < 0.0) {
             throw new IllegalArgumentException("endpointTolerance must be >= 0");
         }
+        HotbarSlotReservations.validateReservedHotbarSlots(reservedHotbarSlots);
     }
 
     public static GroundedSweepSettings defaults() {
@@ -41,6 +66,7 @@ public record GroundedSweepSettings(
                 1,
                 1,
                 true,
+                0,
                 1.0
         );
     }

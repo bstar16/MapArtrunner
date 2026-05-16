@@ -31,6 +31,7 @@ public class MapArtConfigScreen extends Screen {
     private boolean groundedSweepConstantSprint;
     private int placementDelayTicks;
     private int inventoryClickDelayTicks;
+    private int reservedHotbarSlots;
     private int clientTimerSpeed;
     private boolean clientTimerEnabled;
     private boolean manualAirPlaceEnabled;
@@ -56,6 +57,7 @@ public class MapArtConfigScreen extends Screen {
         this.groundedSweepConstantSprint = s.groundedSweepConstantSprint();
         this.placementDelayTicks = s.placementDelayTicks();
         this.inventoryClickDelayTicks = s.inventoryClickDelayTicks();
+        this.reservedHotbarSlots = s.reservedHotbarSlots();
         this.clientTimerSpeed = s.clientTimerSpeed();
         this.clientTimerEnabled = s.clientTimerEnabled();
         this.manualAirPlaceEnabled = s.manualAirPlaceEnabled();
@@ -114,6 +116,10 @@ public class MapArtConfigScreen extends Screen {
                 "Inventory Delay", v -> inventoryClickDelayTicks = v));
         y += ROW_STRIDE;
 
+        addDrawableChild(new IntSlider(rightX, y, COL_W, BTN_H, 0, 8, reservedHotbarSlots,
+                "Reserved Hotbar", v -> reservedHotbarSlots = v));
+        y += ROW_STRIDE;
+
         // Timer speed field + enabled toggle on same row
         timerSpeedField = addDrawableChild(new TextFieldWidget(
                 this.textRenderer, rightX, y, 90, BTN_H, Text.literal("Timer speed")));
@@ -155,7 +161,10 @@ public class MapArtConfigScreen extends Screen {
         context.drawText(this.textRenderer, "SWEEP", cx + 5, LABEL_Y, 0xAAAAAA, true);
         context.drawText(this.textRenderer, "PLAYER", cx - COL_W - 5, SECTION_TOP + ROW_STRIDE * 6 - 10, 0xAAAAAA, true);
         // Label above timer speed field
-        int timerLabelY = SECTION_TOP + ROW_STRIDE * 3;
+        int reservedLabelY = SECTION_TOP + ROW_STRIDE * 3;
+        context.drawText(this.textRenderer, "Protect tools, food, pearls, rockets, pickaxe, ender chest, or shulker slots",
+                cx + 5, reservedLabelY - 10, 0xAAAAAA, false);
+        int timerLabelY = SECTION_TOP + ROW_STRIDE * 4;
         context.drawText(this.textRenderer, "Speed (1-20):", cx + 5, timerLabelY - 10, 0xAAAAAA, false);
         super.render(context, mouseX, mouseY, delta);
     }
@@ -174,6 +183,7 @@ public class MapArtConfigScreen extends Screen {
         settingsStore.set("groundedSweepConstantSprint", String.valueOf(groundedSweepConstantSprint));
         settingsStore.set("placementDelayTicks", String.valueOf(placementDelayTicks));
         settingsStore.set("inventoryClickDelayTicks", String.valueOf(inventoryClickDelayTicks));
+        settingsStore.set("reservedHotbarSlots", String.valueOf(reservedHotbarSlots));
         settingsStore.set("clientTimerEnabled", String.valueOf(clientTimerEnabled));
         settingsStore.set("clientTimerSpeed", String.valueOf(clientTimerSpeed));
         settingsStore.set("manualAirPlaceEnabled", String.valueOf(manualAirPlaceEnabled));
