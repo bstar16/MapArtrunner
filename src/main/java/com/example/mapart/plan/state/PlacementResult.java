@@ -3,6 +3,7 @@ package com.example.mapart.plan.state;
 public record PlacementResult(Status status, String message) {
     public enum Status {
         PLACED,
+        ACCEPTED_PENDING_VERIFICATION,
         ALREADY_CORRECT,
         MISSING_ITEM,
         MOVE_REQUIRED,
@@ -12,6 +13,10 @@ public record PlacementResult(Status status, String message) {
 
     static PlacementResult placed(String message) {
         return new PlacementResult(Status.PLACED, message);
+    }
+
+    static PlacementResult acceptedPendingVerification(String message) {
+        return new PlacementResult(Status.ACCEPTED_PENDING_VERIFICATION, message);
     }
 
     static PlacementResult alreadyCorrect(String message) {

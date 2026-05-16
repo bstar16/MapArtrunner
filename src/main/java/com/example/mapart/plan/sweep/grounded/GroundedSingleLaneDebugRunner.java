@@ -44,6 +44,8 @@ import java.util.function.Predicate;
 public final class GroundedSingleLaneDebugRunner {
     private static final int MAX_PLACEMENT_ATTEMPTS_PER_TICK = 2;
     private static final int PLACEMENT_VERIFICATION_DELAY_TICKS = 3;
+    private static final int MAX_TRANSIENT_PLACEMENT_RETRIES = 3;
+    private static final int TRANSIENT_RETRY_NEAR_BLOCK_DISTANCE = 5;
     private static final double LANE_SHIFT_REACH_DISTANCE_SQ = 1.5 * 1.5;
     private static final double LANE_TRANSITION_AXIS_TOLERANCE = 0.6;
     private static final int MAX_LANE_TRANSITION_TICKS = 120;
@@ -101,8 +103,10 @@ public final class GroundedSingleLaneDebugRunner {
     private Map<Integer, Placement> transitionSupportPlacementsByIndex = Map.of();
     private List<GroundedSweepPlacementExecutor.PlacementTarget> pendingPlacementTargets = List.of();
     private Map<Integer, PendingPlacementVerification> pendingVerificationsByPlacement = Map.of();
+    private Map<Integer, Integer> transientPlacementRetriesByPlacement = Map.of();
     private List<GroundedSweepPlacementExecutor.PlacementTarget> pendingTransitionSupportTargets = List.of();
     private Map<Integer, PendingPlacementVerification> pendingTransitionSupportVerifications = Map.of();
+    private Map<Integer, Integer> transientTransitionSupportRetriesByPlacement = Map.of();
     private List<GroundedSweepLeftoverTracker.GroundedLeftoverRecord> currentLeftovers = List.of();
     private int successfulPlacements;
     private int failedPlacements;
@@ -1958,6 +1962,14 @@ public final class GroundedSingleLaneDebugRunner {
                         traceWatchTarget("WATCH_TARGET_ENTRY_BURST_RESULT", lane, pos, target.placementIndex(), "result=PLACED");
                     }
                 }
+                case ACCEPTED_PENDING_VERIFICATION -> {
+                    entrySupportEstablished = true;
+                    onPlacementAcceptedPendingVerification(target.placementIndex(), placement, pos, laneTicksElapsed);
+                    traceGroundedEvent("entry burst attempt result=ACCEPTED_PENDING_VERIFICATION idx=" + target.placementIndex() + " attempts=" + (usedAttempts + 1));
+                    if (isWatchedNearStartTarget(lane, pos)) {
+                        traceWatchTarget("WATCH_TARGET_ENTRY_BURST_RESULT", lane, pos, target.placementIndex(), "result=ACCEPTED_PENDING_VERIFICATION");
+                    }
+                }
                 case ALREADY_CORRECT -> {
                     entrySupportEstablished = true;
                     onPlacementResult(target.placementIndex(), GroundedSweepPlacementExecutor.PlacementResult.SUCCESS, laneTicksElapsed);
@@ -1967,6 +1979,7 @@ public final class GroundedSingleLaneDebugRunner {
                     }
                 }
                 case RETRY, MOVE_REQUIRED -> {
+                    scheduleTransientPlacementRetry(client, target.placementIndex(), pos, result.status(), laneTicksElapsed, "entry burst");
                     traceGroundedEvent("entry burst attempt result=" + result.status() + " idx=" + target.placementIndex() + " attempts=" + (usedAttempts + 1));
                     if (isWatchedNearStartTarget(lane, pos)) {
                         traceWatchTarget("WATCH_TARGET_ENTRY_BURST_RESULT", lane, pos, target.placementIndex(), "result=" + result.status());
@@ -2519,9 +2532,19 @@ public final class GroundedSingleLaneDebugRunner {
         pendingTransitionSupportVerifications = mutableTransitionSupportVerifications();
         pendingTransitionSupportVerifications.put(
                 placementIndex,
-                new PendingPlacementVerification(placementIndex, worldPos, null, supportTick + PLACEMENT_VERIFICATION_DELAY_TICKS)
+                new PendingPlacementVerification(placementIndex, worldPos, null, supportTick, supportTick + PLACEMENT_VERIFICATION_DELAY_TICKS)
         );
         removePendingTransitionSupportTarget(placementIndex);
+    }
+
+    void recordTransitionSupportAcceptedPendingForTests(int placementIndex, BlockPos worldPos, long supportTick) {
+        pendingTransitionSupportVerifications = mutableTransitionSupportVerifications();
+        pendingTransitionSupportVerifications.put(
+                placementIndex,
+                new PendingPlacementVerification(placementIndex, worldPos, null, supportTick, supportTick + PLACEMENT_VERIFICATION_DELAY_TICKS)
+        );
+        removePendingTransitionSupportTarget(placementIndex);
+        traceTransitionSupportVerificationEvent("PLACEMENT_ACCEPTED_PENDING_VERIFICATION", placementIndex, worldPos, null, supportTick, 0);
     }
 
     int pendingTransitionSupportVerificationCountForTests() {
@@ -2628,9 +2651,27 @@ public final class GroundedSingleLaneDebugRunner {
         pendingVerificationsByPlacement = mutablePendingVerifications();
         pendingVerificationsByPlacement.put(
                 placementIndex,
-                new PendingPlacementVerification(placementIndex, worldPos, null, tick + PLACEMENT_VERIFICATION_DELAY_TICKS)
+                new PendingPlacementVerification(placementIndex, worldPos, null, tick, tick + PLACEMENT_VERIFICATION_DELAY_TICKS)
         );
         removePendingPlacement(placementIndex);
+    }
+
+    void recordPlacementAcceptedPendingForTests(int placementIndex, BlockPos worldPos, long tick) {
+        pendingVerificationsByPlacement = mutablePendingVerifications();
+        pendingVerificationsByPlacement.put(
+                placementIndex,
+                new PendingPlacementVerification(placementIndex, worldPos, null, tick, tick + PLACEMENT_VERIFICATION_DELAY_TICKS)
+        );
+        removePendingPlacement(placementIndex);
+        tracePlacementVerificationEvent("PLACEMENT_ACCEPTED_PENDING_VERIFICATION", placementIndex, worldPos, null, tick, 0);
+    }
+
+    boolean recordTransientPlacementRetryForTests(int placementIndex, BlockPos worldPos, PlacementResult.Status status, long tick, boolean nearTarget) {
+        return scheduleTransientPlacementRetry(placementIndex, worldPos, status, tick, "test", nearTarget);
+    }
+
+    int transientPlacementRetryCountForTests(int placementIndex) {
+        return transientPlacementRetriesByPlacement.getOrDefault(placementIndex, 0);
     }
 
     int pendingVerificationCountForTests() {
@@ -2776,8 +2817,13 @@ public final class GroundedSingleLaneDebugRunner {
             PlacementResult result = placementExecutor.execute(client, activeSession, placement, candidate.worldPos(), reservedHotbarSlots());
             switch (result.status()) {
                 case PLACED -> onPlacementPlaced(candidate.placementIndex(), placement, candidate.worldPos(), laneTicksElapsed);
+                case ACCEPTED_PENDING_VERIFICATION -> onPlacementAcceptedPendingVerification(candidate.placementIndex(), placement, candidate.worldPos(), laneTicksElapsed);
                 case ALREADY_CORRECT -> onPlacementResult(candidate.placementIndex(), GroundedSweepPlacementExecutor.PlacementResult.SUCCESS, laneTicksElapsed);
-                case RETRY, MOVE_REQUIRED -> onPlacementResult(candidate.placementIndex(), GroundedSweepPlacementExecutor.PlacementResult.MISSED, laneTicksElapsed);
+                case RETRY, MOVE_REQUIRED -> {
+                    if (!scheduleTransientPlacementRetry(client, candidate.placementIndex(), candidate.worldPos(), result.status(), laneTicksElapsed, "terminal lane")) {
+                        onPlacementResult(candidate.placementIndex(), GroundedSweepPlacementExecutor.PlacementResult.MISSED, laneTicksElapsed);
+                    }
+                }
                 case MISSING_ITEM, ERROR -> onFinalFailure(candidate.placementIndex());
             }
             attempts++;
@@ -3244,6 +3290,7 @@ public final class GroundedSingleLaneDebugRunner {
         lanePlacementsByIndex = Map.of();
         pendingPlacementTargets = List.of();
         pendingVerificationsByPlacement = Map.of();
+        transientPlacementRetriesByPlacement = Map.of();
         currentLeftovers = List.of();
         awaitingStartApproach = false;
         startApproachIssued = false;
@@ -3324,8 +3371,19 @@ public final class GroundedSingleLaneDebugRunner {
                         return;
                     }
                 }
+                case ACCEPTED_PENDING_VERIFICATION -> {
+                    onPlacementAcceptedPendingVerification(candidate.placementIndex(), placement, candidate.worldPos(), laneTicksElapsed);
+                    if (currentSettings.placementDelayTicks() > 0) {
+                        placementDelayCooldown = currentSettings.placementDelayTicks();
+                        return;
+                    }
+                }
                 case ALREADY_CORRECT -> onPlacementResult(candidate.placementIndex(), GroundedSweepPlacementExecutor.PlacementResult.SUCCESS, laneTicksElapsed);
-                case RETRY, MOVE_REQUIRED -> onPlacementResult(candidate.placementIndex(), GroundedSweepPlacementExecutor.PlacementResult.MISSED, laneTicksElapsed);
+                case RETRY, MOVE_REQUIRED -> {
+                    if (!scheduleTransientPlacementRetry(client, candidate.placementIndex(), candidate.worldPos(), result.status(), laneTicksElapsed, "normal lane")) {
+                        onPlacementResult(candidate.placementIndex(), GroundedSweepPlacementExecutor.PlacementResult.MISSED, laneTicksElapsed);
+                    }
+                }
                 case MISSING_ITEM -> {
                     Identifier itemId = placement.block() == null ? null : Registries.ITEM.getId(placement.block().asItem());
                     int heldCount = countItemInInventory(client.player, itemId);
@@ -3364,6 +3422,14 @@ public final class GroundedSingleLaneDebugRunner {
     }
 
     private void onPlacementPlaced(int placementIndex, Placement placement, BlockPos worldPos, long tick) {
+        onPlacementPendingVerification(placementIndex, placement, worldPos, tick, "PLACEMENT_PENDING_VERIFICATION_SCHEDULED");
+    }
+
+    private void onPlacementAcceptedPendingVerification(int placementIndex, Placement placement, BlockPos worldPos, long tick) {
+        onPlacementPendingVerification(placementIndex, placement, worldPos, tick, "PLACEMENT_ACCEPTED_PENDING_VERIFICATION");
+    }
+
+    private void onPlacementPendingVerification(int placementIndex, Placement placement, BlockPos worldPos, long tick, String eventName) {
         if (placement == null || placement.block() == null) {
             onFinalFailure(placementIndex);
             return;
@@ -3373,9 +3439,12 @@ public final class GroundedSingleLaneDebugRunner {
         pendingVerificationsByPlacement = mutablePendingVerifications();
         pendingVerificationsByPlacement.put(
                 placementIndex,
-                new PendingPlacementVerification(placementIndex, worldPos, placement.block(), tick + PLACEMENT_VERIFICATION_DELAY_TICKS)
+                new PendingPlacementVerification(placementIndex, worldPos, placement.block(), tick, tick + PLACEMENT_VERIFICATION_DELAY_TICKS)
         );
+        transientPlacementRetriesByPlacement = mutableTransientPlacementRetries();
+        transientPlacementRetriesByPlacement.remove(placementIndex);
         removePendingPlacement(placementIndex);
+        tracePlacementVerificationEvent(eventName, placementIndex, worldPos, placement.block(), tick, 0);
     }
 
     private void onPlacementResult(int placementIndex, GroundedSweepPlacementExecutor.PlacementResult groundedResult, long tick) {
@@ -3384,11 +3453,15 @@ public final class GroundedSingleLaneDebugRunner {
             successfulPlacements++;
             lastSuccessfulPlacementTick = laneTicksElapsed;
             reversePlacementFilter.remove(placementIndex);
+            transientPlacementRetriesByPlacement = mutableTransientPlacementRetries();
+            transientPlacementRetriesByPlacement.remove(placementIndex);
             removePendingPlacement(placementIndex);
             return;
         }
         if (groundedResult == GroundedSweepPlacementExecutor.PlacementResult.MISSED) {
             missedPlacements++;
+            transientPlacementRetriesByPlacement = mutableTransientPlacementRetries();
+            transientPlacementRetriesByPlacement.remove(placementIndex);
             if (activeLane != null && lanePlacementsByIndex != null && activeSession != null) {
                 Placement wp = lanePlacementsByIndex.get(placementIndex);
                 if (wp != null) {
@@ -3402,6 +3475,8 @@ public final class GroundedSingleLaneDebugRunner {
             return;
         }
         failedPlacements++;
+        transientPlacementRetriesByPlacement = mutableTransientPlacementRetries();
+        transientPlacementRetriesByPlacement.remove(placementIndex);
         removePendingPlacement(placementIndex);
     }
 
@@ -3409,6 +3484,8 @@ public final class GroundedSingleLaneDebugRunner {
         failedPlacements++;
         placementSelector.recordFinalFailure(placementIndex);
         removePendingVerification(placementIndex);
+        transientPlacementRetriesByPlacement = mutableTransientPlacementRetries();
+        transientPlacementRetriesByPlacement.remove(placementIndex);
         removePendingPlacement(placementIndex);
     }
 
@@ -3443,6 +3520,13 @@ public final class GroundedSingleLaneDebugRunner {
         return new LinkedHashMap<>(pendingVerificationsByPlacement);
     }
 
+    private Map<Integer, Integer> mutableTransientPlacementRetries() {
+        if (transientPlacementRetriesByPlacement instanceof LinkedHashMap<Integer, Integer> linkedHashMap) {
+            return linkedHashMap;
+        }
+        return new LinkedHashMap<>(transientPlacementRetriesByPlacement);
+    }
+
     private void processTerminalPendingVerifications(MinecraftClient client) {
         if (pendingVerificationsByPlacement.isEmpty()) {
             return;
@@ -3473,8 +3557,10 @@ public final class GroundedSingleLaneDebugRunner {
             }
 
             if (verifier.test(pending)) {
+                tracePlacementVerificationEvent("PLACEMENT_PENDING_VERIFICATION_SUCCESS", pending.placementIndex(), pending.worldPos(), pending.expectedBlock(), pending.acceptedTick(), 0);
                 onPlacementResult(pending.placementIndex(), GroundedSweepPlacementExecutor.PlacementResult.SUCCESS, tick);
             } else {
+                tracePlacementVerificationEvent("PLACEMENT_PENDING_VERIFICATION_TIMEOUT", pending.placementIndex(), pending.worldPos(), pending.expectedBlock(), pending.acceptedTick(), 0);
                 onPlacementResult(pending.placementIndex(), GroundedSweepPlacementExecutor.PlacementResult.MISSED, tick);
             }
             iterator.remove();
@@ -3495,6 +3581,81 @@ public final class GroundedSingleLaneDebugRunner {
         }
         BlockState worldState = client.world.getBlockState(pending.worldPos());
         return worldState.isOf(pending.expectedBlock());
+    }
+
+    private boolean scheduleTransientPlacementRetry(
+            MinecraftClient client,
+            int placementIndex,
+            BlockPos worldPos,
+            PlacementResult.Status status,
+            long tick,
+            String path
+    ) {
+        if (!isNearPlacementTarget(client, worldPos)) {
+            return false;
+        }
+        return scheduleTransientPlacementRetry(placementIndex, worldPos, status, tick, path, true);
+    }
+
+    private boolean scheduleTransientPlacementRetry(
+            int placementIndex,
+            BlockPos worldPos,
+            PlacementResult.Status status,
+            long tick,
+            String path,
+            boolean nearTarget
+    ) {
+        if (!nearTarget) {
+            return false;
+        }
+
+        transientPlacementRetriesByPlacement = mutableTransientPlacementRetries();
+        int attempts = transientPlacementRetriesByPlacement.getOrDefault(placementIndex, 0) + 1;
+        if (attempts > MAX_TRANSIENT_PLACEMENT_RETRIES) {
+            transientPlacementRetriesByPlacement.remove(placementIndex);
+            traceGroundedEvent("PLACEMENT_TRANSIENT_RETRY_EXHAUSTED"
+                    + " path=" + path
+                    + " placementIndex=" + placementIndex
+                    + " worldPos=" + worldPos.toShortString()
+                    + " tick=" + tick
+                    + " result=" + status
+                    + " attemptCount=" + (attempts - 1));
+            return false;
+        }
+
+        transientPlacementRetriesByPlacement.put(placementIndex, attempts);
+        placementSelector.recordPlacementResult(placementIndex, GroundedSweepPlacementExecutor.PlacementResult.FAILED, tick);
+        traceGroundedEvent("PLACEMENT_TRANSIENT_RETRY_SCHEDULED"
+                + " path=" + path
+                + " placementIndex=" + placementIndex
+                + " worldPos=" + worldPos.toShortString()
+                + " tick=" + tick
+                + " result=" + status
+                + " attemptCount=" + attempts);
+        return true;
+    }
+
+    private boolean isNearPlacementTarget(MinecraftClient client, BlockPos worldPos) {
+        if (client == null || client.player == null || worldPos == null) {
+            return false;
+        }
+        BlockPos playerPos = client.player.getBlockPos();
+        return Math.abs(playerPos.getX() - worldPos.getX()) <= TRANSIENT_RETRY_NEAR_BLOCK_DISTANCE
+                && Math.abs(playerPos.getY() - worldPos.getY()) <= TRANSIENT_RETRY_NEAR_BLOCK_DISTANCE
+                && Math.abs(playerPos.getZ() - worldPos.getZ()) <= TRANSIENT_RETRY_NEAR_BLOCK_DISTANCE;
+    }
+
+    private void tracePlacementVerificationEvent(String eventName, int placementIndex, BlockPos worldPos, net.minecraft.block.Block expectedBlock, long acceptedTick, int attemptCount) {
+        traceGroundedEvent(eventName
+                + " placementIndex=" + placementIndex
+                + " worldPos=" + (worldPos == null ? "unknown" : worldPos.toShortString())
+                + " expected=" + blockIdForDiagnostics(expectedBlock)
+                + " laneIndex=" + (activeLane == null ? "unknown" : activeLane.laneIndex())
+                + " laneDirection=" + (activeLane == null ? "unknown" : activeLane.direction())
+                + " laneRelativeBand=" + (activeLane == null || worldPos == null ? "unknown" : GroundedSweepPlacementExecutor.laneRelativeBand(activeLane, worldPos))
+                + " acceptedTick=" + acceptedTick
+                + " tick=" + laneTicksElapsed
+                + " attemptCount=" + attemptCount);
     }
 
     private void refreshCurrentLeftovers() {
@@ -3937,23 +4098,27 @@ public final class GroundedSingleLaneDebugRunner {
                 failTransitionSupport(client, "ERROR", target, placement, (PlacementResult) null);
                 return;
             }
+            if (transientTransitionSupportRetriesByPlacement.getOrDefault(target.placementIndex(), 0) > MAX_TRANSIENT_PLACEMENT_RETRIES) {
+                continue;
+            }
             PlacementResult result = placementExecutor.execute(client, activeSession, placement, target.worldPos(), reservedHotbarSlots());
             switch (result.status()) {
                 case PLACED -> {
                     transitionSupportPlacedCount++;
-                    pendingTransitionSupportVerifications = mutableTransitionSupportVerifications();
-                    pendingTransitionSupportVerifications.put(
-                            target.placementIndex(),
-                            new PendingPlacementVerification(target.placementIndex(), target.worldPos(), placement.block(), transitionSupportTicks + PLACEMENT_VERIFICATION_DELAY_TICKS)
-                    );
-                    removePendingTransitionSupportTarget(target.placementIndex());
+                    onTransitionSupportPendingVerification(target.placementIndex(), placement, target.worldPos(), transitionSupportTicks, "PLACEMENT_PENDING_VERIFICATION_SCHEDULED");
+                }
+                case ACCEPTED_PENDING_VERIFICATION -> {
+                    transitionSupportPlacedCount++;
+                    onTransitionSupportPendingVerification(target.placementIndex(), placement, target.worldPos(), transitionSupportTicks, "PLACEMENT_ACCEPTED_PENDING_VERIFICATION");
                 }
                 case ALREADY_CORRECT -> {
                     transitionSupportAlreadyCorrectCount++;
+                    transientTransitionSupportRetriesByPlacement = mutableTransientTransitionSupportRetries();
+                    transientTransitionSupportRetriesByPlacement.remove(target.placementIndex());
                     removePendingTransitionSupportTarget(target.placementIndex());
                 }
                 case RETRY, MOVE_REQUIRED -> {
-                    // Keep target pending.
+                    scheduleTransientTransitionSupportRetry(client, target, result.status(), transitionSupportTicks);
                 }
                 case MISSING_ITEM, ERROR -> {
                     transitionSupportFailedCount++;
@@ -5160,6 +5325,24 @@ public final class GroundedSingleLaneDebugRunner {
         processTransitionSupportVerifications(client, tick, forceAll, pending -> verifyExpectedBlock(client, pending));
     }
 
+    private void onTransitionSupportPendingVerification(
+            int placementIndex,
+            Placement placement,
+            BlockPos worldPos,
+            long tick,
+            String eventName
+    ) {
+        pendingTransitionSupportVerifications = mutableTransitionSupportVerifications();
+        pendingTransitionSupportVerifications.put(
+                placementIndex,
+                new PendingPlacementVerification(placementIndex, worldPos, placement.block(), tick, tick + PLACEMENT_VERIFICATION_DELAY_TICKS)
+        );
+        transientTransitionSupportRetriesByPlacement = mutableTransientTransitionSupportRetries();
+        transientTransitionSupportRetriesByPlacement.remove(placementIndex);
+        removePendingTransitionSupportTarget(placementIndex);
+        traceTransitionSupportVerificationEvent(eventName, placementIndex, worldPos, placement.block(), tick, 0);
+    }
+
     private void processTransitionSupportVerifications(
             MinecraftClient client,
             long tick,
@@ -5177,10 +5360,12 @@ public final class GroundedSingleLaneDebugRunner {
                 continue;
             }
             if (!verifier.test(pending)) {
-                transitionSupportFailedCount++;
-                failTransitionSupport(client, "verification mismatch", null, null, pending);
-                return;
+                traceTransitionSupportVerificationEvent("PLACEMENT_PENDING_VERIFICATION_TIMEOUT", pending.placementIndex(), pending.worldPos(), pending.expectedBlock(), pending.acceptedTick(), 0);
+                requeuePendingTransitionSupportTarget(pending);
+                iterator.remove();
+                continue;
             }
+            traceTransitionSupportVerificationEvent("PLACEMENT_PENDING_VERIFICATION_SUCCESS", pending.placementIndex(), pending.worldPos(), pending.expectedBlock(), pending.acceptedTick(), 0);
             transitionSupportAlreadyCorrectCount++;
             iterator.remove();
         }
@@ -5202,6 +5387,20 @@ public final class GroundedSingleLaneDebugRunner {
         pendingTransitionSupportTargets = List.copyOf(retained);
     }
 
+    private void requeuePendingTransitionSupportTarget(PendingPlacementVerification pending) {
+        if (pending == null) {
+            return;
+        }
+        for (GroundedSweepPlacementExecutor.PlacementTarget target : pendingTransitionSupportTargets) {
+            if (target.placementIndex() == pending.placementIndex()) {
+                return;
+            }
+        }
+        List<GroundedSweepPlacementExecutor.PlacementTarget> retained = new ArrayList<>(pendingTransitionSupportTargets);
+        retained.add(new GroundedSweepPlacementExecutor.PlacementTarget(pending.placementIndex(), pending.worldPos()));
+        pendingTransitionSupportTargets = List.copyOf(retained);
+    }
+
     private Map<Integer, PendingPlacementVerification> mutableTransitionSupportVerifications() {
         if (pendingTransitionSupportVerifications instanceof LinkedHashMap<Integer, PendingPlacementVerification> linkedHashMap) {
             return linkedHashMap;
@@ -5209,10 +5408,64 @@ public final class GroundedSingleLaneDebugRunner {
         return new LinkedHashMap<>(pendingTransitionSupportVerifications);
     }
 
+    private Map<Integer, Integer> mutableTransientTransitionSupportRetries() {
+        if (transientTransitionSupportRetriesByPlacement instanceof LinkedHashMap<Integer, Integer> linkedHashMap) {
+            return linkedHashMap;
+        }
+        return new LinkedHashMap<>(transientTransitionSupportRetriesByPlacement);
+    }
+
+    private boolean scheduleTransientTransitionSupportRetry(
+            MinecraftClient client,
+            GroundedSweepPlacementExecutor.PlacementTarget target,
+            PlacementResult.Status status,
+            long tick
+    ) {
+        if (target == null || !isNearPlacementTarget(client, target.worldPos())) {
+            return false;
+        }
+
+        transientTransitionSupportRetriesByPlacement = mutableTransientTransitionSupportRetries();
+        int attempts = transientTransitionSupportRetriesByPlacement.getOrDefault(target.placementIndex(), 0) + 1;
+        if (attempts > MAX_TRANSIENT_PLACEMENT_RETRIES) {
+            transientTransitionSupportRetriesByPlacement.put(target.placementIndex(), MAX_TRANSIENT_PLACEMENT_RETRIES + 1);
+            traceGroundedEvent("PLACEMENT_TRANSIENT_RETRY_EXHAUSTED"
+                    + " path=transition support"
+                    + " placementIndex=" + target.placementIndex()
+                    + " worldPos=" + target.worldPos().toShortString()
+                    + " tick=" + tick
+                    + " result=" + status
+                    + " attemptCount=" + (attempts - 1));
+            return false;
+        }
+
+        transientTransitionSupportRetriesByPlacement.put(target.placementIndex(), attempts);
+        traceGroundedEvent("PLACEMENT_TRANSIENT_RETRY_SCHEDULED"
+                + " path=transition support"
+                + " placementIndex=" + target.placementIndex()
+                + " worldPos=" + target.worldPos().toShortString()
+                + " tick=" + tick
+                + " result=" + status
+                + " attemptCount=" + attempts);
+        return true;
+    }
+
+    private void traceTransitionSupportVerificationEvent(String eventName, int placementIndex, BlockPos worldPos, net.minecraft.block.Block expectedBlock, long acceptedTick, int attemptCount) {
+        traceGroundedEvent(eventName
+                + " path=transition support"
+                + " placementIndex=" + placementIndex
+                + " worldPos=" + (worldPos == null ? "unknown" : worldPos.toShortString())
+                + " expected=" + blockIdForDiagnostics(expectedBlock)
+                + " tick=" + transitionSupportTicks
+                + " acceptedTick=" + acceptedTick
+                + " attemptCount=" + attemptCount);
+    }
+
     private void clearTransitionSupportState() {
         transitionSupportPlacementsByIndex = Map.of();
         pendingTransitionSupportTargets = List.of();
         pendingTransitionSupportVerifications = Map.of();
+        transientTransitionSupportRetriesByPlacement = Map.of();
         transitionSupportTicks = 0;
         transitionSupportAlreadyCorrectCount = 0;
         transitionSupportPlacedCount = 0;
@@ -5489,6 +5742,7 @@ public final class GroundedSingleLaneDebugRunner {
             int placementIndex,
             BlockPos worldPos,
             net.minecraft.block.Block expectedBlock,
+            long acceptedTick,
             long verifyDueTick
     ) {
         private PendingPlacementVerification {

@@ -1025,7 +1025,7 @@ public class BuildCoordinator {
                 yield pauseForRecoverableFailure(result.message());
             }
             case MOVE_REQUIRED -> beginBuildMovement(stepResult);
-            case RETRY -> {
+            case ACCEPTED_PENDING_VERIFICATION, RETRY -> {
                 debugToFile("Placement retry needed: " + result.message());
                 yield AssistedStepResult.noop();
             }
