@@ -95,6 +95,7 @@ public final class GroundedSingleLaneDebugRunner {
     private GroundedSweepLane activeLane;
     private GroundedSweepSettings activeSettings;
     private GroundedSweepPlacementExecutor placementSelector;
+    private TorchGridPlacementController torchGridController = TorchGridPlacementController.disabled();
     private final GroundedLaneTransitionSupportPlanner transitionSupportPlanner = new GroundedLaneTransitionSupportPlanner();
     private Map<Integer, Placement> lanePlacementsByIndex = Map.of();
     private Map<Integer, Placement> transitionSupportPlacementsByIndex = Map.of();
@@ -549,6 +550,7 @@ public final class GroundedSingleLaneDebugRunner {
         boolean walkerActiveAfterTick = shouldAttemptPlacementAfterWalkerTick(laneWalker.state());
         if (walkerActiveAfterTick) {
             tickPlacementExecutor(client);
+            tickTorchGrid(client);
         }
 
         // Recovery detection: PLACEMENT_STALL
@@ -3002,6 +3004,13 @@ public final class GroundedSingleLaneDebugRunner {
             sb.append("\nRemaining mismatches: ").append(mismatches);
         }
         sb.append("\nRefill trips: ").append(refillTripCount);
+        if (torchGridController != null && torchGridController.diagnostics().enabled()) {
+            TorchGridPlacementController.TorchGridDiagnostics torch = torchGridController.diagnostics();
+            sb.append("\nTorch grid: planned=").append(torch.plannedCount())
+                    .append(", placed=").append(torch.placedCount())
+                    .append(", skippedNoTorch=").append(torch.skippedNoTorchCount())
+                    .append(", skippedNotReady=").append(torch.skippedNotReadyCount());
+        }
         sb.append("\nTime taken: ").append(timeStr);
 
         lastRunSummaryText = sb.toString();
@@ -3027,6 +3036,9 @@ public final class GroundedSingleLaneDebugRunner {
                 payload.put("remainingMismatches", mismatches);
             }
             payload.put("refillTrips", refillTripCount);
+            if (torchGridController != null && torchGridController.diagnostics().enabled()) {
+                payload.put("torchGrid", torchGridController.diagnostics().toMap());
+            }
             payload.put("elapsedSeconds", elapsedNanos / 1_000_000_000L);
             payload.put("elapsedFormatted", timeStr);
             try {
@@ -3228,6 +3240,7 @@ public final class GroundedSingleLaneDebugRunner {
         activeLane = null;
         activeSettings = null;
         placementSelector = null;
+        torchGridController = TorchGridPlacementController.disabled();
         lanePlacementsByIndex = Map.of();
         pendingPlacementTargets = List.of();
         pendingVerificationsByPlacement = Map.of();
@@ -3341,6 +3354,13 @@ public final class GroundedSingleLaneDebugRunner {
         }
 
         currentLeftovers = placementSelector.select(activeLane, activeBounds, currentProgress, laneTicksElapsed, pendingPlacementTargets).leftovers();
+    }
+
+    private void tickTorchGrid(MinecraftClient client) {
+        if (torchGridController == null || activeSettings == null || !activeSettings.torchGridSettings().enabled()) {
+            return;
+        }
+        torchGridController.tick(client, placementExecutor, reservedHotbarSlots());
     }
 
     private void onPlacementPlaced(int placementIndex, Placement placement, BlockPos worldPos, long tick) {
@@ -4619,6 +4639,9 @@ public final class GroundedSingleLaneDebugRunner {
         placements.put("recentPlacementIndices", List.copyOf(recentPlacementIndices));
         placements.put("recentVerificationResults", List.copyOf(recentVerificationResults));
         payload.put("placements", placements);
+        payload.put("torchGrid", torchGridController == null
+                ? TorchGridPlacementController.disabled().diagnostics().toMap()
+                : torchGridController.diagnostics().toMap());
 
         Map<String, Object> refill = new LinkedHashMap<>();
         refill.put("active", refillController.isActive());
@@ -4898,6 +4921,13 @@ public final class GroundedSingleLaneDebugRunner {
         activeSession = session;
         activeBounds = bounds;
         activeSettings = settings;
+        torchGridController = settings.torchGridSettings().enabled()
+                ? new TorchGridPlacementController(session.getPlan(), session.getOrigin(), bounds, settings.torchGridSettings())
+                : TorchGridPlacementController.disabled();
+        if (settings.torchGridSettings().enabled()) {
+            traceGroundedEvent("torch grid enabled: spacing=" + settings.torchGridSettings().spacing()
+                    + " planned=" + torchGridController.plannedCount());
+        }
         refillController.setReservedHotbarSlots(reservedHotbarSlots());
         runMode = mode;
         forwardLanes = List.copyOf(plannedForwardLanes);

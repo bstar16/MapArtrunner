@@ -1,6 +1,7 @@
 package com.example.mapart.settings;
 
 import com.example.mapart.inventory.HotbarSlotReservations;
+import com.example.mapart.plan.sweep.grounded.TorchGridSettings;
 
 public record MapartSettings(
         boolean showHud,
@@ -21,6 +22,10 @@ public record MapartSettings(
         int placementDelayTicks,
         int inventoryClickDelayTicks,
         int reservedHotbarSlots,
+        boolean torchGridEnabled,
+        int torchGridSpacing,
+        boolean torchGridWarnMissingTorches,
+        int torchGridMaxPlacementsPerTick,
         boolean manualAirPlaceEnabled,
         boolean manualAirPlaceRender,
         boolean manualAirPlaceUseCustomRange,
@@ -29,7 +34,9 @@ public record MapartSettings(
         boolean manualAirPlaceDisableWhileRunnerActive
 ) {
     public MapartSettings {
+        torchGridSpacing = TorchGridSettings.FIXED_SPACING;
         HotbarSlotReservations.validateReservedHotbarSlots(reservedHotbarSlots);
+        new TorchGridSettings(torchGridEnabled, torchGridSpacing, torchGridWarnMissingTorches, torchGridMaxPlacementsPerTick);
     }
 
     public static MapartSettings defaults() {
@@ -52,6 +59,10 @@ public record MapartSettings(
                 0,
                 0,
                 0,
+                false,
+                TorchGridSettings.FIXED_SPACING,
+                true,
+                1,
                 false,
                 true,
                 false,
