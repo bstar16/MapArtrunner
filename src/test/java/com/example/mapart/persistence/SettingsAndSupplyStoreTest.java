@@ -23,6 +23,10 @@ class SettingsAndSupplyStoreTest {
         MapartSettingsStore store = new MapartSettingsStore(settingsPath);
 
         assertEquals(0, store.current().reservedHotbarSlots());
+        assertFalse(store.current().torchGridEnabled());
+        assertEquals(12, store.current().torchGridSpacing());
+        assertTrue(store.current().torchGridWarnMissingTorches());
+        assertEquals(1, store.current().torchGridMaxPlacementsPerTick());
         assertFalse(store.current().manualAirPlaceEnabled());
         assertTrue(store.current().manualAirPlaceRender());
         assertFalse(store.current().manualAirPlaceUseCustomRange());
@@ -40,6 +44,9 @@ class SettingsAndSupplyStoreTest {
         assertTrue(store.set("placementDelayTicks", "5").isEmpty());
         assertTrue(store.set("inventoryClickDelayTicks", "3").isEmpty());
         assertTrue(store.set("reservedHotbarSlots", "5").isEmpty());
+        assertTrue(store.set("torchGridEnabled", "true").isEmpty());
+        assertTrue(store.set("torchGridWarnMissingTorches", "false").isEmpty());
+        assertTrue(store.set("torchGridMaxPlacementsPerTick", "3").isEmpty());
         assertTrue(store.set("clientTimerEnabled", "false").isEmpty());
         assertTrue(store.set("manualAirPlaceEnabled", "true").isEmpty());
         assertTrue(store.set("manualAirPlaceRender", "false").isEmpty());
@@ -54,6 +61,10 @@ class SettingsAndSupplyStoreTest {
         assertEquals(5, restored.current().placementDelayTicks());
         assertEquals(3, restored.current().inventoryClickDelayTicks());
         assertEquals(5, restored.current().reservedHotbarSlots());
+        assertTrue(restored.current().torchGridEnabled());
+        assertEquals(12, restored.current().torchGridSpacing());
+        assertFalse(restored.current().torchGridWarnMissingTorches());
+        assertEquals(3, restored.current().torchGridMaxPlacementsPerTick());
         assertFalse(restored.current().clientTimerEnabled());
         assertTrue(restored.current().manualAirPlaceEnabled());
         assertFalse(restored.current().manualAirPlaceRender());
@@ -92,6 +103,56 @@ class SettingsAndSupplyStoreTest {
         assertTrue(store.set("reservedHotbarSlots", "-1").isPresent());
         assertTrue(store.set("reservedHotbarSlots", "9").isPresent());
         assertEquals(8, store.current().reservedHotbarSlots());
+    }
+
+    @Test
+    void torchGridSpacingIsFixedAndNotUserConfigurable() {
+        Path settingsPath = tempDir.resolve("settings-torch-grid-spacing-fixed.json");
+        MapartSettingsStore store = new MapartSettingsStore(settingsPath);
+
+        assertEquals(12, store.current().torchGridSpacing());
+        assertTrue(store.set("torchGridSpacing", "8").isPresent());
+        assertEquals(12, store.current().torchGridSpacing());
+        assertTrue(store.set("torchGridSpacing", "13").isPresent());
+        assertEquals(12, store.current().torchGridSpacing());
+        assertTrue(store.set("torchGridSpacing", "16").isPresent());
+        assertEquals(12, store.current().torchGridSpacing());
+    }
+
+    @Test
+    void oldStoredTorchGridSpacingValuesNormalizeToFixedSpacing() throws Exception {
+        Path settingsPath = tempDir.resolve("settings-old-torch-grid-spacing.json");
+        Files.writeString(settingsPath, """
+                {
+                  "torchGridEnabled": true,
+                  "torchGridSpacing": 16,
+                  "torchGridWarnMissingTorches": false,
+                  "torchGridMaxPlacementsPerTick": 4
+                }
+                """);
+
+        MapartSettingsStore store = new MapartSettingsStore(settingsPath);
+
+        assertTrue(store.current().torchGridEnabled());
+        assertEquals(12, store.current().torchGridSpacing());
+        assertFalse(store.current().torchGridWarnMissingTorches());
+        assertEquals(4, store.current().torchGridMaxPlacementsPerTick());
+    }
+
+    @Test
+    void torchGridMaxPlacementsPerTickAcceptsBoundsAndRejectsOutsideRange() {
+        Path settingsPath = tempDir.resolve("settings-torch-grid-max.json");
+        MapartSettingsStore store = new MapartSettingsStore(settingsPath);
+
+        assertTrue(store.set("torchGridMaxPlacementsPerTick", "1").isEmpty());
+        assertEquals(1, store.current().torchGridMaxPlacementsPerTick());
+
+        assertTrue(store.set("torchGridMaxPlacementsPerTick", "4").isEmpty());
+        assertEquals(4, store.current().torchGridMaxPlacementsPerTick());
+
+        assertTrue(store.set("torchGridMaxPlacementsPerTick", "0").isPresent());
+        assertTrue(store.set("torchGridMaxPlacementsPerTick", "5").isPresent());
+        assertEquals(4, store.current().torchGridMaxPlacementsPerTick());
     }
 
     @Test

@@ -3,6 +3,7 @@ package com.example.mapart.plan.state;
 import com.example.mapart.MapArtMod;
 import com.example.mapart.inventory.HotbarSlotReservations;
 import com.example.mapart.plan.Placement;
+import net.minecraft.block.Block;
 import net.minecraft.block.BlockState;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.network.ClientPlayerEntity;
@@ -109,6 +110,67 @@ public class PlacementExecutor {
         }
 
         return PlacementResult.retry("Placement interaction succeeded but the world still shows "
+                + Registries.BLOCK.getId(placedState.getBlock()) + " at " + targetPos.toShortString() + ".");
+    }
+
+    public PlacementResult executeUtilityBlock(MinecraftClient client, BlockPos targetPos, Item expectedItem, Block expectedBlock, int reservedHotbarSlots) {
+        HotbarSlotReservations.validateReservedHotbarSlots(reservedHotbarSlots);
+        if (client == null || client.player == null || client.world == null || client.interactionManager == null) {
+            return PlacementResult.error("Client context is unavailable for utility placement.");
+        }
+        if (targetPos == null || expectedItem == null || expectedBlock == null) {
+            return PlacementResult.error("Utility placement target is not available.");
+        }
+
+        ClientPlayerEntity player = client.player;
+        ClientWorld world = client.world;
+        if (!world.isPosLoaded(targetPos) || !world.isPosLoaded(targetPos.down())) {
+            return PlacementResult.retry("Utility target chunk is not loaded at " + targetPos.toShortString() + ".");
+        }
+
+        BlockState currentState = world.getBlockState(targetPos);
+        if (currentState.isOf(expectedBlock)) {
+            return PlacementResult.alreadyCorrect("Utility target already matches expected block at " + targetPos.toShortString() + ".");
+        }
+        if (!currentState.isReplaceable()) {
+            return PlacementResult.retry("Utility target is occupied by " + Registries.BLOCK.getId(currentState.getBlock())
+                    + " at " + targetPos.toShortString() + ".");
+        }
+        if (!isWithinPlaceRange(player.getBlockPos(), targetPos)) {
+            return PlacementResult.moveRequired("Utility target is outside placement range at " + targetPos.toShortString() + ".");
+        }
+        if (!(expectedItem instanceof BlockItem)) {
+            return PlacementResult.error("Expected utility item " + Registries.ITEM.getId(expectedItem) + " is not a placeable block item.");
+        }
+
+        InventorySelection selection = ensureSelectedItem(client, player, expectedItem, reservedHotbarSlots);
+        if (!selection.available()) {
+            return PlacementResult.missingItem("Missing required utility item " + Registries.ITEM.getId(expectedItem) + ".");
+        }
+
+        BlockPos supportPos = targetPos.down();
+        BlockState supportState = world.getBlockState(supportPos);
+        if (supportState.isReplaceable()) {
+            return PlacementResult.retry("Utility target support is not ready at " + supportPos.toShortString() + ".");
+        }
+        BlockHitResult hitResult = new BlockHitResult(
+                Vec3d.ofCenter(supportPos).add(0.0, 0.5, 0.0),
+                Direction.UP,
+                supportPos,
+                false
+        );
+        ActionResult result = client.interactionManager.interactBlock(player, Hand.MAIN_HAND, hitResult);
+        if (result.isAccepted()) {
+            player.swingHand(Hand.MAIN_HAND);
+        } else {
+            return PlacementResult.retry("Utility placement interaction was not accepted for " + targetPos.toShortString() + ".");
+        }
+
+        BlockState placedState = world.getBlockState(targetPos);
+        if (placedState.isOf(expectedBlock)) {
+            return PlacementResult.placed("Placed utility block " + Registries.BLOCK.getId(expectedBlock) + " at " + targetPos.toShortString() + ".");
+        }
+        return PlacementResult.retry("Utility placement interaction succeeded but the world still shows "
                 + Registries.BLOCK.getId(placedState.getBlock()) + " at " + targetPos.toShortString() + ".");
     }
 

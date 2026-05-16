@@ -30,6 +30,7 @@ public class MapArtConfigScreen extends Screen {
     private int placementDelayTicks;
     private int inventoryClickDelayTicks;
     private int reservedHotbarSlots;
+    private boolean torchGridEnabled;
     private int clientTimerSpeed;
     private boolean clientTimerEnabled;
     private boolean manualAirPlaceEnabled;
@@ -51,6 +52,7 @@ public class MapArtConfigScreen extends Screen {
         this.placementDelayTicks = s.placementDelayTicks();
         this.inventoryClickDelayTicks = s.inventoryClickDelayTicks();
         this.reservedHotbarSlots = s.reservedHotbarSlots();
+        this.torchGridEnabled = s.torchGridEnabled();
         this.clientTimerSpeed = s.clientTimerSpeed();
         this.clientTimerEnabled = s.clientTimerEnabled();
         this.manualAirPlaceEnabled = s.manualAirPlaceEnabled();
@@ -94,6 +96,9 @@ public class MapArtConfigScreen extends Screen {
 
         addDrawableChild(new IntSlider(rightX, y, COL_W, BTN_H, 0, 8, reservedHotbarSlots,
                 "Reserved Hotbar", v -> reservedHotbarSlots = v));
+        y += ROW_STRIDE;
+
+        addTorchGridRow(rightX, y);
         y += ROW_STRIDE;
 
         // Timer speed field + enabled toggle on same row
@@ -140,7 +145,7 @@ public class MapArtConfigScreen extends Screen {
         int reservedLabelY = SECTION_TOP + ROW_STRIDE * 3;
         context.drawText(this.textRenderer, "Protect tools, food, pearls, rockets, pickaxe, ender chest, or shulker slots",
                 cx + 5, reservedLabelY - 10, 0xAAAAAA, false);
-        int timerLabelY = SECTION_TOP + ROW_STRIDE * 4;
+        int timerLabelY = SECTION_TOP + ROW_STRIDE * 5;
         context.drawText(this.textRenderer, "Speed (1-20):", cx + 5, timerLabelY - 10, 0xAAAAAA, false);
         super.render(context, mouseX, mouseY, delta);
     }
@@ -160,6 +165,7 @@ public class MapArtConfigScreen extends Screen {
         settingsStore.set("placementDelayTicks", String.valueOf(placementDelayTicks));
         settingsStore.set("inventoryClickDelayTicks", String.valueOf(inventoryClickDelayTicks));
         settingsStore.set("reservedHotbarSlots", String.valueOf(reservedHotbarSlots));
+        settingsStore.set("torchGridEnabled", String.valueOf(torchGridEnabled));
         settingsStore.set("clientTimerEnabled", String.valueOf(clientTimerEnabled));
         settingsStore.set("clientTimerSpeed", String.valueOf(clientTimerSpeed));
         settingsStore.set("manualAirPlaceEnabled", String.valueOf(manualAirPlaceEnabled));
@@ -170,8 +176,16 @@ public class MapArtConfigScreen extends Screen {
         this.manualAirPlaceEnabled = settingsStore.current().manualAirPlaceEnabled();
     }
 
+    void refreshTorchGridFromStore() {
+        this.torchGridEnabled = settingsStore.current().torchGridEnabled();
+    }
+
     private void openAirPlaceSettings() {
         this.client.setScreen(new AirPlaceConfigScreen(settingsStore, this));
+    }
+
+    private void openTorchGridSettings() {
+        this.client.setScreen(new TorchGridConfigScreen(settingsStore, this));
     }
 
     private void addManualAirPlaceRow(int x, int y) {
@@ -180,6 +194,16 @@ public class MapArtConfigScreen extends Screen {
         addToggle(x, y, COL_W - gearWidth - gap, "Manual Air Place", manualAirPlaceEnabled,
                 v -> manualAirPlaceEnabled = v);
         addDrawableChild(ButtonWidget.builder(Text.literal("\u2699"), b -> openAirPlaceSettings())
+                .dimensions(x + COL_W - gearWidth, y, gearWidth, BTN_H)
+                .build());
+    }
+
+    private void addTorchGridRow(int x, int y) {
+        int gearWidth = 28;
+        int gap = 4;
+        addToggle(x, y, COL_W - gearWidth - gap, "Torch Grid", torchGridEnabled,
+                v -> torchGridEnabled = v);
+        addDrawableChild(ButtonWidget.builder(Text.literal("\u2699"), b -> openTorchGridSettings())
                 .dimensions(x + COL_W - gearWidth, y, gearWidth, BTN_H)
                 .build());
     }

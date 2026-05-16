@@ -10,6 +10,7 @@ public record GroundedSweepSettings(
         int trivialBehindCleanupSteps,
         boolean groundedSweepConstantSprint,
         int reservedHotbarSlots,
+        TorchGridSettings torchGridSettings,
         double endpointTolerance
 ) {
     public GroundedSweepSettings(
@@ -29,6 +30,7 @@ public record GroundedSweepSettings(
                 trivialBehindCleanupSteps,
                 groundedSweepConstantSprint,
                 0,
+                TorchGridSettings.disabled(),
                 endpointTolerance
         );
     }
@@ -56,6 +58,9 @@ public record GroundedSweepSettings(
             throw new IllegalArgumentException("endpointTolerance must be >= 0");
         }
         HotbarSlotReservations.validateReservedHotbarSlots(reservedHotbarSlots);
+        if (torchGridSettings == null) {
+            torchGridSettings = TorchGridSettings.disabled();
+        }
     }
 
     public static GroundedSweepSettings defaults() {
@@ -67,6 +72,7 @@ public record GroundedSweepSettings(
                 1,
                 true,
                 0,
+                TorchGridSettings.disabled(),
                 1.0
         );
     }

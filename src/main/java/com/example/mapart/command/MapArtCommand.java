@@ -10,6 +10,7 @@ import com.example.mapart.plan.sweep.grounded.GroundedRecoveryState;
 import com.example.mapart.plan.sweep.grounded.GroundedSingleLaneDebugRunner;
 import com.example.mapart.plan.sweep.grounded.GroundedSweepLeftoverTracker;
 import com.example.mapart.plan.sweep.grounded.GroundedSweepSettings;
+import com.example.mapart.plan.sweep.grounded.TorchGridSettings;
 import com.example.mapart.runtime.MapArtRuntime;
 import com.example.mapart.settings.MapartSettings;
 import com.example.mapart.settings.MapartSettingsStore;
@@ -462,6 +463,12 @@ public final class MapArtCommand {
                 settings.trivialBehindCleanupSteps(),
                 settings.groundedSweepConstantSprint(),
                 settings.reservedHotbarSlots(),
+                new TorchGridSettings(
+                        settings.torchGridEnabled(),
+                        settings.torchGridSpacing(),
+                        settings.torchGridWarnMissingTorches(),
+                        settings.torchGridMaxPlacementsPerTick()
+                ),
                 1.0
         );
     }
@@ -587,6 +594,10 @@ public final class MapArtCommand {
                 + " for tools, food, pearls, rockets, pickaxe, ender chest, or future shulker slots)")));
         source.sendFeedback(Text.literal("clientTimerSpeed=" + settings.clientTimerSpeed()));
         source.sendFeedback(Text.literal("clientTimerEnabled=" + settings.clientTimerEnabled()));
+        source.sendFeedback(Text.literal("torchGridEnabled=" + settings.torchGridEnabled()));
+        source.sendFeedback(Text.literal("torchGridSpacing=" + settings.torchGridSpacing()));
+        source.sendFeedback(Text.literal("torchGridWarnMissingTorches=" + settings.torchGridWarnMissingTorches()));
+        source.sendFeedback(Text.literal("torchGridMaxPlacementsPerTick=" + settings.torchGridMaxPlacementsPerTick()));
         source.sendFeedback(Text.literal("manualAirPlaceEnabled=" + settings.manualAirPlaceEnabled()));
         source.sendFeedback(Text.literal("manualAirPlaceRender=" + settings.manualAirPlaceRender()));
         source.sendFeedback(Text.literal("manualAirPlaceUseCustomRange=" + settings.manualAirPlaceUseCustomRange()));

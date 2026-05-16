@@ -2,6 +2,7 @@ package com.example.mapart.settings;
 
 import com.example.mapart.MapArtMod;
 import com.example.mapart.inventory.HotbarSlotReservations;
+import com.example.mapart.plan.sweep.grounded.TorchGridSettings;
 import com.google.gson.Gson;
 import net.fabricmc.loader.api.FabricLoader;
 
@@ -57,6 +58,14 @@ public class MapartSettingsStore {
                 case "placementdelayticks" -> settings = with(placementDelayTicks(parseBoundedInt(value, "placementDelayTicks", 0, 10)));
                 case "inventoryclickdelayticks" -> settings = with(inventoryClickDelayTicks(parseBoundedInt(value, "inventoryClickDelayTicks", 0, 10)));
                 case "reservedhotbarslots" -> settings = with(reservedHotbarSlots(parseBoundedInt(value, "reservedHotbarSlots", 0, 8)));
+                case "torchgridenabled" -> settings = with(torchGridEnabled(parseBoolean(value)));
+                case "torchgridspacing" -> {
+                    settings = with(torchGridSpacing(TorchGridSettings.FIXED_SPACING));
+                    saveToDisk();
+                    return Optional.of("torchGridSpacing is fixed at " + TorchGridSettings.FIXED_SPACING + ".");
+                }
+                case "torchgridwarnmissingtorches" -> settings = with(torchGridWarnMissingTorches(parseBoolean(value)));
+                case "torchgridmaxplacementspertick" -> settings = with(torchGridMaxPlacementsPerTick(parseBoundedInt(value, "torchGridMaxPlacementsPerTick", TorchGridSettings.MIN_MAX_PLACEMENTS_PER_TICK, TorchGridSettings.MAX_MAX_PLACEMENTS_PER_TICK)));
                 case "manualairplaceenabled" -> settings = with(manualAirPlaceEnabled(parseBoolean(value)));
                 case "manualairplacerender" -> settings = with(manualAirPlaceRender(parseBoolean(value)));
                 case "manualairplaceusecustomrange" -> settings = with(manualAirPlaceUseCustomRange(parseBoolean(value)));
@@ -96,6 +105,10 @@ public class MapartSettingsStore {
                 mutator.placementDelayTicks != null ? mutator.placementDelayTicks : current.placementDelayTicks(),
                 mutator.inventoryClickDelayTicks != null ? mutator.inventoryClickDelayTicks : current.inventoryClickDelayTicks(),
                 mutator.reservedHotbarSlots != null ? mutator.reservedHotbarSlots : current.reservedHotbarSlots(),
+                mutator.torchGridEnabled != null ? mutator.torchGridEnabled : current.torchGridEnabled(),
+                mutator.torchGridSpacing != null ? mutator.torchGridSpacing : current.torchGridSpacing(),
+                mutator.torchGridWarnMissingTorches != null ? mutator.torchGridWarnMissingTorches : current.torchGridWarnMissingTorches(),
+                mutator.torchGridMaxPlacementsPerTick != null ? mutator.torchGridMaxPlacementsPerTick : current.torchGridMaxPlacementsPerTick(),
                 mutator.manualAirPlaceEnabled != null ? mutator.manualAirPlaceEnabled : current.manualAirPlaceEnabled(),
                 mutator.manualAirPlaceRender != null ? mutator.manualAirPlaceRender : current.manualAirPlaceRender(),
                 mutator.manualAirPlaceUseCustomRange != null ? mutator.manualAirPlaceUseCustomRange : current.manualAirPlaceUseCustomRange(),
@@ -126,6 +139,10 @@ public class MapartSettingsStore {
     private static SettingsMutator placementDelayTicks(int value) { return new SettingsMutator().placementDelayTicks(value); }
     private static SettingsMutator inventoryClickDelayTicks(int value) { return new SettingsMutator().inventoryClickDelayTicks(value); }
     private static SettingsMutator reservedHotbarSlots(int value) { return new SettingsMutator().reservedHotbarSlots(value); }
+    private static SettingsMutator torchGridEnabled(boolean value) { return new SettingsMutator().torchGridEnabled(value); }
+    private static SettingsMutator torchGridSpacing(int value) { return new SettingsMutator().torchGridSpacing(value); }
+    private static SettingsMutator torchGridWarnMissingTorches(boolean value) { return new SettingsMutator().torchGridWarnMissingTorches(value); }
+    private static SettingsMutator torchGridMaxPlacementsPerTick(int value) { return new SettingsMutator().torchGridMaxPlacementsPerTick(value); }
     private static SettingsMutator manualAirPlaceEnabled(boolean value) { return new SettingsMutator().manualAirPlaceEnabled(value); }
     private static SettingsMutator manualAirPlaceRender(boolean value) { return new SettingsMutator().manualAirPlaceRender(value); }
     private static SettingsMutator manualAirPlaceUseCustomRange(boolean value) { return new SettingsMutator().manualAirPlaceUseCustomRange(value); }
@@ -238,6 +255,10 @@ public class MapartSettingsStore {
                     stored.placementDelayTicks == null ? defaults.placementDelayTicks() : parseBoundedInt(Integer.toString(stored.placementDelayTicks), "placementDelayTicks", 0, 10),
                     stored.inventoryClickDelayTicks == null ? defaults.inventoryClickDelayTicks() : parseBoundedInt(Integer.toString(stored.inventoryClickDelayTicks), "inventoryClickDelayTicks", 0, 10),
                     stored.reservedHotbarSlots == null ? defaults.reservedHotbarSlots() : HotbarSlotReservations.validateReservedHotbarSlots(stored.reservedHotbarSlots),
+                    stored.torchGridEnabled == null ? defaults.torchGridEnabled() : stored.torchGridEnabled,
+                    TorchGridSettings.FIXED_SPACING,
+                    stored.torchGridWarnMissingTorches == null ? defaults.torchGridWarnMissingTorches() : stored.torchGridWarnMissingTorches,
+                    stored.torchGridMaxPlacementsPerTick == null ? defaults.torchGridMaxPlacementsPerTick() : parseBoundedInt(Integer.toString(stored.torchGridMaxPlacementsPerTick), "torchGridMaxPlacementsPerTick", TorchGridSettings.MIN_MAX_PLACEMENTS_PER_TICK, TorchGridSettings.MAX_MAX_PLACEMENTS_PER_TICK),
                     stored.manualAirPlaceEnabled == null ? defaults.manualAirPlaceEnabled() : stored.manualAirPlaceEnabled,
                     stored.manualAirPlaceRender == null ? defaults.manualAirPlaceRender() : stored.manualAirPlaceRender,
                     stored.manualAirPlaceUseCustomRange == null ? defaults.manualAirPlaceUseCustomRange() : stored.manualAirPlaceUseCustomRange,
@@ -299,6 +320,10 @@ public class MapartSettingsStore {
         private Integer placementDelayTicks;
         private Integer inventoryClickDelayTicks;
         private Integer reservedHotbarSlots;
+        private Boolean torchGridEnabled;
+        private Integer torchGridSpacing;
+        private Boolean torchGridWarnMissingTorches;
+        private Integer torchGridMaxPlacementsPerTick;
         private Boolean manualAirPlaceEnabled;
         private Boolean manualAirPlaceRender;
         private Boolean manualAirPlaceUseCustomRange;
@@ -324,6 +349,10 @@ public class MapartSettingsStore {
         SettingsMutator placementDelayTicks(int value) { this.placementDelayTicks = value; return this; }
         SettingsMutator inventoryClickDelayTicks(int value) { this.inventoryClickDelayTicks = value; return this; }
         SettingsMutator reservedHotbarSlots(int value) { this.reservedHotbarSlots = value; return this; }
+        SettingsMutator torchGridEnabled(boolean value) { this.torchGridEnabled = value; return this; }
+        SettingsMutator torchGridSpacing(int value) { this.torchGridSpacing = value; return this; }
+        SettingsMutator torchGridWarnMissingTorches(boolean value) { this.torchGridWarnMissingTorches = value; return this; }
+        SettingsMutator torchGridMaxPlacementsPerTick(int value) { this.torchGridMaxPlacementsPerTick = value; return this; }
         SettingsMutator manualAirPlaceEnabled(boolean value) { this.manualAirPlaceEnabled = value; return this; }
         SettingsMutator manualAirPlaceRender(boolean value) { this.manualAirPlaceRender = value; return this; }
         SettingsMutator manualAirPlaceUseCustomRange(boolean value) { this.manualAirPlaceUseCustomRange = value; return this; }
@@ -351,6 +380,10 @@ public class MapartSettingsStore {
         Integer placementDelayTicks;
         Integer inventoryClickDelayTicks;
         Integer reservedHotbarSlots;
+        Boolean torchGridEnabled;
+        Integer torchGridSpacing;
+        Boolean torchGridWarnMissingTorches;
+        Integer torchGridMaxPlacementsPerTick;
         Boolean manualAirPlaceEnabled;
         Boolean manualAirPlaceRender;
         Boolean manualAirPlaceUseCustomRange;
@@ -380,6 +413,10 @@ public class MapartSettingsStore {
             this.placementDelayTicks = settings.placementDelayTicks();
             this.inventoryClickDelayTicks = settings.inventoryClickDelayTicks();
             this.reservedHotbarSlots = settings.reservedHotbarSlots();
+            this.torchGridEnabled = settings.torchGridEnabled();
+            this.torchGridSpacing = settings.torchGridSpacing();
+            this.torchGridWarnMissingTorches = settings.torchGridWarnMissingTorches();
+            this.torchGridMaxPlacementsPerTick = settings.torchGridMaxPlacementsPerTick();
             this.manualAirPlaceEnabled = settings.manualAirPlaceEnabled();
             this.manualAirPlaceRender = settings.manualAirPlaceRender();
             this.manualAirPlaceUseCustomRange = settings.manualAirPlaceUseCustomRange();
