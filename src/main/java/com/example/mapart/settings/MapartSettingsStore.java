@@ -55,6 +55,12 @@ public class MapartSettingsStore {
                 case "groundedsweepconstantsprint" -> settings = with(groundedSweepConstantSprint(parseBoolean(value)));
                 case "placementdelayticks" -> settings = with(placementDelayTicks(parseBoundedInt(value, "placementDelayTicks", 0, 10)));
                 case "inventoryclickdelayticks" -> settings = with(inventoryClickDelayTicks(parseBoundedInt(value, "inventoryClickDelayTicks", 0, 10)));
+                case "manualairplaceenabled" -> settings = with(manualAirPlaceEnabled(parseBoolean(value)));
+                case "manualairplacerender" -> settings = with(manualAirPlaceRender(parseBoolean(value)));
+                case "manualairplaceusecustomrange" -> settings = with(manualAirPlaceUseCustomRange(parseBoolean(value)));
+                case "manualairplacecustomrange" -> settings = with(manualAirPlaceCustomRange(parseBoundedDouble(value, "manualAirPlaceCustomRange", 0.0, 6.0)));
+                case "manualairplacerequiresneak" -> settings = with(manualAirPlaceRequireSneak(parseBoolean(value)));
+                case "manualairplacedisablewhilerunneractive" -> settings = with(manualAirPlaceDisableWhileRunnerActive(parseBoolean(value)));
                 default -> {
                     return Optional.of("Unknown settings key: " + key);
                 }
@@ -86,7 +92,13 @@ public class MapartSettingsStore {
                 mutator.trivialBehindCleanupSteps != null ? mutator.trivialBehindCleanupSteps : current.trivialBehindCleanupSteps(),
                 mutator.groundedSweepConstantSprint != null ? mutator.groundedSweepConstantSprint : current.groundedSweepConstantSprint(),
                 mutator.placementDelayTicks != null ? mutator.placementDelayTicks : current.placementDelayTicks(),
-                mutator.inventoryClickDelayTicks != null ? mutator.inventoryClickDelayTicks : current.inventoryClickDelayTicks()
+                mutator.inventoryClickDelayTicks != null ? mutator.inventoryClickDelayTicks : current.inventoryClickDelayTicks(),
+                mutator.manualAirPlaceEnabled != null ? mutator.manualAirPlaceEnabled : current.manualAirPlaceEnabled(),
+                mutator.manualAirPlaceRender != null ? mutator.manualAirPlaceRender : current.manualAirPlaceRender(),
+                mutator.manualAirPlaceUseCustomRange != null ? mutator.manualAirPlaceUseCustomRange : current.manualAirPlaceUseCustomRange(),
+                mutator.manualAirPlaceCustomRange != null ? mutator.manualAirPlaceCustomRange : current.manualAirPlaceCustomRange(),
+                mutator.manualAirPlaceRequireSneak != null ? mutator.manualAirPlaceRequireSneak : current.manualAirPlaceRequireSneak(),
+                mutator.manualAirPlaceDisableWhileRunnerActive != null ? mutator.manualAirPlaceDisableWhileRunnerActive : current.manualAirPlaceDisableWhileRunnerActive()
         );
 
         validateGroundedSweepWidths(updated.sweepHalfWidth(), updated.sweepTotalWidth());
@@ -110,6 +122,12 @@ public class MapartSettingsStore {
     private static SettingsMutator groundedSweepConstantSprint(boolean value) { return new SettingsMutator().groundedSweepConstantSprint(value); }
     private static SettingsMutator placementDelayTicks(int value) { return new SettingsMutator().placementDelayTicks(value); }
     private static SettingsMutator inventoryClickDelayTicks(int value) { return new SettingsMutator().inventoryClickDelayTicks(value); }
+    private static SettingsMutator manualAirPlaceEnabled(boolean value) { return new SettingsMutator().manualAirPlaceEnabled(value); }
+    private static SettingsMutator manualAirPlaceRender(boolean value) { return new SettingsMutator().manualAirPlaceRender(value); }
+    private static SettingsMutator manualAirPlaceUseCustomRange(boolean value) { return new SettingsMutator().manualAirPlaceUseCustomRange(value); }
+    private static SettingsMutator manualAirPlaceCustomRange(double value) { return new SettingsMutator().manualAirPlaceCustomRange(value); }
+    private static SettingsMutator manualAirPlaceRequireSneak(boolean value) { return new SettingsMutator().manualAirPlaceRequireSneak(value); }
+    private static SettingsMutator manualAirPlaceDisableWhileRunnerActive(boolean value) { return new SettingsMutator().manualAirPlaceDisableWhileRunnerActive(value); }
 
     private static boolean parseBoolean(String value) {
         if ("true".equalsIgnoreCase(value) || "false".equalsIgnoreCase(value)) {
@@ -145,6 +163,19 @@ public class MapartSettingsStore {
     private static int parseBoundedInt(String value, String key, int min, int max) {
         int parsed = parseInt(value);
         if (parsed < min || parsed > max) {
+            throw new IllegalArgumentException(key + " must be between " + min + " and " + max + ".");
+        }
+        return parsed;
+    }
+
+    private static double parseBoundedDouble(String value, String key, double min, double max) {
+        double parsed;
+        try {
+            parsed = Double.parseDouble(value);
+        } catch (NumberFormatException exception) {
+            throw new IllegalArgumentException("Expected decimal, got: " + value);
+        }
+        if (Double.isNaN(parsed) || parsed < min || parsed > max) {
             throw new IllegalArgumentException(key + " must be between " + min + " and " + max + ".");
         }
         return parsed;
@@ -201,7 +232,13 @@ public class MapartSettingsStore {
                     stored.trivialBehindCleanupSteps == null ? defaults.trivialBehindCleanupSteps() : parseNonNegativeInt(Integer.toString(stored.trivialBehindCleanupSteps), "trivialBehindCleanupSteps"),
                     stored.groundedSweepConstantSprint == null ? defaults.groundedSweepConstantSprint() : stored.groundedSweepConstantSprint,
                     stored.placementDelayTicks == null ? defaults.placementDelayTicks() : parseBoundedInt(Integer.toString(stored.placementDelayTicks), "placementDelayTicks", 0, 10),
-                    stored.inventoryClickDelayTicks == null ? defaults.inventoryClickDelayTicks() : parseBoundedInt(Integer.toString(stored.inventoryClickDelayTicks), "inventoryClickDelayTicks", 0, 10)
+                    stored.inventoryClickDelayTicks == null ? defaults.inventoryClickDelayTicks() : parseBoundedInt(Integer.toString(stored.inventoryClickDelayTicks), "inventoryClickDelayTicks", 0, 10),
+                    stored.manualAirPlaceEnabled == null ? defaults.manualAirPlaceEnabled() : stored.manualAirPlaceEnabled,
+                    stored.manualAirPlaceRender == null ? defaults.manualAirPlaceRender() : stored.manualAirPlaceRender,
+                    stored.manualAirPlaceUseCustomRange == null ? defaults.manualAirPlaceUseCustomRange() : stored.manualAirPlaceUseCustomRange,
+                    stored.manualAirPlaceCustomRange == null ? defaults.manualAirPlaceCustomRange() : parseBoundedDouble(Double.toString(stored.manualAirPlaceCustomRange), "manualAirPlaceCustomRange", 0.0, 6.0),
+                    stored.manualAirPlaceRequireSneak == null ? defaults.manualAirPlaceRequireSneak() : stored.manualAirPlaceRequireSneak,
+                    stored.manualAirPlaceDisableWhileRunnerActive == null ? defaults.manualAirPlaceDisableWhileRunnerActive() : stored.manualAirPlaceDisableWhileRunnerActive
             );
         } catch (RuntimeException exception) {
             MapArtMod.LOGGER.warn("Settings file {} is malformed; using defaults.", storagePath, exception);
@@ -256,6 +293,12 @@ public class MapartSettingsStore {
         private Boolean groundedSweepConstantSprint;
         private Integer placementDelayTicks;
         private Integer inventoryClickDelayTicks;
+        private Boolean manualAirPlaceEnabled;
+        private Boolean manualAirPlaceRender;
+        private Boolean manualAirPlaceUseCustomRange;
+        private Double manualAirPlaceCustomRange;
+        private Boolean manualAirPlaceRequireSneak;
+        private Boolean manualAirPlaceDisableWhileRunnerActive;
 
         SettingsMutator showHud(boolean value) { this.showHud = value; return this; }
         SettingsMutator showSchematicOverlay(boolean value) { this.showSchematicOverlay = value; return this; }
@@ -274,6 +317,12 @@ public class MapartSettingsStore {
         SettingsMutator groundedSweepConstantSprint(boolean value) { this.groundedSweepConstantSprint = value; return this; }
         SettingsMutator placementDelayTicks(int value) { this.placementDelayTicks = value; return this; }
         SettingsMutator inventoryClickDelayTicks(int value) { this.inventoryClickDelayTicks = value; return this; }
+        SettingsMutator manualAirPlaceEnabled(boolean value) { this.manualAirPlaceEnabled = value; return this; }
+        SettingsMutator manualAirPlaceRender(boolean value) { this.manualAirPlaceRender = value; return this; }
+        SettingsMutator manualAirPlaceUseCustomRange(boolean value) { this.manualAirPlaceUseCustomRange = value; return this; }
+        SettingsMutator manualAirPlaceCustomRange(double value) { this.manualAirPlaceCustomRange = value; return this; }
+        SettingsMutator manualAirPlaceRequireSneak(boolean value) { this.manualAirPlaceRequireSneak = value; return this; }
+        SettingsMutator manualAirPlaceDisableWhileRunnerActive(boolean value) { this.manualAirPlaceDisableWhileRunnerActive = value; return this; }
     }
 
     private static final class StoredSettings {
@@ -294,6 +343,12 @@ public class MapartSettingsStore {
         Boolean groundedSweepConstantSprint;
         Integer placementDelayTicks;
         Integer inventoryClickDelayTicks;
+        Boolean manualAirPlaceEnabled;
+        Boolean manualAirPlaceRender;
+        Boolean manualAirPlaceUseCustomRange;
+        Double manualAirPlaceCustomRange;
+        Boolean manualAirPlaceRequireSneak;
+        Boolean manualAirPlaceDisableWhileRunnerActive;
 
         StoredSettings() {
         }
@@ -316,6 +371,12 @@ public class MapartSettingsStore {
             this.groundedSweepConstantSprint = settings.groundedSweepConstantSprint();
             this.placementDelayTicks = settings.placementDelayTicks();
             this.inventoryClickDelayTicks = settings.inventoryClickDelayTicks();
+            this.manualAirPlaceEnabled = settings.manualAirPlaceEnabled();
+            this.manualAirPlaceRender = settings.manualAirPlaceRender();
+            this.manualAirPlaceUseCustomRange = settings.manualAirPlaceUseCustomRange();
+            this.manualAirPlaceCustomRange = settings.manualAirPlaceCustomRange();
+            this.manualAirPlaceRequireSneak = settings.manualAirPlaceRequireSneak();
+            this.manualAirPlaceDisableWhileRunnerActive = settings.manualAirPlaceDisableWhileRunnerActive();
         }
     }
 }

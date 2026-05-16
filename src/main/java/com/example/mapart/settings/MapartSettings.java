@@ -17,7 +17,13 @@ public record MapartSettings(
         int trivialBehindCleanupSteps,
         boolean groundedSweepConstantSprint,
         int placementDelayTicks,
-        int inventoryClickDelayTicks
+        int inventoryClickDelayTicks,
+        boolean manualAirPlaceEnabled,
+        boolean manualAirPlaceRender,
+        boolean manualAirPlaceUseCustomRange,
+        double manualAirPlaceCustomRange,
+        boolean manualAirPlaceRequireSneak,
+        boolean manualAirPlaceDisableWhileRunnerActive
 ) {
     public static MapartSettings defaults() {
         return new MapartSettings(
@@ -37,7 +43,13 @@ public record MapartSettings(
                 1,
                 true,
                 0,
-                0
+                0,
+                false,
+                true,
+                false,
+                5.0,
+                false,
+                true
         );
     }
 }
