@@ -81,6 +81,20 @@ public class PlacementExecutor {
             return PlacementResult.missingItem("Missing required item " + Registries.ITEM.getId(expectedItem) + " for "
                     + Registries.BLOCK.getId(placement.block()) + ".");
         }
+        if (shouldDelayPlacementAfterSelection(selection)) {
+            MapArtMod.LOGGER.debug(
+                    "PLACEMENT_HOTBAR_SWAP_PENDING worldPos={} expectedItem={} expectedBlock={} sourceInventorySlot={} targetHotbarSlot={} movedToHotbar=true",
+                    targetPos.toShortString(),
+                    Registries.ITEM.getId(expectedItem),
+                    Registries.BLOCK.getId(placement.block()),
+                    selection.sourceInventorySlot(),
+                    selection.selectedSlot()
+            );
+            return PlacementResult.hotbarSwapPending("Hotbar swap pending for " + Registries.ITEM.getId(expectedItem)
+                    + " at " + targetPos.toShortString()
+                    + " sourceInventorySlot=" + selection.sourceInventorySlot()
+                    + " targetHotbarSlot=" + selection.selectedSlot() + ".");
+        }
 
         Optional<BlockHitResult> hitResult = resolvePlacementHit(world, targetPos);
         if (hitResult.isEmpty()) {
@@ -155,6 +169,20 @@ public class PlacementExecutor {
         if (!selection.available()) {
             return PlacementResult.missingItem("Missing required utility item " + Registries.ITEM.getId(expectedItem) + ".");
         }
+        if (shouldDelayPlacementAfterSelection(selection)) {
+            MapArtMod.LOGGER.debug(
+                    "PLACEMENT_HOTBAR_SWAP_PENDING path=torch grid worldPos={} expectedItem={} expectedBlock={} sourceInventorySlot={} targetHotbarSlot={} movedToHotbar=true",
+                    targetPos.toShortString(),
+                    Registries.ITEM.getId(expectedItem),
+                    Registries.BLOCK.getId(expectedBlock),
+                    selection.sourceInventorySlot(),
+                    selection.selectedSlot()
+            );
+            return PlacementResult.hotbarSwapPending("Hotbar swap pending for utility item " + Registries.ITEM.getId(expectedItem)
+                    + " at " + targetPos.toShortString()
+                    + " sourceInventorySlot=" + selection.sourceInventorySlot()
+                    + " targetHotbarSlot=" + selection.selectedSlot() + ".");
+        }
 
         BlockPos supportPos = targetPos.down();
         BlockState supportState = world.getBlockState(supportPos);
@@ -191,7 +219,7 @@ public class PlacementExecutor {
         int selectedSlot = inventory.getSelectedSlot();
         if (player.getMainHandStack().isOf(expectedItem)
                 && isSelectableHotbarSlot(selectedSlot, reservedHotbarSlots, allowReservedExistingHotbarItem)) {
-            return InventorySelection.selected(inventory.getSelectedSlot(), false);
+            return InventorySelection.selected(inventory.getSelectedSlot(), false, -1);
         }
 
         for (int hotbarSlot = 0; hotbarSlot < PlayerInventory.getHotbarSize(); hotbarSlot++) {
@@ -201,7 +229,7 @@ public class PlacementExecutor {
             if (inventory.getStack(hotbarSlot).isOf(expectedItem)) {
                 inventory.setSelectedSlot(hotbarSlot);
                 syncSelectedSlotWithServer(player, hotbarSlot);
-                return InventorySelection.selected(hotbarSlot, false);
+                return InventorySelection.selected(hotbarSlot, false, -1);
             }
         }
 
@@ -217,7 +245,7 @@ public class PlacementExecutor {
             if (inventory.getStack(swapHotbarSlot).isOf(expectedItem)) {
                 inventory.setSelectedSlot(swapHotbarSlot);
                 syncSelectedSlotWithServer(player, swapHotbarSlot);
-                return InventorySelection.selected(swapHotbarSlot, true);
+                return InventorySelection.selected(swapHotbarSlot, true, slot);
             }
         }
 
@@ -245,6 +273,14 @@ public class PlacementExecutor {
             }
         }
         return -1;
+    }
+
+    static boolean shouldDelayPlacementAfterAutomatedHotbarSwapForTests(boolean selectionAvailable, boolean movedToHotbar) {
+        return shouldDelayPlacementAfterSelection(new InventorySelection(selectionAvailable, 0, movedToHotbar, -1));
+    }
+
+    private static boolean shouldDelayPlacementAfterSelection(InventorySelection selection) {
+        return selection.available() && selection.movedToHotbar();
     }
 
     static int firstPreferredSwapHotbarSlotForTests(int selectedSlot, boolean[] emptySlots, int reservedHotbarSlots) {
@@ -320,13 +356,13 @@ public class PlacementExecutor {
                 && Math.abs(playerPos.getZ() - targetPos.getZ()) <= PLACE_RANGE;
     }
 
-    private record InventorySelection(boolean available, int selectedSlot, boolean movedToHotbar) {
-        static InventorySelection selected(int selectedSlot, boolean movedToHotbar) {
-            return new InventorySelection(true, selectedSlot, movedToHotbar);
+    private record InventorySelection(boolean available, int selectedSlot, boolean movedToHotbar, int sourceInventorySlot) {
+        static InventorySelection selected(int selectedSlot, boolean movedToHotbar, int sourceInventorySlot) {
+            return new InventorySelection(true, selectedSlot, movedToHotbar, sourceInventorySlot);
         }
 
         static InventorySelection missing() {
-            return new InventorySelection(false, -1, false);
+            return new InventorySelection(false, -1, false, -1);
         }
     }
 }

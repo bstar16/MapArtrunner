@@ -95,4 +95,19 @@ class PlacementExecutorHotbarReservationTest {
 
         assertEquals(-1, PlacementExecutor.selectMatchingHotbarSlotForTests(0, matchingHotbar, 8, false));
     }
+
+    @Test
+    void alreadySelectedRequiredItemDoesNotRequireHotbarSwapDelay() {
+        assertEquals(false, PlacementExecutor.shouldDelayPlacementAfterAutomatedHotbarSwapForTests(true, false));
+    }
+
+    @Test
+    void mainInventorySwapRequiresHotbarSwapDelay() {
+        assertEquals(true, PlacementExecutor.shouldDelayPlacementAfterAutomatedHotbarSwapForTests(true, true));
+    }
+
+    @Test
+    void unavailableSelectionDoesNotMaskMissingItemAsHotbarSwapDelay() {
+        assertEquals(false, PlacementExecutor.shouldDelayPlacementAfterAutomatedHotbarSwapForTests(false, true));
+    }
 }

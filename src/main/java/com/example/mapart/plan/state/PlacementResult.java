@@ -4,6 +4,7 @@ public record PlacementResult(Status status, String message) {
     public enum Status {
         PLACED,
         ACCEPTED_PENDING_VERIFICATION,
+        HOTBAR_SWAP_PENDING,
         ALREADY_CORRECT,
         MISSING_ITEM,
         MOVE_REQUIRED,
@@ -17,6 +18,10 @@ public record PlacementResult(Status status, String message) {
 
     static PlacementResult acceptedPendingVerification(String message) {
         return new PlacementResult(Status.ACCEPTED_PENDING_VERIFICATION, message);
+    }
+
+    static PlacementResult hotbarSwapPending(String message) {
+        return new PlacementResult(Status.HOTBAR_SWAP_PENDING, message);
     }
 
     static PlacementResult alreadyCorrect(String message) {
