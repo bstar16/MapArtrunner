@@ -646,6 +646,9 @@ public final class GroundedSingleLaneDebugRunner {
         MinecraftClient client = MinecraftClient.getInstance();
         if (client != null) {
             clearControls(client);
+            if (client.player != null) {
+                client.player.setVelocity(0, client.player.getVelocity().y, 0);
+            }
         }
         if (!isActive()) {
             return Optional.empty();
@@ -661,7 +664,18 @@ public final class GroundedSingleLaneDebugRunner {
         laneWalker.interrupt();
         baritoneFacade.cancel();
         traceGroundedEvent("Baritone cancelled");
-        handleTerminalState(client);
+        int clearedAudits = pendingAuditsByPlacement.size();
+        int clearedVerifications = pendingVerificationsByPlacement.size();
+        if (clearedAudits > 0) {
+            traceGroundedEvent("PLACEMENT_AUDITS_TERMINAL_CLEARED_ON_STOP pendingAudits=" + clearedAudits);
+            traceGroundedEvent("STOP_CLEARED_PENDING_AUDITS pendingAudits=" + clearedAudits);
+        }
+        if (clearedVerifications > 0) {
+            traceGroundedEvent("STOP_CLEARED_PENDING_VERIFICATIONS pendingVerifications=" + clearedVerifications);
+        }
+        printRunSummaryIfPending(client, laneWalker.state(), laneWalker.failureReason());
+        captureLastStatus(laneWalker.state(), laneWalker.failureReason());
+        clearActiveRunState();
         exhaustedMaterials.clear();
         exhaustedWarningSent.clear();
         placementDelayCooldown = 0;
@@ -2828,6 +2842,10 @@ public final class GroundedSingleLaneDebugRunner {
         processDuePlacementAudits(tick, true, pending -> matchesByPlacementIndex.getOrDefault(pending.placementIndex(), false));
     }
 
+    void processTerminalPendingAuditsForTests(Map<Integer, Boolean> matchesByPlacementIndex, long tick) {
+        processTerminalPendingAudits(tick, pending -> matchesByPlacementIndex.getOrDefault(pending.placementIndex(), false));
+    }
+
     void recordFinalFailureForTests(int placementIndex) {
         if (placementSelector == null) {
             return;
@@ -3773,10 +3791,18 @@ public final class GroundedSingleLaneDebugRunner {
             return;
         }
         if (client == null || client.world == null) {
-            processDuePlacementAudits(laneTicksElapsed, false, pending -> false);
+            processTerminalPendingAudits(laneTicksElapsed, pending -> false);
             return;
         }
-        processDuePlacementAudits(client, laneTicksElapsed, false);
+        processTerminalPendingAudits(laneTicksElapsed, pending -> verifyExpectedBlock(client, pending));
+    }
+
+    private void processTerminalPendingAudits(long tick, Predicate<PendingPlacementAudit> verifier) {
+        if (pendingAuditsByPlacement.isEmpty()) {
+            return;
+        }
+        traceGroundedEvent("PLACEMENT_AUDITS_TERMINAL_FORCE_PROCESS pendingAudits=" + pendingAuditsByPlacement.size());
+        processDuePlacementAudits(tick, true, verifier);
     }
 
     private void processDuePlacementVerifications(MinecraftClient client, long tick, boolean forceAll) {
