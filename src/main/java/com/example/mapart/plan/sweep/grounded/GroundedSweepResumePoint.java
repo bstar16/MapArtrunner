@@ -33,7 +33,8 @@ public record GroundedSweepResumePoint(
     }
 
     public enum SweepPhase {
-        FORWARD
+        FORWARD,
+        REVERSE
     }
 
     public enum ResumeReason {

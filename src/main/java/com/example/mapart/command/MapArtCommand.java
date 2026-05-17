@@ -153,8 +153,12 @@ public final class MapArtCommand {
                                 context.getSource().sendError(Text.literal("No build is currently active."));
                                 return 0;
                             }
-                            runner.stop();
-                            context.getSource().sendFeedback(Text.literal("Build paused."));
+                            Optional<String> error = runner.pauseForResume();
+                            if (error.isPresent()) {
+                                context.getSource().sendError(Text.literal(error.get()));
+                                return 0;
+                            }
+                            context.getSource().sendFeedback(Text.literal("Build paused. Use /mapart resume to continue from this point."));
                             return 1;
                         }))
                 .then(ClientCommandManager.literal("resume")
@@ -170,12 +174,18 @@ public final class MapArtCommand {
                                 return 0;
                             }
                             GroundedSweepSettings groundedSettings = groundedSettings(settingsStore.current());
-                            Optional<String> error = runner.startFullSweep(session.get(), groundedSettings);
-                            if (error.isPresent()) {
-                                context.getSource().sendError(Text.literal(error.get()));
+                            GroundedSingleLaneDebugRunner.ResumeStartResult result = runner.resumeFromPauseOrSmart(session.get(), groundedSettings);
+                            if (result.error().isPresent()) {
+                                context.getSource().sendError(Text.literal(result.error().get()));
                                 return 0;
                             }
-                            context.getSource().sendFeedback(Text.literal("Build resumed."));
+                            if (result.usedPausedSnapshot()) {
+                                context.getSource().sendFeedback(Text.literal("Resuming paused build."));
+                            } else if (result.fellBackToSmartScan()) {
+                                context.getSource().sendFeedback(Text.literal("Paused resume point was unavailable; falling back to smart resume."));
+                            } else {
+                                context.getSource().sendFeedback(Text.literal("Build resumed."));
+                            }
                             return 1;
                         }))
                 .then(ClientCommandManager.literal("stop")
