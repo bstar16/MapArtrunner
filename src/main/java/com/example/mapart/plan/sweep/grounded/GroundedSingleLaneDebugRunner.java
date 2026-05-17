@@ -331,7 +331,8 @@ public final class GroundedSingleLaneDebugRunner {
                 completionLookup
         );
         if (selection.buildComplete()) {
-            return Optional.of("Grounded full sweep smart resume found no unfinished placements. Build appears complete.");
+            completeNoUnfinishedPlacements(session, bounds, settings, lanes, useSmartResume);
+            return Optional.empty();
         }
 
         GroundedSweepResumePoint resumePoint = selection.resumePoint().orElseThrow();
@@ -421,6 +422,48 @@ public final class GroundedSingleLaneDebugRunner {
                 skippedCompletedForwardLanes
         );
         return Optional.empty();
+    }
+
+    private void completeNoUnfinishedPlacements(
+            BuildSession session,
+            GroundedSchematicBounds bounds,
+            GroundedSweepSettings settings,
+            List<GroundedSweepLane> lanes,
+            boolean useSmartResume
+    ) {
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client != null) {
+            clearControls(client);
+        }
+        laneWalker.interrupt();
+        recoveryState.clear();
+        refillController.clear();
+        baritoneFacade.cancel();
+
+        traceGroundedEvent(GroundedDiagnostics.BUILD_COMPLETE_NO_UNFINISHED_PLACEMENTS);
+        if (client != null && client.player != null) {
+            client.player.sendMessage(
+                    Text.literal("[Mapart grounded] Build complete. No unfinished placements found."),
+                    false);
+        }
+
+        List<GroundedSweepLane> reverse = buildReverseSweepLanes(lanes);
+        initializeRunState(session, bounds, settings, SweepRunMode.FULL_SWEEP, lanes, reverse, SweepPassPhase.COMPLETE);
+        smartResumeUsed = useSmartResume;
+        skippedCompletedForwardLanes = lanes.size();
+
+        // Completion is recorded before clearing active fields. clearActiveRunState()
+        // resets lane/session ownership, so the terminal summary and status snapshot
+        // must be captured while the completed run context is still available.
+        printRunSummaryIfPending(client, GroundedLaneWalker.GroundedLaneWalkState.COMPLETE, Optional.empty());
+        captureLastStatus(GroundedLaneWalker.GroundedLaneWalkState.COMPLETE, Optional.empty());
+        clearActiveRunState();
+        exhaustedMaterials.clear();
+        exhaustedWarningSent.clear();
+        placementDelayCooldown = 0;
+        tickHealthMonitor.reset();
+        clientTickStallActive = false;
+        refillController.setSuppressTimeouts(false);
     }
 
     private BlockPos activeStartApproachTarget() {
@@ -5621,6 +5664,15 @@ public final class GroundedSingleLaneDebugRunner {
      * @return the error from startFullSweep, or empty on success
      */
     Optional<String> simulateRecoveryAutoResumeForTests(BuildSession session, GroundedSweepSettings settings) {
+        return simulateRecoveryAutoResumeForTests(session, settings, null, null);
+    }
+
+    Optional<String> simulateRecoveryAutoResumeForTests(
+            BuildSession session,
+            GroundedSweepSettings settings,
+            Vec3d playerPosition,
+            PlacementCompletionLookup completionLookup
+    ) {
         if (!recoveryState.isActive()) {
             return Optional.of("Recovery is not active");
         }
@@ -5631,7 +5683,15 @@ public final class GroundedSingleLaneDebugRunner {
             return Optional.of("Session or settings not available for auto-resume");
         }
         clearActiveRunState();
-        return startFullSweep(capturedSession, capturedSettings);
+        if (completionLookup == null || playerPosition == null) {
+            return startFullSweep(capturedSession, capturedSettings);
+        }
+        GroundedSchematicBounds bounds = GroundedSchematicBounds.fromPlan(capturedSession.getPlan(), capturedSession.getOrigin());
+        List<GroundedSweepLane> lanes = lanePlanner.planLanes(bounds, capturedSettings);
+        if (lanes.isEmpty()) {
+            return Optional.of("Grounded sweep did not produce any lanes for this schematic footprint.");
+        }
+        return startFullSweepFromSelection(capturedSession, capturedSettings, bounds, lanes, completionLookup, playerPosition, true);
     }
 
     /**

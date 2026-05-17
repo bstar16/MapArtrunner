@@ -667,8 +667,9 @@ class GroundedSingleLaneDebugRunnerTest {
     }
 
     @Test
-    void smartResumeNoUnfinishedPlacementsDoesNotStartRun() {
+    void smartResumeNoUnfinishedPlacementsCompletesCleanlyWithoutStartingRun() {
         GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        runner.setGroundedTraceEnabled(true);
         BuildSession session = rectangularSessionWithOrigin(new Vec3i(3, 1, 3));
         Optional<String> error = runner.startFullSweepSmart(
                 session,
@@ -677,9 +678,15 @@ class GroundedSingleLaneDebugRunnerTest {
                 (worldPos, expected) -> true
         );
 
-        assertTrue(error.isPresent());
+        assertTrue(error.isEmpty());
         assertFalse(runner.isActive());
-        assertTrue(error.orElseThrow().contains("no unfinished placements"));
+        GroundedSingleLaneDebugRunner.DebugStatus status = runner.status();
+        assertFalse(status.active());
+        assertEquals(GroundedLaneWalkState.COMPLETE, status.walkState());
+        assertEquals(GroundedSingleLaneDebugRunner.SweepPassPhase.COMPLETE, status.phase());
+        assertTrue(status.failureReason().isEmpty());
+        assertTrue(runner.groundedTraceEventsForTests().stream()
+                .anyMatch(event -> event.contains(GroundedDiagnostics.BUILD_COMPLETE_NO_UNFINISHED_PLACEMENTS)));
     }
 
     @Test
@@ -1511,6 +1518,27 @@ class GroundedSingleLaneDebugRunnerTest {
     }
 
     @Test
+    void reverseCleanupCompletionStillMarksRunComplete() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        assertTrue(runner.startFullSweep(sessionWithOrigin(), GroundedSweepSettings.defaults()).isEmpty());
+
+        runner.seedLanePlacementsForTests(List.of(new GroundedSweepPlacementExecutor.PlacementTarget(42, new BlockPos(11, 64, 10))));
+        runner.advanceSweepToNextLaneForTests();
+        assertEquals(GroundedSingleLaneDebugRunner.SweepPassPhase.REVERSE, runner.status().phase());
+
+        runner.seedLanePlacementsForTests(List.of());
+        runner.advanceSweepToNextLaneForTests();
+        runner.finalizeTerminalStateWithSummaryForTests(GroundedLaneWalkState.COMPLETE, Optional.empty());
+
+        GroundedSingleLaneDebugRunner.DebugStatus status = runner.status();
+        assertFalse(status.active());
+        assertEquals(GroundedLaneWalkState.COMPLETE, status.walkState());
+        assertEquals(GroundedSingleLaneDebugRunner.SweepPassPhase.COMPLETE, status.phase());
+        assertTrue(status.failureReason().isEmpty());
+        assertTrue(runner.lastRunSummaryTextForTests().contains("Completed: yes"));
+    }
+
+    @Test
     void singleLaneStartStillUsesStartApproachBehavior() {
         RecordingBaritoneFacade baritone = new RecordingBaritoneFacade();
         GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(baritone);
@@ -2203,7 +2231,7 @@ class GroundedSingleLaneDebugRunnerTest {
                 sessionWithOrigin(), GroundedSweepSettings.defaults(),
                 new net.minecraft.util.math.Vec3d(10.5, 64.0, 10.5),
                 (pos, block) -> true);
-        assertTrue(result.isPresent(), "should return build-complete message");
+        assertTrue(result.isEmpty(), "build-complete smart resume should be clean completion, not failure");
         assertFalse(runner.runSummaryPendingForTests(), "build-complete early exit must not set runSummaryPending");
         assertEquals(0, runner.refillTripCountForTests());
     }
@@ -3463,6 +3491,79 @@ class GroundedSingleLaneDebugRunnerTest {
         assertTrue(runner.isActive(), "Runner must be active after successful recovery auto-resume");
         assertFalse(runner.getRecoveryState().isActive(),
                 "Recovery state must be cleared after auto-resume");
+    }
+
+    @Test
+    void recoveryAutoResumeNoUnfinishedPlacementsMarksRunCompleteAndClearsState() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        runner.setGroundedTraceEnabled(true);
+        BuildSession session = sessionWithOrigin(new Vec3i(11, 1, 11));
+        GroundedSweepSettings settings = GroundedSweepSettings.defaults();
+
+        assertTrue(runner.startFullSweep(session, settings).isEmpty());
+        GroundedSweepLane lane = laneForIndex(session, settings, 0);
+        runner.activateRecoveryForTests(lane, GroundedRecoveryReason.BELOW_BUILD_PLANE);
+
+        Optional<String> err = runner.simulateRecoveryAutoResumeForTests(
+                session,
+                settings,
+                new Vec3d(10.5, 64.0, 10.5),
+                (worldPos, expected) -> true);
+
+        assertTrue(err.isEmpty(), "no unfinished placements must not be reported as auto-resume failure");
+        assertFalse(runner.isActive(), "runner must stop after clean completion");
+        assertFalse(runner.getRecoveryState().isActive(), "recovery state must be cleared");
+        assertEquals(GroundedSingleLaneDebugRunner.LaneStartStage.NONE, runner.laneStartStageForTests());
+
+        GroundedSingleLaneDebugRunner.DebugStatus status = runner.status();
+        assertFalse(status.active());
+        assertFalse(status.awaitingStartApproach());
+        assertFalse(status.awaitingLaneShift());
+        assertEquals(GroundedLaneWalkState.COMPLETE, status.walkState());
+        assertEquals(GroundedSingleLaneDebugRunner.SweepPassPhase.COMPLETE, status.phase());
+        assertTrue(status.failureReason().isEmpty());
+        assertTrue(runner.groundedTraceEventsForTests().stream()
+                .anyMatch(event -> event.contains(GroundedDiagnostics.BUILD_COMPLETE_NO_UNFINISHED_PLACEMENTS)));
+        assertFalse(runner.groundedTraceEventsForTests().stream()
+                .anyMatch(event -> event.contains("auto-resume failed")));
+    }
+
+    @Test
+    void recoveryAutoResumeWithUnfinishedPlacementsStillResumesNormally() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        BuildSession session = sessionWithOrigin(new Vec3i(11, 1, 11));
+        GroundedSweepSettings settings = GroundedSweepSettings.defaults();
+
+        assertTrue(runner.startFullSweep(session, settings).isEmpty());
+        GroundedSweepLane lane = laneForIndex(session, settings, 0);
+        runner.activateRecoveryForTests(lane, GroundedRecoveryReason.OFF_CORRIDOR);
+
+        Optional<String> err = runner.simulateRecoveryAutoResumeForTests(
+                session,
+                settings,
+                new Vec3d(10.5, 64.0, 10.5),
+                (worldPos, expected) -> false);
+
+        assertTrue(err.isEmpty());
+        assertTrue(runner.isActive(), "unfinished placements should resume the sweep");
+        assertFalse(runner.getRecoveryState().isActive());
+        GroundedSingleLaneDebugRunner.DebugStatus status = runner.status();
+        assertTrue(status.active());
+        assertEquals(GroundedSingleLaneDebugRunner.SweepPassPhase.FORWARD, status.phase());
+        assertTrue(status.failureReason().isEmpty());
+    }
+
+    @Test
+    void recoveryAutoResumeWithMissingSessionStillReportsFailure() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        GroundedSweepLane lane = eastLane();
+
+        runner.activateRecoveryForTests(lane, GroundedRecoveryReason.OFF_CORRIDOR);
+        Optional<String> err = runner.simulateRecoveryAutoResumeForTests(null, null);
+
+        assertTrue(err.isPresent());
+        assertEquals("Session or settings not available for auto-resume", err.orElseThrow());
+        assertFalse(runner.isActive());
     }
 
     // ─── New support-guard tests (amendments to PR #231) ─────────────────────
