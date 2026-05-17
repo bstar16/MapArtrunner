@@ -80,7 +80,7 @@ class TorchGridPlannerTest {
     }
 
     @Test
-    void automatedTorchPlacementTreatsReservedHotbarSlotsAsUnavailable() {
+    void globalHotbarReservationsStillTreatReservedSlotsAsUnavailableForAutomation() {
         assertTrue(HotbarSlotReservations.isReservedHotbarSlot(0, 1));
         assertFalse(HotbarSlotReservations.isAutomatedHotbarSlot(0, 1));
         assertTrue(HotbarSlotReservations.isAutomatedHotbarSlot(1, 1));
