@@ -45,9 +45,10 @@ import java.util.function.Predicate;
 public final class GroundedSingleLaneDebugRunner {
     private static final int MAX_PLACEMENT_ATTEMPTS_PER_TICK = 2;
     private static final int PLACEMENT_VERIFICATION_DELAY_TICKS = 3;
-    private static final int PLACEMENT_AUDIT_DELAY_TICKS = 15;
+    private static final int PLACEMENT_AUDIT_DELAY_TICKS = 40;
     private static final int MAX_PLACEMENT_AUDITS_PER_PLACEMENT = 2;
     private static final int MAX_PENDING_PLACEMENT_AUDITS = 512;
+    private static final int MAX_TERMINAL_AUDIT_WAIT_TICKS = PLACEMENT_AUDIT_DELAY_TICKS * (MAX_PLACEMENT_AUDITS_PER_PLACEMENT + 2);
     private static final int MAX_TRANSIENT_PLACEMENT_RETRIES = 3;
     private static final int MAX_HOTBAR_SWAP_STABILIZATION_RETRIES = 3;
     private static final int TRANSIENT_RETRY_NEAR_BLOCK_DISTANCE = 5;
@@ -124,6 +125,7 @@ public final class GroundedSingleLaneDebugRunner {
     private int missedPlacements;
     private int delayedAuditFailures;
     private long laneTicksElapsed;
+    private long terminalAuditWaitTicks;
     private boolean awaitingStartApproach;
     private boolean startApproachIssued;
     private boolean startApproachIsTrulyFreshStart;
@@ -537,6 +539,7 @@ public final class GroundedSingleLaneDebugRunner {
             handleTerminalState(client);
             return;
         }
+        terminalAuditWaitTicks = 0;
 
         Vec3d playerPosition = client.player.getEntityPos();
 
@@ -3127,12 +3130,25 @@ public final class GroundedSingleLaneDebugRunner {
         processDuePlacementAudits(tick, false, pending -> matchesByPlacementIndex.getOrDefault(pending.placementIndex(), false));
     }
 
+    void processPendingAuditsUnknownForTests(long tick) {
+        processDuePlacementAuditsWithResult(tick, false, pending -> AuditCheckResult.UNKNOWN);
+    }
+
     void processAllPendingAuditsForTests(Map<Integer, Boolean> matchesByPlacementIndex, long tick) {
         processDuePlacementAudits(tick, true, pending -> matchesByPlacementIndex.getOrDefault(pending.placementIndex(), false));
     }
 
     void processTerminalPendingAuditsForTests(Map<Integer, Boolean> matchesByPlacementIndex, long tick) {
-        processTerminalPendingAudits(tick, pending -> matchesByPlacementIndex.getOrDefault(pending.placementIndex(), false));
+        processTerminalPendingAudits(tick, pending -> matchesByPlacementIndex.getOrDefault(pending.placementIndex(), false)
+                ? AuditCheckResult.CONFIRMED
+                : AuditCheckResult.MISSING);
+    }
+
+    void advanceTerminalPendingAuditsForTests(Map<Integer, Boolean> matchesByPlacementIndex) {
+        long effectiveTick = advanceTerminalAuditWaitTick();
+        processTerminalPendingAudits(effectiveTick, pending -> matchesByPlacementIndex.getOrDefault(pending.placementIndex(), false)
+                ? AuditCheckResult.CONFIRMED
+                : AuditCheckResult.MISSING);
     }
 
     void recordFinalFailureForTests(int placementIndex) {
@@ -3205,19 +3221,30 @@ public final class GroundedSingleLaneDebugRunner {
 
     private void handleTerminalState(MinecraftClient client) {
         processTerminalPendingVerifications(client);
-        processTerminalPendingAudits(client);
 
         GroundedLaneWalker.GroundedLaneWalkState terminalState = laneWalker.state();
         Optional<String> failureReason = laneWalker.failureReason();
         if (terminalState == GroundedLaneWalker.GroundedLaneWalkState.COMPLETE) {
+            long effectiveAuditTick = advanceTerminalAuditWaitTick();
+            processTerminalPendingAudits(client, effectiveAuditTick);
             runFinalEndpointPlacementPass(client);
-            processTerminalPendingAudits(client);
+            processTerminalPendingAudits(client, effectiveAuditTick);
             if (!pendingAuditsByPlacement.isEmpty()) {
                 traceGroundedEvent("lane terminal waiting for delayed placement audits: pendingAudits=" + pendingAuditsByPlacement.size());
+                if (terminalAuditWaitTicks >= MAX_TERMINAL_AUDIT_WAIT_TICKS) {
+                    traceGroundedEvent("TERMINAL_AUDIT_FORCE_FALLBACK pendingAudits=" + pendingAuditsByPlacement.size()
+                            + " effectiveTick=" + effectiveAuditTick);
+                    pendingAuditsByPlacement = Map.of();
+                    auditAttemptsByPlacement = Map.of();
+                } else {
+                    if (client != null) {
+                        clearControls(client);
+                    }
+                    return;
+                }
                 if (client != null) {
                     clearControls(client);
                 }
-                return;
             }
         }
         traceGroundedEvent("lane walker terminal state: " + terminalState + failureReason.map(s -> " (" + s + ")").orElse(""));
@@ -3245,6 +3272,14 @@ public final class GroundedSingleLaneDebugRunner {
             clearControls(client);
         }
         clearActiveRunState();
+    }
+
+    private long advanceTerminalAuditWaitTick() {
+        terminalAuditWaitTicks++;
+        long effectiveAuditTick = laneTicksElapsed + terminalAuditWaitTicks;
+        traceGroundedEvent("TERMINAL_AUDIT_WAIT_ADVANCED pendingAudits=" + pendingAuditsByPlacement.size()
+                + " effectiveTick=" + effectiveAuditTick);
+        return effectiveAuditTick;
     }
 
     private void runFinalEndpointPlacementPass(MinecraftClient client) {
@@ -3770,6 +3805,7 @@ public final class GroundedSingleLaneDebugRunner {
         pendingVerificationsByPlacement = Map.of();
         pendingAuditsByPlacement = Map.of();
         auditAttemptsByPlacement = Map.of();
+        terminalAuditWaitTicks = 0;
         transientPlacementRetriesByPlacement = Map.of();
         hotbarSwapStabilizationByPlacement = Map.of();
         currentLeftovers = List.of();
@@ -4079,23 +4115,22 @@ public final class GroundedSingleLaneDebugRunner {
         processDuePlacementVerifications(client, laneTicksElapsed, true);
     }
 
-    private void processTerminalPendingAudits(MinecraftClient client) {
+    private void processTerminalPendingAudits(MinecraftClient client, long effectiveTick) {
         if (pendingAuditsByPlacement.isEmpty()) {
             return;
         }
         if (client == null || client.world == null) {
-            processTerminalPendingAudits(laneTicksElapsed, pending -> false);
+            processTerminalPendingAudits(effectiveTick, pending -> AuditCheckResult.UNKNOWN);
             return;
         }
-        processTerminalPendingAudits(laneTicksElapsed, pending -> verifyExpectedBlock(client, pending));
+        processTerminalPendingAudits(effectiveTick, pending -> auditExpectedBlock(client, pending));
     }
 
-    private void processTerminalPendingAudits(long tick, Predicate<PendingPlacementAudit> verifier) {
+    private void processTerminalPendingAudits(long tick, java.util.function.Function<PendingPlacementAudit, AuditCheckResult> verifier) {
         if (pendingAuditsByPlacement.isEmpty()) {
             return;
         }
-        traceGroundedEvent("PLACEMENT_AUDITS_TERMINAL_FORCE_PROCESS pendingAudits=" + pendingAuditsByPlacement.size());
-        processDuePlacementAudits(tick, true, verifier);
+        processDuePlacementAuditsWithResult(tick, false, verifier);
     }
 
     private void processDuePlacementVerifications(MinecraftClient client, long tick, boolean forceAll) {
@@ -4173,16 +4208,21 @@ public final class GroundedSingleLaneDebugRunner {
     }
 
     private void processDuePlacementAudits(MinecraftClient client, long tick, boolean forceAll) {
-        processDuePlacementAudits(tick, forceAll, pending -> verifyExpectedBlock(client, pending));
+        processDuePlacementAuditsWithResult(tick, forceAll, pending -> auditExpectedBlock(client, pending));
     }
 
     private void processDuePlacementAudits(long tick, boolean forceAll, Predicate<PendingPlacementAudit> verifier) {
+        processDuePlacementAuditsWithResult(tick, forceAll, pending -> verifier.test(pending) ? AuditCheckResult.CONFIRMED : AuditCheckResult.MISSING);
+    }
+
+    private void processDuePlacementAuditsWithResult(long tick, boolean forceAll, java.util.function.Function<PendingPlacementAudit, AuditCheckResult> verifier) {
         if (placementSelector == null || pendingAuditsByPlacement.isEmpty()) {
             return;
         }
 
         pendingAuditsByPlacement = mutablePendingAudits();
         boolean changed = false;
+        List<PendingPlacementAudit> rechecks = new ArrayList<>();
         Iterator<Map.Entry<Integer, PendingPlacementAudit>> iterator = pendingAuditsByPlacement.entrySet().iterator();
         while (iterator.hasNext()) {
             PendingPlacementAudit pending = iterator.next().getValue();
@@ -4190,15 +4230,44 @@ public final class GroundedSingleLaneDebugRunner {
                 continue;
             }
 
-            if (verifier.test(pending)) {
+            AuditCheckResult auditResult = verifier.apply(pending);
+            if (auditResult == AuditCheckResult.CONFIRMED) {
                 tracePlacementAuditEvent("PLACEMENT_AUDIT_CONFIRMED", pending);
-            } else {
+                auditAttemptsByPlacement = mutableAuditAttempts();
+                auditAttemptsByPlacement.remove(pending.placementIndex());
+                if (auditAttemptsByPlacement.isEmpty()) {
+                    auditAttemptsByPlacement = Map.of();
+                }
+            } else if (auditResult == AuditCheckResult.MISSING) {
                 tracePlacementAuditEvent("PLACEMENT_AUDIT_CORRECTED_OR_MISSING", pending);
-                requeueAuditFailureForCleanup(pending, tick);
-                tracePlacementAuditEvent("PLACEMENT_AUDIT_REQUEUED_FOR_CLEANUP", pending);
-                changed = true;
+                if (pending.auditAttemptCount() < MAX_PLACEMENT_AUDITS_PER_PLACEMENT) {
+                    PendingPlacementAudit recheck = reschedulePlacementAuditRecheck(pending, tick);
+                    tracePlacementAuditEvent("PLACEMENT_AUDIT_SUSPECT_RECHECK", recheck);
+                    iterator.remove();
+                    rechecks.add(recheck);
+                    continue;
+                } else {
+                    tracePlacementAuditEvent("PLACEMENT_AUDIT_CONFIRMED_MISSING", pending);
+                    requeueAuditFailureForCleanup(pending, tick);
+                    tracePlacementAuditEvent("PLACEMENT_AUDIT_REQUEUED_FOR_CLEANUP", pending);
+                    auditAttemptsByPlacement = mutableAuditAttempts();
+                    auditAttemptsByPlacement.remove(pending.placementIndex());
+                    if (auditAttemptsByPlacement.isEmpty()) {
+                        auditAttemptsByPlacement = Map.of();
+                    }
+                    changed = true;
+                }
+            } else {
+                PendingPlacementAudit recheck = reschedulePlacementAuditSameAttempt(pending, tick);
+                tracePlacementAuditEvent("PLACEMENT_AUDIT_SKIPPED_UNLOADED_OR_UNKNOWN", recheck);
+                iterator.remove();
+                rechecks.add(recheck);
+                continue;
             }
             iterator.remove();
+        }
+        for (PendingPlacementAudit recheck : rechecks) {
+            pendingAuditsByPlacement.put(recheck.placementIndex(), recheck);
         }
 
         if (pendingAuditsByPlacement.isEmpty()) {
@@ -4209,12 +4278,40 @@ public final class GroundedSingleLaneDebugRunner {
         }
     }
 
-    private boolean verifyExpectedBlock(MinecraftClient client, PendingPlacementAudit pending) {
+    private AuditCheckResult auditExpectedBlock(MinecraftClient client, PendingPlacementAudit pending) {
         if (client == null || client.world == null || pending.expectedBlock() == null) {
-            return false;
+            return AuditCheckResult.UNKNOWN;
+        }
+        if (!client.world.isChunkLoaded(pending.worldPos().getX() >> 4, pending.worldPos().getZ() >> 4)) {
+            return AuditCheckResult.UNKNOWN;
         }
         BlockState worldState = client.world.getBlockState(pending.worldPos());
-        return worldState.isOf(pending.expectedBlock());
+        return worldState.isOf(pending.expectedBlock()) ? AuditCheckResult.CONFIRMED : AuditCheckResult.MISSING;
+    }
+
+    private PendingPlacementAudit reschedulePlacementAuditRecheck(PendingPlacementAudit pending, long tick) {
+        auditAttemptsByPlacement = mutableAuditAttempts();
+        int nextAttempt = Math.min(pending.auditAttemptCount() + 1, MAX_PLACEMENT_AUDITS_PER_PLACEMENT);
+        auditAttemptsByPlacement.put(pending.placementIndex(), nextAttempt);
+        return new PendingPlacementAudit(
+                pending.placementIndex(),
+                pending.worldPos(),
+                pending.expectedBlock(),
+                pending.confirmedTick(),
+                tick + PLACEMENT_AUDIT_DELAY_TICKS,
+                nextAttempt
+        );
+    }
+
+    private PendingPlacementAudit reschedulePlacementAuditSameAttempt(PendingPlacementAudit pending, long tick) {
+        return new PendingPlacementAudit(
+                pending.placementIndex(),
+                pending.worldPos(),
+                pending.expectedBlock(),
+                pending.confirmedTick(),
+                tick + PLACEMENT_AUDIT_DELAY_TICKS,
+                pending.auditAttemptCount()
+        );
     }
 
     private void requeueAuditFailureForCleanup(PendingPlacementAudit pending, long tick) {
@@ -5892,6 +5989,7 @@ public final class GroundedSingleLaneDebugRunner {
         missedPlacements = 0;
         delayedAuditFailures = 0;
         laneTicksElapsed = 0;
+        terminalAuditWaitTicks = 0;
         forwardLeftoverPlacements.clear();
         reversePlacementFilter.clear();
         auditRequeuedPlacementIndices.clear();
@@ -6208,40 +6306,99 @@ public final class GroundedSingleLaneDebugRunner {
     }
 
     private void processTransitionSupportAudits(MinecraftClient client, long tick, boolean forceAll) {
-        processTransitionSupportAudits(tick, forceAll, pending -> verifyExpectedBlock(client, pending));
+        processTransitionSupportAuditsWithResult(tick, forceAll, pending -> auditExpectedBlock(client, pending));
     }
 
     private void processTransitionSupportAudits(long tick, boolean forceAll, Predicate<PendingPlacementAudit> verifier) {
+        processTransitionSupportAuditsWithResult(tick, forceAll, pending -> verifier.test(pending) ? AuditCheckResult.CONFIRMED : AuditCheckResult.MISSING);
+    }
+
+    private void processTransitionSupportAuditsWithResult(long tick, boolean forceAll, java.util.function.Function<PendingPlacementAudit, AuditCheckResult> verifier) {
         if (pendingTransitionSupportAudits.isEmpty()) {
             return;
         }
 
         pendingTransitionSupportAudits = mutableTransitionSupportAudits();
+        List<PendingPlacementAudit> rechecks = new ArrayList<>();
         Iterator<Map.Entry<Integer, PendingPlacementAudit>> iterator = pendingTransitionSupportAudits.entrySet().iterator();
         while (iterator.hasNext()) {
             PendingPlacementAudit pending = iterator.next().getValue();
             if (!forceAll && tick < pending.auditDueTick()) {
                 continue;
             }
-            if (verifier.test(pending)) {
+            AuditCheckResult auditResult = verifier.apply(pending);
+            if (auditResult == AuditCheckResult.CONFIRMED) {
                 traceTransitionSupportAuditEvent("PLACEMENT_AUDIT_CONFIRMED", pending);
-            } else {
+                transitionSupportAuditAttemptsByPlacement = mutableTransitionSupportAuditAttempts();
+                transitionSupportAuditAttemptsByPlacement.remove(pending.placementIndex());
+                if (transitionSupportAuditAttemptsByPlacement.isEmpty()) {
+                    transitionSupportAuditAttemptsByPlacement = Map.of();
+                }
+            } else if (auditResult == AuditCheckResult.MISSING) {
                 traceTransitionSupportAuditEvent("PLACEMENT_AUDIT_CORRECTED_OR_MISSING", pending);
-                delayedAuditFailures++;
-                requeuePendingTransitionSupportTarget(new PendingPlacementVerification(
-                        pending.placementIndex(),
-                        pending.worldPos(),
-                        pending.expectedBlock(),
-                        pending.confirmedTick(),
-                        pending.auditDueTick()
-                ));
-                traceTransitionSupportAuditEvent("PLACEMENT_AUDIT_REQUEUED_FOR_CLEANUP", pending);
+                if (pending.auditAttemptCount() < MAX_PLACEMENT_AUDITS_PER_PLACEMENT) {
+                    PendingPlacementAudit recheck = rescheduleTransitionSupportAuditRecheck(pending, tick);
+                    traceTransitionSupportAuditEvent("PLACEMENT_AUDIT_SUSPECT_RECHECK", recheck);
+                    iterator.remove();
+                    rechecks.add(recheck);
+                    continue;
+                } else {
+                    traceTransitionSupportAuditEvent("PLACEMENT_AUDIT_CONFIRMED_MISSING", pending);
+                    delayedAuditFailures++;
+                    requeuePendingTransitionSupportTarget(new PendingPlacementVerification(
+                            pending.placementIndex(),
+                            pending.worldPos(),
+                            pending.expectedBlock(),
+                            pending.confirmedTick(),
+                            pending.auditDueTick()
+                    ));
+                    traceTransitionSupportAuditEvent("PLACEMENT_AUDIT_REQUEUED_FOR_CLEANUP", pending);
+                    transitionSupportAuditAttemptsByPlacement = mutableTransitionSupportAuditAttempts();
+                    transitionSupportAuditAttemptsByPlacement.remove(pending.placementIndex());
+                    if (transitionSupportAuditAttemptsByPlacement.isEmpty()) {
+                        transitionSupportAuditAttemptsByPlacement = Map.of();
+                    }
+                }
+            } else {
+                PendingPlacementAudit recheck = rescheduleTransitionSupportAuditSameAttempt(pending, tick);
+                traceTransitionSupportAuditEvent("PLACEMENT_AUDIT_SKIPPED_UNLOADED_OR_UNKNOWN", recheck);
+                iterator.remove();
+                rechecks.add(recheck);
+                continue;
             }
             iterator.remove();
+        }
+        for (PendingPlacementAudit recheck : rechecks) {
+            pendingTransitionSupportAudits.put(recheck.placementIndex(), recheck);
         }
         if (pendingTransitionSupportAudits.isEmpty()) {
             pendingTransitionSupportAudits = Map.of();
         }
+    }
+
+    private PendingPlacementAudit rescheduleTransitionSupportAuditRecheck(PendingPlacementAudit pending, long tick) {
+        transitionSupportAuditAttemptsByPlacement = mutableTransitionSupportAuditAttempts();
+        int nextAttempt = Math.min(pending.auditAttemptCount() + 1, MAX_PLACEMENT_AUDITS_PER_PLACEMENT);
+        transitionSupportAuditAttemptsByPlacement.put(pending.placementIndex(), nextAttempt);
+        return new PendingPlacementAudit(
+                pending.placementIndex(),
+                pending.worldPos(),
+                pending.expectedBlock(),
+                pending.confirmedTick(),
+                tick + PLACEMENT_AUDIT_DELAY_TICKS,
+                nextAttempt
+        );
+    }
+
+    private PendingPlacementAudit rescheduleTransitionSupportAuditSameAttempt(PendingPlacementAudit pending, long tick) {
+        return new PendingPlacementAudit(
+                pending.placementIndex(),
+                pending.worldPos(),
+                pending.expectedBlock(),
+                pending.confirmedTick(),
+                tick + PLACEMENT_AUDIT_DELAY_TICKS,
+                pending.auditAttemptCount()
+        );
     }
 
     private void removePendingTransitionSupportTarget(int placementIndex) {
@@ -6670,6 +6827,12 @@ public final class GroundedSingleLaneDebugRunner {
     public enum SweepRunMode {
         SINGLE_LANE,
         FULL_SWEEP
+    }
+
+    private enum AuditCheckResult {
+        CONFIRMED,
+        MISSING,
+        UNKNOWN
     }
 
     private record PendingPlacementVerification(

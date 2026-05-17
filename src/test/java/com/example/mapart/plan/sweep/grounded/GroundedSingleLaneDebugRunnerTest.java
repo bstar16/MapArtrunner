@@ -567,7 +567,7 @@ class GroundedSingleLaneDebugRunnerTest {
         runner.recordPlacementPlacedForTests(44, new BlockPos(11, 64, 12), 10);
         runner.processPendingVerificationsForTests(Map.of(44, true), 13);
 
-        runner.processPendingAuditsForTests(Map.of(44, true), 28);
+        runner.processPendingAuditsForTests(Map.of(44, true), 53);
 
         GroundedSingleLaneDebugRunner.DebugStatus status = runner.status();
         assertEquals(1, status.successfulPlacements());
@@ -580,7 +580,7 @@ class GroundedSingleLaneDebugRunnerTest {
     }
 
     @Test
-    void delayedAuditFailureRequeuesForCleanupWithoutDoubleCountingMissed() {
+    void firstDelayedAuditFailureSchedulesSuspectRecheckWithoutRequeue() {
         GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
         runner.setGroundedTraceEnabled(true);
         assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
@@ -589,7 +589,33 @@ class GroundedSingleLaneDebugRunnerTest {
         runner.recordPlacementPlacedForTests(45, pos, 10);
         runner.processPendingVerificationsForTests(Map.of(45, true), 13);
 
-        runner.processPendingAuditsForTests(Map.of(45, false), 28);
+        runner.processPendingAuditsForTests(Map.of(45, false), 53);
+
+        GroundedSingleLaneDebugRunner.DebugStatus status = runner.status();
+        assertTrue(status.active());
+        assertEquals(1, status.successfulPlacements());
+        assertEquals(0, status.missedPlacements());
+        assertEquals(0, runner.delayedAuditFailuresForTests());
+        assertEquals(1, runner.pendingAuditCountForTests());
+        assertEquals(2, runner.auditAttemptCountForTests(45));
+        assertFalse(runner.pendingPlacementIndicesForTests().contains(45));
+        assertTrue(status.leftovers().stream().noneMatch(record -> record.placementIndex() == 45));
+        assertTrue(runner.groundedTraceEventsForTests().stream().anyMatch(event -> event.contains("PLACEMENT_AUDIT_SUSPECT_RECHECK")
+                && event.contains("placementIndex=45")));
+    }
+
+    @Test
+    void secondDelayedAuditFailureRequeuesForCleanupWithoutDoubleCountingMissed() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        runner.setGroundedTraceEnabled(true);
+        assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
+        BlockPos pos = new BlockPos(12, 64, 12);
+        runner.seedLanePlacementsForTests(List.of(new GroundedSweepPlacementExecutor.PlacementTarget(46, pos)));
+        runner.recordPlacementPlacedForTests(46, pos, 10);
+        runner.processPendingVerificationsForTests(Map.of(46, true), 13);
+
+        runner.processPendingAuditsForTests(Map.of(46, false), 53);
+        runner.processPendingAuditsForTests(Map.of(46, false), 93);
 
         GroundedSingleLaneDebugRunner.DebugStatus status = runner.status();
         assertTrue(status.active());
@@ -597,49 +623,96 @@ class GroundedSingleLaneDebugRunnerTest {
         assertEquals(0, status.missedPlacements());
         assertEquals(1, runner.delayedAuditFailuresForTests());
         assertEquals(0, runner.pendingAuditCountForTests());
-        assertTrue(runner.pendingPlacementIndicesForTests().contains(45));
-        assertTrue(status.leftovers().stream().anyMatch(record -> record.placementIndex() == 45));
-        assertTrue(runner.groundedTraceEventsForTests().stream().anyMatch(event -> event.contains("PLACEMENT_AUDIT_REQUEUED_FOR_CLEANUP")
-                && event.contains("placementIndex=45")));
+        assertTrue(runner.pendingPlacementIndicesForTests().contains(46));
+        assertTrue(status.leftovers().stream().anyMatch(record -> record.placementIndex() == 46));
+        assertTrue(runner.groundedTraceEventsForTests().stream()
+                .anyMatch(event -> event.contains("PLACEMENT_AUDIT_CONFIRMED_MISSING")
+                        && event.contains("placementIndex=46")));
     }
 
     @Test
-    void terminalPendingAuditsAreForceProcessedBeforeDueTick() {
+    void successfulSecondAuditClearsSuspectStateWithoutRequeue() {
         GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
         runner.setGroundedTraceEnabled(true);
         assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
-        BlockPos pos = new BlockPos(11, 64, 12);
+        BlockPos pos = new BlockPos(13, 64, 12);
+        runner.seedLanePlacementsForTests(List.of(new GroundedSweepPlacementExecutor.PlacementTarget(47, pos)));
+        runner.recordPlacementPlacedForTests(47, pos, 10);
+        runner.processPendingVerificationsForTests(Map.of(47, true), 13);
+
+        runner.processPendingAuditsForTests(Map.of(47, false), 53);
+        runner.processPendingAuditsForTests(Map.of(47, true), 93);
+
+        assertEquals(0, runner.pendingAuditCountForTests());
+        assertEquals(0, runner.auditAttemptCountForTests(47));
+        assertEquals(0, runner.delayedAuditFailuresForTests());
+        assertEquals(1, runner.status().successfulPlacements());
+        assertEquals(0, runner.status().missedPlacements());
+        assertFalse(runner.pendingPlacementIndicesForTests().contains(47));
+        assertTrue(runner.status().leftovers().stream().noneMatch(record -> record.placementIndex() == 47));
+    }
+
+    @Test
+    void unavailableDelayedAuditStateReschedulesWithoutCountingMissing() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        runner.setGroundedTraceEnabled(true);
+        assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
+        BlockPos pos = new BlockPos(14, 64, 12);
         runner.seedLanePlacementsForTests(List.of(new GroundedSweepPlacementExecutor.PlacementTarget(48, pos)));
         runner.recordPlacementPlacedForTests(48, pos, 10);
         runner.processPendingVerificationsForTests(Map.of(48, true), 13);
 
-        runner.processTerminalPendingAuditsForTests(Map.of(48, true), 13);
+        runner.processPendingAuditsUnknownForTests(53);
 
-        assertEquals(0, runner.pendingAuditCountForTests());
+        assertEquals(1, runner.pendingAuditCountForTests());
+        assertEquals(1, runner.auditAttemptCountForTests(48));
+        assertEquals(0, runner.delayedAuditFailuresForTests());
         assertEquals(1, runner.status().successfulPlacements());
         assertEquals(0, runner.status().missedPlacements());
+        assertFalse(runner.pendingPlacementIndicesForTests().contains(48));
         assertTrue(runner.groundedTraceEventsForTests().stream()
-                .anyMatch(event -> event.contains("PLACEMENT_AUDITS_TERMINAL_FORCE_PROCESS")
-                        && event.contains("pendingAudits=1")));
+                .anyMatch(event -> event.contains("PLACEMENT_AUDIT_SKIPPED_UNLOADED_OR_UNKNOWN")
+                        && event.contains("placementIndex=48")));
     }
 
     @Test
-    void terminalAuditFailureRequeuesForCleanupWhileRunContinues() {
+    void terminalPendingAuditsRespectDueTickBeforeProcessing() {
         GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        runner.setGroundedTraceEnabled(true);
         assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
-        BlockPos pos = new BlockPos(11, 64, 12);
+        BlockPos pos = new BlockPos(15, 64, 12);
         runner.seedLanePlacementsForTests(List.of(new GroundedSweepPlacementExecutor.PlacementTarget(49, pos)));
         runner.recordPlacementPlacedForTests(49, pos, 10);
         runner.processPendingVerificationsForTests(Map.of(49, true), 13);
 
-        runner.processTerminalPendingAuditsForTests(Map.of(49, false), 13);
+        runner.processTerminalPendingAuditsForTests(Map.of(49, true), 13);
 
-        assertTrue(runner.isActive());
-        assertEquals(0, runner.pendingAuditCountForTests());
-        assertEquals(1, runner.delayedAuditFailuresForTests());
+        assertEquals(1, runner.pendingAuditCountForTests());
         assertEquals(1, runner.status().successfulPlacements());
         assertEquals(0, runner.status().missedPlacements());
-        assertTrue(runner.pendingPlacementIndicesForTests().contains(49));
+    }
+
+    @Test
+    void terminalAuditWaitAdvancesEffectiveTimeUntilDueAuditProcesses() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        runner.setGroundedTraceEnabled(true);
+        assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
+        BlockPos pos = new BlockPos(16, 64, 12);
+        runner.seedLanePlacementsForTests(List.of(new GroundedSweepPlacementExecutor.PlacementTarget(51, pos)));
+        runner.recordPlacementPlacedForTests(51, pos, 10);
+        runner.processPendingVerificationsForTests(Map.of(51, true), 13);
+
+        for (int i = 0; i < 52; i++) {
+            runner.advanceTerminalPendingAuditsForTests(Map.of(51, true));
+        }
+        assertEquals(1, runner.pendingAuditCountForTests());
+
+        runner.advanceTerminalPendingAuditsForTests(Map.of(51, true));
+
+        assertEquals(0, runner.pendingAuditCountForTests());
+        assertTrue(runner.groundedTraceEventsForTests().stream()
+                .anyMatch(event -> event.contains("TERMINAL_AUDIT_WAIT_ADVANCED")
+                        && event.contains("effectiveTick=53")));
     }
 
     @Test
@@ -671,7 +744,8 @@ class GroundedSingleLaneDebugRunnerTest {
         runner.seedLanePlacementsForTests(List.of(new GroundedSweepPlacementExecutor.PlacementTarget(46, pos)));
         runner.recordPlacementPlacedForTests(46, pos, 10);
         runner.processPendingVerificationsForTests(Map.of(46, true), 13);
-        runner.processPendingAuditsForTests(Map.of(46, false), 28);
+        runner.processPendingAuditsForTests(Map.of(46, false), 53);
+        runner.processPendingAuditsForTests(Map.of(46, false), 93);
 
         runner.recordPlacementOutcomeForTests(46, GroundedSweepPlacementExecutor.PlacementResult.SUCCESS, 29);
 
@@ -2117,7 +2191,8 @@ class GroundedSingleLaneDebugRunnerTest {
         runner.recordTransitionSupportPlacedForTests(target.placementIndex(), target.worldPos(), 0);
         runner.processTransitionSupportVerificationsForTests(Map.of(target.placementIndex(), true), 3);
 
-        runner.processTransitionSupportAuditsForTests(Map.of(target.placementIndex(), false), 18);
+        runner.processTransitionSupportAuditsForTests(Map.of(target.placementIndex(), false), 43);
+        runner.processTransitionSupportAuditsForTests(Map.of(target.placementIndex(), false), 83);
 
         assertTrue(runner.awaitingTransitionSupportForTests());
         assertEquals(0, runner.pendingTransitionSupportAuditCountForTests());
@@ -2164,7 +2239,7 @@ class GroundedSingleLaneDebugRunnerTest {
         assertTrue(runner.status().awaitingLaneShift());
         assertEquals(0, runner.status().ticksElapsed());
 
-        runner.processTransitionSupportAuditsForTests(Map.of(target.placementIndex(), true), 18);
+        runner.processTransitionSupportAuditsForTests(Map.of(target.placementIndex(), true), 43);
         assertEquals(0, runner.pendingTransitionSupportAuditCountForTests());
         assertFalse(runner.awaitingTransitionSupportForTests());
         assertTrue(runner.status().awaitingLaneShift());
