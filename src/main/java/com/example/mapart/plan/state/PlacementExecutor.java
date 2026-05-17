@@ -128,6 +128,14 @@ public class PlacementExecutor {
     }
 
     public PlacementResult executeUtilityBlock(MinecraftClient client, BlockPos targetPos, Item expectedItem, Block expectedBlock, int reservedHotbarSlots) {
+        return executeUtilityBlock(client, targetPos, expectedItem, expectedBlock, reservedHotbarSlots, false);
+    }
+
+    public PlacementResult executeUtilityBlockAllowingReservedExistingHotbarItem(MinecraftClient client, BlockPos targetPos, Item expectedItem, Block expectedBlock, int reservedHotbarSlots) {
+        return executeUtilityBlock(client, targetPos, expectedItem, expectedBlock, reservedHotbarSlots, true);
+    }
+
+    private PlacementResult executeUtilityBlock(MinecraftClient client, BlockPos targetPos, Item expectedItem, Block expectedBlock, int reservedHotbarSlots, boolean allowReservedExistingHotbarItem) {
         HotbarSlotReservations.validateReservedHotbarSlots(reservedHotbarSlots);
         if (client == null || client.player == null || client.world == null || client.interactionManager == null) {
             return PlacementResult.error("Client context is unavailable for utility placement.");
@@ -157,7 +165,7 @@ public class PlacementExecutor {
             return PlacementResult.error("Expected utility item " + Registries.ITEM.getId(expectedItem) + " is not a placeable block item.");
         }
 
-        InventorySelection selection = ensureSelectedItem(client, player, expectedItem, reservedHotbarSlots);
+        InventorySelection selection = ensureSelectedItem(client, player, expectedItem, reservedHotbarSlots, allowReservedExistingHotbarItem);
         if (!selection.available()) {
             return PlacementResult.missingItem("Missing required utility item " + Registries.ITEM.getId(expectedItem) + ".");
         }
@@ -203,14 +211,21 @@ public class PlacementExecutor {
     }
 
     private InventorySelection ensureSelectedItem(MinecraftClient client, ClientPlayerEntity player, Item expectedItem, int reservedHotbarSlots) {
+        return ensureSelectedItem(client, player, expectedItem, reservedHotbarSlots, false);
+    }
+
+    private InventorySelection ensureSelectedItem(MinecraftClient client, ClientPlayerEntity player, Item expectedItem, int reservedHotbarSlots, boolean allowReservedExistingHotbarItem) {
         PlayerInventory inventory = player.getInventory();
         int selectedSlot = inventory.getSelectedSlot();
         if (player.getMainHandStack().isOf(expectedItem)
-                && HotbarSlotReservations.isAutomatedHotbarSlot(selectedSlot, reservedHotbarSlots)) {
+                && isSelectableHotbarSlot(selectedSlot, reservedHotbarSlots, allowReservedExistingHotbarItem)) {
             return InventorySelection.selected(inventory.getSelectedSlot(), false, -1);
         }
 
-        for (int hotbarSlot = reservedHotbarSlots; hotbarSlot < PlayerInventory.getHotbarSize(); hotbarSlot++) {
+        for (int hotbarSlot = 0; hotbarSlot < PlayerInventory.getHotbarSize(); hotbarSlot++) {
+            if (!isSelectableHotbarSlot(hotbarSlot, reservedHotbarSlots, allowReservedExistingHotbarItem)) {
+                continue;
+            }
             if (inventory.getStack(hotbarSlot).isOf(expectedItem)) {
                 inventory.setSelectedSlot(hotbarSlot);
                 syncSelectedSlotWithServer(player, hotbarSlot);
@@ -235,6 +250,29 @@ public class PlacementExecutor {
         }
 
         return InventorySelection.missing();
+    }
+
+    private static boolean isSelectableHotbarSlot(int hotbarSlot, int reservedHotbarSlots, boolean allowReservedExistingHotbarItem) {
+        return HotbarSlotReservations.isAutomatedHotbarSlot(hotbarSlot, reservedHotbarSlots)
+                || (allowReservedExistingHotbarItem && HotbarSlotReservations.isReservedHotbarSlot(hotbarSlot, reservedHotbarSlots));
+    }
+
+    static int selectMatchingHotbarSlotForTests(int selectedSlot, boolean[] matchingHotbarSlots, int reservedHotbarSlots, boolean allowReservedExistingHotbarItem) {
+        HotbarSlotReservations.validateReservedHotbarSlots(reservedHotbarSlots);
+        if (selectedSlot >= 0
+                && selectedSlot < matchingHotbarSlots.length
+                && selectedSlot < PlayerInventory.getHotbarSize()
+                && matchingHotbarSlots[selectedSlot]
+                && isSelectableHotbarSlot(selectedSlot, reservedHotbarSlots, allowReservedExistingHotbarItem)) {
+            return selectedSlot;
+        }
+        for (int hotbarSlot = 0; hotbarSlot < Math.min(PlayerInventory.getHotbarSize(), matchingHotbarSlots.length); hotbarSlot++) {
+            if (matchingHotbarSlots[hotbarSlot]
+                    && isSelectableHotbarSlot(hotbarSlot, reservedHotbarSlots, allowReservedExistingHotbarItem)) {
+                return hotbarSlot;
+            }
+        }
+        return -1;
     }
 
     static boolean shouldDelayPlacementAfterAutomatedHotbarSwapForTests(boolean selectionAvailable, boolean movedToHotbar) {

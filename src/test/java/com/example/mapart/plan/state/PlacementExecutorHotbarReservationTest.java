@@ -13,8 +13,22 @@ class PlacementExecutorHotbarReservationTest {
     }
 
     @Test
+    void normalPlacementSelectionRefusesMatchingReservedHotbarSlot() {
+        boolean[] matchingHotbar = {true, false, false, false, false, false, false, false, false};
+
+        assertEquals(-1, PlacementExecutor.selectMatchingHotbarSlotForTests(0, matchingHotbar, 5, false));
+    }
+
+    @Test
     void automatedPlacementSwapNeverChoosesReservedHotbarSlot() {
         boolean[] emptyHotbar = {true, true, true, true, true, false, false, false, false};
+
+        assertEquals(5, PlacementExecutor.firstPreferredSwapHotbarSlotForTests(0, emptyHotbar, 5));
+    }
+
+    @Test
+    void normalPlacementSwapNeverMovesMapartBlockIntoReservedHotbarSlot() {
+        boolean[] emptyHotbar = {true, true, true, true, true, true, false, false, false};
 
         assertEquals(5, PlacementExecutor.firstPreferredSwapHotbarSlotForTests(0, emptyHotbar, 5));
     }
@@ -24,6 +38,62 @@ class PlacementExecutorHotbarReservationTest {
         boolean[] emptyHotbar = {true, true, true, true, true, true, true, true, true};
 
         assertEquals(8, PlacementExecutor.firstPreferredSwapHotbarSlotForTests(0, emptyHotbar, 8));
+    }
+
+    @Test
+    void torchGridSelectionCanUseTorchAlreadyInReservedHotbarSlot() {
+        boolean[] matchingHotbar = {true, false, false, false, false, false, false, false, false};
+
+        assertEquals(0, PlacementExecutor.selectMatchingHotbarSlotForTests(0, matchingHotbar, 5, true));
+    }
+
+    @Test
+    void torchGridSwapDoesNotMoveTorchIntoReservedHotbarSlot() {
+        boolean[] emptyHotbar = {true, true, true, true, true, false, false, false, false};
+
+        assertEquals(5, PlacementExecutor.firstPreferredSwapHotbarSlotForTests(0, emptyHotbar, 5));
+    }
+
+    @Test
+    void torchGridSelectionLeavesNonTorchReservedSlotAlone() {
+        boolean[] matchingHotbar = {false, false, false, false, false, true, false, false, false};
+
+        assertEquals(5, PlacementExecutor.selectMatchingHotbarSlotForTests(0, matchingHotbar, 5, true));
+    }
+
+    @Test
+    void torchGridSelectionDoesNotTreatNonTorchReservedSlotAsUsable() {
+        boolean[] matchingHotbar = {false, false, false, false, false, false, false, false, false};
+
+        assertEquals(-1, PlacementExecutor.selectMatchingHotbarSlotForTests(0, matchingHotbar, 5, true));
+    }
+
+    @Test
+    void torchGridSelectionStillUsesUnreservedHotbarTorch() {
+        boolean[] matchingHotbar = {false, false, false, false, false, false, true, false, false};
+
+        assertEquals(6, PlacementExecutor.selectMatchingHotbarSlotForTests(0, matchingHotbar, 5, true));
+    }
+
+    @Test
+    void torchGridMainInventoryTorchStillSwapsOnlyIntoUnreservedHotbarSlot() {
+        boolean[] emptyHotbar = {true, true, true, true, true, false, true, false, false};
+
+        assertEquals(6, PlacementExecutor.firstPreferredSwapHotbarSlotForTests(0, emptyHotbar, 5));
+    }
+
+    @Test
+    void torchGridSelectionAllowsReservedTorchWhenEightSlotsReserved() {
+        boolean[] matchingHotbar = {false, false, false, false, false, false, false, true, false};
+
+        assertEquals(7, PlacementExecutor.selectMatchingHotbarSlotForTests(0, matchingHotbar, 8, true));
+    }
+
+    @Test
+    void normalPlacementSelectionDoesNotUseReservedSlotForSchematicBlocksWhenEightSlotsReserved() {
+        boolean[] matchingHotbar = {false, false, false, false, false, false, false, true, false};
+
+        assertEquals(-1, PlacementExecutor.selectMatchingHotbarSlotForTests(0, matchingHotbar, 8, false));
     }
 
     @Test

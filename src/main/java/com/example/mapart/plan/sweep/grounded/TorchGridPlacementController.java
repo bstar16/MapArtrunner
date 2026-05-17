@@ -105,7 +105,7 @@ public final class TorchGridPlacementController {
                 continue;
             }
 
-            PlacementResult result = placementExecutor.executeUtilityBlock(
+            PlacementResult result = placementExecutor.executeUtilityBlockAllowingReservedExistingHotbarItem(
                     client,
                     target.torchPos(),
                     Items.TORCH,
