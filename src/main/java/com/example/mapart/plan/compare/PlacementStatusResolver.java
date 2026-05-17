@@ -58,6 +58,17 @@ public class PlacementStatusResolver {
         return Optional.of(new PlacementStatusSnapshot(nextIndex, placement, absolutePos.get(), status, true));
     }
 
+    public PlacementStatusSnapshot resolveSnapshot(
+            ClientWorld world,
+            Placement placement,
+            BlockPos absolutePos,
+            int index,
+            int nextIndex
+    ) {
+        PlacementStatus status = resolveStatus(world, placement, absolutePos, index, nextIndex);
+        return new PlacementStatusSnapshot(index, placement, absolutePos, status, index == nextIndex);
+    }
+
     private PlacementStatus resolveStatus(ClientWorld world, Placement expected, BlockPos absolutePos, int index, int nextIndex) {
         if (!world.isChunkLoaded(absolutePos.getX() >> 4, absolutePos.getZ() >> 4)) {
             return PlacementStatus.PENDING;

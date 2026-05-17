@@ -20,18 +20,22 @@ import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.util.shape.VoxelShapes;
 
-import java.util.HashSet;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
-import java.util.Set;
 
 public class SchematicOverlayRenderer implements WorldRenderEvents.BeforeTranslucent {
     private static final double OUTLINE_EXPANSION = 0.002D;
+    private static final int RENDER_DISTANCE_MARGIN_CHUNKS = 1;
     private static final net.minecraft.util.shape.VoxelShape OUTLINE_SHAPE = VoxelShapes.cuboid(
             -OUTLINE_EXPANSION, -OUTLINE_EXPANSION, -OUTLINE_EXPANSION,
             1.0D + OUTLINE_EXPANSION, 1.0D + OUTLINE_EXPANSION, 1.0D + OUTLINE_EXPANSION
     );
     private final PlacementStatusResolver statusResolver;
+    private OverlayCache overlayCache = OverlayCache.empty();
 
     public SchematicOverlayRenderer(PlacementStatusResolver statusResolver) {
         this.statusResolver = statusResolver;
@@ -65,25 +69,73 @@ public class SchematicOverlayRenderer implements WorldRenderEvents.BeforeTranslu
             session = cloneWithPreviewOrigin(session, origin);
         }
 
-        BuildPlan plan = session.getPlan();
-        Set<Placement> activeRegionPlacements = resolveRegionFilter(session, settings.overlayCurrentRegionOnly());
-        List<PlacementStatusSnapshot> snapshots = statusResolver.resolve(client.world, session, snapshot -> {
-            if (settings.overlayCurrentRegionOnly() && !activeRegionPlacements.contains(snapshot.placement())) {
-                return false;
-            }
-
-            if (settings.overlayShowOnlyIncorrect() && snapshot.status() == PlacementStatus.CORRECT && !snapshot.nextTarget()) {
-                return false;
-            }
-
-            return true;
-        });
+        String dimensionKey = client.world.getRegistryKey().getValue().toString();
+        OverlayCache cache = rebuildOverlayCacheIfNeeded(session, dimensionKey, settings);
+        if (cache.isEmpty()) {
+            return;
+        }
 
         MatrixStack matrices = context.matrices();
         VertexConsumer lines = context.consumers().getBuffer(RenderLayers.secondaryBlockOutline());
         Vec3d camera = client.gameRenderer.getCamera().getCameraPos();
+        int nextIndex = session.getCurrentPlacementIndex();
 
-        for (PlacementStatusSnapshot snapshot : snapshots) {
+        ClientPlayerEntity player = client.player;
+        OverlayRegion playerRegion = player == null ? null : currentPlayerOverlayRegion(player.getBlockPos());
+        int renderDistance = client.options.getViewDistance().getValue() + RENDER_DISTANCE_MARGIN_CHUNKS;
+
+        if (settings.overlayCurrentRegionOnly()) {
+            if (playerRegion == null) {
+                return;
+            }
+
+            renderTargets(cache.targetsForRegion(playerRegion), client, session, settings, matrices, lines, camera, nextIndex);
+            return;
+        }
+
+        for (Map.Entry<OverlayRegion, List<OverlayTarget>> entry : cache.targetsByRegion().entrySet()) {
+            OverlayRegion region = entry.getKey();
+            if (playerRegion != null && !isWithinRenderDistance(region, playerRegion, renderDistance)) {
+                continue;
+            }
+            if (!client.world.isChunkLoaded(region.x, region.z)) {
+                continue;
+            }
+
+            renderTargets(entry.getValue(), client, session, settings, matrices, lines, camera, nextIndex);
+        }
+    }
+
+    private void renderTargets(
+            List<OverlayTarget> targets,
+            MinecraftClient client,
+            BuildSession session,
+            MapartSettings settings,
+            MatrixStack matrices,
+            VertexConsumer lines,
+            Vec3d camera,
+            int nextIndex
+    ) {
+        if (targets.isEmpty() || client.world == null) {
+            return;
+        }
+
+        for (OverlayTarget target : targets) {
+            if (!shouldRenderOverlayBlock(client, target)) {
+                continue;
+            }
+
+            PlacementStatusSnapshot snapshot = statusResolver.resolveSnapshot(
+                    client.world,
+                    target.placement(),
+                    target.absolutePos(),
+                    target.index(),
+                    nextIndex
+            );
+            if (settings.overlayShowOnlyIncorrect() && snapshot.status() == PlacementStatus.CORRECT && !snapshot.nextTarget()) {
+                continue;
+            }
+
             int baseColor = pickColor(snapshot);
             float r = ((baseColor >> 16) & 0xFF) / 255.0f;
             float g = ((baseColor >> 8) & 0xFF) / 255.0f;
@@ -110,17 +162,73 @@ public class SchematicOverlayRenderer implements WorldRenderEvents.BeforeTranslu
         };
     }
 
-    private static Set<Placement> resolveRegionFilter(BuildSession session, boolean regionOnly) {
-        if (!regionOnly) {
-            return Set.of();
+    OverlayCache rebuildOverlayCacheIfNeeded(BuildSession session, String dimensionKey, MapartSettings settings) {
+        CacheKey key = new CacheKey(
+                session.getPlan(),
+                session.getOrigin(),
+                dimensionKey,
+                settings.overlayCurrentRegionOnly(),
+                settings.overlayShowOnlyIncorrect()
+        );
+        if (!overlayCache.matches(key)) {
+            overlayCache = buildOverlayCache(key, session);
         }
 
-        int index = session.getCurrentRegionIndex();
-        if (index < 0 || index >= session.getPlan().regions().size()) {
-            return Set.of();
+        return overlayCache;
+    }
+
+    static OverlayCache buildOverlayCache(CacheKey key, BuildSession session) {
+        BuildPlan plan = session.getPlan();
+        BlockPos origin = session.getOrigin();
+        List<OverlayTarget> allTargets = new ArrayList<>(plan.placements().size());
+        Map<OverlayRegion, List<OverlayTarget>> targetsByRegion = new LinkedHashMap<>();
+
+        for (int i = 0; i < plan.placements().size(); i++) {
+            Placement placement = plan.placements().get(i);
+            if (placement.relativePos() == null) {
+                continue;
+            }
+
+            BlockPos absolutePos = origin.add(placement.relativePos());
+            OverlayRegion region = overlayRegionForBlock(absolutePos);
+            OverlayTarget target = new OverlayTarget(i, placement, absolutePos, region);
+            allTargets.add(target);
+            targetsByRegion.computeIfAbsent(region, ignored -> new ArrayList<>()).add(target);
         }
 
-        return new HashSet<>(session.getPlan().regions().get(index).placements());
+        return new OverlayCache(key, List.copyOf(allTargets), freezeBuckets(targetsByRegion), allTargets.size());
+    }
+
+    private static Map<OverlayRegion, List<OverlayTarget>> freezeBuckets(Map<OverlayRegion, List<OverlayTarget>> targetsByRegion) {
+        Map<OverlayRegion, List<OverlayTarget>> frozen = new LinkedHashMap<>(targetsByRegion.size());
+        for (Map.Entry<OverlayRegion, List<OverlayTarget>> entry : targetsByRegion.entrySet()) {
+            frozen.put(entry.getKey(), List.copyOf(entry.getValue()));
+        }
+        return Map.copyOf(frozen);
+    }
+
+    static OverlayRegion currentPlayerOverlayRegion(BlockPos playerPos) {
+        // "Current region" is the player's current render chunk region, not the
+        // schematic origin, run start, lane start, or build-progress region.
+        return overlayRegionForBlock(playerPos);
+    }
+
+    static OverlayRegion overlayRegionForBlock(BlockPos pos) {
+        return new OverlayRegion(pos.getX() >> 4, pos.getZ() >> 4);
+    }
+
+    static boolean isWithinRenderDistance(OverlayRegion region, OverlayRegion playerRegion, int renderDistanceChunks) {
+        return Math.abs(region.x - playerRegion.x) <= renderDistanceChunks
+                && Math.abs(region.z - playerRegion.z) <= renderDistanceChunks;
+    }
+
+    static boolean shouldRenderOverlayBlock(MinecraftClient client, OverlayTarget target) {
+        if (client.world == null) {
+            return false;
+        }
+
+        OverlayRegion region = target.region();
+        return client.world.isChunkLoaded(region.x, region.z);
     }
 
     private static BuildSession cloneWithPreviewOrigin(BuildSession session, BlockPos origin) {
@@ -129,5 +237,96 @@ public class SchematicOverlayRenderer implements WorldRenderEvents.BeforeTranslu
         preview.setCurrentRegionIndex(session.getCurrentRegionIndex());
         preview.setOrigin(origin);
         return preview;
+    }
+
+    record OverlayRegion(int x, int z) {
+    }
+
+    record OverlayTarget(int index, Placement placement, BlockPos absolutePos, OverlayRegion region) {
+    }
+
+    static final class CacheKey {
+        private final BuildPlan plan;
+        private final BlockPos origin;
+        private final String dimensionKey;
+        private final boolean currentRegionOnly;
+        private final boolean showOnlyIncorrect;
+
+        CacheKey(BuildPlan plan, BlockPos origin, String dimensionKey, boolean currentRegionOnly, boolean showOnlyIncorrect) {
+            this.plan = plan;
+            this.origin = origin;
+            this.dimensionKey = dimensionKey;
+            this.currentRegionOnly = currentRegionOnly;
+            this.showOnlyIncorrect = showOnlyIncorrect;
+        }
+
+        @Override
+        public boolean equals(Object other) {
+            if (this == other) {
+                return true;
+            }
+            if (!(other instanceof CacheKey cacheKey)) {
+                return false;
+            }
+            return plan == cacheKey.plan
+                    && currentRegionOnly == cacheKey.currentRegionOnly
+                    && showOnlyIncorrect == cacheKey.showOnlyIncorrect
+                    && Objects.equals(origin, cacheKey.origin)
+                    && Objects.equals(dimensionKey, cacheKey.dimensionKey);
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(System.identityHashCode(plan), origin, dimensionKey, currentRegionOnly, showOnlyIncorrect);
+        }
+    }
+
+    static final class OverlayCache {
+        private static final OverlayCache EMPTY = new OverlayCache(null, List.of(), Map.of(), 0);
+
+        private final CacheKey key;
+        private final List<OverlayTarget> allTargets;
+        private final Map<OverlayRegion, List<OverlayTarget>> targetsByRegion;
+        private final int totalTargets;
+
+        private OverlayCache(
+                CacheKey key,
+                List<OverlayTarget> allTargets,
+                Map<OverlayRegion, List<OverlayTarget>> targetsByRegion,
+                int totalTargets
+        ) {
+            this.key = key;
+            this.allTargets = allTargets;
+            this.targetsByRegion = targetsByRegion;
+            this.totalTargets = totalTargets;
+        }
+
+        static OverlayCache empty() {
+            return EMPTY;
+        }
+
+        boolean matches(CacheKey key) {
+            return Objects.equals(this.key, key);
+        }
+
+        boolean isEmpty() {
+            return totalTargets == 0;
+        }
+
+        List<OverlayTarget> allTargets() {
+            return allTargets;
+        }
+
+        List<OverlayTarget> targetsForRegion(OverlayRegion region) {
+            return targetsByRegion.getOrDefault(region, List.of());
+        }
+
+        Map<OverlayRegion, List<OverlayTarget>> targetsByRegion() {
+            return targetsByRegion;
+        }
+
+        int regionCount() {
+            return targetsByRegion.size();
+        }
     }
 }
