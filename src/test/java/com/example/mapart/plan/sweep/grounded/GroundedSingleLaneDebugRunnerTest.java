@@ -407,6 +407,74 @@ class GroundedSingleLaneDebugRunnerTest {
     }
 
     @Test
+    void hotbarSwapPendingKeepsPlacementPendingAndDoesNotCountMissed() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
+        runner.setGroundedTraceEnabled(true);
+
+        BlockPos worldPos = new BlockPos(11, 64, 12);
+        runner.seedLanePlacementsForTests(List.of(new GroundedSweepPlacementExecutor.PlacementTarget(1, worldPos)));
+
+        assertTrue(runner.recordHotbarSwapPendingForTests(1, new Placement(new BlockPos(1, 0, 2), null), worldPos, 1));
+
+        assertEquals(List.of(1), runner.pendingPlacementIndicesForTests());
+        assertEquals(0, runner.status().missedPlacements());
+        assertEquals(0, runner.pendingVerificationCountForTests());
+        assertEquals(1, runner.hotbarSwapStabilizationCountForTests(1));
+    }
+
+    @Test
+    void hotbarSwapRetryReadyIsDiagnosticOnlyAndNextTickCanRetrySamePlacement() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
+        runner.setGroundedTraceEnabled(true);
+
+        BlockPos worldPos = new BlockPos(11, 64, 12);
+        Placement placement = new Placement(new BlockPos(1, 0, 2), null);
+        runner.seedLanePlacementsForTests(List.of(new GroundedSweepPlacementExecutor.PlacementTarget(1, worldPos)));
+
+        assertTrue(runner.recordHotbarSwapPendingForTests(1, placement, worldPos, 1));
+        runner.traceHotbarSwapRetryReadyForTests(1, placement, worldPos, 2);
+
+        assertEquals(List.of(1), runner.pendingPlacementIndicesForTests());
+        assertEquals(List.of(1), runner.rankedPlacementIndicesForTests(11, 2));
+        assertTrue(runner.groundedTraceEventsForTests().stream().anyMatch(event -> event.contains("PLACEMENT_HOTBAR_SWAP_RETRY_READY")));
+    }
+
+    @Test
+    void hotbarSwapPendingIsBoundedToPreventInfinitePlacementLoop() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
+        runner.setGroundedTraceEnabled(true);
+
+        BlockPos worldPos = new BlockPos(11, 64, 12);
+        Placement placement = new Placement(new BlockPos(1, 0, 2), null);
+
+        assertTrue(runner.recordHotbarSwapPendingForTests(1, placement, worldPos, 1));
+        assertTrue(runner.recordHotbarSwapPendingForTests(1, placement, worldPos, 2));
+        assertTrue(runner.recordHotbarSwapPendingForTests(1, placement, worldPos, 3));
+        assertFalse(runner.recordHotbarSwapPendingForTests(1, placement, worldPos, 4));
+
+        assertEquals(0, runner.hotbarSwapStabilizationCountForTests(1));
+        assertTrue(runner.groundedTraceEventsForTests().stream().anyMatch(event -> event.contains("PLACEMENT_HOTBAR_SWAP_RETRY_EXHAUSTED")));
+    }
+
+    @Test
+    void transitionSupportHotbarSwapPendingDoesNotFailTransitionTargetImmediately() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
+        runner.setGroundedTraceEnabled(true);
+
+        BlockPos worldPos = new BlockPos(11, 64, 12);
+        Placement placement = new Placement(new BlockPos(1, 0, 2), null);
+
+        assertTrue(runner.recordTransitionSupportHotbarSwapPendingForTests(7, placement, worldPos, 1));
+
+        assertEquals(1, runner.transitionSupportHotbarSwapStabilizationCountForTests(7));
+        assertTrue(runner.groundedTraceEventsForTests().stream().anyMatch(event -> event.contains("path=transition support")));
+    }
+
+    @Test
     void hardFailedPlacementBecomesFinalFailedLeftoverAndIsRemovedFromPending() {
         GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
         assertTrue(runner.start(sessionWithOrigin(), 0, GroundedSweepSettings.defaults()).isEmpty());
