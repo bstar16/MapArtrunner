@@ -929,6 +929,208 @@ class GroundedSingleLaneDebugRunnerTest {
     }
 
     @Test
+    void pauseCapturesActiveLaneIndexAndProgress() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        BuildSession session = rectangularSessionWithOrigin(new Vec3i(21, 1, 11));
+        GroundedSweepSettings settings = GroundedSweepSettings.defaults();
+        assertTrue(runner.startFullSweep(session, settings).isEmpty());
+        runner.advanceSweepToNextLaneForTests();
+        GroundedSweepLane lane1 = laneForIndex(session, settings, 1);
+        runner.setLastPlacedBlockPosForTests(new BlockPos(lane1.endPoint().getX(), 64, lane1.centerlineCoordinate()));
+
+        assertTrue(runner.pauseForResume().isEmpty());
+
+        PausedGroundedRunSnapshot snapshot = runner.pausedResumeSnapshotForTests().orElseThrow();
+        assertEquals(1, snapshot.laneIndex());
+        assertEquals(GroundedSingleLaneDebugRunner.SweepPassPhase.FORWARD, snapshot.passPhase());
+        assertEquals(lane1.direction(), snapshot.laneDirection());
+        assertEquals(lane1.endPoint().getX(), snapshot.progressCoordinate());
+        assertFalse(runner.isActive());
+    }
+
+    @Test
+    void resumeUsesPauseSnapshotInsteadOfFirstUnfinishedScan() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        runner.setGroundedTraceEnabled(true);
+        BuildSession session = rectangularSessionWithOrigin(new Vec3i(21, 1, 11));
+        GroundedSweepSettings settings = GroundedSweepSettings.defaults();
+        assertTrue(runner.startFullSweep(session, settings).isEmpty());
+        runner.advanceSweepToNextLaneForTests();
+        runner.advanceSweepToNextLaneForTests();
+        GroundedSweepLane lane2 = laneForIndex(session, settings, 2);
+        runner.setLastPlacedBlockPosForTests(new BlockPos(lane2.startPoint().getX() + 2, 64, lane2.centerlineCoordinate()));
+        assertTrue(runner.pauseForResume().isEmpty());
+
+        GroundedSingleLaneDebugRunner.ResumeStartResult result = runner.resumeFromPauseOrSmart(
+                session,
+                settings,
+                Vec3d.ofBottomCenter(session.getOrigin()),
+                (worldPos, expected) -> false
+        );
+
+        assertTrue(result.error().isEmpty());
+        assertTrue(result.usedPausedSnapshot());
+        assertFalse(result.fellBackToSmartScan());
+        assertEquals(2, runner.status().laneIndex());
+        assertEquals(GroundedSweepResumePoint.ResumeReason.PARTIAL_LANE, runner.status().resumePoint().orElseThrow().reason());
+        assertTrue(runner.groundedTraceEventsForTests().stream()
+                .anyMatch(event -> event.contains("RESUME_USING_PAUSE_SNAPSHOT lane=2")));
+        assertFalse(runner.groundedTraceEventsForTests().stream()
+                .anyMatch(event -> event.contains("FIRST_UNFINISHED")));
+    }
+
+    @Test
+    void resumeFromPauseDoesNotResetToLaneZeroUnlessSnapshotPointsThere() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        BuildSession session = rectangularSessionWithOrigin(new Vec3i(21, 1, 11));
+        GroundedSweepSettings settings = GroundedSweepSettings.defaults();
+        assertTrue(runner.startFullSweep(session, settings).isEmpty());
+        runner.advanceSweepToNextLaneForTests();
+        GroundedSweepLane lane1 = laneForIndex(session, settings, 1);
+        runner.setLastPlacedBlockPosForTests(new BlockPos(lane1.startPoint().getX() - 2, 64, lane1.centerlineCoordinate()));
+        assertTrue(runner.pauseForResume().isEmpty());
+
+        GroundedSingleLaneDebugRunner.ResumeStartResult result = runner.resumeFromPauseOrSmart(
+                session,
+                settings,
+                Vec3d.ofBottomCenter(session.getOrigin()),
+                (worldPos, expected) -> false
+        );
+
+        assertTrue(result.error().isEmpty());
+        assertEquals(1, runner.status().laneIndex());
+    }
+
+    @Test
+    void stopClearsPausedSnapshot() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        BuildSession session = rectangularSessionWithOrigin(new Vec3i(11, 1, 11));
+        assertTrue(runner.startFullSweep(session, GroundedSweepSettings.defaults()).isEmpty());
+        assertTrue(runner.pauseForResume().isEmpty());
+        assertTrue(runner.hasPausedResumeSnapshot());
+
+        assertTrue(runner.stop().isEmpty());
+
+        assertFalse(runner.hasPausedResumeSnapshot());
+    }
+
+    @Test
+    void resumeWithNoPauseSnapshotFallsBackToSmartResume() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        BuildSession session = rectangularSessionWithOrigin(new Vec3i(11, 1, 11));
+
+        GroundedSingleLaneDebugRunner.ResumeStartResult result = runner.resumeFromPauseOrSmart(
+                session,
+                GroundedSweepSettings.defaults(),
+                Vec3d.ofBottomCenter(session.getOrigin()),
+                (worldPos, expected) -> false
+        );
+
+        assertTrue(result.error().isEmpty());
+        assertFalse(result.usedPausedSnapshot());
+        assertTrue(result.fellBackToSmartScan());
+        assertTrue(runner.status().smartResumeUsed());
+    }
+
+    @Test
+    void invalidPauseSnapshotFallsBackToSmartResumeWithDiagnostic() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        runner.setGroundedTraceEnabled(true);
+        BuildSession session = rectangularSessionWithOrigin(new Vec3i(11, 1, 11));
+        PausedGroundedRunSnapshot invalid = new PausedGroundedRunSnapshot(
+                GroundedSingleLaneDebugRunner.SweepRunMode.FULL_SWEEP,
+                GroundedSingleLaneDebugRunner.SweepPassPhase.FORWARD,
+                99,
+                GroundedLaneDirection.EAST,
+                new BlockPos(999, 64, 999),
+                new BlockPos(1000, 64, 999),
+                999,
+                new BlockPos(999, 65, 999),
+                new Vec3d(999.5, 65, 999.5),
+                null,
+                false,
+                false,
+                false,
+                null,
+                null,
+                Set.of(),
+                Set.of()
+        );
+        runner.setPausedResumeSnapshotForTests(invalid);
+
+        GroundedSingleLaneDebugRunner.ResumeStartResult result = runner.resumeFromPauseOrSmart(
+                session,
+                GroundedSweepSettings.defaults(),
+                Vec3d.ofBottomCenter(session.getOrigin()),
+                (worldPos, expected) -> false
+        );
+
+        assertTrue(result.error().isEmpty());
+        assertTrue(result.fellBackToSmartScan());
+        assertTrue(runner.groundedTraceEventsForTests().stream()
+                .anyMatch(event -> event.contains("RESUME_PAUSE_SNAPSHOT_INVALID reason=snapshot_lane_not_found")));
+        assertTrue(runner.groundedTraceEventsForTests().stream()
+                .anyMatch(event -> event.contains("RESUME_FALLBACK_SMART_SCAN reason=snapshot_lane_not_found")));
+    }
+
+    @Test
+    void pauseDuringForwardPhaseResumesForward() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        BuildSession session = rectangularSessionWithOrigin(new Vec3i(11, 1, 11));
+        GroundedSweepSettings settings = GroundedSweepSettings.defaults();
+        assertTrue(runner.startFullSweep(session, settings).isEmpty());
+        assertTrue(runner.pauseForResume().isEmpty());
+
+        GroundedSingleLaneDebugRunner.ResumeStartResult result = runner.resumeFromPauseOrSmart(
+                session,
+                settings,
+                Vec3d.ofBottomCenter(session.getOrigin()),
+                (worldPos, expected) -> false
+        );
+
+        assertTrue(result.error().isEmpty());
+        assertEquals(GroundedSingleLaneDebugRunner.SweepPassPhase.FORWARD, runner.status().phase());
+    }
+
+    @Test
+    void pauseDuringReversePhaseResumesReverseCleanup() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        BuildSession session = rectangularSessionWithOrigin(new Vec3i(11, 1, 11));
+        GroundedSweepSettings settings = GroundedSweepSettings.defaults();
+        assertTrue(runner.startFullSweep(session, settings).isEmpty());
+        runner.activateReverseSnapshotStateForTests(Set.of(0));
+        assertTrue(runner.pauseForResume().isEmpty());
+
+        GroundedSingleLaneDebugRunner.ResumeStartResult result = runner.resumeFromPauseOrSmart(
+                session,
+                settings,
+                Vec3d.ofBottomCenter(session.getOrigin()),
+                (worldPos, expected) -> false
+        );
+
+        assertTrue(result.error().isEmpty());
+        assertTrue(result.usedPausedSnapshot());
+        assertEquals(GroundedSingleLaneDebugRunner.SweepPassPhase.REVERSE, runner.status().phase());
+        assertEquals(GroundedSweepResumePoint.SweepPhase.REVERSE, runner.status().resumePoint().orElseThrow().phase());
+    }
+
+    @Test
+    void pauseDuringRefillReturnPreservesRefillHints() {
+        GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
+        BuildSession session = rectangularSessionWithOrigin(new Vec3i(21, 1, 11));
+        GroundedSweepSettings settings = GroundedSweepSettings.defaults();
+        assertTrue(runner.startFullSweep(session, settings).isEmpty());
+        runner.advanceSweepToNextLaneForTests();
+        runner.setRefillHintForTests(17, 1);
+
+        assertTrue(runner.pauseForResume().isEmpty());
+
+        PausedGroundedRunSnapshot snapshot = runner.pausedResumeSnapshotForTests().orElseThrow();
+        assertEquals(17, snapshot.refillLaneProgressHint());
+        assertEquals(1, snapshot.refillLaneCursorHint());
+    }
+
+    @Test
     void groundedTraceIsDisabledByDefault() {
         GroundedSingleLaneDebugRunner runner = new GroundedSingleLaneDebugRunner(new NoOpBaritoneFacade());
         assertFalse(runner.groundedTraceEnabled());

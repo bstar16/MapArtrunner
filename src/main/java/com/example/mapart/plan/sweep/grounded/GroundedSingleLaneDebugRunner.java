@@ -185,6 +185,7 @@ public final class GroundedSingleLaneDebugRunner {
     private BlockPos lastPlacedBlockPos;
     private Integer refillLaneProgressHint;
     private Integer refillLaneCursorHint;
+    private PausedGroundedRunSnapshot pausedResumeSnapshot;
 
     private final SupplyStore supplyStore;
     private final GroundedRefillController refillController = new GroundedRefillController();
@@ -642,6 +643,266 @@ public final class GroundedSingleLaneDebugRunner {
         stop();
     }
 
+    public Optional<String> pauseForResume() {
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (!isActive()) {
+            return Optional.of("No build is currently active.");
+        }
+
+        Optional<PausedGroundedRunSnapshot> snapshot = capturePausedResumeSnapshot(client);
+        if (client != null) {
+            clearControls(client);
+            if (client.player != null) {
+                client.player.setVelocity(0, client.player.getVelocity().y, 0);
+            }
+        }
+        awaitingStartApproach = false;
+        awaitingLaneShift = false;
+        awaitingTransitionSupport = false;
+        laneWalker.interrupt();
+        if (refillController.isActive()) {
+            refillController.cancel(baritoneFacade);
+            refillController.clear();
+        }
+        baritoneFacade.cancel();
+        traceGroundedEvent("Baritone cancelled");
+
+        if (snapshot.isEmpty()) {
+            traceGroundedEvent("RESUME_PAUSE_SNAPSHOT_INVALID reason=capture_failed");
+            captureLastStatus(GroundedLaneWalker.GroundedLaneWalkState.IDLE, Optional.empty());
+            clearActiveRunState();
+            return Optional.of("Unable to capture paused resume point.");
+        }
+
+        pausedResumeSnapshot = snapshot.get();
+        traceGroundedEvent("PAUSE_SNAPSHOT_CAPTURED lane=" + pausedResumeSnapshot.laneIndex()
+                + " phase=" + pausedResumeSnapshot.passPhase()
+                + " progress=" + pausedResumeSnapshot.progressCoordinate()
+                + " playerPos=" + pausedResumeSnapshot.playerPosition());
+        captureLastStatus(GroundedLaneWalker.GroundedLaneWalkState.IDLE, Optional.empty());
+        clearActiveRunState();
+        placementDelayCooldown = 0;
+        tickHealthMonitor.reset();
+        clientTickStallActive = false;
+        refillController.setSuppressTimeouts(false);
+        return Optional.empty();
+    }
+
+    private Optional<PausedGroundedRunSnapshot> capturePausedResumeSnapshot(MinecraftClient client) {
+        if (activeLane == null || activeBounds == null || activeSession == null || activeSettings == null) {
+            return Optional.empty();
+        }
+        Vec3d playerPosition = client != null && client.player != null
+                ? client.player.getEntityPos()
+                : Vec3d.ofCenter(activeLane.startPoint());
+        BlockPos standingPosition = new BlockPos(
+                MathHelper.floor(playerPosition.x),
+                activeBounds.minY() + 1,
+                MathHelper.floor(playerPosition.z)
+        );
+        int playerProgress = activeLane.direction().alongX()
+                ? MathHelper.floor(playerPosition.x)
+                : MathHelper.floor(playerPosition.z);
+        Integer lastPlacedProgress = lastPlacedBlockPos == null
+                ? null
+                : (activeLane.direction().alongX() ? lastPlacedBlockPos.getX() : lastPlacedBlockPos.getZ());
+        int resumeProgress = saferResumeProgress(activeLane, playerProgress, lastPlacedProgress);
+        return Optional.of(new PausedGroundedRunSnapshot(
+                runMode,
+                sweepPassPhase,
+                activeLane.laneIndex(),
+                activeLane.direction(),
+                activeLane.startPoint(),
+                activeLane.endPoint(),
+                resumeProgress,
+                standingPosition,
+                playerPosition,
+                lastPlacedProgress,
+                awaitingStartApproach,
+                awaitingLaneShift,
+                awaitingTransitionSupport,
+                refillLaneProgressHint,
+                refillLaneCursorHint,
+                forwardLeftoverPlacements,
+                reversePlacementFilter
+        ));
+    }
+
+    private Optional<String> resumeFromPausedSnapshot(
+            BuildSession session,
+            GroundedSweepSettings settings,
+            PausedGroundedRunSnapshot snapshot
+    ) {
+        Optional<String> validation = validateStart(session, settings);
+        if (validation.isPresent()) {
+            return validation;
+        }
+        if (snapshot.passPhase() == SweepPassPhase.COMPLETE) {
+            return Optional.of("snapshot_phase_complete");
+        }
+
+        GroundedSchematicBounds bounds = GroundedSchematicBounds.fromPlan(session.getPlan(), session.getOrigin());
+        List<GroundedSweepLane> lanes = lanePlanner.planLanes(bounds, settings);
+        if (lanes.isEmpty()) {
+            return Optional.of("no_planned_lanes");
+        }
+        List<GroundedSweepLane> reverse = buildReverseSweepLanes(lanes);
+        List<GroundedSweepLane> activeLaneList = snapshot.passPhase() == SweepPassPhase.REVERSE ? reverse : lanes;
+        int selectedCursor = findSnapshotLaneCursor(snapshot, activeLaneList);
+        if (selectedCursor < 0) {
+            return Optional.of("snapshot_lane_not_found");
+        }
+        if (snapshot.passPhase() == SweepPassPhase.REVERSE && snapshot.reversePlacementFilter().isEmpty()) {
+            return Optional.of("reverse_snapshot_missing_leftovers");
+        }
+
+        initializeRunState(session, bounds, settings, snapshot.runMode(), lanes, reverse, snapshot.passPhase());
+        forwardLeftoverPlacements.addAll(snapshot.forwardLeftoverPlacements());
+        reversePlacementFilter.addAll(snapshot.reversePlacementFilter());
+        refillLaneProgressHint = snapshot.refillLaneProgressHint();
+        refillLaneCursorHint = snapshot.refillLaneCursorHint();
+
+        GroundedSweepLane resumeLane = activeLaneList.get(selectedCursor);
+        laneCursor = selectedCursor;
+        smartResumeUsed = false;
+        selectedResumePoint = new GroundedSweepResumePoint(
+                snapshot.laneIndex(),
+                snapshot.passPhase() == SweepPassPhase.REVERSE
+                        ? GroundedSweepResumePoint.SweepPhase.REVERSE
+                        : GroundedSweepResumePoint.SweepPhase.FORWARD,
+                resumeLane.direction(),
+                resumeLane.centerlineCoordinate(),
+                snapshot.progressCoordinate(),
+                snapshot.standingPosition(),
+                resumeLane.direction().yawDegrees(),
+                GroundedSweepResumePoint.ResumeReason.PARTIAL_LANE,
+                0,
+                0
+        );
+        skippedCompletedForwardLanes = snapshot.passPhase() == SweepPassPhase.FORWARD ? selectedCursor : lanes.size();
+        laneEntryAnchor = buildLaneEntryAnchorFromProgressHint(resumeLane, bounds, snapshot.progressCoordinate());
+
+        Set<Integer> placementFilter = snapshot.passPhase() == SweepPassPhase.REVERSE ? reversePlacementFilter : Set.of();
+        activateLaneData(resumeLane, placementFilter, Optional.of(snapshot.progressCoordinate()));
+        Optional<String> preflightFailure = runPreflightMaterialCheckBeforeSweep();
+        if (preflightFailure.isPresent()) {
+            return preflightFailure;
+        }
+        beginRunSummaryIfNeeded();
+        if (refillController.isActive()) {
+            awaitingStartApproach = false;
+            startApproachIssued = false;
+            return Optional.empty();
+        }
+
+        startApproachIsTrulyFreshStart = false;
+        awaitingStartApproach = true;
+        startApproachIssued = false;
+        awaitingLaneShift = false;
+        awaitingTransitionSupport = false;
+        laneShiftTarget = null;
+        pendingShiftLane = null;
+        laneShiftPlan = null;
+        laneTransitionStage = LaneTransitionStage.TURN_TO_SHIFT_DIRECTION;
+        laneTransitionTicks = 0;
+        laneTransitionYawLockTicks = 0;
+        lastKnownProgressCoordinate = snapshot.progressCoordinate();
+        ticksSinceProgressAdvance = 0;
+        consecutiveYawDriftTicks = 0;
+        lastStatus = new DebugStatus(
+                true,
+                resumeLane.laneIndex(),
+                GroundedLaneWalker.GroundedLaneWalkState.IDLE,
+                true,
+                false,
+                Optional.empty(),
+                laneTicksElapsed,
+                successfulPlacements,
+                missedPlacements,
+                failedPlacements,
+                0,
+                currentLeftovers,
+                sweepPassPhase,
+                smartResumeUsed,
+                Optional.ofNullable(selectedResumePoint),
+                skippedCompletedForwardLanes
+        );
+        return Optional.empty();
+    }
+
+    private static int saferResumeProgress(GroundedSweepLane lane, int playerProgress, Integer lastPlacedProgress) {
+        if (lastPlacedProgress == null) {
+            return playerProgress;
+        }
+        int playerSigned = playerProgress * lane.direction().forwardSign();
+        int lastPlacedSigned = lastPlacedProgress * lane.direction().forwardSign();
+        return lastPlacedSigned > playerSigned ? lastPlacedProgress : playerProgress;
+    }
+
+    private static int findSnapshotLaneCursor(PausedGroundedRunSnapshot snapshot, List<GroundedSweepLane> lanes) {
+        for (int i = 0; i < lanes.size(); i++) {
+            GroundedSweepLane lane = lanes.get(i);
+            if (lane.laneIndex() == snapshot.laneIndex()
+                    && lane.direction() == snapshot.laneDirection()
+                    && lane.startPoint().equals(snapshot.laneStart())
+                    && lane.endPoint().equals(snapshot.laneEnd())) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    public boolean hasPausedResumeSnapshot() {
+        return pausedResumeSnapshot != null;
+    }
+
+    public void clearPausedResumeSnapshot() {
+        if (pausedResumeSnapshot != null) {
+            pausedResumeSnapshot = null;
+            traceGroundedEvent("PAUSE_SNAPSHOT_CLEARED");
+        }
+    }
+
+    public ResumeStartResult resumeFromPauseOrSmart(
+            BuildSession session,
+            GroundedSweepSettings settings,
+            Vec3d playerPosition,
+            PlacementCompletionLookup completionLookup
+    ) {
+        if (pausedResumeSnapshot == null) {
+            traceGroundedEvent("RESUME_FALLBACK_SMART_SCAN reason=no_pause_snapshot");
+            return ResumeStartResult.smartFallback(startFullSweepSmart(session, settings, playerPosition, completionLookup));
+        }
+
+        Optional<String> resumeError = resumeFromPausedSnapshot(session, settings, pausedResumeSnapshot);
+        if (resumeError.isEmpty()) {
+            traceGroundedEvent("RESUME_USING_PAUSE_SNAPSHOT lane=" + laneCursor
+                    + " phase=" + sweepPassPhase
+                    + " progress=" + (laneEntryAnchor == null ? "none" : laneEntryAnchor.progressCoordinate()));
+            pausedResumeSnapshot = null;
+            traceGroundedEvent("PAUSE_SNAPSHOT_CLEARED");
+            return ResumeStartResult.paused(Optional.empty());
+        }
+
+        String reason = resumeError.get();
+        traceGroundedEvent("RESUME_PAUSE_SNAPSHOT_INVALID reason=" + reason);
+        traceGroundedEvent("RESUME_FALLBACK_SMART_SCAN reason=" + reason);
+        pausedResumeSnapshot = null;
+        traceGroundedEvent("PAUSE_SNAPSHOT_CLEARED");
+        return ResumeStartResult.smartFallback(startFullSweepSmart(session, settings, playerPosition, completionLookup));
+    }
+
+    public ResumeStartResult resumeFromPauseOrSmart(BuildSession session, GroundedSweepSettings settings) {
+        MinecraftClient client = MinecraftClient.getInstance();
+        Vec3d playerPosition = client != null && client.player != null ? client.player.getEntityPos() : Vec3d.ZERO;
+        PlacementCompletionLookup lookup = (worldPos, expectedBlock) ->
+                client != null
+                        && client.world != null
+                        && expectedBlock != null
+                        && client.world.getBlockState(worldPos).isOf(expectedBlock);
+        return resumeFromPauseOrSmart(session, settings, playerPosition, lookup);
+    }
+
     public Optional<String> stop() {
         MinecraftClient client = MinecraftClient.getInstance();
         if (client != null) {
@@ -649,6 +910,11 @@ public final class GroundedSingleLaneDebugRunner {
             if (client.player != null) {
                 client.player.setVelocity(0, client.player.getVelocity().y, 0);
             }
+        }
+        clearPausedResumeSnapshot();
+        if (refillController.isActive()) {
+            refillController.cancel(baritoneFacade);
+            refillController.clear();
         }
         if (!isActive()) {
             return Optional.empty();
@@ -2704,6 +2970,29 @@ public final class GroundedSingleLaneDebugRunner {
         sweepPassPhase = SweepPassPhase.COMPLETE;
     }
 
+    Optional<PausedGroundedRunSnapshot> pausedResumeSnapshotForTests() {
+        return Optional.ofNullable(pausedResumeSnapshot);
+    }
+
+    void setPausedResumeSnapshotForTests(PausedGroundedRunSnapshot snapshot) {
+        pausedResumeSnapshot = snapshot;
+    }
+
+    void activateReverseSnapshotStateForTests(Set<Integer> placementFilter) {
+        if (forwardLanes.isEmpty()) {
+            return;
+        }
+        forwardLeftoverPlacements.clear();
+        forwardLeftoverPlacements.addAll(placementFilter);
+        reversePlacementFilter.clear();
+        reversePlacementFilter.addAll(placementFilter);
+        sweepPassPhase = SweepPassPhase.REVERSE;
+        List<GroundedSweepLane> reverse = buildReverseSweepLanes(forwardLanes);
+        reverseLanes = reverse;
+        laneCursor = 0;
+        activateLaneData(reverse.getFirst(), reversePlacementFilter, Optional.empty());
+    }
+
     void seedLanePlacementsForTests(List<GroundedSweepPlacementExecutor.PlacementTarget> pendingPlacements) {
         pendingPlacementTargets = List.copyOf(pendingPlacements);
         currentLeftovers = List.of();
@@ -2888,6 +3177,10 @@ public final class GroundedSingleLaneDebugRunner {
     void setRefillHintForTests(int progressHint, int cursorHint) {
         refillLaneProgressHint = progressHint;
         refillLaneCursorHint = cursorHint;
+    }
+
+    void setLastPlacedBlockPosForTests(BlockPos pos) {
+        lastPlacedBlockPos = pos == null ? null : pos.toImmutable();
     }
 
     void markExhaustedForTests(Identifier id, GroundedRefillController.SupplyExhaustedReason reason) {
@@ -6299,6 +6592,24 @@ public final class GroundedSingleLaneDebugRunner {
         }
     }
 
+    public record ResumeStartResult(
+            Optional<String> error,
+            boolean usedPausedSnapshot,
+            boolean fellBackToSmartScan
+    ) {
+        public ResumeStartResult {
+            error = error == null ? Optional.empty() : error;
+        }
+
+        static ResumeStartResult paused(Optional<String> error) {
+            return new ResumeStartResult(error, true, false);
+        }
+
+        static ResumeStartResult smartFallback(Optional<String> error) {
+            return new ResumeStartResult(error, false, true);
+        }
+    }
+
     public enum SweepPassPhase {
         FORWARD,
         REVERSE,
@@ -6356,7 +6667,7 @@ public final class GroundedSingleLaneDebugRunner {
     ) {
     }
 
-    private enum SweepRunMode {
+    public enum SweepRunMode {
         SINGLE_LANE,
         FULL_SWEEP
     }
