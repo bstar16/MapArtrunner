@@ -59,6 +59,11 @@ public final class GroundedDiagnostics {
      */
     public static final String WEST_NEAR_END_TARGET_TRACE = "WEST_NEAR_END_TARGET_TRACE";
 
+    /**
+     * Emitted when smart resume scans the world and finds no unfinished schematic placements.
+     */
+    public static final String BUILD_COMPLETE_NO_UNFINISHED_PLACEMENTS = "BUILD_COMPLETE_NO_UNFINISHED_PLACEMENTS";
+
     private boolean enabled = true;
     private final Path overrideLogPath;
 
