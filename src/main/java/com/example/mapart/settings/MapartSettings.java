@@ -4,15 +4,11 @@ import com.example.mapart.inventory.HotbarSlotReservations;
 import com.example.mapart.plan.sweep.grounded.TorchGridSettings;
 
 public record MapartSettings(
-        boolean showHud,
         boolean showSchematicOverlay,
         boolean overlayCurrentRegionOnly,
         boolean overlayShowOnlyIncorrect,
-        boolean hudCompact,
         int clientTimerSpeed,
         boolean clientTimerEnabled,
-        int hudX,
-        int hudY,
         int sweepHalfWidth,
         int sweepTotalWidth,
         int laneStride,
@@ -43,13 +39,9 @@ public record MapartSettings(
         return new MapartSettings(
                 true,
                 true,
-                true,
-                false,
                 false,
                 1,
                 true,
-                8,
-                8,
                 2,
                 5,
                 5,

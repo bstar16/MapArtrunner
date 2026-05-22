@@ -14,7 +14,6 @@ import com.example.mapart.plan.sweep.grounded.GroundedSingleLaneDebugRunner;
 import com.example.mapart.plan.state.BuildCoordinator;
 import com.example.mapart.plan.state.BuildPlanService;
 import com.example.mapart.plan.state.WorldPlacementResolver;
-import com.example.mapart.render.HudRenderer;
 import com.example.mapart.render.ManualAirPlaceOverlayRenderer;
 import com.example.mapart.render.SchematicOverlayRenderer;
 import com.example.mapart.runtime.ClientTimerController;
@@ -28,7 +27,6 @@ import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
-import net.fabricmc.fabric.api.client.rendering.v1.HudRenderCallback;
 import net.fabricmc.fabric.api.client.rendering.v1.world.WorldRenderEvents;
 import net.minecraft.client.option.KeyBinding;
 import net.minecraft.client.util.InputUtil;
@@ -120,7 +118,6 @@ public class MapArtClientMod implements ClientModInitializer {
         });
 
         PlacementStatusResolver resolver = new PlacementStatusResolver();
-        HudRenderCallback.EVENT.register(new HudRenderer(resolver));
         WorldRenderEvents.BEFORE_TRANSLUCENT.register(new SchematicOverlayRenderer(resolver));
         WorldRenderEvents.BEFORE_TRANSLUCENT.register(new ManualAirPlaceOverlayRenderer());
 

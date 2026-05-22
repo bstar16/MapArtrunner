@@ -39,8 +39,6 @@ class SettingsAndSupplyStoreTest {
     void settingsStorePersistsValues() {
         Path settingsPath = tempDir.resolve("settings.json");
         MapartSettingsStore store = new MapartSettingsStore(settingsPath);
-        assertTrue(store.set("showHud", "false").isEmpty());
-        assertTrue(store.set("hudX", "42").isEmpty());
         assertTrue(store.set("placementDelayTicks", "5").isEmpty());
         assertTrue(store.set("inventoryClickDelayTicks", "3").isEmpty());
         assertTrue(store.set("reservedHotbarSlots", "5").isEmpty());
@@ -56,8 +54,6 @@ class SettingsAndSupplyStoreTest {
         assertTrue(store.set("manualAirPlaceDisableWhileRunnerActive", "false").isEmpty());
 
         MapartSettingsStore restored = new MapartSettingsStore(settingsPath);
-        assertFalse(restored.current().showHud());
-        assertEquals(42, restored.current().hudX());
         assertEquals(5, restored.current().placementDelayTicks());
         assertEquals(3, restored.current().inventoryClickDelayTicks());
         assertEquals(5, restored.current().reservedHotbarSlots());
@@ -72,6 +68,30 @@ class SettingsAndSupplyStoreTest {
         assertEquals(4.5, restored.current().manualAirPlaceCustomRange());
         assertTrue(restored.current().manualAirPlaceRequireSneak());
         assertFalse(restored.current().manualAirPlaceDisableWhileRunnerActive());
+    }
+
+    @Test
+    void oldStoredHudValuesAreIgnoredWithoutBreakingLoad() throws Exception {
+        Path settingsPath = tempDir.resolve("settings-old-hud.json");
+        Files.writeString(settingsPath, """
+                {
+                  "showHud": false,
+                  "hudCompact": true,
+                  "hudX": 42,
+                  "hudY": 99,
+                  "showSchematicOverlay": false,
+                  "placementDelayTicks": 5
+                }
+                """);
+
+        MapartSettingsStore store = new MapartSettingsStore(settingsPath);
+
+        assertFalse(store.current().showSchematicOverlay());
+        assertEquals(5, store.current().placementDelayTicks());
+        assertTrue(store.set("showHud", "true").isPresent());
+        assertTrue(store.set("hudCompact", "false").isPresent());
+        assertTrue(store.set("hudX", "1").isPresent());
+        assertTrue(store.set("hudY", "1").isPresent());
     }
 
     @Test
@@ -188,7 +208,7 @@ class SettingsAndSupplyStoreTest {
         Files.writeString(settingsPath, "{bad json");
 
         MapartSettingsStore store = new MapartSettingsStore(settingsPath);
-        assertTrue(store.current().showHud());
+        assertTrue(store.current().showSchematicOverlay());
     }
 
     @Test
