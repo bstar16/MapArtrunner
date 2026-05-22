@@ -40,15 +40,11 @@ public class MapartSettingsStore {
 
         try {
             switch (normalized) {
-                case "showhud" -> settings = with(showHud(parseBoolean(value)));
                 case "showschematicoverlay" -> settings = with(showSchematicOverlay(parseBoolean(value)));
                 case "overlaycurrentregiononly" -> settings = with(overlayCurrentRegionOnly(parseBoolean(value)));
                 case "overlayshowonlyincorrect" -> settings = with(overlayShowOnlyIncorrect(parseBoolean(value)));
-                case "hudcompact" -> settings = with(hudCompact(parseBoolean(value)));
                 case "clienttimerspeed" -> settings = with(clientTimerSpeed(parseClientTimerSpeed(value)));
                 case "clienttimerenabled" -> settings = with(clientTimerEnabled(parseBoolean(value)));
-                case "hudx" -> settings = with(hudX(parseInt(value)));
-                case "hudy" -> settings = with(hudY(parseInt(value)));
                 case "sweephalfwidth" -> settings = with(sweepHalfWidth(parseNonNegativeInt(value, "sweepHalfWidth")));
                 case "sweeptotalwidth" -> settings = with(sweepTotalWidth(parsePositiveInt(value, "sweepTotalWidth")));
                 case "lanestride" -> settings = with(laneStride(parsePositiveInt(value, "laneStride")));
@@ -87,15 +83,11 @@ public class MapartSettingsStore {
     private MapartSettings with(SettingsMutator mutator) {
         MapartSettings current = settings;
         MapartSettings updated = new MapartSettings(
-                mutator.showHud != null ? mutator.showHud : current.showHud(),
                 mutator.showSchematicOverlay != null ? mutator.showSchematicOverlay : current.showSchematicOverlay(),
                 mutator.overlayCurrentRegionOnly != null ? mutator.overlayCurrentRegionOnly : current.overlayCurrentRegionOnly(),
                 mutator.overlayShowOnlyIncorrect != null ? mutator.overlayShowOnlyIncorrect : current.overlayShowOnlyIncorrect(),
-                mutator.hudCompact != null ? mutator.hudCompact : current.hudCompact(),
                 mutator.clientTimerSpeed != null ? mutator.clientTimerSpeed : current.clientTimerSpeed(),
                 mutator.clientTimerEnabled != null ? mutator.clientTimerEnabled : current.clientTimerEnabled(),
-                mutator.hudX != null ? mutator.hudX : current.hudX(),
-                mutator.hudY != null ? mutator.hudY : current.hudY(),
                 mutator.sweepHalfWidth != null ? mutator.sweepHalfWidth : current.sweepHalfWidth(),
                 mutator.sweepTotalWidth != null ? mutator.sweepTotalWidth : current.sweepTotalWidth(),
                 mutator.laneStride != null ? mutator.laneStride : current.laneStride(),
@@ -121,15 +113,11 @@ public class MapartSettingsStore {
         return updated;
     }
 
-    private static SettingsMutator showHud(boolean value) { return new SettingsMutator().showHud(value); }
     private static SettingsMutator showSchematicOverlay(boolean value) { return new SettingsMutator().showSchematicOverlay(value); }
     private static SettingsMutator overlayCurrentRegionOnly(boolean value) { return new SettingsMutator().overlayCurrentRegionOnly(value); }
     private static SettingsMutator overlayShowOnlyIncorrect(boolean value) { return new SettingsMutator().overlayShowOnlyIncorrect(value); }
-    private static SettingsMutator hudCompact(boolean value) { return new SettingsMutator().hudCompact(value); }
     private static SettingsMutator clientTimerSpeed(int value) { return new SettingsMutator().clientTimerSpeed(value); }
     private static SettingsMutator clientTimerEnabled(boolean value) { return new SettingsMutator().clientTimerEnabled(value); }
-    private static SettingsMutator hudX(int value) { return new SettingsMutator().hudX(value); }
-    private static SettingsMutator hudY(int value) { return new SettingsMutator().hudY(value); }
     private static SettingsMutator sweepHalfWidth(int value) { return new SettingsMutator().sweepHalfWidth(value); }
     private static SettingsMutator sweepTotalWidth(int value) { return new SettingsMutator().sweepTotalWidth(value); }
     private static SettingsMutator laneStride(int value) { return new SettingsMutator().laneStride(value); }
@@ -237,15 +225,11 @@ public class MapartSettingsStore {
             validateGroundedSweepWidths(sweepHalfWidth, sweepTotalWidth);
 
             settings = new MapartSettings(
-                    stored.showHud == null ? defaults.showHud() : stored.showHud,
                     stored.showSchematicOverlay == null ? defaults.showSchematicOverlay() : stored.showSchematicOverlay,
                     stored.overlayCurrentRegionOnly == null ? defaults.overlayCurrentRegionOnly() : stored.overlayCurrentRegionOnly,
                     stored.overlayShowOnlyIncorrect == null ? defaults.overlayShowOnlyIncorrect() : stored.overlayShowOnlyIncorrect,
-                    stored.hudCompact == null ? defaults.hudCompact() : stored.hudCompact,
                     stored.clientTimerSpeed == null ? defaults.clientTimerSpeed() : parseClientTimerSpeed(Integer.toString(stored.clientTimerSpeed)),
                     stored.clientTimerEnabled == null ? defaults.clientTimerEnabled() : stored.clientTimerEnabled,
-                    stored.hudX == null ? defaults.hudX() : stored.hudX,
-                    stored.hudY == null ? defaults.hudY() : stored.hudY,
                     sweepHalfWidth,
                     sweepTotalWidth,
                     stored.laneStride == null ? defaults.laneStride() : parsePositiveInt(Integer.toString(stored.laneStride), "laneStride"),
@@ -302,15 +286,11 @@ public class MapartSettingsStore {
     }
 
     private static final class SettingsMutator {
-        private Boolean showHud;
         private Boolean showSchematicOverlay;
         private Boolean overlayCurrentRegionOnly;
         private Boolean overlayShowOnlyIncorrect;
-        private Boolean hudCompact;
         private Integer clientTimerSpeed;
         private Boolean clientTimerEnabled;
-        private Integer hudX;
-        private Integer hudY;
         private Integer sweepHalfWidth;
         private Integer sweepTotalWidth;
         private Integer laneStride;
@@ -331,15 +311,11 @@ public class MapartSettingsStore {
         private Boolean manualAirPlaceRequireSneak;
         private Boolean manualAirPlaceDisableWhileRunnerActive;
 
-        SettingsMutator showHud(boolean value) { this.showHud = value; return this; }
         SettingsMutator showSchematicOverlay(boolean value) { this.showSchematicOverlay = value; return this; }
         SettingsMutator overlayCurrentRegionOnly(boolean value) { this.overlayCurrentRegionOnly = value; return this; }
         SettingsMutator overlayShowOnlyIncorrect(boolean value) { this.overlayShowOnlyIncorrect = value; return this; }
-        SettingsMutator hudCompact(boolean value) { this.hudCompact = value; return this; }
         SettingsMutator clientTimerSpeed(int value) { this.clientTimerSpeed = value; return this; }
         SettingsMutator clientTimerEnabled(boolean value) { this.clientTimerEnabled = value; return this; }
-        SettingsMutator hudX(int value) { this.hudX = value; return this; }
-        SettingsMutator hudY(int value) { this.hudY = value; return this; }
         SettingsMutator sweepHalfWidth(int value) { this.sweepHalfWidth = value; return this; }
         SettingsMutator sweepTotalWidth(int value) { this.sweepTotalWidth = value; return this; }
         SettingsMutator laneStride(int value) { this.laneStride = value; return this; }
@@ -362,15 +338,11 @@ public class MapartSettingsStore {
     }
 
     private static final class StoredSettings {
-        Boolean showHud;
         Boolean showSchematicOverlay;
         Boolean overlayCurrentRegionOnly;
         Boolean overlayShowOnlyIncorrect;
-        Boolean hudCompact;
         Integer clientTimerSpeed;
         Boolean clientTimerEnabled;
-        Integer hudX;
-        Integer hudY;
         Integer sweepHalfWidth;
         Integer sweepTotalWidth;
         Integer laneStride;
@@ -395,15 +367,11 @@ public class MapartSettingsStore {
         }
 
         StoredSettings(MapartSettings settings) {
-            this.showHud = settings.showHud();
             this.showSchematicOverlay = settings.showSchematicOverlay();
             this.overlayCurrentRegionOnly = settings.overlayCurrentRegionOnly();
             this.overlayShowOnlyIncorrect = settings.overlayShowOnlyIncorrect();
-            this.hudCompact = settings.hudCompact();
             this.clientTimerSpeed = settings.clientTimerSpeed();
             this.clientTimerEnabled = settings.clientTimerEnabled();
-            this.hudX = settings.hudX();
-            this.hudY = settings.hudY();
             this.sweepHalfWidth = settings.sweepHalfWidth();
             this.sweepTotalWidth = settings.sweepTotalWidth();
             this.laneStride = settings.laneStride();

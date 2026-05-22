@@ -21,8 +21,6 @@ public class MapArtConfigScreen extends Screen {
     private final MapartSettingsStore settingsStore;
     private final Screen parent;
 
-    private boolean showHud;
-    private boolean hudCompact;
     private boolean showSchematicOverlay;
     private boolean overlayCurrentRegionOnly;
     private boolean overlayShowOnlyIncorrect;
@@ -43,8 +41,6 @@ public class MapArtConfigScreen extends Screen {
         this.settingsStore = settingsStore;
         this.parent = parent;
         MapartSettings s = settingsStore.current();
-        this.showHud = s.showHud();
-        this.hudCompact = s.hudCompact();
         this.showSchematicOverlay = s.showSchematicOverlay();
         this.overlayCurrentRegionOnly = s.overlayCurrentRegionOnly();
         this.overlayShowOnlyIncorrect = s.overlayShowOnlyIncorrect();
@@ -67,10 +63,6 @@ public class MapArtConfigScreen extends Screen {
         // --- DISPLAY column ---
         int y = SECTION_TOP;
 
-        addToggle(leftX, y, "Show HUD", showHud, v -> showHud = v);
-        y += ROW_STRIDE;
-        addToggle(leftX, y, "HUD Compact", hudCompact, v -> hudCompact = v);
-        y += ROW_STRIDE;
         addToggle(leftX, y, "Schematic Overlay", showSchematicOverlay, v -> showSchematicOverlay = v);
         y += ROW_STRIDE;
         addToggle(leftX, y, "Current Region Only", overlayCurrentRegionOnly, v -> overlayCurrentRegionOnly = v);
@@ -140,7 +132,7 @@ public class MapArtConfigScreen extends Screen {
         context.drawCenteredTextWithShadow(this.textRenderer, this.title, cx, 8, 0xFFFFFF);
         context.drawText(this.textRenderer, "DISPLAY", cx - COL_W - 5, LABEL_Y, 0xAAAAAA, true);
         context.drawText(this.textRenderer, "SWEEP", cx + 5, LABEL_Y, 0xAAAAAA, true);
-        context.drawText(this.textRenderer, "PLAYER", cx - COL_W - 5, SECTION_TOP + ROW_STRIDE * 6 - 10, 0xAAAAAA, true);
+        context.drawText(this.textRenderer, "PLAYER", cx - COL_W - 5, SECTION_TOP + ROW_STRIDE * 4 - 10, 0xAAAAAA, true);
         // Label above timer speed field
         int reservedLabelY = SECTION_TOP + ROW_STRIDE * 3;
         context.drawText(this.textRenderer, "Protect tools, food, pearls, rockets, pickaxe, ender chest, or shulker slots",
@@ -156,8 +148,6 @@ public class MapArtConfigScreen extends Screen {
     }
 
     private void save() {
-        settingsStore.set("showHud", String.valueOf(showHud));
-        settingsStore.set("hudCompact", String.valueOf(hudCompact));
         settingsStore.set("showSchematicOverlay", String.valueOf(showSchematicOverlay));
         settingsStore.set("overlayCurrentRegionOnly", String.valueOf(overlayCurrentRegionOnly));
         settingsStore.set("overlayShowOnlyIncorrect", String.valueOf(overlayShowOnlyIncorrect));

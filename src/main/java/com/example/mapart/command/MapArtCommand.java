@@ -589,8 +589,6 @@ public final class MapArtCommand {
 
     private static int showSettings(FabricClientCommandSource source, MapartSettingsStore settingsStore) {
         MapartSettings settings = settingsStore.current();
-        source.sendFeedback(Text.literal("showHud=" + settings.showHud()));
-        source.sendFeedback(Text.literal("hudCompact=" + settings.hudCompact()));
         source.sendFeedback(Text.literal("showSchematicOverlay=" + settings.showSchematicOverlay()));
         source.sendFeedback(Text.literal("overlayCurrentRegionOnly=" + settings.overlayCurrentRegionOnly()));
         source.sendFeedback(Text.literal("overlayShowOnlyIncorrect=" + settings.overlayShowOnlyIncorrect()));

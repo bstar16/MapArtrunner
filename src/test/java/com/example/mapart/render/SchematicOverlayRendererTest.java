@@ -138,15 +138,11 @@ class SchematicOverlayRendererTest {
     private static MapartSettings settings(boolean currentRegionOnly, boolean showOnlyIncorrect) {
         MapartSettings defaults = MapartSettings.defaults();
         return new MapartSettings(
-                defaults.showHud(),
                 defaults.showSchematicOverlay(),
                 currentRegionOnly,
                 showOnlyIncorrect,
-                defaults.hudCompact(),
                 defaults.clientTimerSpeed(),
                 defaults.clientTimerEnabled(),
-                defaults.hudX(),
-                defaults.hudY(),
                 defaults.sweepHalfWidth(),
                 defaults.sweepTotalWidth(),
                 defaults.laneStride(),
