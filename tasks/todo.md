@@ -8,7 +8,7 @@ Implementation approved on 28 October 2026, using task-by-task agents and indepe
 - [x] 4. Enforce architecture boundaries
 - [x] Checkpoint A: independently buildable core with meaningful tests and boundary checks
 - [x] 5. Prove the Fabric test environment
-- [ ] 6a. Implement expected-target ledger
+- [x] 6a. Implement [expected-target ledger](../docs/superpowers/plans/2026-10-28-v2-placement-ledger.md)
 - [ ] 6b. Implement native lane movement
 - [ ] 6c. Integrate tick effects and control ownership
 - [ ] 6d. Import a real schematic into the neutral plan

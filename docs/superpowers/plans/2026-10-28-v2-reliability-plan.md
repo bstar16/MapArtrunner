@@ -114,12 +114,14 @@
 
 ### 6a. Expected-target ledger
 
+Execute the reviewed [focused ledger plan](2026-10-28-v2-placement-ledger.md), including explicit run binding, evidence freshness and reversible accounting outcomes. Local environment feasibility passed in Task 5; production evidence mapping remains Task 6c.
+
 **Files:** create `v2/core/src/main/java/com/mapartrunner/core/placement/PlacementLedger.java`, its JUnit test, and `.../placement/PlacementObservation.java`.
 
 **Interface:** `PlacementLedger(BuildPlan plan)`, `observe(PlacementObservation observation)`, `recordAttempt(UUID runId, long actionId, int targetId, long tick)`, `unfinishedTargets()`, and `outcome()`. Observation includes target ID, run/action correlation where applicable, observed state and freshness; unknown/predicted/matching server evidence are distinct.
 
-- [ ] Test immutable expected targets surviving failed/missed attempts; unknown/unloaded observations; stale action/run results; delayed confirmation; and success only when every target is confirmed.
-- [ ] Run focused tests red, implement ledger accounting, then run them green and the core suite. Commit.
+- [x] Test immutable expected targets surviving failed/missed attempts; unknown/unloaded observations; stale action/run results; delayed confirmation; and success only when every target is confirmed. Ledger accounting is reversible and does not establish terminal run success.
+- [x] Run focused tests red, implement ledger accounting, then run them green and the core suite. Commit. Independent review approved; 19 focused cases and 63 full-core tests passed, zero failures/errors/skips.
 
 ### 6b. Native lane movement
 
