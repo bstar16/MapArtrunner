@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "id": "mapart",
+  "version": "${version}",
+  "name": "MapArtRunner v2",
+  "description": "Client-side mapart builder; v2 feasibility slice, gameplay not implemented yet.",
+  "environment": "client",
+  "depends": {
+    "fabricloader": ">=0.19.2",
+    "minecraft": "1.21.11",
+    "java": ">=21",
+    "fabric-api": "*"
+  }
+}
