@@ -1,0 +1,289 @@
+{
+  "schemaVersion": 1,
+  "recordedDate": "2026-10-28",
+  "purpose": "V1 reference inventory for separate v2; requirements are not v2 implementation evidence.",
+  "reference": {
+    "repository": "https://github.com/bstar16/MapArtrunner",
+    "commit": "51ad8a53a578901e5bb83db082e98f8104abbf58",
+    "sourceTree": "cc4c4ad97b2a2364f47f90cfe29d585a33b62f34",
+    "assessment": "docs/assessments/2026-10-28-reliability-baseline.md",
+    "design": "docs/superpowers/specs/2026-10-28-v2-reliability-design.md",
+    "parity": "v2/docs/behavior-parity.md",
+    "constraints": "CONSTRAINTS.md"
+  },
+  "platform": {
+    "minecraft": "1.21.11",
+    "java": 21,
+    "fabricLoader": "0.19.2",
+    "fabricApi": "0.141.1+1.21.11",
+    "yarn": "1.21.11+build.4",
+    "loom": "1.16.1",
+    "gradle": "9.5.0",
+    "junitJupiter": "5.10.2"
+  },
+  "verification": {
+    "v1JUnit": {
+      "status": "passed_previously_recorded",
+      "command": "gradlew.bat test --no-daemon",
+      "tests": 419,
+      "suites": 31,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "jdk": "Microsoft OpenJDK 21.0.10",
+      "gradle": "9.5.0",
+      "rerunForTask1": false,
+      "reason": "Documentation only; v1 source/build/tests and environment not changed. Original generated XML/log evidence was local and not committed."
+    },
+    "liveMinecraft": {
+      "status": "not_run"
+    },
+    "realBaritone": {
+      "status": "not_run",
+      "compatibleBinaryValidated": false
+    },
+    "sixDefects": {
+      "status": "source_verified_not_live_reproduced"
+    },
+    "v2Implementation": {
+      "status": "not_started_at_task_1",
+      "automatedArchitectureGates": "not_yet_implemented"
+    }
+  },
+  "commands": {
+    "source": "src/main/java/com/example/mapart/command/MapArtCommand.java",
+    "registration": "src/main/java/com/example/mapart/MapArtClientMod.java",
+    "namespaces": [
+      "mapart",
+      "maprunner",
+      "mapartrunner"
+    ],
+    "suffixes": [
+      "load <path>",
+      "unload",
+      "info",
+      "setorigin",
+      "setorigin <x> <y> <z>",
+      "status",
+      "start",
+      "pause",
+      "resume",
+      "stop",
+      "panic",
+      "supply add",
+      "supply add <name>",
+      "supply list",
+      "supply remove <id>",
+      "supply clear",
+      "supply status",
+      "settings",
+      "settings show",
+      "settings set <key> <value>",
+      "debug status",
+      "debug grounded-trace on",
+      "debug grounded-trace off",
+      "debug grounded-trace status",
+      "debug diagnostics on",
+      "debug diagnostics off",
+      "debug diagnostics status",
+      "debug diagnostics path",
+      "debug grounded-recovery status",
+      "debug mismatches",
+      "debug mismatches <limit>"
+    ],
+    "status": "preserve_pending",
+    "allNamespacesShareTree": true,
+    "mismatchDefaultLimit": 100,
+    "mismatchLimitRange": [
+      1,
+      10000
+    ],
+    "activeStartRoute": "GroundedSingleLaneDebugRunner.startFullSweep",
+    "coordinatorRole": "BuildCoordinator remains plan/session backing through BuildPlanService; not classified as unused.",
+    "unregisteredHistoricalRoutes": [
+      "debug grounded-sweep start",
+      "debug sweep"
+    ]
+  },
+  "settings": {
+    "source": "src/main/java/com/example/mapart/settings/MapartSettings.java",
+    "store": "src/main/java/com/example/mapart/settings/MapartSettingsStore.java",
+    "status": "preserve_pending",
+    "storage": "config/mapartrunner/settings.json",
+    "keysCaseInsensitive": true,
+    "defaults": {
+      "showHud": true,
+      "showSchematicOverlay": true,
+      "overlayCurrentRegionOnly": true,
+      "overlayShowOnlyIncorrect": false,
+      "hudCompact": false,
+      "clientTimerSpeed": 1,
+      "clientTimerEnabled": true,
+      "hudX": 8,
+      "hudY": 8,
+      "sweepHalfWidth": 2,
+      "sweepTotalWidth": 5,
+      "laneStride": 5,
+      "forwardLookaheadSteps": 1,
+      "trivialBehindCleanupSteps": 1,
+      "groundedSweepConstantSprint": true,
+      "placementDelayTicks": 0,
+      "inventoryClickDelayTicks": 0,
+      "reservedHotbarSlots": 0,
+      "torchGridEnabled": false,
+      "torchGridSpacing": 12,
+      "torchGridWarnMissingTorches": true,
+      "torchGridMaxPlacementsPerTick": 1,
+      "manualAirPlaceEnabled": false,
+      "manualAirPlaceRender": true,
+      "manualAirPlaceUseCustomRange": false,
+      "manualAirPlaceCustomRange": 5.0,
+      "manualAirPlaceRequireSneak": false,
+      "manualAirPlaceDisableWhileRunnerActive": true
+    },
+    "bounds": {
+      "clientTimerSpeed": [
+        1,
+        20
+      ],
+      "placementDelayTicks": [
+        0,
+        10
+      ],
+      "inventoryClickDelayTicks": [
+        0,
+        10
+      ],
+      "reservedHotbarSlots": [
+        0,
+        8
+      ],
+      "torchGridMaxPlacementsPerTick": [
+        1,
+        4
+      ],
+      "manualAirPlaceCustomRange": [
+        0.0,
+        6.0
+      ]
+    },
+    "fixed": {
+      "torchGridSpacing": 12
+    },
+    "validationNotes": [
+      "sweepHalfWidth >= 0; sweepTotalWidth > 0; sweepTotalWidth = 2 * sweepHalfWidth + 1; each reference update validates both widths.",
+      "laneStride > 0; forwardLookaheadSteps >= 0; trivialBehindCleanupSteps >= 0.",
+      "hudX and hudY accept integers.",
+      "Booleans accept true/false, case-insensitive.",
+      "torchGridSpacing set attempts save fixed 12 and report the fixed-spacing error.",
+      "Normal schematic/refill accounting and automated swap destinations exclude reserved slots. Torch grid explicitly may select/use an existing reserved-slot torch; it never swaps items into reserved slots."
+    ]
+  },
+  "keybindings": {
+    "config": {
+      "default": "K",
+      "translation": "key.mapart.config"
+    },
+    "panic": {
+      "default": "unbound",
+      "translation": "key.mapart.panic"
+    },
+    "status": "preserve_pending"
+  },
+  "runtimeDefaults": {
+    "groundedTraceEnabled": false,
+    "groundedDiagnosticsEnabled": true,
+    "recoveryAutoResumeEnabled": true,
+    "stallThresholdMs": 2000
+  },
+  "geometryDefaults": {
+    "startCorner": "north-west",
+    "firstLane": "EAST",
+    "halfWidth": 2,
+    "totalWidth": 5,
+    "laneStride": 5,
+    "shiftDirection": "SOUTH",
+    "pattern": [
+      "EAST",
+      "WEST"
+    ],
+    "passes": [
+      "full_forward",
+      "selective_reverse_cleanup"
+    ]
+  },
+  "preservedHelpers": [
+    "HUD with compact mode/offsets",
+    "schematic overlay and preview/filters",
+    "settings GUI and helper screens",
+    "supply registration/persistence",
+    "manual air place and preview",
+    "torch grid",
+    "client timer",
+    "trace/diagnostics/mismatch scan",
+    "stack quotient+remainder material formatting",
+    "plan/origin/progress persistence"
+  ],
+  "expectedCorrections": [
+    {
+      "id": "C1",
+      "case": "smart_resume_retains_earlier_unfinished_targets",
+      "sourceAnchors": [
+        "src/main/java/com/example/mapart/plan/sweep/grounded/GroundedSweepResumeScanner.java#L146",
+        "src/main/java/com/example/mapart/plan/sweep/grounded/GroundedSingleLaneDebugRunner.java#L378"
+      ]
+    },
+    {
+      "id": "C2",
+      "case": "selective_reverse_lane_reaches_both_entry_coordinates_and_yaw",
+      "sourceAnchors": [
+        "src/main/java/com/example/mapart/plan/sweep/grounded/GroundedSingleLaneDebugRunner.java#L3423",
+        "src/main/java/com/example/mapart/plan/sweep/grounded/GroundedSingleLaneDebugRunner.java#L4863"
+      ]
+    },
+    {
+      "id": "C3",
+      "case": "refill_60_target_total_40_held_collects_20_once",
+      "sourceAnchors": [
+        "src/main/java/com/example/mapart/plan/sweep/grounded/GroundedSingleLaneDebugRunner.java#L1560",
+        "src/main/java/com/example/mapart/plan/sweep/grounded/GroundedRefillController.java#L923"
+      ]
+    },
+    {
+      "id": "C4",
+      "case": "rejected_or_stopped_return_navigation_has_bounded_outcome",
+      "sourceAnchors": [
+        "src/main/java/com/example/mapart/plan/sweep/grounded/GroundedRefillController.java#L375",
+        "src/main/java/com/example/mapart/plan/sweep/grounded/GroundedRefillController.java#L542"
+      ]
+    },
+    {
+      "id": "C5",
+      "case": "failed_required_floor_stays_expected",
+      "sourceAnchors": [
+        "src/main/java/com/example/mapart/plan/sweep/grounded/GroundedSingleLaneDebugRunner.java#L1170"
+      ]
+    },
+    {
+      "id": "C6",
+      "case": "old_world_run_never_automatically_resumes_after_rejoin",
+      "sourceAnchors": [
+        "src/main/java/com/example/mapart/plan/sweep/grounded/GroundedSingleLaneDebugRunner.java#L509",
+        "src/main/java/com/example/mapart/MapArtClientMod.java"
+      ]
+    }
+  ],
+  "approvedDeferrals": [
+    {
+      "feature": "experimental Elytra flight/sweep and new flight/staircasing",
+      "status": "deferred_owner_decision",
+      "authority": "docs/superpowers/specs/2026-10-28-v2-reliability-design.md#goals-and-limits"
+    },
+    {
+      "feature": "executable Minecraft 1.12.2 port and loader/runtime choice",
+      "status": "deferred_owner_decision",
+      "authority": "docs/superpowers/specs/2026-10-28-v2-reliability-design.md#later-1122-port"
+    }
+  ],
+  "policy": "Preserve all other working behavior before replacement; any intentional omission requires an explicit owner decision. Preserve v1 source/build/test inputs."
+}

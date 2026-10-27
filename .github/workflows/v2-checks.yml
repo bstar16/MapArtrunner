@@ -1,0 +1,82 @@
+name: v2 checks
+
+on:
+  push:
+    paths:
+      - 'v2/**'
+      - 'gradlew'
+      - 'gradlew.bat'
+      - 'gradle/**'
+      - '.github/workflows/v2-checks.yml'
+  pull_request:
+    paths:
+      - 'v2/**'
+      - 'gradlew'
+      - 'gradlew.bat'
+      - 'gradle/**'
+      - '.github/workflows/v2-checks.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Java 21
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@3f5f9adaf7d9fecd50b5935e54106014257a94e6 # v6
+        with:
+          cache-provider: basic
+
+      - name: Run core checks and compile Fabric sources
+        shell: bash
+        run: |
+          set -e -o pipefail
+          mkdir -p v2/build
+          ./gradlew -p v2 :core:check :fabric:compileJava :fabric:compileGametestJava :fabric:test --no-daemon --stacktrace 2>&1 | tee v2/build/ci-gradle.log
+          python3 - <<'PY' 2>&1 | tee -a v2/build/ci-gradle.log
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          reports = sorted(Path('v2/core/build/test-results/test').glob('TEST-*.xml'))
+          if not reports:
+              raise SystemExit('No core JUnit XML reports found')
+          totals = dict.fromkeys(('tests', 'failures', 'errors', 'skipped'), 0)
+          for report in reports:
+              suite = ET.parse(report).getroot()
+              for name in totals:
+                  totals[name] += int(suite.attrib[name])
+          print('Core JUnit XML totals: ' + ', '.join(f'{name}={count}' for name, count in totals.items()), flush=True)
+          if totals['tests'] <= 0 or any(totals[name] != 0 for name in ('failures', 'errors', 'skipped')):
+              raise SystemExit('Core tests must run with no failures, errors or skips')
+          PY
+
+      - name: Upload failure evidence
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: v2-checks-failure
+          path: |
+            v2/build/ci-gradle.log
+            v2/core/build/reports/
+            v2/core/build/test-results/
+            v2/fabric/build/reports/
+            v2/fabric/build/test-results/
+          if-no-files-found: warn
+          retention-days: 7

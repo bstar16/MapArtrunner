@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** proposed plan for review; no implementation is authorized by this document alone.
+**Status:** approved by the owner on 28 October 2026 for task-by-task implementation with independent reviews. Track completed work in the linked checklist.
 
 **Goal:** Build a separate, reliable MapArtRunner v2 with stable responsibility boundaries, preserved working behavior, and repeatable game testing.
 
@@ -85,7 +85,7 @@
 
 **Dependencies:** 3. **Files:** modify `v2/core/build.gradle`; create `v2/core/src/test/java/com/mapartrunner/core/architecture/CoreArchitectureTest.java`; update `CONSTRAINTS.md` and `v2/docs/behavior-parity.md`.
 
-**Interfaces:** ordinary JUnit architecture tests run within `:core:test`. Use `com.tngtech.archunit:archunit-junit5:1.5.1` as a reviewed test-only dependency; do not add runtime tooling.
+**Interfaces:** ordinary JUnit architecture tests run within `:core:test`. Use `com.tngtech.archunit:archunit:1.5.1` as a reviewed test-only dependency; do not add runtime tooling. The core artifact supports ordinary Jupiter tests while preserving the baseline JUnit pins; the JUnit 5 aggregate's transitive engine would upgrade Jupiter/Platform.
 
 - [ ] Write rules against actual compiled core classes: no forbidden platform dependencies, no core package cycles, immutable model fields. Require matching imported classes so empty scans fail.
 - [ ] Demonstrate a forbidden dependency or rule violation in a temporary test fixture, confirm failure, then remove that fixture. Keep the permanent rule.
