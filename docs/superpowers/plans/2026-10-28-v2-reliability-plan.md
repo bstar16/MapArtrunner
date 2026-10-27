@@ -136,6 +136,8 @@ Execute the [focused native movement plan](2026-10-28-v2-native-movement.md) as 
 
 ### 6c. Tick effects and control ownership
 
+Execute the reviewed [focused tick-boundary plan](2026-10-28-v2-tick-boundary.md), including placement-owned timing, coherent client evidence, exclusive controls and real positive/fault game proofs. Its twelve reviewed slices retain the parent scope and do not establish complete traversal or parity early.
+
 **Files:** create `.../core/run/BuildEngine.java`, `.../fabric/runtime/FabricBuildAdapter.java`, `.../fabric/runtime/ControlArbiter.java`, and focused core/adapter tests (maximum five files per reviewed slice; split adapter tests if needed).
 
 **Interfaces:** `BuildEngine.tick(TickInput input)` returns `TickDecision`; `FabricBuildAdapter.tick()` snapshots game facts, advances the engine once, and applies typed effects. `ControlArbiter` is the only writer of automation keys and Baritone ownership. Inputs/results never expose Minecraft objects to core.
