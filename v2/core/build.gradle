@@ -1,0 +1,11 @@
+plugins {
+    id 'java-library'
+}
+
+base {
+    archivesName = 'mapartrunner-v2-core'
+}
+
+dependencies {
+    testImplementation 'com.tngtech.archunit:archunit:1.5.1'
+}

@@ -1,6 +1,6 @@
 # MapArtRunner v2 design
 
-Status: proposed design for review. Planning only; implementation has not started.
+Status: approved by the owner on 28 October 2026. Implementation uses task-by-task agents and independent reviews; v1 remains the reference.
 
 ## Intent and chosen approach
 

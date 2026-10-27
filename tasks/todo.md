@@ -1,12 +1,12 @@
 # MapArtRunner v2 task index
 
-Planning only. All implementation tasks remain unchecked. The owner selected a separate v2 with v1 kept as a reference. Requirements and verification live in the [canonical plan](../docs/superpowers/plans/2026-10-28-v2-reliability-plan.md); this file only tracks its ordered tasks.
+Implementation approved on 28 October 2026, using task-by-task agents and independent reviews. V1 remains the reference. Requirements and verification live in the [canonical plan](../docs/superpowers/plans/2026-10-28-v2-reliability-plan.md); this file only tracks its ordered tasks.
 
-- [ ] 1. Pin reference behavior and constraints
-- [ ] 2. Establish isolated v2 builds and test entry points
-- [ ] 3. Introduce immutable plan and lifecycle contracts
-- [ ] 4. Enforce architecture boundaries
-- [ ] Checkpoint A: independently buildable core with meaningful tests and boundary checks
+- [x] 1. Pin reference behavior and constraints
+- [x] 2. Establish isolated v2 builds and test entry points
+- [x] 3. Introduce immutable plan and lifecycle contracts
+- [x] 4. Enforce architecture boundaries
+- [x] Checkpoint A: independently buildable core with meaningful tests and boundary checks
 - [ ] 5. Prove the Fabric test environment
 - [ ] 6a. Implement expected-target ledger
 - [ ] 6b. Implement native lane movement
@@ -22,5 +22,6 @@ Planning only. All implementation tasks remain unchecked. The owner selected a s
 - [ ] Checkpoint C: complete grounded workflow and six defect scenarios covered
 - [ ] 13. Reach supported feature parity and preserve diagnostics
 - [ ] 14. Prove CI, repeatability and release readiness
+- [ ] 14a. Add the [early unit/build CI gate](../docs/superpowers/plans/2026-10-28-v2-early-ci.md)
 - [ ] Checkpoint D: review evidence before making v2 the default
 - [ ] Later: create a separate 1.12.2 feasibility and port plan

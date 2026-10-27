@@ -2,6 +2,10 @@
 
 Project-specific instructions for AI coding agents working on MapArtRunner.
 
+- [V2 scope and mandatory constraints; v1 source/build/tests remain the reference](CONSTRAINTS.md)
+- [V2 preservation requirements, actual v1 command routes, corrections and approved deferrals](v2/docs/behavior-parity.md)
+- [V1 reference commit and recorded verification evidence](v2/docs/reference-baseline.json)
+
 ## Repo
 
 Repository: https://github.com/bstar16/MapArtrunner  
