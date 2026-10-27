@@ -7,7 +7,7 @@ Implementation approved on 28 October 2026, using task-by-task agents and indepe
 - [x] 3. Introduce immutable plan and lifecycle contracts
 - [x] 4. Enforce architecture boundaries
 - [x] Checkpoint A: independently buildable core with meaningful tests and boundary checks
-- [ ] 5. Prove the Fabric test environment
+- [x] 5. Prove the Fabric test environment
 - [ ] 6a. Implement expected-target ledger
 - [ ] 6b. Implement native lane movement
 - [ ] 6c. Integrate tick effects and control ownership
@@ -22,6 +22,6 @@ Implementation approved on 28 October 2026, using task-by-task agents and indepe
 - [ ] Checkpoint C: complete grounded workflow and six defect scenarios covered
 - [ ] 13. Reach supported feature parity and preserve diagnostics
 - [ ] 14. Prove CI, repeatability and release readiness
-- [ ] 14a. Add the [early unit/build CI gate](../docs/superpowers/plans/2026-10-28-v2-early-ci.md)
+- [x] 14a. Add the [early unit/build CI gate](../docs/superpowers/plans/2026-10-28-v2-early-ci.md)
 - [ ] Checkpoint D: review evidence before making v2 the default
 - [ ] Later: create a separate 1.12.2 feasibility and port plan

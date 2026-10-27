@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "id": "mapart-test",
+  "version": "1.0.0",
+  "name": "MapArtRunner v2 environment probe (test only)",
+  "environment": "client",
+  "entrypoints": {
+    "fabric-client-gametest": [
+      "com.mapartrunner.fabric.scenario.EnvironmentProbeGameTest"
+    ]
+  },
+  "depends": {
+    "mapart": "*",
+    "fabric-client-gametest-api-v1": "*"
+  }
+}
