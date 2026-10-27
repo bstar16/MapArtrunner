@@ -7,7 +7,7 @@ Implementation approved on 28 October 2026, using task-by-task agents and indepe
 - [x] 3. Introduce immutable plan and lifecycle contracts
 - [x] 4. Enforce architecture boundaries
 - [x] Checkpoint A: independently buildable core with meaningful tests and boundary checks
-- [ ] 5. Prove the Fabric test environment
+- [x] 5. Prove the Fabric test environment
 - [ ] 6a. Implement expected-target ledger
 - [ ] 6b. Implement native lane movement
 - [ ] 6c. Integrate tick effects and control ownership
