@@ -125,12 +125,14 @@ Execute the reviewed [focused ledger plan](2026-10-28-v2-placement-ledger.md), i
 
 ### 6b. Native lane movement
 
+Execute the [focused native movement plan](2026-10-28-v2-native-movement.md) as two reviewed slices: immutable lane geometry/expected floor, then the complete bounded movement policy. Actual game effects and physics remain Task 6c.
+
 **Files:** create `.../traversal/LanePlanner.java`, `.../movement/MovementPolicy.java`, and their two core test files.
 
 **Interfaces:** `LanePlanner.plan(BuildPlan plan, int halfWidth, int stride)`; `MovementPolicy.decide(PlayerObservation player, LaneEntry entry, SupportObservation support)` returns immutable movement/yaw intent. Return types are declared beside the producing class and used unchanged by consumers.
 
-- [ ] Port verified v1 geometry/strafe assertions to plain coordinates. Test half-width 2, stride 5, narrow/partial edge lanes, all four correction directions, both entry coordinates, and hold on expected missing/unknown support.
-- [ ] Prove the cases red/green against production-used logic, with bounded hold behavior. Do not add Baritone calls. Commit.
+- [x] Port verified v1 geometry/strafe assertions to plain coordinates. Test half-width 2, stride 5, narrow/partial edge lanes, all four correction directions, both entry coordinates, and hold on expected missing/unknown support.
+- [x] Prove the cases red/green against production-used logic, with bounded hold behavior. Do not add Baritone calls. Commit. Both focused task reviews approved; 45 planner, 144 movement and 252 full-core cases passed. Actual controls/physics remain Task 6c.
 
 ### 6c. Tick effects and control ownership
 
