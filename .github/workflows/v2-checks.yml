@@ -47,9 +47,25 @@ jobs:
       - name: Run core checks and compile Fabric sources
         shell: bash
         run: |
-          set -o pipefail
+          set -e -o pipefail
           mkdir -p v2/build
           ./gradlew -p v2 :core:check :fabric:compileJava :fabric:compileGametestJava :fabric:test --no-daemon --stacktrace 2>&1 | tee v2/build/ci-gradle.log
+          python3 - <<'PY' 2>&1 | tee -a v2/build/ci-gradle.log
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          reports = sorted(Path('v2/core/build/test-results/test').glob('TEST-*.xml'))
+          if not reports:
+              raise SystemExit('No core JUnit XML reports found')
+          totals = dict.fromkeys(('tests', 'failures', 'errors', 'skipped'), 0)
+          for report in reports:
+              suite = ET.parse(report).getroot()
+              for name in totals:
+                  totals[name] += int(suite.attrib[name])
+          print('Core JUnit XML totals: ' + ', '.join(f'{name}={count}' for name, count in totals.items()), flush=True)
+          if totals['tests'] <= 0 or any(totals[name] != 0 for name in ('failures', 'errors', 'skipped')):
+              raise SystemExit('Core tests must run with no failures, errors or skips')
+          PY
 
       - name: Upload failure evidence
         if: failure()

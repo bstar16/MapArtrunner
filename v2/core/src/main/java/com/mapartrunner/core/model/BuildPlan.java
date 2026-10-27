@@ -13,11 +13,15 @@ public record BuildPlan(String fingerprint, GridSize dimensions, List<Target> ta
         Objects.requireNonNull(dimensions, "dimensions");
         targets = List.copyOf(targets);
         var ids = new HashSet<Integer>();
+        var positions = new HashSet<GridPos>();
         for (Target target : targets) {
             if (!ids.add(target.id())) {
                 throw new IllegalArgumentException("Duplicate target ID: " + target.id());
             }
             GridPos pos = target.relativePos();
+            if (!positions.add(pos)) {
+                throw new IllegalArgumentException("Duplicate target position for target " + target.id() + ": " + pos);
+            }
             if (pos.x() < 0 || pos.x() >= dimensions.width()
                     || pos.y() < 0 || pos.y() >= dimensions.height()
                     || pos.z() < 0 || pos.z() >= dimensions.depth()) {

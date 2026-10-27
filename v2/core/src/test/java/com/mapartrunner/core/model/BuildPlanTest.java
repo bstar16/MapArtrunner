@@ -50,6 +50,33 @@ class BuildPlanTest {
         assertEquals(original, targets);
     }
 
+    @Test
+    void conflictingBlocksAtTheSamePositionAreRejectedWithoutModifyingCallerList() {
+        var targets = new ArrayList<>(List.of(target(2, 0, 0, 0),
+                new Target(7, new GridPos(0, 0, 0), new BlockSpec("minecraft:dirt", Map.of()))));
+        var original = List.copyOf(targets);
+        assertThrows(IllegalArgumentException.class, () -> new BuildPlan("hash", SIZE, targets));
+        assertEquals(original, targets);
+    }
+
+    @Test
+    void identicalBlocksAtTheSamePositionAreRejectedWithoutModifyingCallerList() {
+        var targets = new ArrayList<>(List.of(target(2, 0, 0, 0), target(7, 0, 0, 0)));
+        var original = List.copyOf(targets);
+        assertThrows(IllegalArgumentException.class, () -> new BuildPlan("hash", SIZE, targets));
+        assertEquals(original, targets);
+    }
+
+    @Test
+    void distinctPositionsPreserveCallerOrderAndIds() {
+        var targets = new ArrayList<>(List.of(target(7, 1, 0, 2), target(2, 0, 0, 0)));
+        var original = List.copyOf(targets);
+        var plan = new BuildPlan("hash", SIZE, targets);
+        assertEquals(original, targets);
+        assertEquals(original, plan.targets());
+        assertEquals(List.of(7, 2), plan.targets().stream().map(Target::id).toList());
+    }
+
     @ParameterizedTest
     @ValueSource(strings = {"stone", "Minecraft:stone", "minecraft:", ":stone", "minecraft:stone:extra", "minecraft:bad block", " minecraft:stone"})
     void invalidBlockIdentifiersAreRejected(String id) {
