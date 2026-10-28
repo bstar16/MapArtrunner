@@ -4,9 +4,11 @@
   "version": "1.0.0",
   "name": "MapArtRunner v2 environment probe (test only)",
   "environment": "client",
+  "mixins": ["mapart-test.mixins.json"],
   "entrypoints": {
     "fabric-client-gametest": [
-      "com.mapartrunner.fabric.scenario.EnvironmentProbeGameTest"
+      "com.mapartrunner.fabric.scenario.EnvironmentProbeGameTest",
+      "com.mapartrunner.fabric.scenario.GroundedSingleLaneGameTest"
     ]
   },
   "depends": {

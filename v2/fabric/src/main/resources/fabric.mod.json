@@ -3,8 +3,17 @@
   "id": "mapart",
   "version": "${version}",
   "name": "MapArtRunner v2",
-  "description": "Client-side mapart builder; v2 feasibility slice, gameplay not implemented yet.",
+  "description": "Client-side mapart builder; v2 single-lane Java runtime milestone.",
   "environment": "client",
+  "entrypoints": {
+    "client": ["com.mapartrunner.fabric.MapArtClient"]
+  },
+  "mixins": [
+    {
+      "config": "mapart.client.mixins.json",
+      "environment": "client"
+    }
+  ],
   "depends": {
     "fabricloader": ">=0.19.2",
     "minecraft": "1.21.11",

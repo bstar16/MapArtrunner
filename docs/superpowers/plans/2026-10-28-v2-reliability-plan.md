@@ -136,13 +136,17 @@ Execute the [focused native movement plan](2026-10-28-v2-native-movement.md) as 
 
 ### 6c. Tick effects and control ownership
 
+Execute the reviewed [focused tick-boundary plan](2026-10-28-v2-tick-boundary.md), including placement-owned timing, coherent client evidence, exclusive controls and real positive/fault game proofs. Its twelve reviewed slices retain the parent scope and do not establish complete traversal or parity early.
+
 **Files:** create `.../core/run/BuildEngine.java`, `.../fabric/runtime/FabricBuildAdapter.java`, `.../fabric/runtime/ControlArbiter.java`, and focused core/adapter tests (maximum five files per reviewed slice; split adapter tests if needed).
 
 **Interfaces:** `BuildEngine.tick(TickInput input)` returns `TickDecision`; `FabricBuildAdapter.tick()` snapshots game facts, advances the engine once, and applies typed effects. `ControlArbiter` is the only writer of automation keys and Baritone ownership. Inputs/results never expose Minecraft objects to core.
 
-- [ ] Test stop/pause/world loss releasing controls, old effect rejection, native/travel exclusivity, and accepted placement remaining pending.
-- [ ] Wire native inputs, item selection and actual placement effects. Preserve correct yaw/head/body behavior and report unavailable observations honestly.
-- [ ] Execute a real single-lane game test with sufficient inventory, assert server blocks independently, and deliberately withhold a confirmation to prove it cannot falsely pass. Commit.
+- [x] Test stop/pause/world loss releasing controls, old effect rejection, native/travel exclusivity, and accepted placement remaining pending.
+- [x] Wire native inputs, item selection and actual placement effects. Preserve correct yaw/head/body behavior and report unavailable observations honestly.
+- [x] Execute a real single-lane game test with sufficient inventory, assert server blocks independently, and deliberately withhold a confirmation to prove it cannot falsely pass. Commit.
+
+Verified: all twelve focused tasks and the independent whole-6c review passed at17a87ac0d73d3d364eca8723cd7d048afbc8077f (draft PR251). Fresh local core327+Fabric187=514 tests had zero failures/errors/skips; gametest compilation and release remap actually executed, with test hooks excluded. Real survival lane, lifecycle, held-response, sustained missing-observation, computed-decision invalidation and actual missing-state/latest-prediction proofs include independent server checks and a specific external negative plus separate full15-lane-case recovery. Both exact-head hosted checks pass. Production OBSERVED remains loaded-client/nonpending evidence, DELTA is compile-only, and known host/default-sprint/disconnect-hook/installed-release limits remain disclosed. This accepts a programmatic single lane; real import6d, full traversal/parity and replacement are still open.
 
 ### 6d. Import a real schematic into the neutral plan
 

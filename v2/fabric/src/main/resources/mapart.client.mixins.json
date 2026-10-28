@@ -1,0 +1,10 @@
+{
+  "required": true,
+  "minVersion": "0.8.7",
+  "package": "com.mapartrunner.fabric.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "client": [
+    "ClientWorldPendingUpdateAccessor",
+    "PendingUpdateManagerMixin"
+  ]
+}

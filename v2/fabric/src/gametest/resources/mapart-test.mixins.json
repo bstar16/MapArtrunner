@@ -1,0 +1,8 @@
+{
+  "required": true,
+  "minVersion": "0.8.7",
+  "package": "com.mapartrunner.fabric.scenario.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "client": ["WithheldActionResponseMixin", "WithheldObservationMixin", "ComputedDecisionBarrierMixin", "WithheldBlockStateMixin"],
+  "injectors": { "defaultRequire": 1 }
+}
