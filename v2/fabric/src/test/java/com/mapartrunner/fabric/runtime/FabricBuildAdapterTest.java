@@ -41,6 +41,37 @@ class FabricBuildAdapterTest {
         Bootstrap.initialize();
     }
 
+    @Test void policyFailureRetainsCanonicalCauseAndInputEvidenceThroughCleanup() {
+        var h = new Harness(new BuildPlan("support failure", new GridSize(12, 1, 5),
+                List.of(new Target(7, new GridPos(1, 0, 2), STONE))));
+        h.start(); h.walk();
+        assertEquals(1, h.adapter.status().engine().laneEntry().orElseThrow().supportHoldTicks());
+        for (int i = 0; i < 38; i++) h.adapter.tick();
+        assertEquals(39, h.adapter.status().engine().laneEntry().orElseThrow().supportHoldTicks());
+        for (var control : ControlArbiter.Control.values()) h.keys.put(control, true);
+        h.events.clear(); h.adapter.tick();
+        var failed = h.adapter.status();
+        assertEquals(Outcome.FAILED, failed.engine().lifecycle().outcome().orElseThrow());
+        assertEquals(Reason.MOVEMENT_FAILED, failed.engine().diagnostic().orElseThrow().reason());
+        assertEquals("SUPPORT_TIMEOUT", failed.engine().diagnostic().orElseThrow().detail());
+        assertEquals("laneIndex=0, substage=LANE, transitionTicks=0, stage=WALK, stageElapsedTicks=0, "
+                + "entryElapsedTicks=0, consecutiveYawAlignedTicks=0, supportHoldTicks=39, yawHoldTicks=0",
+                failed.engine().diagnostic().orElseThrow().traversalDetail());
+        assertEquals(List.of(7), failed.engine().diagnostic().orElseThrow().targetIds());
+        assertEquals(List.of(7), failed.engine().unfinishedTargetIds());
+        assertTrue(failed.engine().pendingTargetIds().isEmpty()); assertTrue(failed.engine().traversal().isEmpty());
+        assertTrue(failed.engine().laneEntry().isEmpty()); assertTrue(failed.failure().isEmpty());
+        assertEquals(NONE, failed.controlOwner()); h.assertAllReleased();
+        assertEquals(9, h.events.stream().filter(e -> e.startsWith("key:")).count());
+        assertTrue(h.events.contains("release"));
+        assertFalse(h.events.contains("yaw")); assertFalse(h.events.contains("interact"));
+        h.events.clear(); h.adapter.tick(); h.adapter.stop();
+        assertEquals(failed, h.adapter.status()); assertTrue(h.events.isEmpty());
+        h.start(); assertTrue(h.adapter.status().engine().diagnostic().isEmpty());
+        assertEquals("SUPPORT_TIMEOUT", failed.engine().diagnostic().orElseThrow().detail());
+        assertTrue(failed.engine().diagnostic().orElseThrow().traversalDetail().contains("supportHoldTicks=39"));
+    }
+
     @Test void oneCallbackCapturesOnceThenUsesRealPlacementStagesAndDeliversFeedbackNextCallback() {
         var h = new Harness(12);
         h.ready = READY;

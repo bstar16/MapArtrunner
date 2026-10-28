@@ -8,6 +8,7 @@ import com.mapartrunner.core.placement.PlacementObservation.Evidence;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.*;
 
@@ -18,6 +19,147 @@ import static org.junit.jupiter.api.Assertions.*;
 class BuildEngineTest {
     static final BlockSpec STONE = new BlockSpec("minecraft:stone", Map.of());
     static final BlockSpec AIR = new BlockSpec("minecraft:air", Map.of());
+
+    @Test void supportTimeoutPreservesCanonicalCause() {
+        var h = new Harness(plan(12, 5, target(7, 1, 2)));
+        h.support = support(h.plan, AIR, Evidence.OBSERVED); h.ready();
+        for (int i = 0; i < 39; i++) assertRunning(h.step());
+        assertEquals(39, h.engine.snapshot().laneEntry().orElseThrow().supportHoldTicks());
+        var failed = h.step(); assertReason(failed, Reason.MOVEMENT_FAILED);
+        assertEquals("SUPPORT_TIMEOUT", failed.snapshot().diagnostic().orElseThrow().detail());
+    }
+
+    @Test void supportTimeoutRetainsDecisionInputBeforePolicyClearsCounters() {
+        var h = new Harness(plan(12, 5, target(7, 1, 2)));
+        h.support = support(h.plan, AIR, Evidence.OBSERVED); h.ready();
+        for (int i = 0; i < 39; i++) assertRunning(h.step());
+        assertEquals(39, h.engine.snapshot().laneEntry().orElseThrow().supportHoldTicks());
+        var input = h.engine.snapshot().traversal().orElseThrow();
+        var failed = h.step(); assertReason(failed, Reason.MOVEMENT_FAILED);
+        var diagnostic = failed.snapshot().diagnostic().orElseThrow();
+        assertTrue(diagnostic.traversalDetail().contains("supportHoldTicks=39"));
+        assertTraversalDetail(diagnostic, input, 0);
+        assertEquals(List.of(7), diagnostic.targetIds());
+        var terminal = h.engine.snapshot(); h.step(); h.engine.stop();
+        assertEquals(terminal, h.engine.snapshot());
+        var fresh = new Context(UUID.randomUUID(), h.context.connectionId(), h.context.worldId(), h.context.dimension(),
+                h.plan.fingerprint(), h.context.origin(), h.settings.fingerprint());
+        h.engine.start(h.plan, fresh, h.settings);
+        assertTrue(h.engine.snapshot().diagnostic().isEmpty());
+        assertEquals(0, h.engine.snapshot().laneEntry().orElseThrow().supportHoldTicks());
+        assertEquals(diagnostic, terminal.diagnostic().orElseThrow());
+        assertTraversalDetail(terminal.diagnostic().orElseThrow(), input, 0);
+    }
+
+    @ParameterizedTest @ValueSource(ints = {12, 2})
+    void pendingTimeoutPreservesCanonicalCauseInBuildAndVerify(int width) {
+        var h = new Harness(plan(width, 5, target(7, 0, 0)));
+        h.available.put(7, PlacementAvailability.READY); h.step();
+        for (int i = 0; i < 79; i++) assertRunning(h.step());
+        assertEquals(width == 2 ? Activity.VERIFY : Activity.BUILD,
+                h.engine.snapshot().lifecycle().activity().orElseThrow());
+        var input = h.engine.snapshot().traversal().orElseThrow();
+        var failed = h.step(); assertReason(failed, Reason.PENDING_EVIDENCE_TIMEOUT);
+        assertEquals("Pending evidence reached eligible age 80", failed.snapshot().diagnostic().orElseThrow().detail());
+        assertTraversalDetail(failed.snapshot().diagnostic().orElseThrow(), input, 0);
+        assertEquals(List.of(7), failed.snapshot().diagnostic().orElseThrow().targetIds());
+    }
+
+    @ParameterizedTest @ValueSource(booleans = {false, true})
+    void uncertainAndPendingSupportRetain79AtFailure(boolean pending) {
+        var h = new Harness(plan(12, 5, target(7, 1, 2))); h.ready();
+        if (pending) {
+            h.support = support(h.plan, AIR, Evidence.OBSERVED);
+            h.available.put(7, PlacementAvailability.READY);
+        }
+        for (int i = 0; i < 79; i++) assertRunning(h.step());
+        var input = h.engine.snapshot().traversal().orElseThrow();
+        assertEquals(79, input.entry().supportHoldTicks());
+        assertEquals(pending ? Set.of(7) : Set.of(), h.engine.snapshot().pendingTargetIds());
+        var failed = h.step(); assertReason(failed, Reason.MOVEMENT_FAILED);
+        assertEquals("SUPPORT_TIMEOUT", failed.snapshot().diagnostic().orElseThrow().detail());
+        assertTraversalDetail(failed.snapshot().diagnostic().orElseThrow(), input, 0);
+        assertEquals(List.of(7), failed.snapshot().diagnostic().orElseThrow().targetIds());
+    }
+
+    @ParameterizedTest @ValueSource(ints = {40, 52})
+    void entryTimeoutRetainsDecisionInputCounters(int limit) {
+        var h = new Harness(plan(12, 5, target(7, 0, 0)));
+        h.at(new PlayerObservation(1.5, 1, 2.5, -90));
+        for (int i = 0; i < 40; i++) assertRunning(h.step());
+        if (limit == 52) {
+            h.at(new PlayerObservation(.5, 1, 2.5, 0)); h.step();
+            for (int i = 0; i < 10; i++) assertRunning(h.step());
+            h.at(new PlayerObservation(1.5, 1, 2.5, 0)); h.step();
+        }
+        var input = h.engine.snapshot().traversal().orElseThrow();
+        assertEquals(limit, input.entry().entryElapsedTicks());
+        assertEquals(limit == 40 ? 40 : 0, input.entry().stageElapsedTicks());
+        var failed = h.step(); assertReason(failed, Reason.MOVEMENT_FAILED);
+        assertEquals("ENTRY_TIMEOUT", failed.snapshot().diagnostic().orElseThrow().detail());
+        assertTraversalDetail(failed.snapshot().diagnostic().orElseThrow(), input, 0);
+    }
+
+    @Test void yawFailuresRetainInputHoldAndAlignmentCounters() {
+        var walking = new Harness(plan(12, 5, target(7, 0, 0))); walking.ready();
+        walking.at(new PlayerObservation(.5, 1, 2.5, 0));
+        for (int i = 0; i < 19; i++) assertRunning(walking.step());
+        var input = walking.engine.snapshot().traversal().orElseThrow();
+        assertEquals(19, input.entry().yawHoldTicks());
+        var failed = walking.step(); assertReason(failed, Reason.MOVEMENT_FAILED);
+        assertEquals("YAW_UNALIGNED", failed.snapshot().diagnostic().orElseThrow().detail());
+        assertTraversalDetail(failed.snapshot().diagnostic().orElseThrow(), input, 0);
+
+        var entering = new Harness(plan(12, 5, target(7, 0, 0)));
+        entering.at(new PlayerObservation(.5, 1, 2.5, 0)); entering.step();
+        for (int i = 0; i < 9; i++) assertRunning(entering.step());
+        entering.at(new PlayerObservation(.5, 1, 2.5, -90)); entering.step();
+        input = entering.engine.snapshot().traversal().orElseThrow();
+        assertEquals(10, input.entry().stageElapsedTicks());
+        assertEquals(1, input.entry().consecutiveYawAlignedTicks());
+        entering.at(new PlayerObservation(.5, 1, 2.5, 0));
+        failed = entering.step(); assertReason(failed, Reason.MOVEMENT_FAILED);
+        assertEquals("YAW_TIMEOUT", failed.snapshot().diagnostic().orElseThrow().detail());
+        assertTraversalDetail(failed.snapshot().diagnostic().orElseThrow(), input, 0);
+    }
+
+    @Test void transitionPolicyFailureRetainsInputCountersAndConsumedTotal() {
+        var h = shiftHarness(target(7, 11, 3)); h.support = support(h.plan, AIR, Evidence.OBSERVED);
+        for (int i = 0; i < 39; i++) assertRunning(h.step());
+        var input = h.engine.snapshot().traversal().orElseThrow();
+        assertEquals(39, input.entry().supportHoldTicks());
+        assertEquals(ForwardTraversal.Substage.SHIFT, input.substage());
+        var failed = h.step(); assertReason(failed, Reason.MOVEMENT_FAILED);
+        assertEquals("SUPPORT_TIMEOUT", failed.snapshot().diagnostic().orElseThrow().detail());
+        assertTraversalDetail(failed.snapshot().diagnostic().orElseThrow(), input, input.transitionTicks() + 1);
+    }
+
+    @Test void noTraversalOutcomesKeepCauseAndEmptyEvidence() {
+        var empty = new Harness(plan(2, 5));
+        var diagnostic = empty.engine.snapshot().diagnostic().orElseThrow();
+        assertReason(empty.step(), Reason.NOTHING_TO_BUILD);
+        assertEquals("The normalized plan is empty", diagnostic.detail()); assertEquals("", diagnostic.traversalDetail());
+        var unsupported = new Harness(new BuildPlan("nonflat", new GridSize(2, 2, 5),
+                List.of(target(7, 0, 0), new Target(8, new GridPos(1, 1, 0), STONE))));
+        assertReason(unsupported.step(), Reason.UNSUPPORTED_PLAN);
+        diagnostic = unsupported.engine.snapshot().diagnostic().orElseThrow();
+        assertEquals("Expected-floor targets must share one Y level", diagnostic.detail());
+        assertEquals("", diagnostic.traversalDetail()); assertEquals(List.of(7, 8), diagnostic.targetIds());
+        assertThrows(NullPointerException.class, () -> new Diagnostic(Reason.CANCELLED, List.of(), "cause", null));
+    }
+
+    @Test void stopAndCoarseEntryKeepCanonicalCausesWithTraversalEvidence() {
+        var stopped = new Harness(plan(12, 5, target(7, 1, 2))); stopped.ready();
+        stopped.step(); var input = stopped.engine.snapshot().traversal().orElseThrow(); stopped.engine.stop();
+        var terminal = stopped.step(); assertReason(terminal, Reason.CANCELLED);
+        assertEquals("Stopped by owner", terminal.snapshot().diagnostic().orElseThrow().detail());
+        assertTraversalDetail(terminal.snapshot().diagnostic().orElseThrow(), input, 0);
+        var coarse = new Harness(plan(12, 5, target(7, 0, 0)));
+        input = coarse.engine.snapshot().traversal().orElseThrow(); coarse.at(new PlayerObservation(99, 1, 2.5, -90));
+        terminal = coarse.step(); assertReason(terminal, Reason.COARSE_TRAVEL_UNAVAILABLE);
+        assertEquals("Native entry requires unavailable coarse travel", terminal.snapshot().diagnostic().orElseThrow().detail());
+        assertTraversalDetail(terminal.snapshot().diagnostic().orElseThrow(), input, 0);
+    }
 
     @Test void firstCompleteSelectsShiftAndLastSelectsVerify() {
         var h = new Harness(plan(12, 10, target(7, 0, 0)));
@@ -74,7 +216,7 @@ class BuildEngineTest {
             var held = h.step(); assertRunning(held); assertTrue(held.placement().isEmpty());
         }
         assertReason(h.step(), Reason.MOVEMENT_FAILED);
-        assertTrue(h.engine.snapshot().diagnostic().orElseThrow().detail().contains("SUPPORT_TIMEOUT"));
+        assertEquals("SUPPORT_TIMEOUT", h.engine.snapshot().diagnostic().orElseThrow().detail());
     }
 
     @ParameterizedTest @EnumSource(value = PlacementAvailability.class, names = {"NO_USABLE_ITEM", "NO_VALID_HIT"})
@@ -128,7 +270,9 @@ class BuildEngineTest {
             assertEquals(List.of(90), failed.snapshot().diagnostic().orElseThrow().targetIds());
             assertEquals(List.of(90), failed.snapshot().unfinishedTargetIds());
             assertTrue(failed.snapshot().traversal().isEmpty()); assertTrue(failed.snapshot().laneEntry().isEmpty());
-            var detail = failed.snapshot().diagnostic().orElseThrow().detail();
+            assertEquals("Transition exhausted 120 active callbacks", failed.snapshot().diagnostic().orElseThrow().detail());
+            assertTraversalDetail(failed.snapshot().diagnostic().orElseThrow(), last, 120);
+            var detail = failed.snapshot().diagnostic().orElseThrow().traversalDetail();
             assertTrue(detail.contains("laneIndex=" + last.laneIndex()));
             assertTrue(detail.contains("substage=" + stage)); assertTrue(detail.contains("transitionTicks=120"));
             assertTrue(detail.contains("stage=" + entry.stage()));
@@ -497,7 +641,7 @@ class BuildEngineTest {
         h.support = support(h.plan, AIR, Evidence.OBSERVED); h.ready();
         for (int i = 0; i < 39; i++) assertRunning(h.step());
         assertReason(h.step(), Reason.MOVEMENT_FAILED);
-        assertTrue(h.engine.snapshot().diagnostic().orElseThrow().detail().contains("SUPPORT_TIMEOUT"));
+        assertEquals("SUPPORT_TIMEOUT", h.engine.snapshot().diagnostic().orElseThrow().detail());
     }
 
     @Test void pendingSupportEightyIsNotExtendedByPlacementOrFeedback() {
@@ -538,7 +682,7 @@ class BuildEngineTest {
         h.available.put(7, PlacementAvailability.READY);
         for (int i = 0; i < 40; i++) assertRunning(h.step());
         assertReason(h.step(), Reason.MOVEMENT_FAILED);
-        assertTrue(h.engine.snapshot().diagnostic().orElseThrow().detail().contains("ENTRY_TIMEOUT"));
+        assertEquals("ENTRY_TIMEOUT", h.engine.snapshot().diagnostic().orElseThrow().detail());
     }
 
     @Test void movementWinsSimultaneousPendingAndSupportTimeout() {
@@ -655,6 +799,17 @@ class BuildEngineTest {
         assertEquals(Phase.TERMINAL, d.snapshot().lifecycle().phase());
         assertEquals(reason, d.snapshot().diagnostic().orElseThrow().reason());
         assertEquals(ControlOwner.NONE, d.owner()); assertTrue(d.placement().isEmpty()); assertTrue(d.movement().isEmpty());
+        assertTrue(d.snapshot().traversal().isEmpty()); assertTrue(d.snapshot().laneEntry().isEmpty());
+        assertTrue(d.snapshot().pendingTargetIds().isEmpty());
+    }
+    static void assertTraversalDetail(Diagnostic diagnostic, ForwardTraversal.Snapshot input, int transitionTicks) {
+        var entry = input.entry();
+        assertEquals("laneIndex=" + input.laneIndex() + ", substage=" + input.substage()
+                + ", transitionTicks=" + transitionTicks + ", stage=" + entry.stage()
+                + ", stageElapsedTicks=" + entry.stageElapsedTicks() + ", entryElapsedTicks=" + entry.entryElapsedTicks()
+                + ", consecutiveYawAlignedTicks=" + entry.consecutiveYawAlignedTicks()
+                + ", supportHoldTicks=" + entry.supportHoldTicks() + ", yawHoldTicks=" + entry.yawHoldTicks(),
+                diagnostic.traversalDetail());
     }
     static final class Harness {
         final BuildEngine engine = new BuildEngine();

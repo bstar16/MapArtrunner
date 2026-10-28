@@ -104,6 +104,7 @@ public final class BuildEngine {
         if (wasVerifying) verifyTicks++;
         Optional<MovementIntent> movement = Optional.empty();
         if (!wasVerifying) {
+            LaneEntry decisionInput = traversal.snapshot().entry();
             var advanced = input.player().isPresent()
                     ? traversal.advance(input.player().orElseThrow(), input.support(), ledger.pendingTargetIds())
                     : traversal.advanceWithoutPlayer();
@@ -115,13 +116,14 @@ public final class BuildEngine {
             if (result != null && state.activity().orElseThrow() == Activity.APPROACH) {
                 // The single policy result owns the local envelope, not physical staging safety.
                 if (result.failure() == Failure.BELOW_BUILD_PLANE || result.failure() == Failure.OUTSIDE_CORRIDOR) {
-                    finish(Outcome.FAILED, Reason.COARSE_TRAVEL_UNAVAILABLE, unresolvedIds(), "Native entry requires unavailable coarse travel");
+                    finish(Outcome.FAILED, Reason.COARSE_TRAVEL_UNAVAILABLE, unresolvedIds(),
+                            "Native entry requires unavailable coarse travel", decisionInput);
                     return currentDecision(input.tick(), Optional.empty(), Optional.empty());
                 }
                 lifecycle.updateActivity(input.runId(), Activity.BUILD);
             }
             if (result != null && result.status() == Status.FAILED) {
-                finish(Outcome.FAILED, Reason.MOVEMENT_FAILED, unresolvedIds(), result.failure().name());
+                finish(Outcome.FAILED, Reason.MOVEMENT_FAILED, unresolvedIds(), result.failure().name(), decisionInput);
                 return currentDecision(input.tick(), Optional.empty(), Optional.empty());
             }
             if (advanced.forwardComplete()) {
@@ -282,19 +284,25 @@ public final class BuildEngine {
     }
 
     private void finish(Outcome outcome, Reason reason, List<Integer> ids, String detail) {
+        finish(outcome, reason, ids, detail, traversal == null ? null : traversal.snapshot().entry());
+    }
+
+    private void finish(Outcome outcome, Reason reason, List<Integer> ids, String detail, LaneEntry entry) {
         // Invalidate routing first, capture immutable diagnostics, then discard mutable owners.
         // The adapter must invalidate its captured generation and release controls before effects.
         lifecycle.stop(outcome);
+        String traversalDetail = "";
         if (traversal != null) {
-            var state = traversal.snapshot(); var entry = state.entry();
-            detail += "; laneIndex=" + state.laneIndex() + ", substage=" + state.substage()
+            // Policy failures retain input counters; the transition total includes the consumed callback.
+            var state = traversal.snapshot();
+            traversalDetail = "laneIndex=" + state.laneIndex() + ", substage=" + state.substage()
                     + ", transitionTicks=" + state.transitionTicks() + ", stage=" + entry.stage()
                     + ", stageElapsedTicks=" + entry.stageElapsedTicks() + ", entryElapsedTicks=" + entry.entryElapsedTicks()
                     + ", consecutiveYawAlignedTicks=" + entry.consecutiveYawAlignedTicks()
                     + ", supportHoldTicks=" + entry.supportHoldTicks() + ", yawHoldTicks=" + entry.yawHoldTicks();
         }
         terminalSummary = new Snapshot(lifecycle.snapshot(), eligibleTicks, verifyTicks, Optional.empty(),
-                unfinishedIds(), Set.of(), Optional.of(new Diagnostic(reason, ids, detail)), effectResults);
+                unfinishedIds(), Set.of(), Optional.of(new Diagnostic(reason, ids, detail, traversalDetail)), effectResults);
         traversal = null; ledger = null; plan = null; settings = null;
     }
 
@@ -358,9 +366,10 @@ public final class BuildEngine {
         }
         public Optional<LaneEntry> laneEntry() { return traversal.map(ForwardTraversal.Snapshot::entry); }
     }
-    public record Diagnostic(Reason reason, List<Integer> targetIds, String detail) {
+    public record Diagnostic(Reason reason, List<Integer> targetIds, String detail, String traversalDetail) {
         public Diagnostic {
             Objects.requireNonNull(reason, "reason"); Objects.requireNonNull(detail, "detail"); targetIds = List.copyOf(targetIds);
+            Objects.requireNonNull(traversalDetail, "traversalDetail");
         }
     }
     private static void requireIdentity(UUID runId, long actionId, int targetId, long tick) {
