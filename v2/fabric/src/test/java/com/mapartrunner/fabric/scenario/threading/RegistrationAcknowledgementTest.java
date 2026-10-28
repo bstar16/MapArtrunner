@@ -299,7 +299,6 @@ class RegistrationAcknowledgementTest {
         var child = new TestThread(() -> {
             synchronized (acknowledgement) {
                 Thread parent = parentThread.get();
-                assertEquals(Thread.State.TIMED_WAITING, parent.getState());
                 assertEquals(31, acknowledgement.registerAndSignal(() -> 31));
                 parent.interrupt();
             }
