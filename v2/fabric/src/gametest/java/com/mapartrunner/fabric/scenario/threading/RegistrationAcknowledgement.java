@@ -36,6 +36,7 @@ public final class RegistrationAcknowledgement {
                             }
                             TimeUnit.NANOSECONDS.timedWait(this, remaining);
                         }
+                        if (Thread.currentThread().isInterrupted()) throw new InterruptedException();
                     } catch (InterruptedException interrupted) {
                         Thread.currentThread().interrupt();
                         fail(ticket, new IllegalStateException("Interrupted awaiting test thread registration", interrupted));

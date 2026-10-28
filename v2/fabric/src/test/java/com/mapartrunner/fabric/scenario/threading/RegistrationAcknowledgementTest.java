@@ -13,6 +13,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -287,6 +288,42 @@ class RegistrationAcknowledgementTest {
         } finally {
             release.countDown();
         }
+    }
+
+    @Test
+    void notifiedThenInterruptedParentCannotAcceptAcknowledgement() throws Exception {
+        var acknowledgement = new RegistrationAcknowledgement();
+        var parentThread = new AtomicReference<Thread>();
+        var interrupted = new AtomicBoolean();
+        var continuations = new AtomicInteger();
+        var child = new TestThread(() -> {
+            synchronized (acknowledgement) {
+                Thread parent = parentThread.get();
+                assertEquals(Thread.State.TIMED_WAITING, parent.getState());
+                assertEquals(31, acknowledgement.registerAndSignal(() -> 31));
+                parent.interrupt();
+            }
+        });
+        var parent = new TestThread(() -> {
+            // The child cannot acquire this monitor until the helper's real timed wait releases it.
+            synchronized (acknowledgement) {
+                try {
+                    acknowledgement.startAndAwait(child, TIMEOUT);
+                    continuations.incrementAndGet();
+                } finally {
+                    interrupted.set(Thread.currentThread().isInterrupted());
+                }
+            }
+        });
+        parentThread.set(parent);
+        parent.start();
+        completed(child);
+        Throwable failure = failed(parent);
+        assertInstanceOf(IllegalStateException.class, failure);
+        assertInstanceOf(InterruptedException.class, failure.getCause());
+        assertTrue(interrupted.get());
+        assertEquals(0, continuations.get());
+        freshStart(acknowledgement);
     }
 
     @Test
