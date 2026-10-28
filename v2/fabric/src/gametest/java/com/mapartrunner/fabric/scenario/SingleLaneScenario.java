@@ -48,7 +48,8 @@ import static com.mapartrunner.core.placement.PlacementObservation.Evidence.*;
 
 /** One disposable fixture; no reset, server-to-production observations or post-start physics edits. */
 final class SingleLaneScenario {
-    enum Kind { BASELINE, STOP, FAILURE, DISCONNECT, REPLACEMENT, WITHHELD_RESPONSE, POST_FAULT_BASELINE }
+    enum Kind { BASELINE, STOP, FAILURE, DISCONNECT, REPLACEMENT, WITHHELD_RESPONSE, POST_FAULT_BASELINE,
+        WITHHELD_OBSERVATION, POST_OBSERVATION_BASELINE }
     private static final int WAIT = ClientGameTestContext.DEFAULT_TIMEOUT;
     private static final GridPos ORIGIN = new GridPos(0,65,0);
     private static final BuildEngine.Settings SETTINGS = new BuildEngine.Settings(2,5,false,1);
@@ -100,8 +101,9 @@ final class SingleLaneScenario {
                 disconnected.note("PASS after owned close and fresh-world 20 idle physics ticks; followup=" + artifacts);
             }
             start();
-            if (kind == Kind.BASELINE || kind == Kind.POST_FAULT_BASELINE) baseline();
+            if (kind == Kind.BASELINE || kind == Kind.POST_FAULT_BASELINE || kind == Kind.POST_OBSERVATION_BASELINE) baseline();
             else if (kind == Kind.WITHHELD_RESPONSE) withheldResponse();
+            else if (kind == Kind.WITHHELD_OBSERVATION) withheldObservation();
             else if (kind == Kind.FAILURE) {
                 await(s -> s.client().status().engine().lifecycle().phase() == Phase.TERMINAL, 1200, "material-starved failure");
                 var terminal = read().client().status();
@@ -227,7 +229,7 @@ final class SingleLaneScenario {
         context.runOnClient(client -> {
             require(client.world == bound && !client.isPaused() && client.currentScreen == null, "Binding changed before start");
             require(!PredictionFaults.snapshot().active(), "Fault leaked into fresh fixture");
-            if(kind==Kind.WITHHELD_RESPONSE) {
+            if(faultCase()) {
                 var prediction=(PendingPredictionView)((ClientWorldPendingUpdateAccessor)bound).mapart$getPendingUpdateManager();
                 for(var target:PLAN.targets()) require(!prediction.mapart$hasPendingPrediction(new BlockPos(
                         target.relativePos().x(),65,target.relativePos().z())), "Pre-start pending target");
@@ -242,6 +244,16 @@ final class SingleLaneScenario {
                 refused(() -> PredictionFaults.arm(client,ownedServer,ownedSave,runId),"duplicate activation");
                 require(PredictionFaults.snapshot().equals(armed),"Refused activation mutated gate");
                 note("FAULT ARMED: simulated cumulative-response withholding; refusals=unmanaged-save,wrong-run,duplicate; "+armed);
+            }
+            if(kind==Kind.WITHHELD_OBSERVATION) {
+                refused(() -> PredictionFaults.armObservation(client,ownedServer,ownedSave.resolve("unmanaged"),runId),"unmanaged save");
+                refused(() -> PredictionFaults.armObservation(client,ownedServer,ownedSave,UUID.randomUUID()),"wrong run");
+                PredictionFaults.armObservation(client,ownedServer,ownedSave,runId);
+                var armed=PredictionFaults.snapshot();
+                refused(() -> PredictionFaults.armObservation(client,ownedServer,ownedSave,runId),"duplicate activation");
+                refused(() -> PredictionFaults.arm(client,ownedServer,ownedSave,runId),"concurrent response mode");
+                require(PredictionFaults.snapshot().equals(armed),"Refused activation mutated observation gate");
+                note("FAULT ARMED: simulated producer omission55; refusals=unmanaged-save,wrong-run,duplicate,response-mode; "+armed);
             }
         });
         writtenSamples=0;
@@ -308,6 +320,82 @@ final class SingleLaneScenario {
                     && bound.getBlockState(target).equals(Blocks.STONE.getDefaultState()),"Actual repeated read-only pending query lost matching prediction");
         });
     }
+
+    private void withheldObservation() {
+        String expected=System.getenv("MAPART_WITHHELD_OBSERVATION_EXPECT_SUCCESS");
+        require(expected==null || expected.isEmpty() || expected.equals("1"),"Invalid MAPART_WITHHELD_OBSERVATION_EXPECT_SUCCESS");
+        var current=await(s -> context.computeOnClient(c -> PredictionFaults.snapshot().omissions()).stream()
+                        .anyMatch(o -> o.removed().evidence()==PREDICTED)
+                && s.server().blocks().stream().allMatch(Boolean::booleanValue)
+                && s.server().usable()==63 && s.client().pose().usable()==63,WAIT,"real ID55 prediction and all60 server truth");
+        long previous=current.client().status().engine().eligibleTicks();
+        int activeSamples=0,verifySamples=0;
+        for(int waited=0;waited<120;waited++) {
+            observationCondition(current);
+            var engine=current.client().status().engine();
+            if(engine.lifecycle().phase()==Phase.TERMINAL) break;
+            require(engine.lifecycle().phase()==Phase.RUNNING && engine.eligibleTicks()==previous,"Nonconsecutive omission eligible sample");
+            activeSamples++;
+            if(verifySamples>0) require(engine.lifecycle().activity().orElseThrow()==Activity.VERIFY,"Left VERIFY before terminal");
+            if(engine.lifecycle().activity().orElseThrow()==Activity.VERIFY) verifySamples++;
+            current=step(); previous++;
+        }
+        var terminal=current.client().status().engine();
+        require(terminal.lifecycle().phase()==Phase.TERMINAL && terminal.lifecycle().outcome().orElseThrow()==Outcome.FAILED,
+                "Missing producer evidence did not fail: "+terminal);
+        var diagnostic=terminal.diagnostic().orElseThrow();
+        require(diagnostic.reason()==BuildEngine.Reason.PENDING_EVIDENCE_TIMEOUT && diagnostic.targetIds().equals(List.of(55))
+                && diagnostic.detail().equals("Pending evidence reached eligible age 80") && terminal.verifyTicks()>0,"Wrong omission timeout: "+terminal);
+        var samples=context.computeOnClient(c -> watch.copy());
+        var issuance=samples.stream().filter(s -> s.phase().equals("END") && s.status().engine().pendingTargetIds().contains(55)).findFirst().orElseThrow();
+        var before=samples.stream().filter(s -> s.tick()==issuance.tick() && s.phase().equals("START")).findFirst().orElseThrow();
+        long e=issuance.status().engine().eligibleTicks();
+        require(!before.status().engine().pendingTargetIds().contains(55) && before.status().engine().eligibleTicks()+1==e,
+                "Issuance E not established by one real START/END callback");
+        var action=samples.stream().flatMap(s -> s.status().engine().effectResults().stream()).distinct()
+                .filter(r -> r.runId().equals(runId) && r.targetId()==55 && r.status()==BuildEngine.EffectStatus.ACCEPTED).toList();
+        require(action.size()==1,"Expected one native ACCEPTED ID55 action: "+action);
+        var verify=samples.stream().filter(s -> s.phase().equals("END") && s.status().engine().lifecycle().activity().orElse(null)==Activity.VERIFY)
+                .findFirst().orElseThrow();
+        long v=verify.status().engine().eligibleTicks(),t=terminal.eligibleTicks();
+        require(e<=v && v<e+80 && t==e+80 && verifySamples>=20 && activeSamples>=verifySamples,
+                "Wrong actual E/V/T or sustained VERIFY: "+e+"/"+v+"/"+t+" samples="+verifySamples);
+        require(verify.status().engine().laneEntry().isPresent() && verify.status().engine().pendingTargetIds().equals(java.util.Set.of(55))
+                && verify.status().engine().unfinishedTargetIds().equals(List.of(55)) && !verify.keys().getFirst(),"No actual movement COMPLETE/VERIFY entry");
+        require(maxClientX-.5>clientReach && maxServerX-.5>serverReach,"Omission motion did not exceed initial measured reach");
+        note("OMISSION ISSUANCE E="+e+"; action/sample="+action+"; BEFORE="+before.line()+"\nISSUED="+issuance.line()
+                +"\nMOVEMENT COMPLETE/VERIFY V="+v+"; "+verify.line()+"\nTERMINAL T="+t+"; "+terminal);
+        idlePhysics("withheld observation pending80 failure",20);
+        var gate=context.computeOnClient(c -> PredictionFaults.snapshot());
+        require(gate.responses().isEmpty(),"Observation mode withheld a response");
+        var rawPredicted=gate.omissions().stream().filter(o -> o.removed().evidence()==PREDICTED).findFirst().orElseThrow();
+        var rawObserved=gate.omissions().stream().filter(o -> o.conversion()>rawPredicted.conversion() && o.removed().evidence()==OBSERVED
+                && o.removed().observedState().orElseThrow().equals(STONE)).findFirst().orElseThrow();
+        require(rawPredicted.eligibleTick()==e && rawPredicted.removed().observedState().orElseThrow().equals(STONE)
+                && rawObserved.eligibleTick()<t,"No initial prediction then normal pending-key disappearance/raw OBSERVED stone");
+        note("OMISSION VERIFIED: E="+e+"; V="+v+"; T="+t+"; consecutiveActive="+activeSamples+"; consecutiveVerify="+verifySamples
+                +"; displacement client="+(maxClientX-.5)+" server="+(maxServerX-.5)+"; reaches="+clientReach+","+serverReach
+                +"; firstRawPrediction="+rawPredicted+"; laterRawObserved="+rawObserved+"; conversionInvocations="+gate.omissions().size());
+        for(var conversion:gate.omissions()) note("OMISSION CONVERSION (not adapter/sample/eligible tick) "+conversion);
+        require(!"1".equals(expected) || terminal.lifecycle().outcome().orElseThrow()==Outcome.SUCCESS,
+                "Deliberate false SUCCESS expectation: withheld ID55 producer evidence correctly caused PENDING_EVIDENCE_TIMEOUT after VERIFY");
+    }
+
+    private void observationCondition(Step s) {
+        var engine=s.client().status().engine();
+        require(s.client().status().failure().isEmpty() && engine.lifecycle().outcome().orElse(null)!=Outcome.SUCCESS
+                && engine.unfinishedTargetIds().equals(List.of(55)),"Omission confirmed or unrelated unfinished work: "+s.client().line());
+        if(engine.lifecycle().phase()==Phase.RUNNING) require(engine.pendingTargetIds().equals(java.util.Set.of(55)),"Missing real pending55");
+        require(s.client().observations().size()==59 && s.client().observations().stream().noneMatch(o -> o.targetId()==55),"Omitted55 escaped producer");
+        require(s.server().blocks().stream().allMatch(Boolean::booleanValue) && s.server().reserved()==7 && s.server().usable()==63
+                && s.client().pose().reserved()==7 && s.client().pose().usable()==63,"Omission server truth/inventory changed: "+s);
+        context.runOnClient(c -> {
+            var prediction=(PendingPredictionView)((ClientWorldPendingUpdateAccessor)bound).mapart$getPendingUpdateManager();
+            if(engine.lifecycle().phase()==Phase.TERMINAL) require(!prediction.mapart$hasPendingPrediction(new BlockPos(11,65,0)),"Native prediction did not reconcile normally");
+        });
+    }
+
+    private boolean faultCase() { return kind==Kind.WITHHELD_RESPONSE || kind==Kind.WITHHELD_OBSERVATION; }
 
     private void baseline() {
         await(s -> s.client().pose().x()>1.25 && s.client().keys().getFirst(), WAIT, "motion before pause");
@@ -470,10 +558,12 @@ final class SingleLaneScenario {
         }
         var gate=context.computeOnClient(c -> PredictionFaults.snapshot());
         require(gate.failure().isEmpty(),"Sticky fault fixture error: "+gate);
-        if(kind==Kind.WITHHELD_RESPONSE && runId!=null) require(gate.active(),"Fault deactivated before explicit cleanup");
+        if(faultCase() && runId!=null) require(gate.active(),"Fault deactivated before explicit cleanup");
         else require(!gate.active(),"Fault leaked to ordinary fixture");
         if(kind==Kind.WITHHELD_RESPONSE && client.status().engine().lifecycle().phase()==Phase.TERMINAL)
             faultCondition(new Step(client,server));
+        if(kind==Kind.WITHHELD_OBSERVATION && client.status().engine().lifecycle().phase()==Phase.TERMINAL)
+            observationCondition(new Step(client,server));
         drain(); note("SERVER "+server);
         return new Step(client,server);
     }
@@ -524,7 +614,7 @@ final class SingleLaneScenario {
         require(!closeAttempted,"Attempted double-close");
         closeAttempted=true;
         Throwable primary=null;
-        try { if(kind==Kind.WITHHELD_RESPONSE) context.runOnClient(client -> PredictionFaults.clear()); }
+        try { if(faultCase()) context.runOnClient(client -> PredictionFaults.clear()); }
         catch(RuntimeException | Error failure) { primary=failure; }
         try { world.close(); }
         catch(RuntimeException | Error failure) {
@@ -540,7 +630,10 @@ final class SingleLaneScenario {
         }
         if(primary instanceof RuntimeException runtime) throw runtime;
         if(primary instanceof Error error) throw error;
-        if(kind==Kind.WITHHELD_RESPONSE) require(!context.computeOnClient(c -> PredictionFaults.snapshot().active()),"Fault cleanup retained native scope");
+        if(faultCase()) {
+            var gate=context.computeOnClient(c -> PredictionFaults.snapshot());
+            require(!gate.active() && gate.failure().isEmpty(),"Fault cleanup retained native scope or sticky error: "+gate);
+        }
         note("WORLD CLOSED normally; run="+runId);
     }
 
@@ -556,6 +649,7 @@ final class SingleLaneScenario {
         var text=new StringBuilder("single-lane-v1;seed=1;flat;origin=0,65,0;dimensions=12,1,5;survival;player=.5,66,2.5;yaw=0;pitch=60;"
                 +SETTINGS.fingerprint()+";slot0=stone7,selected,reserved;slot1=stone"+stock+";all-other-slots=empty;autoJump=false\n");
         if(kind==Kind.WITHHELD_RESPONSE) text.append("SIMULATED RESPONSE FAULT;BEFORE-start all-but-ID0 prefill;no same-world recovery\n");
+        if(kind==Kind.WITHHELD_OBSERVATION) text.append("SIMULATED PRODUCER OMISSION;BEFORE-start all-but-ID55 prefill;no full-building baseline credit\n");
         for(int x=-2;x<=13;x++) for(int z=-2;z<=6;z++) for(int y=64;y<=70;y++) text.append(x).append(',').append(y).append(',').append(z).append('=')
                 .append(y==64?"bedrock":y==65 && initiallyStone(x,z)?"stone":"air").append('\n');
         for(var target:PLAN.targets()) text.append("target=").append(target).append('\n');
@@ -566,7 +660,8 @@ final class SingleLaneScenario {
     }
 
     private boolean initiallyStone(int x,int z) {
-        return x<0 || x>=12 || z<0 || z>=5 || (kind==Kind.WITHHELD_RESPONSE ? x!=0 || z!=0 : x==0 && z==2);
+        return x<0 || x>=12 || z<0 || z>=5 || (kind==Kind.WITHHELD_RESPONSE ? x!=0 || z!=0
+                : kind==Kind.WITHHELD_OBSERVATION ? x!=11 || z!=0 : x==0 && z==2);
     }
 
     private static BuildPlan plan() {
@@ -579,7 +674,10 @@ final class SingleLaneScenario {
         try { return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(value.getBytes(StandardCharsets.UTF_8))); }
         catch(NoSuchAlgorithmException e) { throw new AssertionError(e); }
     }
-    private void noteFailure(Throwable error) { var text=new StringWriter(); error.printStackTrace(new PrintWriter(text)); note("FAIL "+text); }
+    private void noteFailure(Throwable error) {
+        var text=new StringWriter(); error.printStackTrace(new PrintWriter(text)); note("FAIL "+text);
+        if(kind==Kind.WITHHELD_OBSERVATION) write("fault-diagnostics.txt",context.computeOnClient(c -> PredictionFaults.snapshot()).toString());
+    }
     private void note(String value) {
         try { Files.writeString(artifacts.resolve("scenario.log"),value+System.lineSeparator(),StandardOpenOption.CREATE,StandardOpenOption.APPEND); }
         catch(IOException e) { throw new UncheckedIOException(e); }
