@@ -7,6 +7,8 @@ import com.mapartrunner.core.placement.PlacementObservation;
 import com.mapartrunner.core.run.BuildEngine;
 import com.mapartrunner.core.run.RunLifecycle.*;
 import com.mapartrunner.fabric.MapArtClient;
+import com.mapartrunner.fabric.mixin.ClientWorldPendingUpdateAccessor;
+import com.mapartrunner.fabric.prediction.PendingPredictionView;
 import com.mapartrunner.fabric.scenario.GroundedSingleLaneGameTest.*;
 import net.fabricmc.fabric.api.client.gametest.v1.context.ClientGameTestContext;
 import net.fabricmc.fabric.api.client.gametest.v1.context.TestSingleplayerContext;
@@ -46,7 +48,7 @@ import static com.mapartrunner.core.placement.PlacementObservation.Evidence.*;
 
 /** One disposable fixture; no reset, server-to-production observations or post-start physics edits. */
 final class SingleLaneScenario {
-    enum Kind { BASELINE, STOP, FAILURE, DISCONNECT, REPLACEMENT }
+    enum Kind { BASELINE, STOP, FAILURE, DISCONNECT, REPLACEMENT, WITHHELD_RESPONSE, POST_FAULT_BASELINE }
     private static final int WAIT = ClientGameTestContext.DEFAULT_TIMEOUT;
     private static final GridPos ORIGIN = new GridPos(0,65,0);
     private static final BuildEngine.Settings SETTINGS = new BuildEngine.Settings(2,5,false,1);
@@ -98,7 +100,8 @@ final class SingleLaneScenario {
                 disconnected.note("PASS after owned close and fresh-world 20 idle physics ticks; followup=" + artifacts);
             }
             start();
-            if (kind == Kind.BASELINE) baseline();
+            if (kind == Kind.BASELINE || kind == Kind.POST_FAULT_BASELINE) baseline();
+            else if (kind == Kind.WITHHELD_RESPONSE) withheldResponse();
             else if (kind == Kind.FAILURE) {
                 await(s -> s.client().status().engine().lifecycle().phase() == Phase.TERMINAL, 1200, "material-starved failure");
                 var terminal = read().client().status();
@@ -155,8 +158,7 @@ final class SingleLaneScenario {
             require(level.getSeed() == 1, "Fixture seed is not 1: " + level.getSeed());
             for (int x=-2;x<=13;x++) for (int z=-2;z<=6;z++) {
                 level.setBlockState(new BlockPos(x,64,z), Blocks.BEDROCK.getDefaultState());
-                boolean target = x>=0 && x<12 && z>=0 && z<5;
-                level.setBlockState(new BlockPos(x,65,z), !target || x==0 && z==2 ? Blocks.STONE.getDefaultState() : Blocks.AIR.getDefaultState());
+                level.setBlockState(new BlockPos(x,65,z), initiallyStone(x,z) ? Blocks.STONE.getDefaultState() : Blocks.AIR.getDefaultState());
                 for (int y=66;y<=70;y++) level.setBlockState(new BlockPos(x,y,z), Blocks.AIR.getDefaultState());
             }
             if (kind == Kind.REPLACEMENT) {
@@ -190,7 +192,7 @@ final class SingleLaneScenario {
             require(!client.player.getAbilities().flying && !client.player.getAbilities().allowFlying, "Not ordinary survival");
             for (int x=-2;x<=13;x++) for (int z=-2;z<=6;z++) {
                 require(client.world.getBlockState(new BlockPos(x,64,z)).isOf(Blocks.BEDROCK), "Client floor mismatch");
-                boolean stone = x<0 || x>=12 || z<0 || z>=5 || x==0 && z==2;
+                boolean stone = initiallyStone(x,z);
                 require(stone ? client.world.getBlockState(new BlockPos(x,65,z)).isOf(Blocks.STONE)
                         : client.world.getBlockState(new BlockPos(x,65,z)).isAir(), "Client initial target/apron mismatch");
                 for (int y=66;y<=70;y++) require(client.world.getBlockState(new BlockPos(x,y,z)).isAir(), "Client clearance mismatch");
@@ -206,7 +208,7 @@ final class SingleLaneScenario {
                     && p.getInventory().getStack(1).isOf(Items.STONE) && p.getInventory().getStack(1).getCount()==stock, "Server stock mismatch");
             for (int slot=2;slot<p.getInventory().size();slot++) require(p.getInventory().getStack(slot).isEmpty(), "Server extra inventory");
             for (int x=-2;x<=13;x++) for (int z=-2;z<=6;z++) {
-                var level=server.getOverworld(); boolean stone=x<0||x>=12||z<0||z>=5||x==0&&z==2;
+                var level=server.getOverworld(); boolean stone=initiallyStone(x,z);
                 require(level.getBlockState(new BlockPos(x,64,z)).isOf(Blocks.BEDROCK), "Server floor mismatch");
                 require(stone ? level.getBlockState(new BlockPos(x,65,z)).isOf(Blocks.STONE)
                         : level.getBlockState(new BlockPos(x,65,z)).isAir(), "Server target/apron mismatch");
@@ -220,14 +222,91 @@ final class SingleLaneScenario {
     }
 
     private void start() {
+        var ownedServer=world.getServer().computeOnServer(server -> server);
+        var ownedSave=world.getWorldSave().getSaveDirectory().toAbsolutePath().normalize();
         context.runOnClient(client -> {
             require(client.world == bound && !client.isPaused() && client.currentScreen == null, "Binding changed before start");
+            require(!PredictionFaults.snapshot().active(), "Fault leaked into fresh fixture");
+            if(kind==Kind.WITHHELD_RESPONSE) {
+                var prediction=(PendingPredictionView)((ClientWorldPendingUpdateAccessor)bound).mapart$getPendingUpdateManager();
+                for(var target:PLAN.targets()) require(!prediction.mapart$hasPendingPrediction(new BlockPos(
+                        target.relativePos().x(),65,target.relativePos().z())), "Pre-start pending target");
+            }
             runId = MapArtClient.start(PLAN,ORIGIN,SETTINGS);
             watch.arm(client,PLAN);
+            if(kind==Kind.WITHHELD_RESPONSE) {
+                refused(() -> PredictionFaults.arm(client,ownedServer,ownedSave.resolve("unmanaged"),runId),"unmanaged save");
+                refused(() -> PredictionFaults.arm(client,ownedServer,ownedSave,UUID.randomUUID()),"wrong run");
+                PredictionFaults.arm(client,ownedServer,ownedSave,runId);
+                var armed=PredictionFaults.snapshot();
+                refused(() -> PredictionFaults.arm(client,ownedServer,ownedSave,runId),"duplicate activation");
+                require(PredictionFaults.snapshot().equals(armed),"Refused activation mutated gate");
+                note("FAULT ARMED: simulated cumulative-response withholding; refusals=unmanaged-save,wrong-run,duplicate; "+armed);
+            }
         });
         writtenSamples=0;
         note("START PRODUCTION run=" + runId + "; origin=" + ORIGIN + "; settings=" + SETTINGS.fingerprint());
         read();
+    }
+
+    private static void refused(Runnable activation,String why) {
+        try { activation.run(); } catch(IllegalStateException expected) { return; }
+        throw new AssertionError("Fault accepted "+why);
+    }
+
+    private void withheldResponse() {
+        var first=await(s -> evidence(s.client(),0,PREDICTED) && s.server().blocks().stream().allMatch(Boolean::booleanValue)
+                && s.server().usable()==63 && s.client().pose().usable()==63
+                && !context.computeOnClient(c -> PredictionFaults.snapshot().responses()).isEmpty(),
+                WAIT,"real predicted placement, withheld response and all60 server blocks");
+        long previous=first.client().status().engine().eligibleTicks();
+        int activeSamples=0;
+        var current=first;
+        for(int waited=0;waited<120;waited++) {
+            faultCondition(current);
+            var engine=current.client().status().engine();
+            if(engine.lifecycle().phase()==Phase.TERMINAL) break;
+            require(engine.lifecycle().phase()==Phase.RUNNING && engine.eligibleTicks()==previous,
+                    "Fault active sample was not the next eligible callback");
+            activeSamples++;
+            current=step();
+            previous++;
+        }
+        var terminal=current.client().status().engine();
+        require(activeSamples>=20,"Fewer than20 successive actual eligible matching-prediction samples: "+activeSamples);
+        require(terminal.lifecycle().phase()==Phase.TERMINAL && terminal.lifecycle().outcome().orElseThrow()==Outcome.FAILED,
+                "Held prediction did not reach actual FAILED: "+terminal);
+        var diagnostic=terminal.diagnostic().orElseThrow();
+        require(diagnostic.reason()==BuildEngine.Reason.PENDING_EVIDENCE_TIMEOUT && diagnostic.targetIds().equals(List.of(0))
+                && diagnostic.detail().equals("Pending evidence reached eligible age 80"),"Wrong fault timeout: "+terminal);
+        var samples=context.computeOnClient(c -> watch.copy());
+        var action=samples.stream().flatMap(s -> s.status().engine().effectResults().stream())
+                .filter(r -> r.runId().equals(runId) && r.targetId()==0 && r.status()==BuildEngine.EffectStatus.ACCEPTED)
+                .findFirst().orElseThrow();
+        require(samples.stream().anyMatch(s -> s.phase().equals("END") && evidence(s,0,PREDICTED)
+                && s.status().engine().pendingTargetIds().equals(java.util.Set.of(0))),"No original effect-phase matching prediction");
+        idlePhysics("held prediction pending80 failure",20);
+        var gate=context.computeOnClient(c -> PredictionFaults.snapshot());
+        require(gate.active() && !gate.responses().isEmpty(),"No real withheld response invocation");
+        note("FAULT VERIFIED all60 server blocks correct; activeSuccessiveSamples="+activeSamples+"; realAction="+action
+                +"; terminal="+terminal+"; gate="+gate+"; issuance eligible age80 is the core diagnostic, not feedback receipt time");
+    }
+
+    private void faultCondition(Step s) {
+        var engine=s.client().status().engine();
+        require(s.client().status().failure().isEmpty() && engine.lifecycle().outcome().orElse(null)!=Outcome.SUCCESS,
+                "Matching prediction became SUCCESS or adapter failure");
+        require(engine.unfinishedTargetIds().equals(List.of(0)) && evidence(s.client(),0,PREDICTED),
+                "Prediction was confirmed, changed, or unrelated targets remain unfinished: "+s.client().line());
+        if(engine.lifecycle().phase()==Phase.RUNNING) require(engine.pendingTargetIds().equals(java.util.Set.of(0)),"Missing pending ID0");
+        require(s.server().blocks().stream().allMatch(Boolean::booleanValue) && s.server().reserved()==7 && s.server().usable()==63
+                && s.client().pose().reserved()==7 && s.client().pose().usable()==63,"All60 server truth/inventory not correct: "+s);
+        context.runOnClient(c -> {
+            var prediction=(PendingPredictionView)((ClientWorldPendingUpdateAccessor)bound).mapart$getPendingUpdateManager();
+            var target=new BlockPos(0,65,0);
+            require(prediction.mapart$hasPendingPrediction(target) && prediction.mapart$hasPendingPrediction(target)
+                    && bound.getBlockState(target).equals(Blocks.STONE.getDefaultState()),"Actual repeated read-only pending query lost matching prediction");
+        });
     }
 
     private void baseline() {
@@ -389,6 +468,12 @@ final class SingleLaneScenario {
             safety(client); position(server.x(),server.y(),server.z(),transferred,"server");
             maxServerX=Math.max(maxServerX,server.x());
         }
+        var gate=context.computeOnClient(c -> PredictionFaults.snapshot());
+        require(gate.failure().isEmpty(),"Sticky fault fixture error: "+gate);
+        if(kind==Kind.WITHHELD_RESPONSE && runId!=null) require(gate.active(),"Fault deactivated before explicit cleanup");
+        else require(!gate.active(),"Fault leaked to ordinary fixture");
+        if(kind==Kind.WITHHELD_RESPONSE && client.status().engine().lifecycle().phase()==Phase.TERMINAL)
+            faultCondition(new Step(client,server));
         drain(); note("SERVER "+server);
         return new Step(client,server);
     }
@@ -439,15 +524,23 @@ final class SingleLaneScenario {
         require(!closeAttempted,"Attempted double-close");
         closeAttempted=true;
         Throwable primary=null;
+        try { if(kind==Kind.WITHHELD_RESPONSE) context.runOnClient(client -> PredictionFaults.clear()); }
+        catch(RuntimeException | Error failure) { primary=failure; }
         try { world.close(); }
-        catch(RuntimeException | Error failure) { primary=failure; throw failure; }
+        catch(RuntimeException | Error failure) {
+            if(primary==null) primary=failure;
+            else primary.addSuppressed(failure);
+        }
         finally {
             try { context.runOnClient(client -> watch.closeWorld()); }
             catch(RuntimeException | Error cleanup) {
-                if(primary==null) throw cleanup;
-                primary.addSuppressed(cleanup);
+                if(primary==null) primary=cleanup;
+                else primary.addSuppressed(cleanup);
             } finally { world=null; bound=null; }
         }
+        if(primary instanceof RuntimeException runtime) throw runtime;
+        if(primary instanceof Error error) throw error;
+        if(kind==Kind.WITHHELD_RESPONSE) require(!context.computeOnClient(c -> PredictionFaults.snapshot().active()),"Fault cleanup retained native scope");
         note("WORLD CLOSED normally; run="+runId);
     }
 
@@ -462,13 +555,18 @@ final class SingleLaneScenario {
     private String manifest() {
         var text=new StringBuilder("single-lane-v1;seed=1;flat;origin=0,65,0;dimensions=12,1,5;survival;player=.5,66,2.5;yaw=0;pitch=60;"
                 +SETTINGS.fingerprint()+";slot0=stone7,selected,reserved;slot1=stone"+stock+";all-other-slots=empty;autoJump=false\n");
+        if(kind==Kind.WITHHELD_RESPONSE) text.append("SIMULATED RESPONSE FAULT;BEFORE-start all-but-ID0 prefill;no same-world recovery\n");
         for(int x=-2;x<=13;x++) for(int z=-2;z<=6;z++) for(int y=64;y<=70;y++) text.append(x).append(',').append(y).append(',').append(z).append('=')
-                .append(y==64?"bedrock":y==65 && (x<0||x>=12||z<0||z>=5||x==0&&z==2)?"stone":"air").append('\n');
+                .append(y==64?"bedrock":y==65 && initiallyStone(x,z)?"stone":"air").append('\n');
         for(var target:PLAN.targets()) text.append("target=").append(target).append('\n');
         if(kind==Kind.REPLACEMENT) for(int x=-4;x<=4;x++) for(int z=-4;z<=4;z++) for(int y=64;y<=70;y++)
             text.append("minecraft:the_nether:").append(x).append(',').append(y).append(',').append(z).append('=')
                     .append(y==64?"bedrock":y==65?"stone":"air").append('\n');
         return text.toString();
+    }
+
+    private boolean initiallyStone(int x,int z) {
+        return x<0 || x>=12 || z<0 || z>=5 || (kind==Kind.WITHHELD_RESPONSE ? x!=0 || z!=0 : x==0 && z==2);
     }
 
     private static BuildPlan plan() {
