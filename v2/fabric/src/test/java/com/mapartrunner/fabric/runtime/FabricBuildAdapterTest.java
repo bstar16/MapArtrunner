@@ -8,6 +8,7 @@ import com.mapartrunner.core.placement.PlacementObservation.Evidence;
 import com.mapartrunner.core.run.BuildEngine;
 import com.mapartrunner.core.run.BuildEngine.*;
 import com.mapartrunner.core.run.RunLifecycle;
+import com.mapartrunner.core.run.ForwardTraversal.Substage;
 import com.mapartrunner.fabric.runtime.FabricBuildAdapter.*;
 import net.minecraft.Bootstrap;
 import net.minecraft.SharedConstants;
@@ -118,6 +119,127 @@ class FabricBuildAdapterTest {
                 h.arbiter, h.placementBinding, h.lastGuard);
         assertEquals(EffectStatus.STALE, replay.effect().status());
         assertTrue(h.events.isEmpty());
+    }
+
+    @Test void nativeShiftAppliesYawBeforePlacementBeforeKeys() {
+        var h = twoLaneShift(); h.ready = READY; h.events.clear();
+        h.sample(11.5, 3.5, 0);
+        assertEquals(8, h.intent.targetId());
+        assertEquals(List.of("capture", "yaw", "inspect", "slot", "inspect", "interact",
+                "key:FORWARD:true", "key:BACK:false", "key:LEFT:false", "key:RIGHT:false",
+                "key:JUMP:false", "key:SNEAK:false", "key:SPRINT:false", "key:USE:false", "key:ATTACK:false"), h.events);
+        assertEquals(Activity.SHIFT, h.adapter.status().engine().lifecycle().activity().orElseThrow());
+        h.ready = NO_USABLE_ITEM;
+        h.sample(11, 6.5, 0);
+        assertEquals(Substage.NEXT_ENTRY, h.adapter.status().engine().traversal().orElseThrow().substage());
+        assertEquals(NONE, h.adapter.status().controlOwner()); h.assertAllReleased();
+        h.sample(11, 6.5, 90);
+        assertTrue(h.keys.get(ControlArbiter.Control.BACK));
+        h.sample(11.5, 6.5, 90);
+        assertTrue(h.keys.get(ControlArbiter.Control.LEFT));
+        assertFalse(h.keys.get(ControlArbiter.Control.BACK));
+        h.sample(11.5, 7.5, 90); h.assertNoTranslation();
+        h.pose = new PlayerObservation(11.5, 1, 7.5, 0);
+        h.adapter.tick(); h.assertNoTranslation();
+        assertEquals(0, h.adapter.status().engine().laneEntry().orElseThrow().consecutiveYawAlignedTicks());
+        h.sample(11.5, 7.5, 90); h.assertNoTranslation();
+        h.sample(11.5, 7.5, 90); h.assertNoTranslation();
+        var west = h.adapter.status().engine();
+        assertEquals(Substage.LANE, west.traversal().orElseThrow().substage());
+        assertEquals(1, west.traversal().orElseThrow().laneIndex());
+        assertEquals(Stage.WALK, west.laneEntry().orElseThrow().stage());
+        assertEquals(Activity.BUILD, west.lifecycle().activity().orElseThrow());
+        h.sample(11.5, 7.5, 90);
+        assertTrue(h.keys.get(ControlArbiter.Control.FORWARD));
+        assertTrue(h.keys.get(ControlArbiter.Control.SPRINT));
+        assertTrue(h.acquiredOwners.stream().allMatch(owner -> owner == NATIVE));
+    }
+
+    @ParameterizedTest @ValueSource(strings = {"yaw", "inspect", "slot", "interact"})
+    void shiftPauseInvalidatesAlreadyComputedEffects(String at) {
+        var h = twoLaneShift(); h.ready = READY; h.events.clear();
+        h.hooks.put(at, h.adapter::pause);
+        h.sample(11.5, 3.5, 0);
+        var paused = h.adapter.status().engine();
+        assertEquals(Phase.PAUSED, paused.lifecycle().phase());
+        assertEquals(Substage.SHIFT, paused.traversal().orElseThrow().substage());
+        assertEquals(Set.of(8), paused.pendingTargetIds());
+        assertEquals(NONE, h.adapter.status().controlOwner()); h.assertAllReleased();
+        assertEquals(9, h.events.stream().filter(e -> e.startsWith("key:")).count());
+        if (!at.equals("interact")) assertFalse(h.events.contains("interact"));
+        if (at.equals("yaw") || at.equals("inspect")) assertFalse(h.events.contains("slot"));
+        assertFalse(h.lastGuard != null && h.lastGuard.getAsBoolean());
+        h.events.clear(); h.adapter.tick();
+        var stillPaused = h.adapter.status().engine();
+        assertEquals(paused.lifecycle(), stillPaused.lifecycle());
+        assertEquals(paused.eligibleTicks(), stillPaused.eligibleTicks());
+        assertEquals(paused.traversal(), stillPaused.traversal());
+        assertEquals(paused.unfinishedTargetIds(), stillPaused.unfinishedTargetIds());
+        assertEquals(List.of("capture"), h.events);
+        h.adapter.resume(); h.sample(11.5, 3.5, 0);
+        assertTrue(h.adapter.status().engine().effectResults().isEmpty());
+        assertTrue(h.acquiredOwners.stream().allMatch(owner -> owner == NATIVE));
+    }
+
+    @ParameterizedTest @ValueSource(strings = {"stop", "world"})
+    void shiftStopAndWorldReplacementReleaseEveryKey(String path) {
+        var h = twoLaneShift(); h.ready = READY; h.events.clear();
+        for (var control : ControlArbiter.Control.values()) h.keys.put(control, true);
+        h.hooks.put("slot", () -> {
+            if (path.equals("stop")) h.adapter.stop();
+            else { h.state = h.withWorld(new Object()); h.adapter.worldChanged(h.state.world()); }
+            h.assertAllReleased();
+        });
+        h.sample(11.5, 3.5, 0);
+        var stopped = h.adapter.status();
+        assertEquals(Phase.TERMINAL, stopped.engine().lifecycle().phase());
+        assertEquals(Outcome.CANCELLED, stopped.engine().lifecycle().outcome().orElseThrow());
+        assertEquals(NONE, stopped.controlOwner()); h.assertAllReleased();
+        assertEquals(9, h.events.stream().filter(e -> e.startsWith("key:")).count());
+        assertTrue(h.events.contains("release")); assertFalse(h.events.contains("interact"));
+        assertFalse(h.lastGuard.getAsBoolean()); assertFalse(h.arbiter.isCurrent(h.placementBinding));
+        assertTrue(stopped.engine().traversal().isEmpty()); assertTrue(stopped.engine().pendingTargetIds().isEmpty());
+        h.events.clear(); h.adapter.tick(); assertTrue(h.events.isEmpty());
+        assertTrue(h.acquiredOwners.stream().allMatch(owner -> owner == NATIVE));
+    }
+
+    @Test void oldShiftEnvelopeCannotAcquireFreshRunControls() {
+        var h = twoLaneShift(); h.ready = READY; h.events.clear();
+        var oldRun = h.adapter.status().engine().lifecycle().context().orElseThrow();
+        h.hooks.put("slot", () -> { h.adapter.stop(); h.start(); });
+        h.sample(11.5, 3.5, 0);
+        var oldBinding = h.placementBinding; var oldIntent = h.intent; var oldGuard = h.lastGuard;
+        var fresh = h.adapter.status().engine();
+        assertNotEquals(oldRun.runId(), fresh.lifecycle().context().orElseThrow().runId());
+        assertEquals(0, fresh.eligibleTicks()); assertEquals(NONE, h.adapter.status().controlOwner());
+        assertFalse(h.events.contains("interact")); h.assertAllReleased();
+        h.ready = NO_USABLE_ITEM;
+        h.sample(.5, 2.5, -90);
+        assertEquals(NATIVE, h.adapter.status().controlOwner());
+        h.events.clear();
+        assertEquals(ControlArbiter.AcquireStatus.STALE, h.arbiter.acquire(oldBinding, NATIVE).status());
+        var replay = FabricPlacementEffects.apply(h.placement, h.plan, oldRun, Settings.defaults(), oldIntent,
+                h.arbiter, oldBinding, oldGuard);
+        assertEquals(EffectStatus.STALE, replay.effect().status());
+        assertTrue(h.events.isEmpty()); assertEquals(NATIVE, h.adapter.status().controlOwner());
+        assertTrue(h.adapter.status().engine().pendingTargetIds().isEmpty());
+        assertTrue(h.acquiredOwners.stream().allMatch(owner -> owner == NATIVE));
+    }
+
+    private static Harness twoLaneShift() {
+        var h = new Harness(new BuildPlan("two lanes", new GridSize(12, 1, 10), List.of(
+                new Target(7, new GridPos(0, 0, 0), STONE), new Target(8, new GridPos(10, 0, 3), STONE))));
+        h.start(); h.walk();
+        h.sample(11.5, 2.5, -90);
+        assertEquals(Substage.ENDPOINT, h.adapter.status().engine().traversal().orElseThrow().substage());
+        assertEquals(NONE, h.adapter.status().controlOwner()); h.assertAllReleased();
+        for (int i = 0; i < 3; i++) h.sample(11.5, 2.5, -90);
+        for (int i = 0; i < 3; i++) h.sample(11.5, 2.5, 0);
+        var shift = h.adapter.status().engine().traversal().orElseThrow();
+        assertEquals(Substage.SHIFT, shift.substage());
+        assertEquals(com.mapartrunner.core.traversal.LanePlanner.Direction.SOUTH, shift.entry().lane().direction());
+        assertEquals(Stage.WALK, shift.entry().stage());
+        return h;
     }
 
     @Test void pauseAndResumeDuringCaptureCannotRefreshOldAuthority() {
@@ -427,6 +549,7 @@ class FabricBuildAdapterTest {
 
     private static final class Harness implements FabricBuildAdapter.Access, ControlArbiter.Sink {
         final List<String> events = new ArrayList<>();
+        final List<ControlOwner> acquiredOwners = new ArrayList<>();
         final Map<String, Runnable> hooks = new HashMap<>();
         final EnumMap<ControlArbiter.Control, Boolean> keys = new EnumMap<>(ControlArbiter.Control.class);
         final ControlArbiter arbiter = new ControlArbiter(this);
@@ -439,6 +562,7 @@ class FabricBuildAdapterTest {
         BlockSpec observed = AIR;
         int captures;
         int slot;
+        float expectedYaw = -90;
         boolean acquireAvailable = true;
         Runnable nextStateRead;
         ScreenKey sticky;
@@ -447,15 +571,31 @@ class FabricBuildAdapterTest {
         ControlArbiter.Binding placementBinding;
         BooleanSupplier lastGuard;
         Harness(int width) {
-            plan = new BuildPlan("adapter", new GridSize(width, 1, 5), List.of(new Target(7, new GridPos(0, 0, 0), STONE)));
+            this(new BuildPlan("adapter", new GridSize(width, 1, 5), List.of(new Target(7, new GridPos(0, 0, 0), STONE))));
+        }
+        Harness(BuildPlan plan) {
+            this.plan = plan;
             for (var control : ControlArbiter.Control.values()) keys.put(control, false);
         }
         UUID start() { return adapter.start(plan, ORIGIN, Settings.defaults()); }
         void walk() { for (int i = 0; i < 4; i++) adapter.tick(); }
+        void sample(double x, double z, float yaw) {
+            pose = new PlayerObservation(x, 1, z, yaw); expectedYaw = yaw;
+            long ticks = adapter.status().engine().eligibleTicks(); int before = captures;
+            adapter.tick();
+            assertEquals(before + 1, captures);
+            if (adapter.status().engine().lifecycle().context().orElseThrow().runId().equals(run.runId())) {
+                assertEquals(ticks + 1, adapter.status().engine().eligibleTicks());
+            }
+            assertNotEquals(TRAVEL, adapter.status().controlOwner());
+        }
         void fire(String event) { events.add(event); var hook = hooks.remove(event); if (hook != null) hook.run(); }
         ClientState withWorld(Object world) { return new ClientState(world, state.handler(), state.connection(), state.player(), state.dimension(), true, false, false); }
         void assertNoTranslation() {
             for (var c : List.of(ControlArbiter.Control.FORWARD, ControlArbiter.Control.BACK, ControlArbiter.Control.LEFT, ControlArbiter.Control.RIGHT)) assertFalse(keys.get(c), c.name());
+        }
+        void assertAllReleased() {
+            for (var control : ControlArbiter.Control.values()) assertFalse(keys.get(control), control.name());
         }
         @Override public void requireClientThread() { }
         @Override public ClientState state() {
@@ -476,7 +616,7 @@ class FabricBuildAdapterTest {
             }
             return new Facts(Optional.ofNullable(pose), new SupportObservation(samples), observations, available);
         }
-        @Override public void alignYaw(ClientState bound, float yaw) { assertSame(state.player(), bound.player()); assertEquals(-90, yaw); fire("yaw"); }
+        @Override public void alignYaw(ClientState bound, float yaw) { assertSame(state.player(), bound.player()); assertEquals(expectedYaw, yaw); fire("yaw"); }
         @Override public FabricPlacementEffects.Result place(BuildPlan plan, RunLifecycle.Context run, Settings settings,
                 PlacementIntent intent, ControlArbiter arbiter, ControlArbiter.Binding binding, BooleanSupplier currentAction) {
             this.intent = intent; placementBinding = binding; lastGuard = currentAction;
@@ -493,7 +633,7 @@ class FabricBuildAdapterTest {
             @Override public void selectSlot(int selected) { slot = selected; fire("slot"); }
             @Override public ActionResult interactBlock(BlockHitResult hit) { fire("interact"); return ActionResult.SUCCESS; }
         };
-        @Override public boolean acquire(ControlOwner owner) { fire("acquire"); return acquireAvailable && owner == NATIVE; }
+        @Override public boolean acquire(ControlOwner owner) { acquiredOwners.add(owner); fire("acquire"); return acquireAvailable && owner == NATIVE; }
         @Override public void setPressed(ControlArbiter.Control control, boolean pressed) {
             fire("key:" + control + ":" + pressed); keys.put(control, pressed);
             if (sticky != null && control == ControlArbiter.Control.SPRINT) ControlArbiter.MinecraftSink.writeKey(sticky, pressed);

@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** Adopted on 28 October 2026 after fresh independent Spec PASS and Architecture/Quality Approved preflight. Prerequisite 6c/6d/Checkpoint B is accepted and published at `85ab1c73a5d801c93d8c469ea83c61925a116ac5`, tree `c1e9b14d1413673a101368a0e4d98981fb0ebed2`; both exact-head hosted checks pass. Tasks 1–2 core owner and engine integration are independently accepted; explicit adapter effect proof and Task 7 native/reset acceptance remain pending. Execute through task agents and independent reviews, retaining all required proof.
+**Status:** Adopted on 28 October 2026 after fresh independent Spec PASS and Architecture/Quality Approved preflight. Prerequisite 6c/6d/Checkpoint B is accepted and published at `85ab1c73a5d801c93d8c469ea83c61925a116ac5`, tree `c1e9b14d1413673a101368a0e4d98981fb0ebed2`; both exact-head hosted checks pass. Tasks 1–3 core traversal, engine integration and adapter effect proof are independently accepted; Task 7 native/reset acceptance remains pending. Execute through task agents and independent reviews, retaining all required proof.
 
 **Goal:** Run a real imported two-lane build through one finite Windows command, with an actual dirty production failure followed by two independently validated successful builds in the same owned world.
 
@@ -92,9 +92,11 @@ Verified: source `3492beadd74e47bd203815ec97f88c5a2e67b0bc` passed fresh indepen
 
 **Interfaces:** Existing `FabricBuildAdapter.tick` and `ControlArbiter`; actual P2 snapshots/intents, not fabricated SHIFT success. No new facade or control writer.
 
-- [ ] Add `nativeShiftAppliesYawBeforePlacementBeforeKeys`, `shiftPauseInvalidatesAlreadyComputedEffects`, `shiftStopAndWorldReplacementReleaseEveryKey`, `oldShiftEnvelopeCannotAcquireFreshRunControls`. Drive real engine into SOUTH then next WEST entry. Assert nine-key release, NONE/NATIVE only, and no TRAVEL acquisition.
-- [ ] Run `./gradlew.bat -p v2 :fabric:test --tests '*FabricBuildAdapterTest' --tests '*ControlArbiterTest' --no-daemon --console=plain`. New tests may already pass because this is a proof slice; label that honestly. For any exposed bug retain the failure before the minimal adapter fix.
-- [ ] Run `./gradlew.bat -p v2 :core:test :fabric:test :fabric:compileGametestJava --no-daemon --console=plain`. Review P1–P3 together for owner lifecycle and one-tick flow, then commit `test(v2): cover native shift effect boundaries`. Native movement capability remains unproved until F4/H3.
+- [x] Add `nativeShiftAppliesYawBeforePlacementBeforeKeys`, `shiftPauseInvalidatesAlreadyComputedEffects`, `shiftStopAndWorldReplacementReleaseEveryKey`, `oldShiftEnvelopeCannotAcquireFreshRunControls`. Drive real engine into SOUTH then next WEST entry. Assert nine-key release, NONE/NATIVE only, and no TRAVEL acquisition.
+- [x] Run `./gradlew.bat -p v2 :fabric:test --tests '*FabricBuildAdapterTest' --tests '*ControlArbiterTest' --no-daemon --console=plain`. New tests may already pass because this is a proof slice; label that honestly. For any exposed bug retain the failure before the minimal adapter fix.
+- [x] Run `./gradlew.bat -p v2 :core:test :fabric:test :fabric:compileGametestJava --no-daemon --console=plain`. Review P1–P3 together for owner lifecycle and one-tick flow, then commit `test(v2): cover native shift effect boundaries`. Native movement capability remains unproved until F4/H3.
+
+Verified: source `c6e82d95eb4e2de7b3146700f98acadb7e711656` passed fresh independent Spec PASS/Quality APPROVE with no fixes. Two test paths, no production change; focused120 and full fresh Fabric215 cases passed. Core342 and gametest compilation were reused from unchanged Task2 inputs, not freshly executed. Initial five failures were corrected test assumptions, not production regression evidence. Real engine SOUTH/WEST entry, effect ordering and stale-authority unit proof are accepted; native physics/reset remain pending.
 
 ### Task 4 — F1: extract one observer without changing case behavior (5 paths)
 
