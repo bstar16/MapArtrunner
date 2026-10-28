@@ -1,6 +1,13 @@
 package com.mapartrunner.fabric.scenario;
 
 import com.mapartrunner.core.run.RunLifecycle.Phase;
+import com.mapartrunner.core.run.BuildEngine;
+import com.mapartrunner.core.movement.MovementPolicy;
+import com.mapartrunner.fabric.runtime.FabricBuildAdapter;
+import com.mapartrunner.fabric.mixin.ClientWorldPendingUpdateAccessor;
+import com.mapartrunner.fabric.prediction.PendingPredictionView;
+import net.minecraft.util.math.BlockPos;
+import com.mapartrunner.fabric.scenario.GroundedSingleLaneGameTest.Pose;
 import com.mapartrunner.core.model.BuildPlan.GridPos;
 import com.mapartrunner.core.movement.MovementPolicy.SupportSample;
 import com.mapartrunner.core.placement.PlacementObservation;
@@ -28,7 +35,10 @@ public final class PredictionFaults {
     private static final List<Response> responses = new ArrayList<>();
     private static final List<Omission> omissions = new ArrayList<>();
     private static boolean omissionLatched;
-    private enum Mode { RESPONSE, OBSERVATION }
+    private enum Mode { RESPONSE, OBSERVATION, COMPUTED_STOP, COMPUTED_PAUSE_RESUME }
+    private static Barrier barrier;
+    private static boolean transitioning;
+    private static final List<BuildEngine.TickDecision> fresh = new ArrayList<>();
 
     private PredictionFaults() { }
 
@@ -37,7 +47,11 @@ public final class PredictionFaults {
     record Omission(int conversion, int playerAge, long eligibleTick, String phase, String activity,
                     PlacementObservation removed, SupportSample originalSupport, List<Integer> returnedIds) { }
     record Snapshot(boolean active, Optional<String> failure, List<Response> responses,
-                    boolean omissionLatched, List<Omission> omissions) { }
+                    boolean omissionLatched, List<Omission> omissions, Optional<Barrier> barrier, List<BuildEngine.TickDecision> fresh) { }
+    record Yaw(float yaw, float head, float body, float last, float lastHead, float lastBody) { }
+    record BarrierState(Pose pose, Yaw yaw, List<Boolean> keys, FabricBuildAdapter.Status status, boolean air, boolean pending) { }
+    record Barrier(BuildEngine.TickDecision decision, int decisionIdentity, BarrierState before,
+                   Optional<BarrierState> paused, BarrierState after) { }
     private record Scope(MinecraftServer server, ClientWorld world, ClientPlayNetworkHandler handler,
                          ClientConnection connection, UUID runId, Path save, int age, Mode mode) { }
 
@@ -47,6 +61,10 @@ public final class PredictionFaults {
 
     static void armObservation(MinecraftClient client, MinecraftServer ownedServer, Path ownedSave, UUID runId) {
         arm(client,ownedServer,ownedSave,runId,Mode.OBSERVATION);
+    }
+
+    static void armComputed(MinecraftClient client, MinecraftServer ownedServer, Path ownedSave, UUID runId, boolean resume) {
+        arm(client,ownedServer,ownedSave,runId,resume?Mode.COMPUTED_PAUSE_RESUME:Mode.COMPUTED_STOP);
     }
 
     private static void arm(MinecraftClient client, MinecraftServer ownedServer, Path ownedSave, UUID runId, Mode mode) {
@@ -70,7 +88,7 @@ public final class PredictionFaults {
         if(!withinWindow(0,0) || !withinWindow(WINDOW,0) || withinWindow(WINDOW+1,0) || withinWindow(-1,0))
             throw new AssertionError("Fault window boundary self-check failed");
         responses.clear();
-        omissions.clear(); omissionLatched=false;
+        omissions.clear(); omissionLatched=false; barrier=null; transitioning=false; fresh.clear();
         scope=new Scope(ownedServer,client.world,handler,handler.getConnection(),runId,save,client.player.age,mode);
     }
 
@@ -128,11 +146,91 @@ public final class PredictionFaults {
         return List.copyOf(returned);
     }
 
+    private static boolean computed(Scope owned) {
+        return owned.mode()==Mode.COMPUTED_STOP || owned.mode()==Mode.COMPUTED_PAUSE_RESUME;
+    }
+
+    /** Runs only after the real engine STORE; consumption precedes lifecycle reentry and never changes the decision. */
+    public static void afterDecision(BuildEngine.TickDecision decision) {
+        var owned=scope;
+        if(owned==null || !computed(owned)) return;
+        var client=MinecraftClient.getInstance();
+        requireThread(client); check(client);
+        if(scope==null) return;
+        if(barrier!=null) {
+            demand(decision.tick()>barrier.decision().tick() && fresh.size()<WINDOW,"Fresh computed decision identity/bound failed");
+            fresh.add(decision);
+            return;
+        }
+        if(decision.runId().filter(owned.runId()::equals).isEmpty() || decision.snapshot().lifecycle().phase()!=Phase.RUNNING
+                || decision.owner()!=BuildEngine.ControlOwner.NATIVE || decision.placement().filter(p -> p.targetId()==55).isEmpty()
+                || decision.movement().filter(m -> m.forward() || m.back() || m.strafe()!=MovementPolicy.Strafe.NONE).isEmpty()) return;
+        var before=barrierState(client);
+        demand(before.status().engine().equals(decision.snapshot()) && before.status().controlOwner()==BuildEngine.ControlOwner.NATIVE
+                && before.keys().subList(0,4).stream().anyMatch(Boolean::booleanValue) && before.pose().selectedSlot()==0
+                && before.pose().reserved()==7 && before.pose().usable()==64 && before.air() && !before.pending(),"Computed opportunity lacks actual prior native controls/initial target/stock");
+        barrier=new Barrier(decision,System.identityHashCode(decision),before,Optional.empty(),before);
+        transitioning=true; // Only this consumed mode may see its own PAUSED transition; scope stays owned through cleanup.
+        try {
+            if(owned.mode()==Mode.COMPUTED_STOP) {
+                MapArtClient.stop();
+                var after=barrierState(client);
+                barrier=new Barrier(decision,barrier.decisionIdentity(),before,Optional.empty(),after);
+                demand(after.status().engine().lifecycle().outcome().orElseThrow()==com.mapartrunner.core.run.RunLifecycle.Outcome.CANCELLED,"Computed stop did not cancel");
+                released(after);
+            } else {
+                MapArtClient.pause();
+                var paused=barrierState(client);
+                barrier=new Barrier(decision,barrier.decisionIdentity(),before,Optional.of(paused),paused);
+                var original=before.status().engine(); var retained=paused.status().engine();
+                demand(retained.lifecycle().phase()==Phase.PAUSED && retained.lifecycle().context().equals(original.lifecycle().context())
+                        && retained.laneEntry().equals(original.laneEntry()) && retained.unfinishedTargetIds().equals(original.unfinishedTargetIds())
+                        && retained.eligibleTicks()==original.eligibleTicks(),"Computed pause lost run/context/lane/unfinished data");
+                released(paused);
+                demand(paused.yaw().equals(before.yaw()) && paused.pose().selectedSlot()==0 && paused.pose().reserved()==7
+                        && paused.pose().usable()==64 && paused.air() && !paused.pending(),"Pause changed native effects");
+                MapArtClient.resume();
+                var after=barrierState(client);
+                barrier=new Barrier(decision,barrier.decisionIdentity(),before,Optional.of(paused),after);
+                demand(after.status().engine().lifecycle().phase()==Phase.RUNNING
+                        && after.status().engine().lifecycle().context().equals(original.lifecycle().context())
+                        && after.status().engine().laneEntry().equals(original.laneEntry())
+                        && after.status().engine().unfinishedTargetIds().equals(original.unfinishedTargetIds()),"Synchronous resume lost same run/context/lane/unfinished");
+                released(after);
+            }
+            demand(barrier.after().yaw().equals(before.yaw()) && barrier.after().pose().selectedSlot()==0
+                    && barrier.after().pose().reserved()==7 && barrier.after().pose().usable()==64
+                    && barrier.after().air() && !barrier.after().pending(),"Lifecycle hook changed native effects");
+            check(client);
+        } finally { transitioning=false; }
+    }
+
+    private static BarrierState barrierState(MinecraftClient c) {
+        var p=c.player; var o=c.options;
+        var keys=List.of(o.forwardKey.isPressed(),o.backKey.isPressed(),o.leftKey.isPressed(),o.rightKey.isPressed(),
+                o.jumpKey.isPressed(),o.sneakKey.isPressed(),o.sprintKey.isPressed(),o.useKey.isPressed(),o.attackKey.isPressed());
+        var pose=new Pose(p.getX(),p.getY(),p.getZ(),p.getVelocity(),p.getEyePos(),p.age,c.world.getTime(),p.getYaw(),p.headYaw,p.bodyYaw,
+                p.getAbilities().flying,p.isSprinting(),p.getInventory().getSelectedSlot(),p.getInventory().getStack(0).getCount(),p.getInventory().getStack(1).getCount());
+        var yaw=new Yaw(p.getYaw(),p.headYaw,p.bodyYaw,p.lastYaw,p.lastHeadYaw,p.lastBodyYaw);
+        boolean pending=((PendingPredictionView)((ClientWorldPendingUpdateAccessor)c.world).mapart$getPendingUpdateManager())
+                .mapart$hasPendingPrediction(new BlockPos(11,65,0));
+        return new BarrierState(pose,yaw,keys,MapArtClient.status(),c.world.getBlockState(new BlockPos(11,65,0)).isAir(),pending);
+    }
+
+    private static void released(BarrierState state) {
+        demand(state.status().controlOwner()==BuildEngine.ControlOwner.NONE && state.keys().stream().noneMatch(Boolean::booleanValue)
+                && !state.pose().sprinting(),"Computed lifecycle did not synchronously release all controls");
+    }
+
+    private static void demand(boolean condition,String detail) {
+        if(!condition) { fail(detail); throw new AssertionError(detail); }
+    }
+
     static Snapshot snapshot() {
         var client=MinecraftClient.getInstance();
         requireThread(client);
         check(client);
-        return new Snapshot(scope!=null,Optional.ofNullable(failure),List.copyOf(responses),omissionLatched,List.copyOf(omissions));
+        return new Snapshot(scope!=null,Optional.ofNullable(failure),List.copyOf(responses),omissionLatched,List.copyOf(omissions),Optional.ofNullable(barrier),List.copyOf(fresh));
     }
 
     static void clear() {
@@ -149,7 +247,9 @@ public final class PredictionFaults {
                 || client.player==null || client.player.getEntityWorld()!=owned.world()
                 || !owned.server().getSavePath(WorldSavePath.ROOT).toAbsolutePath().normalize().equals(owned.save())
                 || state.context().isEmpty() || !state.context().orElseThrow().runId().equals(owned.runId())
-                || (state.phase()!=Phase.RUNNING && state.phase()!=Phase.TERMINAL)
+                || (state.phase()!=Phase.RUNNING && state.phase()!=Phase.TERMINAL
+                    && !(transitioning && owned.mode()==Mode.COMPUTED_PAUSE_RESUME && state.phase()==Phase.PAUSED))
+                || (computed(owned) && barrier==null && state.phase()!=Phase.RUNNING)
                 || client.isPaused() || client.currentScreen!=null) fail("Owned fault scope lost");
         else if(!withinWindow(client.player.age,owned.age())) fail("Owned fault window exceeded "+WINDOW+" physics ticks");
     }

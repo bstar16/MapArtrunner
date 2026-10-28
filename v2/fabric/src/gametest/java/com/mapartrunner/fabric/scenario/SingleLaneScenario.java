@@ -49,7 +49,7 @@ import static com.mapartrunner.core.placement.PlacementObservation.Evidence.*;
 /** One disposable fixture; no reset, server-to-production observations or post-start physics edits. */
 final class SingleLaneScenario {
     enum Kind { BASELINE, STOP, FAILURE, DISCONNECT, REPLACEMENT, WITHHELD_RESPONSE, POST_FAULT_BASELINE,
-        WITHHELD_OBSERVATION, POST_OBSERVATION_BASELINE }
+        WITHHELD_OBSERVATION, POST_OBSERVATION_BASELINE, COMPUTED_STOP, COMPUTED_PAUSE_RESUME }
     private static final int WAIT = ClientGameTestContext.DEFAULT_TIMEOUT;
     private static final GridPos ORIGIN = new GridPos(0,65,0);
     private static final BuildEngine.Settings SETTINGS = new BuildEngine.Settings(2,5,false,1);
@@ -104,6 +104,7 @@ final class SingleLaneScenario {
             if (kind == Kind.BASELINE || kind == Kind.POST_FAULT_BASELINE || kind == Kind.POST_OBSERVATION_BASELINE) baseline();
             else if (kind == Kind.WITHHELD_RESPONSE) withheldResponse();
             else if (kind == Kind.WITHHELD_OBSERVATION) withheldObservation();
+            else if (computedCase()) computedBarrier();
             else if (kind == Kind.FAILURE) {
                 await(s -> s.client().status().engine().lifecycle().phase() == Phase.TERMINAL, 1200, "material-starved failure");
                 var terminal = read().client().status();
@@ -244,6 +245,16 @@ final class SingleLaneScenario {
                 refused(() -> PredictionFaults.arm(client,ownedServer,ownedSave,runId),"duplicate activation");
                 require(PredictionFaults.snapshot().equals(armed),"Refused activation mutated gate");
                 note("FAULT ARMED: simulated cumulative-response withholding; refusals=unmanaged-save,wrong-run,duplicate; "+armed);
+            }
+            if(computedCase()) {
+                refused(() -> PredictionFaults.armComputed(client,ownedServer,ownedSave.resolve("unmanaged"),runId,kind==Kind.COMPUTED_PAUSE_RESUME),"unmanaged save");
+                refused(() -> PredictionFaults.armComputed(client,ownedServer,ownedSave,UUID.randomUUID(),kind==Kind.COMPUTED_PAUSE_RESUME),"wrong run");
+                PredictionFaults.armComputed(client,ownedServer,ownedSave,runId,kind==Kind.COMPUTED_PAUSE_RESUME);
+                var armed=PredictionFaults.snapshot();
+                refused(() -> PredictionFaults.armComputed(client,ownedServer,ownedSave,runId,true),"duplicate activation");
+                refused(() -> PredictionFaults.arm(client,ownedServer,ownedSave,runId),"concurrent response mode");
+                require(PredictionFaults.snapshot().equals(armed),"Refusal mutated computed gate");
+                note("FAULT ARMED: single-use actual computed decision barrier; "+armed);
             }
             if(kind==Kind.WITHHELD_OBSERVATION) {
                 refused(() -> PredictionFaults.armObservation(client,ownedServer,ownedSave.resolve("unmanaged"),runId),"unmanaged save");
@@ -395,7 +406,60 @@ final class SingleLaneScenario {
         });
     }
 
-    private boolean faultCase() { return kind==Kind.WITHHELD_RESPONSE || kind==Kind.WITHHELD_OBSERVATION; }
+    private boolean computedCase() { return kind==Kind.COMPUTED_STOP || kind==Kind.COMPUTED_PAUSE_RESUME; }
+
+    private boolean faultCase() { return kind==Kind.WITHHELD_RESPONSE || kind==Kind.WITHHELD_OBSERVATION || computedCase(); }
+
+    private void computedBarrier() {
+        read();
+        for(int ticks=0;ticks<200 && context.computeOnClient(c -> PredictionFaults.snapshot().barrier()).isEmpty();ticks++) step();
+        var gate=context.computeOnClient(c -> PredictionFaults.snapshot());
+        var barrier=gate.barrier().orElseThrow(() -> new AssertionError("No real translating/native/ID55 decision within owned window"));
+        var decision=barrier.decision(); var before=barrier.before();
+        var samples=context.computeOnClient(c -> watch.copy());
+        var end=samples.stream().filter(s -> s.phase().equals("END") && s.pose()!=null && s.pose().age()==before.pose().age()).findFirst().orElseThrow();
+        var start=samples.stream().filter(s -> s.phase().equals("START") && s.tick()==end.tick()).findFirst().orElseThrow();
+        require(start.status().controlOwner()==BuildEngine.ControlOwner.NATIVE && start.keys().subList(0,4).stream().anyMatch(Boolean::booleanValue)
+                && before.status().controlOwner()==BuildEngine.ControlOwner.NATIVE && before.keys().subList(0,4).stream().anyMatch(Boolean::booleanValue),
+                "Barrier lacked prior actual native ownership/controls");
+        require(decision.runId().orElseThrow().equals(runId) && decision.placement().orElseThrow().targetId()==55
+                && decision.placement().orElseThrow().tick()==decision.tick() && decision.owner()==BuildEngine.ControlOwner.NATIVE
+                && decision.movement().filter(m -> m.forward() || m.back() || m.strafe()!=MovementPolicy.Strafe.NONE).isPresent(),"Wrong real computed opportunity");
+        released(end,"computed stale callback END");
+        require(end.status().engine().eligibleTicks()==decision.snapshot().eligibleTicks() && end.pose().selectedSlot()==0
+                && end.pose().reserved()==7 && end.pose().usable()==64 && end.pose().yaw()==before.pose().yaw()
+                && end.pose().headYaw()==before.pose().headYaw() && end.pose().bodyYaw()==before.pose().bodyYaw()
+                && end.observations().stream().filter(o -> o.targetId()==55 && o.evidence()==OBSERVED && o.observedState().orElseThrow().id().equals("minecraft:air")).count()==1,
+                "Stale callback changed yaw/slot/inventory/target: "+end.line());
+        require(samples.stream().flatMap(s -> s.status().engine().effectResults().stream()).noneMatch(a -> a.runId().equals(runId)
+                && a.actionId()==decision.placement().orElseThrow().actionId() && a.status()==BuildEngine.EffectStatus.ACCEPTED),"Captured stale action accepted");
+        require(barrier.after().yaw().equals(before.yaw()) && !barrier.after().pending() && barrier.after().air(),"Immediate barrier changed native yaw/target");
+        note("COMPUTED BARRIER="+barrier+"\nSAME CALLBACK START="+start.line()+"\nSAME CALLBACK END="+end.line());
+        if(kind==Kind.COMPUTED_STOP) {
+            require(end.status().engine().lifecycle().outcome().orElseThrow()==Outcome.CANCELLED,"Computed stop did not cancel");
+            idlePhysics("computed stop",20);
+        } else {
+            require(end.status().engine().lifecycle().phase()==Phase.RUNNING && end.status().engine().lifecycle().context().orElseThrow().runId().equals(runId),"Same-UUID resume lost run");
+            await(s -> s.client().status().engine().lifecycle().phase()==Phase.TERMINAL,WAIT,"fresh callback verified completion");
+            var done=read(); var engine=done.client().status().engine();
+            require(engine.lifecycle().outcome().orElseThrow()==Outcome.SUCCESS && engine.diagnostic().orElseThrow().reason()==BuildEngine.Reason.VERIFIED
+                    && engine.unfinishedTargetIds().isEmpty() && engine.pendingTargetIds().isEmpty() && done.client().status().failure().isEmpty(),"Fresh callbacks did not verify");
+            var later=context.computeOnClient(c -> PredictionFaults.snapshot().fresh());
+            var accepted=context.computeOnClient(c -> watch.copy()).stream().flatMap(s -> s.status().engine().effectResults().stream()).distinct()
+                    .filter(a -> a.targetId()==55 && a.status()==BuildEngine.EffectStatus.ACCEPTED).toList();
+            require(accepted.size()==1 && accepted.getFirst().runId().equals(runId) && accepted.getFirst().actionId()>decision.placement().orElseThrow().actionId()
+                    && accepted.getFirst().tick()>decision.tick() && later.stream().anyMatch(d -> d.tick()==accepted.getFirst().tick()
+                    && d.placement().isPresent() && d.placement().orElseThrow().actionId()==accepted.getFirst().actionId()),"No correlated fresh real decision/accepted action: "+accepted);
+            require(done.client().observations().size()==60 && done.client().observations().stream().allMatch(o -> o.evidence()==OBSERVED && o.observedState().orElseThrow().equals(STONE))
+                    && done.server().blocks().stream().allMatch(Boolean::booleanValue) && done.server().usable()==63 && done.client().pose().usable()==63
+                    && maxClientX-.5>clientReach && maxServerX-.5>serverReach,"Fresh completion truth/inventory/motion mismatch");
+            note("FRESH COMPUTED PROGRESS: decisions="+later+"; accepted="+accepted+"; displacement="+(maxClientX-.5)+","+(maxServerX-.5));
+            idlePhysics("computed pause/resume success",20);
+        }
+        gate=context.computeOnClient(c -> PredictionFaults.snapshot());
+        require(gate.responses().isEmpty() && gate.omissions().isEmpty(),"Computed mode interfered with response/observation");
+        write("fault-diagnostics.txt",gate.toString());
+    }
 
     private void baseline() {
         await(s -> s.client().pose().x()>1.25 && s.client().keys().getFirst(), WAIT, "motion before pause");
@@ -564,6 +628,13 @@ final class SingleLaneScenario {
             faultCondition(new Step(client,server));
         if(kind==Kind.WITHHELD_OBSERVATION && client.status().engine().lifecycle().phase()==Phase.TERMINAL)
             observationCondition(new Step(client,server));
+        if(computedCase() && client.status().engine().lifecycle().phase()==Phase.TERMINAL) {
+            int usable=kind==Kind.COMPUTED_STOP?64:63;
+            require(server.usable()==usable && client.pose().usable()==usable && server.reserved()==7 && client.pose().reserved()==7
+                    && server.blocks().get(55)==(kind==Kind.COMPUTED_PAUSE_RESUME),"Computed terminal target/inventory changed");
+            context.runOnClient(c -> require(!((PendingPredictionView)((ClientWorldPendingUpdateAccessor)bound).mapart$getPendingUpdateManager())
+                    .mapart$hasPendingPrediction(new BlockPos(11,65,0)),"Computed terminal native prediction remains"));
+        }
         drain(); note("SERVER "+server);
         return new Step(client,server);
     }
@@ -650,6 +721,7 @@ final class SingleLaneScenario {
                 +SETTINGS.fingerprint()+";slot0=stone7,selected,reserved;slot1=stone"+stock+";all-other-slots=empty;autoJump=false\n");
         if(kind==Kind.WITHHELD_RESPONSE) text.append("SIMULATED RESPONSE FAULT;BEFORE-start all-but-ID0 prefill;no same-world recovery\n");
         if(kind==Kind.WITHHELD_OBSERVATION) text.append("SIMULATED PRODUCER OMISSION;BEFORE-start all-but-ID55 prefill;no full-building baseline credit\n");
+        if(computedCase()) text.append("SIMULATED COMPUTED LIFECYCLE BARRIER;BEFORE-start all-but-ID55 prefill;no full-building baseline credit\n");
         for(int x=-2;x<=13;x++) for(int z=-2;z<=6;z++) for(int y=64;y<=70;y++) text.append(x).append(',').append(y).append(',').append(z).append('=')
                 .append(y==64?"bedrock":y==65 && initiallyStone(x,z)?"stone":"air").append('\n');
         for(var target:PLAN.targets()) text.append("target=").append(target).append('\n');
@@ -661,7 +733,7 @@ final class SingleLaneScenario {
 
     private boolean initiallyStone(int x,int z) {
         return x<0 || x>=12 || z<0 || z>=5 || (kind==Kind.WITHHELD_RESPONSE ? x!=0 || z!=0
-                : kind==Kind.WITHHELD_OBSERVATION ? x!=11 || z!=0 : x==0 && z==2);
+                : (kind==Kind.WITHHELD_OBSERVATION || computedCase()) ? x!=11 || z!=0 : x==0 && z==2);
     }
 
     private static BuildPlan plan() {
@@ -676,7 +748,7 @@ final class SingleLaneScenario {
     }
     private void noteFailure(Throwable error) {
         var text=new StringWriter(); error.printStackTrace(new PrintWriter(text)); note("FAIL "+text);
-        if(kind==Kind.WITHHELD_OBSERVATION) write("fault-diagnostics.txt",context.computeOnClient(c -> PredictionFaults.snapshot()).toString());
+        if(kind==Kind.WITHHELD_OBSERVATION || computedCase()) write("fault-diagnostics.txt",context.computeOnClient(c -> PredictionFaults.snapshot()).toString());
     }
     private void note(String value) {
         try { Files.writeString(artifacts.resolve("scenario.log"),value+System.lineSeparator(),StandardOpenOption.CREATE,StandardOpenOption.APPEND); }

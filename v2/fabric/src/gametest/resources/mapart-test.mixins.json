@@ -3,6 +3,6 @@
   "minVersion": "0.8.7",
   "package": "com.mapartrunner.fabric.scenario.mixin",
   "compatibilityLevel": "JAVA_21",
-  "client": ["WithheldActionResponseMixin", "WithheldObservationMixin"],
+  "client": ["WithheldActionResponseMixin", "WithheldObservationMixin", "ComputedDecisionBarrierMixin"],
   "injectors": { "defaultRequire": 1 }
 }
