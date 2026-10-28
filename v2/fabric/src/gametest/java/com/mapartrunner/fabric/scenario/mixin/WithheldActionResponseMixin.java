@@ -14,7 +14,9 @@ public abstract class WithheldActionResponseMixin {
             at=@At(value="INVOKE",target="Lnet/minecraft/client/world/ClientWorld;handlePlayerActionResponse(I)V"),
             require=1,allow=1)
     private void mapart$withholdResponse(ClientWorld world,int sequence) {
-        if(!PredictionFaults.withhold((ClientPlayNetworkHandler)(Object)this,world,sequence))
+        if(!PredictionFaults.withhold((ClientPlayNetworkHandler)(Object)this,world,sequence)) {
             world.handlePlayerActionResponse(sequence);
+            PredictionFaults.afterNormalResponse((ClientPlayNetworkHandler)(Object)this,world,sequence);
+        }
     }
 }

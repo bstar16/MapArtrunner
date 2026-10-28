@@ -17,10 +17,17 @@ import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.block.Blocks;
 import net.minecraft.client.gui.screen.GameMenuScreen;
 import net.minecraft.client.world.ClientWorld;
+import net.minecraft.client.network.ClientPlayNetworkHandler;
+import net.minecraft.network.ClientConnection;
+import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Vec3d;
+import net.minecraft.util.math.Direction;
+import net.minecraft.util.math.ChunkPos;
+import net.minecraft.util.hit.BlockHitResult;
+import net.minecraft.util.Hand;
 import net.minecraft.world.GameMode;
 import net.minecraft.world.TeleportTarget;
 import net.minecraft.world.World;
@@ -49,7 +56,9 @@ import static com.mapartrunner.core.placement.PlacementObservation.Evidence.*;
 /** One disposable fixture; no reset, server-to-production observations or post-start physics edits. */
 final class SingleLaneScenario {
     enum Kind { BASELINE, STOP, FAILURE, DISCONNECT, REPLACEMENT, WITHHELD_RESPONSE, POST_FAULT_BASELINE,
-        WITHHELD_OBSERVATION, POST_OBSERVATION_BASELINE, COMPUTED_STOP, COMPUTED_PAUSE_RESUME }
+        WITHHELD_OBSERVATION, POST_OBSERVATION_BASELINE, COMPUTED_STOP, COMPUTED_PAUSE_RESUME,
+        WITHHELD_STATE, POST_STATE_BASELINE, REPEATED_STATE, POST_REPEATED_STATE_BASELINE }
+    private record Fixture(int missingTarget, Item usableItem, int stock, int selected) { }
     private static final int WAIT = ClientGameTestContext.DEFAULT_TIMEOUT;
     private static final GridPos ORIGIN = new GridPos(0,65,0);
     private static final BuildEngine.Settings SETTINGS = new BuildEngine.Settings(2,5,false,1);
@@ -58,10 +67,12 @@ final class SingleLaneScenario {
     private final ClientGameTestContext context;
     private final Watch watch;
     private final Kind kind;
-    private final int stock;
+    private final Fixture fixture;
     private final Path artifacts;
     private TestSingleplayerContext world;
     private ClientWorld bound;
+    private ClientPlayNetworkHandler boundHandler;
+    private ClientConnection boundConnection;
     private UUID runId;
     private boolean closeAttempted;
     private boolean transferred;
@@ -70,10 +81,16 @@ final class SingleLaneScenario {
     private double serverReach;
     private double maxClientX = .5;
     private double maxServerX = .5;
+    private Step stateSettled;
 
     SingleLaneScenario(ClientGameTestContext context, Watch watch, Kind kind) {
         this.context = context; this.watch = watch; this.kind = kind;
-        stock = kind == Kind.FAILURE ? 12 : 64;
+        fixture = switch(kind) {
+            case WITHHELD_RESPONSE, WITHHELD_STATE -> new Fixture(0,Items.STONE,64,0);
+            case WITHHELD_OBSERVATION, COMPUTED_STOP, COMPUTED_PAUSE_RESUME -> new Fixture(55,Items.STONE,64,0);
+            case REPEATED_STATE -> new Fixture(0,Items.SNOW,2,1);
+            default -> new Fixture(-1,Items.STONE,kind==Kind.FAILURE?12:64,0);
+        };
         var game = FabricLoader.getInstance().getGameDir().toAbsolutePath().normalize();
         require(game.getParent().getFileName().toString().equals("run")
                 && game.getParent().getParent().getFileName().toString().equals("build"), "Unmanaged game directory: " + game);
@@ -101,9 +118,12 @@ final class SingleLaneScenario {
                 disconnected.note("PASS after owned close and fresh-world 20 idle physics ticks; followup=" + artifacts);
             }
             start();
-            if (kind == Kind.BASELINE || kind == Kind.POST_FAULT_BASELINE || kind == Kind.POST_OBSERVATION_BASELINE) baseline();
+            if (kind == Kind.BASELINE || kind == Kind.POST_FAULT_BASELINE || kind == Kind.POST_OBSERVATION_BASELINE
+                    || kind==Kind.POST_STATE_BASELINE || kind==Kind.POST_REPEATED_STATE_BASELINE) baseline();
             else if (kind == Kind.WITHHELD_RESPONSE) withheldResponse();
             else if (kind == Kind.WITHHELD_OBSERVATION) withheldObservation();
+            else if (kind == Kind.WITHHELD_STATE) withheldState();
+            else if (kind == Kind.REPEATED_STATE) repeatedState();
             else if (computedCase()) computedBarrier();
             else if (kind == Kind.FAILURE) {
                 await(s -> s.client().status().engine().lifecycle().phase() == Phase.TERMINAL, 1200, "material-starved failure");
@@ -179,18 +199,20 @@ final class SingleLaneScenario {
             var p = server.getPlayerManager().getPlayerList().getFirst();
             p.changeGameMode(GameMode.SURVIVAL); p.setHealth(20); p.getHungerManager().setFoodLevel(20);
             p.getInventory().clear(); p.getInventory().setStack(0,new ItemStack(Items.STONE,7));
-            p.getInventory().setStack(1,new ItemStack(Items.STONE,stock)); p.getInventory().setSelectedSlot(0);
+            p.getInventory().setStack(1,new ItemStack(fixture.usableItem(),fixture.stock())); p.getInventory().setSelectedSlot(fixture.selected());
             p.getInventory().markDirty(); p.currentScreenHandler.sendContentUpdates();
             require(p.teleport(level,.5,66,2.5,java.util.Set.of(),0,60,false), "Setup teleport rejected");
         });
+        context.runOnClient(client -> client.player.getInventory().setSelectedSlot(fixture.selected()));
         context.waitFor(client -> client.player != null && client.interactionManager != null && client.currentScreen == null
                 && !client.isPaused() && client.interactionManager.getCurrentGameMode() == GameMode.SURVIVAL
                 && client.player.squaredDistanceTo(.5,66,2.5) < .0001 && Math.abs(client.player.getYaw()) < .01
-                && client.player.getInventory().getSelectedSlot()==0 && client.player.getInventory().getStack(0).isOf(Items.STONE)
-                && client.player.getInventory().getStack(0).getCount()==7 && client.player.getInventory().getStack(1).isOf(Items.STONE)
-                && client.player.getInventory().getStack(1).getCount()==stock && client.player.isOnGround(), WAIT);
+                && client.player.getInventory().getSelectedSlot()==fixture.selected() && client.player.getInventory().getStack(0).isOf(Items.STONE)
+                && client.player.getInventory().getStack(0).getCount()==7 && client.player.getInventory().getStack(1).isOf(fixture.usableItem())
+                && client.player.getInventory().getStack(1).getCount()==fixture.stock() && client.player.isOnGround(), WAIT);
         context.runOnClient(client -> {
             bound = client.world;
+            boundHandler=client.getNetworkHandler(); boundConnection=boundHandler.getConnection();
             clientReach = client.player.getBlockInteractionRange();
             require(!client.player.getAbilities().flying && !client.player.getAbilities().allowFlying, "Not ordinary survival");
             for (int x=-2;x<=13;x++) for (int z=-2;z<=6;z++) {
@@ -205,10 +227,10 @@ final class SingleLaneScenario {
         serverReach = world.getServer().computeOnServer(server -> {
             var p = server.getPlayerManager().getPlayerList().getFirst();
             require(p.interactionManager.getGameMode()==GameMode.SURVIVAL && !p.getAbilities().flying
-                    && !p.getAbilities().allowFlying && p.getInventory().getSelectedSlot()==0
+                    && !p.getAbilities().allowFlying && p.getInventory().getSelectedSlot()==fixture.selected()
                     && p.squaredDistanceTo(.5,66,2.5)<.0001 && Math.abs(p.getYaw())<.01, "Server survival/pose/inventory mismatch");
             require(p.getInventory().getStack(0).isOf(Items.STONE) && p.getInventory().getStack(0).getCount()==7
-                    && p.getInventory().getStack(1).isOf(Items.STONE) && p.getInventory().getStack(1).getCount()==stock, "Server stock mismatch");
+                    && p.getInventory().getStack(1).isOf(fixture.usableItem()) && p.getInventory().getStack(1).getCount()==fixture.stock(), "Server stock mismatch");
             for (int slot=2;slot<p.getInventory().size();slot++) require(p.getInventory().getStack(slot).isEmpty(), "Server extra inventory");
             for (int x=-2;x<=13;x++) for (int z=-2;z<=6;z++) {
                 var level=server.getOverworld(); boolean stone=initiallyStone(x,z);
@@ -220,8 +242,8 @@ final class SingleLaneScenario {
             return p.getBlockInteractionRange();
         });
         context.waitTicks(3);
-        note("INITIAL VALIDATED: survival; seed=1; player=.5,66,2.5; yaw=0; selected=0; matching stone sentinel=7; usable="
-                + stock + "; measured clientReach=" + clientReach + "; serverReach=" + serverReach);
+        note("INITIAL VALIDATED: survival; seed=1; player=.5,66,2.5; yaw=0; selected="+fixture.selected()+"; matching stone sentinel=7; usable="
+                + fixture.usableItem()+fixture.stock() + "; measured clientReach=" + clientReach + "; serverReach=" + serverReach);
     }
 
     private void start() {
@@ -237,6 +259,22 @@ final class SingleLaneScenario {
             }
             runId = MapArtClient.start(PLAN,ORIGIN,SETTINGS);
             watch.arm(client,PLAN);
+            if(stateCase()) {
+                boolean repeated=kind==Kind.REPEATED_STATE;
+                refused(() -> PredictionFaults.armState(client,ownedServer,ownedSave.resolve("unmanaged"),runId,PLAN,0,repeated),"unmanaged save");
+                refused(() -> PredictionFaults.armState(client,ownedServer,ownedSave,UUID.randomUUID(),PLAN,0,repeated),"wrong run");
+                PredictionFaults.armState(client,ownedServer,ownedSave,runId,PLAN,0,repeated);
+                var armed=PredictionFaults.stateSnapshot();
+                refused(() -> PredictionFaults.armState(client,ownedServer,ownedSave,runId,PLAN,0,repeated),"duplicate activation");
+                refused(() -> PredictionFaults.arm(client,ownedServer,ownedSave,runId),"concurrent response mode");
+                require(PredictionFaults.stateSnapshot().equals(armed),"Refused state activation mutated gate");
+                if(repeated) {
+                    var hit=new BlockHitResult(new Vec3d(.5,65,.5),Direction.UP,new BlockPos(0,64,0),false);
+                    var result=client.interactionManager.interactBlock(client.player,Hand.MAIN_HAND,hit);
+                    PredictionFaults.recordFirstNativePrediction(result.isAccepted());
+                }
+                note("STATE ARMED nativeOnly="+repeated+"; "+PredictionFaults.stateSnapshot());
+            }
             if(kind==Kind.WITHHELD_RESPONSE) {
                 refused(() -> PredictionFaults.arm(client,ownedServer,ownedSave.resolve("unmanaged"),runId),"unmanaged save");
                 refused(() -> PredictionFaults.arm(client,ownedServer,ownedSave,UUID.randomUUID()),"wrong run");
@@ -275,6 +313,191 @@ final class SingleLaneScenario {
     private static void refused(Runnable activation,String why) {
         try { activation.run(); } catch(IllegalStateException expected) { return; }
         throw new AssertionError("Fault accepted "+why);
+    }
+
+    private void verifyStateBoundaries(boolean repeated) {
+        var state=context.computeOnClient(c -> PredictionFaults.stateSnapshot());
+        require(state.active() && state.failure().isEmpty(),"State gate failed: "+state);
+        var air=Blocks.AIR.getDefaultState().toString();
+        var rolledBack=state.events().stream().filter(e -> e.boundary().equals("POST")
+                && !e.sample().pending() && e.sample().state().equals(air)
+                && state.events().stream().anyMatch(pre -> pre.boundary().equals("PRE") && pre.sequence()==e.sequence()
+                    && pre.ordinal()<e.ordinal() && pre.sample().pending())).findFirst().orElseThrow();
+        require(state.events().stream().anyMatch(e -> e.boundary().equals("PRE") && e.sequence()==rolledBack.sequence()
+                && e.ordinal()<rolledBack.ordinal() && e.sample().pending()
+                && e.sample().state().equals(repeated?PredictionFaults.snowState(2):Blocks.STONE.getDefaultState().toString())),"No actual normal PRE/POST rollback");
+        if(repeated) {
+            require(state.n2()>state.n1(),"Missing actual newer native sequence");
+            var older=state.events().stream().filter(e -> e.boundary().equals("POST") && e.sequence()==state.n1()).findFirst().orElseThrow();
+            var first=state.events().stream().filter(e -> e.boundary().equals("FIRST_NATIVE")).findFirst().orElseThrow();
+            var pre=state.events().stream().filter(e -> e.boundary().equals("PRE") && e.sequence()==state.n1()).findFirst().orElseThrow();
+            var second=state.events().stream().filter(e -> e.boundary().equals("SECOND_NATIVE")).findFirst().orElseThrow();
+            require(older.sample().pending() && older.sample().state().equals(PredictionFaults.snowState(2))
+                    && older.ordinal()<rolledBack.ordinal() && rolledBack.sequence()>=state.n2()
+                    && first.ordinal()<pre.ordinal() && pre.ordinal()<second.ordinal() && second.ordinal()<older.ordinal()
+                    && first.sample().managerSequence()==state.n1() && second.sample().managerSequence()==state.n2()
+                    && state.stage().equals("COMPLETE"),"Older response lost latest prediction/original baseline");
+            for(int layers=1;layers<=2;layers++) {
+                String expected=PredictionFaults.snowState(layers);
+                require(state.incoming().stream().anyMatch(e -> e.state().equals(expected)),"Missing actual suppressed "+expected);
+            }
+        } else require(state.incoming().stream().anyMatch(e -> e.state().equals(Blocks.STONE.getDefaultState().toString())),
+                "Missing actual suppressed matching stone");
+        note("STATE BOUNDARIES nativeOnly="+repeated+"; "+state);
+    }
+
+    private void withheldState() {
+        String forced=System.getenv("MAPART_STATE_FAULT_FORCE_TARGET_RELOAD");
+        require(forced==null || forced.isEmpty() || forced.equals("1"),"Invalid MAPART_STATE_FAULT_FORCE_TARGET_RELOAD");
+        captureStateMismatch(false);
+        verifyStateBoundaries(false);
+        awaitStateServer(false);
+        idlePhysics("ack-only real stop",20);
+        stateDiagnostics();
+        if("1".equals(forced)) forcedImportNegative();
+    }
+
+    private void repeatedState() {
+        captureStateMismatch(true);
+        verifyStateBoundaries(true);
+        awaitStateServer(true);
+        idlePhysics("native-only repeat real stop",20);
+        stateDiagnostics();
+    }
+
+    private void captureStateMismatch(boolean repeated) {
+        for(int waited=0;waited<200;waited++) {
+            boolean captured=context.computeOnClient(c -> {
+                var gate=PredictionFaults.stateSnapshot();
+                require(gate.active() && gate.failure().isEmpty(),"State fault invalidated before production mismatch: "+gate);
+                var samples=watch.copy();
+                var accepted=samples.stream().flatMap(s -> s.status().engine().effectResults().stream()).distinct()
+                        .filter(a -> a.runId().equals(runId) && a.status()==BuildEngine.EffectStatus.ACCEPTED).toList();
+                require(accepted.size()<=(repeated?0:1),"Production retry/action obscured native proof: "+accepted);
+                var rollback=gate.events().stream().filter(e -> e.boundary().equals("POST") && !e.sample().pending()
+                        && e.sample().state().equals(Blocks.AIR.getDefaultState().toString())
+                        && gate.events().stream().anyMatch(pre -> pre.boundary().equals("PRE") && pre.sequence()==e.sequence()
+                            && pre.ordinal()<e.ordinal() && pre.sample().pending())).findFirst();
+                if(rollback.isEmpty() || repeated && !gate.stage().equals("COMPLETE")) return false;
+                var end=samples.stream().filter(s -> s.phase().equals("END")
+                        && s.status().engine().eligibleTicks()>rollback.orElseThrow().sample().eligible()
+                        && s.status().engine().pendingTargetIds().isEmpty() && s.status().engine().unfinishedTargetIds().equals(List.of(0))
+                        && s.observations().stream().anyMatch(o -> o.targetId()==0 && o.evidence()==OBSERVED
+                            && o.observedState().orElseThrow().id().equals("minecraft:air"))).reduce((a,b) -> b);
+                if(end.isEmpty()) return false;
+                var actual=end.orElseThrow(); var engine=actual.status().engine();
+                var before=samples.stream().filter(s -> s.phase().equals("START") && s.tick()==actual.tick()).findFirst().orElseThrow();
+                require(engine.lifecycle().phase()==Phase.RUNNING && actual.status().failure().isEmpty()
+                        && engine.eligibleTicks()==before.status().engine().eligibleTicks()+1
+                        && MapArtClient.status().engine().equals(engine),"Mismatch was not the current original production callback");
+                if(!repeated) {
+                    require(accepted.size()==1 && accepted.getFirst().targetId()==0,"Missing real production ACCEPTED0");
+                    var action=accepted.getFirst();
+                    var predicted=samples.stream().filter(s -> s.phase().equals("END") && evidence(s,0,PREDICTED)
+                            && s.status().engine().pendingTargetIds().equals(java.util.Set.of(0))).findFirst().orElseThrow();
+                    require(action.runId().equals(runId) && action.tick()>=0 && predicted.tick()<actual.tick()
+                            && predicted.status().engine().eligibleTicks()<engine.eligibleTicks()
+                            && before.status().engine().pendingTargetIds().contains(0),"No original prediction→production mismatch chain");
+                    note("STATE REAL ACCEPTED="+action+"; ORIGINAL PREDICTED END="+predicted.line());
+                }
+                note("STATE PRODUCTION MISMATCH nativeOnly="+repeated+"; ROLLBACK="+rollback.orElseThrow()
+                        +"\nORIGINAL START="+before.line()+"\nORIGINAL END="+actual.line());
+                MapArtClient.stop();
+                return true;
+            });
+            if(captured) { cancelled("state mismatch captured"); return; }
+            step();
+        }
+        throw new AssertionError("No unambiguous production OBSERVED air before retry within state window");
+    }
+
+    private void awaitStateServer(boolean repeated) {
+        for(int waited=0;waited<40;waited++) {
+            var s=read();
+            boolean ready=repeated ? world.getServer().computeOnServer(server -> server.getOverworld().getBlockState(new BlockPos(0,65,0))
+                    .toString().equals(PredictionFaults.snowState(2))) : s.server().blocks().stream().allMatch(Boolean::booleanValue);
+            if(ready && s.server().usable()==(repeated?0:63) && s.client().pose().usable()==(repeated?0:63)) {
+                stateSettled=s;
+                note("STATE INDEPENDENT SERVER nativeOnly="+repeated+"; "+s.server()); return;
+            }
+            step();
+        }
+        throw new AssertionError("State proof server state/inventory did not converge");
+    }
+
+    private void stateTerminalCondition(Step s) {
+        require(s.client().status().engine().lifecycle().outcome().orElseThrow()==Outcome.CANCELLED
+                && s.client().pose().reserved()==7 && s.server().reserved()==7,"State stop/run/sentinel changed");
+        require(s.client().observations().stream().anyMatch(o -> o.targetId()==0 && o.evidence()==OBSERVED
+                && o.observedState().orElseThrow().id().equals("minecraft:air")),"Stopped state gate did not retain original air");
+        context.runOnClient(c -> require(!((PendingPredictionView)((ClientWorldPendingUpdateAccessor)bound).mapart$getPendingUpdateManager())
+                .mapart$hasPendingPrediction(new BlockPos(0,65,0)),"Stopped state target regained prediction"));
+        if(kind==Kind.REPEATED_STATE) require(s.server().blocks().subList(1,60).stream().allMatch(Boolean::booleanValue),"Repeated case changed other59 stone");
+        if(stateSettled!=null) {
+            require(s.server().blocks().equals(stateSettled.server().blocks()) && s.server().usable()==stateSettled.server().usable()
+                    && s.client().pose().usable()==stateSettled.client().pose().usable(),"Settled state server truth/inventory changed during release");
+            if(kind==Kind.REPEATED_STATE) require(world.getServer().computeOnServer(server -> server.getOverworld().getBlockState(new BlockPos(0,65,0))
+                    .toString().equals(PredictionFaults.snowState(2))),"Server lost actual layers2 during release");
+        }
+    }
+
+    private void stateDiagnostics() {
+        var state=context.computeOnClient(c -> PredictionFaults.stateSnapshot());
+        require(state.active() && state.failure().isEmpty(),"State gate failed during release");
+        require(context.computeOnClient(c -> watch.copy()).stream().flatMap(s -> s.status().engine().effectResults().stream()).distinct()
+                .filter(a -> a.runId().equals(runId) && a.status()==BuildEngine.EffectStatus.ACCEPTED).count()==(kind==Kind.REPEATED_STATE?0:1),
+                "State run gained unexpected production ACCEPTED action");
+        for(var route:PredictionFaults.StateRoute.values()) note("STATE ACTUAL ROUTE "+route+"="+state.incoming().stream().filter(e -> e.route()==route).count());
+        write("state-diagnostics.txt",state.toString());
+    }
+
+    private record ReloadSample(PredictionFaults.StateSnapshot gate, String state, boolean pending, boolean sameBinding, Sample observer) { }
+
+    private ReloadSample collectForcedReload() {
+        return context.computeOnClient(c -> new ReloadSample(PredictionFaults.stateSnapshot(),c.world.getBlockState(new BlockPos(0,65,0)).toString(),
+                ((PendingPredictionView)((ClientWorldPendingUpdateAccessor)c.world).mapart$getPendingUpdateManager()).mapart$hasPendingPrediction(new BlockPos(0,65,0)),
+                c.world==bound && c.getNetworkHandler()==boundHandler && boundHandler.getConnection()==boundConnection && boundConnection.isOpen(),
+                watch.sample(c,"FORCED_RELOAD_NEGATIVE_ONLY")));
+    }
+
+    private void forcedImportNegative() {
+        var before=context.computeOnClient(c -> PredictionFaults.stateSnapshot());
+        require(before.active() && before.failure().isEmpty(),"Forced resend requires still-valid gate after release20");
+        var playerId=context.computeOnClient(c -> c.player.getUuid());
+        world.getServer().runOnServer(server -> {
+            var player=server.getPlayerManager().getPlayer(playerId);
+            require(player!=null && server.getPlayerManager().getPlayerList().size()==1
+                    && server.getPlayerManager().getPlayerList().getFirst()==player && player.getEntityWorld()==server.getOverworld(),"Forced resend wrong owned player/world");
+            long chunkPos=ChunkPos.toLong(0,0);
+            var chunk=server.getOverworld().getChunkManager().chunkLoadingManager.getPostProcessedChunk(chunkPos);
+            require(chunk!=null && chunk.getPos().x==0 && chunk.getPos().z==0
+                    && chunk.getBlockState(new BlockPos(0,65,0)).equals(Blocks.STONE.getDefaultState()),"Forced resend lacks actual loaded postprocessed stone chunk");
+            var sender=player.networkHandler.chunkDataSender;
+            require(!sender.isInNextBatch(chunkPos),"Target chunk already queued before forced resend");
+            sender.add(chunk);
+            require(sender.isInNextBatch(chunkPos),"Native sender did not queue actual target chunk");
+        });
+        note("TEST-FORCED NATIVE RESEND: actual loaded target chunk queued once; ordinary server ticks/ACKs drain sender");
+        for(int waited=0;waited<200;waited++) {
+            context.waitTick();
+            var sample=collectForcedReload();
+            require(sample.sameBinding(),"Forced negative lost world/connection scope");
+            var gate=sample.gate();
+            if(gate.failure().isPresent()) {
+                require(gate.failure().orElseThrow().equals("TARGET_CHUNK_RELOAD") && !gate.active(),"Wrong forced negative fatal: "+gate);
+                var imported=gate.imported().orElseThrow();
+                require(imported.loaded() && imported.chunkX()==0 && imported.chunkZ()==0 && imported.identity().equals(before.identity())
+                        && imported.age()-before.identity().armedAge()>=0 && imported.age()-before.identity().armedAge()<=200,"No actual armed/loaded BEFORE-import proof");
+                require(sample.observer().status().engine().lifecycle().outcome().orElseThrow()==Outcome.CANCELLED,"Forced negative changed stopped outcome");
+                released(sample.observer(),"forced negative");
+                if(sample.state().equals(Blocks.STONE.getDefaultState().toString()) && !sample.pending()) {
+                    note("FORCED IMPORT VERIFIED: first fatal retained despite later matching client state; no exclusive payload attribution; "+sample);
+                    write("state-diagnostics.txt",gate.toString());
+                    throw new AssertionError("DELIBERATE TARGET_CHUNK_RELOAD: armed loaded BEFORE-import guard remained fatal after matching client stone");
+                }
+            } else require(gate.active(),"Forced negative silently deactivated gate");
+        }
+        throw new AssertionError("Missing armed native import/matching state within original forced-negative window");
     }
 
     private void withheldResponse() {
@@ -408,7 +631,9 @@ final class SingleLaneScenario {
 
     private boolean computedCase() { return kind==Kind.COMPUTED_STOP || kind==Kind.COMPUTED_PAUSE_RESUME; }
 
-    private boolean faultCase() { return kind==Kind.WITHHELD_RESPONSE || kind==Kind.WITHHELD_OBSERVATION || computedCase(); }
+    private boolean stateCase() { return kind==Kind.WITHHELD_STATE || kind==Kind.REPEATED_STATE; }
+
+    private boolean faultCase() { return kind==Kind.WITHHELD_RESPONSE || kind==Kind.WITHHELD_OBSERVATION || computedCase() || stateCase(); }
 
     private void computedBarrier() {
         read();
@@ -611,7 +836,7 @@ final class SingleLaneScenario {
                     t.relativePos().x(),65,t.relativePos().z())).equals(Blocks.STONE.getDefaultState())).toList();
             require(p.getInventory().getStack(0).isOf(Items.STONE) && p.getInventory().getStack(0).getCount()==7,"Reserved server stone was consumed");
             require(!p.getAbilities().flying && !p.getAbilities().allowFlying && p.interactionManager.getGameMode()==GameMode.SURVIVAL,"Server left ordinary survival");
-            require(p.getInventory().getStack(1).isEmpty() || p.getInventory().getStack(1).isOf(Items.STONE),"Usable server material changed");
+            require(p.getInventory().getStack(1).isEmpty() || p.getInventory().getStack(1).isOf(fixture.usableItem()),"Usable server material changed");
             for(int slot=2;slot<p.getInventory().size();slot++) require(p.getInventory().getStack(slot).isEmpty(),"Unexpected server inventory at "+slot);
             return new ServerSample(s.getTicks(),p.age,p.getEntityWorld().getTime(),p.getEntityWorld().getRegistryKey().getValue().toString(),
                     p.getX(),p.getY(),p.getZ(),p.getVelocity(),p.getInventory().getStack(0).getCount(),p.getInventory().getStack(1).getCount(),blocks);
@@ -635,6 +860,7 @@ final class SingleLaneScenario {
             context.runOnClient(c -> require(!((PendingPredictionView)((ClientWorldPendingUpdateAccessor)bound).mapart$getPendingUpdateManager())
                     .mapart$hasPendingPrediction(new BlockPos(11,65,0)),"Computed terminal native prediction remains"));
         }
+        if(stateCase() && client.status().engine().lifecycle().phase()==Phase.TERMINAL) stateTerminalCondition(new Step(client,server));
         drain(); note("SERVER "+server);
         return new Step(client,server);
     }
@@ -697,15 +923,15 @@ final class SingleLaneScenario {
             catch(RuntimeException | Error cleanup) {
                 if(primary==null) primary=cleanup;
                 else primary.addSuppressed(cleanup);
-            } finally { world=null; bound=null; }
+            } finally { world=null; bound=null; boundHandler=null; boundConnection=null; }
         }
         if(primary instanceof RuntimeException runtime) throw runtime;
         if(primary instanceof Error error) throw error;
+        note("WORLD CLOSED normally; run="+runId);
         if(faultCase()) {
             var gate=context.computeOnClient(c -> PredictionFaults.snapshot());
             require(!gate.active() && gate.failure().isEmpty(),"Fault cleanup retained native scope or sticky error: "+gate);
         }
-        note("WORLD CLOSED normally; run="+runId);
     }
 
     private void screenshot(String name) {
@@ -718,10 +944,13 @@ final class SingleLaneScenario {
 
     private String manifest() {
         var text=new StringBuilder("single-lane-v1;seed=1;flat;origin=0,65,0;dimensions=12,1,5;survival;player=.5,66,2.5;yaw=0;pitch=60;"
-                +SETTINGS.fingerprint()+";slot0=stone7,selected,reserved;slot1=stone"+stock+";all-other-slots=empty;autoJump=false\n");
+                +SETTINGS.fingerprint()+";slot0=stone7,"+(fixture.selected()==0?"selected,":"")+"reserved;slot1="
+                +(fixture.usableItem()==Items.SNOW?"snow":"stone")+fixture.stock()+(fixture.selected()==1?",selected":"")+";all-other-slots=empty;autoJump=false\n");
         if(kind==Kind.WITHHELD_RESPONSE) text.append("SIMULATED RESPONSE FAULT;BEFORE-start all-but-ID0 prefill;no same-world recovery\n");
         if(kind==Kind.WITHHELD_OBSERVATION) text.append("SIMULATED PRODUCER OMISSION;BEFORE-start all-but-ID55 prefill;no full-building baseline credit\n");
         if(computedCase()) text.append("SIMULATED COMPUTED LIFECYCLE BARRIER;BEFORE-start all-but-ID55 prefill;no full-building baseline credit\n");
+        if(stateCase()) text.append(kind==Kind.REPEATED_STATE?"NATIVE-ONLY REPEATED STATE;BEFORE-start snow2/selected1/all-but-ID0;no production action credit\n"
+                :"SIMULATED STATE WITHHOLDING;BEFORE-start all-but-ID0 prefill;no same-world recovery\n");
         for(int x=-2;x<=13;x++) for(int z=-2;z<=6;z++) for(int y=64;y<=70;y++) text.append(x).append(',').append(y).append(',').append(z).append('=')
                 .append(y==64?"bedrock":y==65 && initiallyStone(x,z)?"stone":"air").append('\n');
         for(var target:PLAN.targets()) text.append("target=").append(target).append('\n');
@@ -732,8 +961,7 @@ final class SingleLaneScenario {
     }
 
     private boolean initiallyStone(int x,int z) {
-        return x<0 || x>=12 || z<0 || z>=5 || (kind==Kind.WITHHELD_RESPONSE ? x!=0 || z!=0
-                : (kind==Kind.WITHHELD_OBSERVATION || computedCase()) ? x!=11 || z!=0 : x==0 && z==2);
+        return x<0 || x>=12 || z<0 || z>=5 || (fixture.missingTarget()>=0 ? x*5+z!=fixture.missingTarget() : x==0 && z==2);
     }
 
     private static BuildPlan plan() {
@@ -749,6 +977,7 @@ final class SingleLaneScenario {
     private void noteFailure(Throwable error) {
         var text=new StringWriter(); error.printStackTrace(new PrintWriter(text)); note("FAIL "+text);
         if(kind==Kind.WITHHELD_OBSERVATION || computedCase()) write("fault-diagnostics.txt",context.computeOnClient(c -> PredictionFaults.snapshot()).toString());
+        if(stateCase()) write("state-diagnostics.txt",context.computeOnClient(c -> PredictionFaults.stateSnapshot()).toString());
     }
     private void note(String value) {
         try { Files.writeString(artifacts.resolve("scenario.log"),value+System.lineSeparator(),StandardOpenOption.CREATE,StandardOpenOption.APPEND); }
