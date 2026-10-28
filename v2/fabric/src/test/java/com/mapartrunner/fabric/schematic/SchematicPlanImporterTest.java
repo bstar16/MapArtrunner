@@ -4,7 +4,10 @@ import com.mapartrunner.core.model.BuildPlan;
 import com.mapartrunner.core.model.BuildPlan.*;
 import net.minecraft.Bootstrap;
 import net.minecraft.SharedConstants;
+import net.minecraft.item.Items;
 import net.minecraft.nbt.*;
+import net.minecraft.registry.Registries;
+import net.minecraft.util.Identifier;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -18,6 +21,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
@@ -25,6 +29,8 @@ import java.util.function.Consumer;
 import java.util.zip.GZIPOutputStream;
 
 import static org.junit.jupiter.api.Assertions.*;
+import static java.util.stream.Collectors.counting;
+import static java.util.stream.Collectors.groupingBy;
 
 class SchematicPlanImporterTest {
     @TempDir Path temporary;
@@ -58,6 +64,225 @@ class SchematicPlanImporterTest {
         assertThrows(UnsupportedOperationException.class, () -> plan.targets().clear());
         assertThrows(UnsupportedOperationException.class, () -> plan.targets().getFirst().block().properties().put("x", "y"));
         assertTrue(plan.fingerprint().matches("[0-9a-f]{64}"));
+    }
+
+    @Test
+    void importsCheckedInStructure() throws Exception {
+        // Authored offline on 2026-10-28 with Python 3.14 stdlib struct/gzip (mtime=0).
+        // Real 174-byte gzip NBT: INT-list 18x3x5, palette log[axis=x]=0/stone=1;
+        // record order (3,1,4),(17,1,0),(1,1,2),(0,1,0),(16,1,2), empty entities.
+        var source = copyFixture("flat-asymmetric.nbt", "asymmetric.NBT");
+        assertEquals("5cf68ed66fa3f0062bb7996961a86423668ecc11896d762dcd43fc8e9f5bdec6",
+                HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(Files.readAllBytes(source))));
+        var plan = SchematicPlanImporter.importPlan(source);
+        assertEquals(new GridSize(18, 3, 5), plan.dimensions());
+        assertEquals(List.of(new GridPos(0, 1, 0), new GridPos(17, 1, 0), new GridPos(16, 1, 2),
+                new GridPos(1, 1, 2), new GridPos(3, 1, 4)), plan.targets().stream().map(Target::relativePos).toList());
+        var stone = new BlockSpec("minecraft:stone", Map.of());
+        var log = new BlockSpec("minecraft:oak_log", Map.of("axis", "x"));
+        assertEquals(List.of(stone, log, log, stone, stone), plan.targets().stream().map(Target::block).toList());
+        assertEquals(List.of(0, 1, 2, 3, 4), plan.targets().stream().map(Target::id).toList());
+        assertEquals(Map.of(Items.STONE, 3L, Items.OAK_LOG, 2L), plan.targets().stream().collect(groupingBy(
+                target -> Registries.BLOCK.getOptionalValue(Identifier.of(target.block().id())).orElseThrow().asItem(), counting())));
+        assertEquals(Map.of(List.of(0, 0), 3L, List.of(1, 0), 2L), plan.targets().stream().collect(groupingBy(
+                target -> List.of(target.relativePos().x() >> 4, target.relativePos().z() >> 4), counting())));
+    }
+
+    @Test
+    void structureAndSpongeHaveSameNormalizedPlan() throws Exception {
+        var original = NbtIo.readCompressed(copyFixture("flat-asymmetric.nbt", "original.nbt"), NbtSizeTracker.forLevel());
+        var expected = read(original);
+        var sponge = schematic(18, 3, 5, "minecraft:air", new byte[270]);
+        var palette = sponge.getCompound("Palette").orElseThrow();
+        palette.putInt("minecraft:stone", 1);
+        palette.putInt("minecraft:oak_log[axis=x]", 2);
+        byte[] data = new byte[270];
+        data[90] = 1;
+        data[107] = 2;
+        data[127] = 1;
+        data[142] = 2;
+        data[165] = 1;
+        sponge.putByteArray("BlockData", data);
+        assertEquals(expected, read(sponge));
+        var alternate = original.copy();
+        var entries = alternate.getList("palette").orElseThrow();
+        Collections.reverse(entries);
+        var records = alternate.getList("blocks").orElseThrow();
+        Collections.reverse(records);
+        for (var element : records) {
+            var block = (NbtCompound) element;
+            block.putInt("state", 1 - block.getInt("state").orElseThrow());
+        }
+        alternate.putInt("DataVersion", Integer.MAX_VALUE);
+        alternate.putIntArray("Offset", new int[]{90, -20, 5});
+        alternate.putString("author", "ignored producer metadata");
+        var wrapper = new NbtCompound();
+        wrapper.put("Schematic", alternate);
+        for (String suffix : List.of(".schem", ".SCHEM.NBT", ".NbT")) {
+            assertEquals(expected, SchematicPlanImporter.importPlan(write(wrapper, suffix)));
+        }
+        var changed = original.copy();
+        changed.getList("palette").orElseThrow().getCompound(0).orElseThrow()
+                .getCompound("Properties").orElseThrow().putString("axis", "z");
+        assertNotEquals(expected.fingerprint(), read(changed).fingerprint());
+        changed = original.copy();
+        changed.getList("blocks").orElseThrow().getCompound(0).orElseThrow().put("pos", intList(4, 1, 4));
+        assertNotEquals(expected.fingerprint(), read(changed).fingerprint());
+        changed = original.copy();
+        changed.put("size", intList(19, 3, 5));
+        assertNotEquals(expected.fingerprint(), read(changed).fingerprint());
+        changed = original.copy();
+        changed.getList("palette").orElseThrow().getCompound(1).orElseThrow().putString("Name", "minecraft:dirt");
+        assertNotEquals(expected.fingerprint(), read(changed).fingerprint());
+    }
+
+    @Test
+    void structurePreservesNativeDefaultsPropertiesItemsAndAir() throws Exception {
+        var stairs = structure(1, 1, 1, "minecraft:oak_stairs");
+        var expected = read(schematic(1, 1, 1, "minecraft:oak_stairs", new byte[]{0}));
+        assertEquals(expected, read(stairs));
+        var properties = new NbtCompound();
+        properties.putString("waterlogged", "false");
+        properties.putString("shape", "straight");
+        properties.putString("half", "bottom");
+        properties.putString("facing", "north");
+        stairs.getList("palette").orElseThrow().getCompound(0).orElseThrow().put("Properties", properties);
+        assertEquals(expected, read(stairs));
+        var reversed = new NbtCompound();
+        reversed.putString("facing", "north");
+        reversed.putString("half", "bottom");
+        reversed.putString("shape", "straight");
+        reversed.putString("waterlogged", "false");
+        stairs.getList("palette").orElseThrow().getCompound(0).orElseThrow().put("Properties", reversed);
+        assertEquals(expected, read(stairs));
+        var wallSign = read(structure(1, 1, 1, "minecraft:oak_wall_sign")).targets().getFirst().block();
+        assertEquals("minecraft:oak_wall_sign", wallSign.id());
+        var item = Registries.BLOCK.getOptionalValue(Identifier.of(wallSign.id())).orElseThrow().asItem();
+        assertEquals("minecraft:oak_sign", Registries.ITEM.getId(item).toString());
+        assertEquals(1, read(structure(1, 1, 1, "minecraft:chest")).targets().size());
+        for (String air : List.of("minecraft:air", "minecraft:cave_air", "minecraft:void_air")) {
+            var empty = structure(1, 2, 1, air);
+            empty.put("entities", new NbtList());
+            var record = empty.getList("blocks").orElseThrow().getCompound(0).orElseThrow();
+            record.put("nbt", new NbtCompound());
+            empty.getList("blocks").orElseThrow().add(structureBlock(0, 0, 1, 0));
+            var plan = read(empty);
+            assertEquals(new GridSize(1, 2, 1), plan.dimensions());
+            assertTrue(plan.targets().isEmpty());
+            record.putString("nbt", "wrong even on air");
+            rejects(empty, "blocks[0].nbt");
+            record.put("nbt", new NbtCompound());
+            record.getCompound("nbt").orElseThrow().putInt("x", 0);
+            rejects(empty, "blocks[0].nbt");
+        }
+    }
+
+    @Test
+    void structureWorkIsProportionalToRecordsAndValidatesEmptyInput() throws Exception {
+        var sparse = structure(Integer.MAX_VALUE, 1, 1, "minecraft:stone");
+        sparse.getList("blocks").orElseThrow().getCompound(0).orElseThrow()
+                .put("pos", intList(Integer.MAX_VALUE - 1, 0, 0));
+        var plan = read(sparse);
+        assertEquals(new GridSize(Integer.MAX_VALUE, 1, 1), plan.dimensions());
+        assertEquals(new GridPos(Integer.MAX_VALUE - 1, 0, 0), plan.targets().getFirst().relativePos());
+        sparse.put("blocks", new NbtList());
+        assertTrue(read(sparse).targets().isEmpty());
+        sparse.getList("palette").orElseThrow().getCompound(0).orElseThrow().putString("Name", "minecraft:not_real");
+        rejects(sparse, "palette[0].Name");
+    }
+
+    @Test
+    void rejectsMalformedStructure() throws Exception {
+        for (String field : List.of("size", "palette", "blocks")) {
+            rejectsStructure(nbt -> nbt.remove(field), field);
+            rejectsStructure(nbt -> nbt.putString(field, "wrong"), field);
+            rejectsStructure(nbt -> nbt.putIntArray(field, new int[]{1, 1, 1}), field);
+        }
+        for (String field : List.of("size", "pos")) {
+            for (NbtElement bad : List.of(intList(1, 1), intList(1, 1, 1, 1), NbtString.of("1,1,1"),
+                    new NbtIntArray(new int[]{1, 1, 1}), nbtList(NbtShort.of((short) 1), NbtInt.of(1), NbtInt.of(1)),
+                    nbtList(NbtInt.of(1), NbtString.of("1"), NbtInt.of(1)))) {
+                rejectsStructure(nbt -> {
+                    if (field.equals("size")) nbt.put(field, bad);
+                    else nbt.getList("blocks").orElseThrow().getCompound(0).orElseThrow().put(field, bad);
+                }, field);
+            }
+        }
+        for (int axis = 0; axis < 3; axis++) {
+            for (int bad : List.of(0, -1)) {
+                var size = intList(1, 1, 1);
+                size.set(axis, NbtInt.of(bad));
+                rejectsStructure(nbt -> nbt.put("size", size), "size");
+            }
+            for (int bad : List.of(-1, 1)) {
+                var pos = intList(0, 0, 0);
+                pos.set(axis, NbtInt.of(bad));
+                rejectsStructure(nbt -> nbt.getList("blocks").orElseThrow().getCompound(0).orElseThrow().put("pos", pos), "blocks[0].pos");
+            }
+        }
+        rejectsStructure(nbt -> nbt.put("size", intList(Integer.MAX_VALUE, 2, 1)), "volume");
+        rejectsStructure(nbt -> nbt.put("palette", new NbtList()), "palette");
+        for (String field : List.of("palette", "blocks")) {
+            rejectsStructure(nbt -> nbt.put(field, nbtList(NbtInt.of(0))), field + "[0]");
+        }
+        rejectsStructure(nbt -> nbt.getList("palette").orElseThrow().getCompound(0).orElseThrow().remove("Name"), "palette[0].Name");
+        rejectsStructure(nbt -> nbt.getList("palette").orElseThrow().getCompound(0).orElseThrow().putInt("Name", 0), "palette[0].Name");
+        for (String name : List.of("minecraft:not_real", "minecraft:oak_log[axis=x]", "minecraft:stone garbage", "", "Minecraft:stone")) {
+            rejectsStructure(nbt -> nbt.getList("palette").orElseThrow().add(structureState(name)), "palette[1].Name");
+        }
+        rejectsStructure(nbt -> nbt.getList("palette").orElseThrow().add(structureState("minecraft:water")), "palette[1]");
+        for (NbtElement bad : List.of(NbtString.of("axis=x"), new NbtList(), NbtInt.of(0))) {
+            rejectsStructure(nbt -> nbt.getList("palette").orElseThrow().getCompound(0).orElseThrow().put("Properties", bad), "Properties");
+        }
+        for (NbtElement value : List.of(NbtInt.of(1), NbtString.of("bad"), NbtString.of("x,axis=y"))) {
+            var state = structureState("minecraft:oak_log");
+            var properties = new NbtCompound();
+            properties.put("axis", value);
+            state.put("Properties", properties);
+            rejectsStructure(nbt -> nbt.getList("palette").orElseThrow().add(state), "palette[1].Properties.axis");
+        }
+        var unknownProperty = structureState("minecraft:stone");
+        var properties = new NbtCompound();
+        properties.putString("axis", "x");
+        unknownProperty.put("Properties", properties);
+        rejectsStructure(nbt -> nbt.getList("palette").orElseThrow().add(unknownProperty), "palette[1].Properties.axis");
+        for (String field : List.of("state", "pos")) {
+            rejectsStructure(nbt -> nbt.getList("blocks").orElseThrow().getCompound(0).orElseThrow().remove(field), "blocks[0]." + field);
+        }
+        for (NbtElement state : List.of(NbtInt.of(-1), NbtInt.of(1), NbtShort.of((short) 0), NbtString.of("0"))) {
+            rejectsStructure(nbt -> nbt.getList("blocks").orElseThrow().getCompound(0).orElseThrow().put("state", state), "blocks[0].state");
+        }
+        for (String air : List.of("minecraft:stone", "minecraft:air", "minecraft:cave_air", "minecraft:void_air")) {
+            var duplicate = structure(1, 1, 1, air);
+            duplicate.getList("blocks").orElseThrow().add(structureBlock(0, 0, 0, 0));
+            rejects(duplicate, "blocks[1].pos");
+            var outside = structure(1, 1, 1, air);
+            outside.getList("blocks").orElseThrow().getCompound(0).orElseThrow().put("pos", intList(1, 0, 0));
+            rejects(outside, "blocks[0].pos");
+        }
+        var mixedDuplicate = structure(1, 1, 1, "minecraft:stone");
+        mixedDuplicate.getList("palette").orElseThrow().add(structureState("minecraft:air"));
+        mixedDuplicate.getList("blocks").orElseThrow().add(structureBlock(1, 0, 0, 0));
+        rejects(mixedDuplicate, "blocks[1].pos");
+        var multipleY = structure(1, 2, 1, "minecraft:stone");
+        multipleY.getList("blocks").orElseThrow().add(structureBlock(0, 0, 1, 0));
+        rejects(multipleY, "blocks[1]");
+        rejectsStructure(nbt -> nbt.put("palettes", new NbtList()), "palettes");
+        rejectsStructure(nbt -> nbt.putInt("Width", 1), "ambiguous");
+        for (NbtElement payload : List.of(new NbtCompound(), NbtString.of("wrong"),
+                nbtList(new NbtCompound()), nbtList(NbtInt.of(0)))) {
+            rejectsStructure(nbt -> nbt.put("entities", payload), "entities");
+        }
+        for (NbtElement payload : List.of(new NbtList(), NbtString.of("wrong"))) {
+            rejectsStructure(nbt -> nbt.getList("blocks").orElseThrow().getCompound(0).orElseThrow().put("nbt", payload), "blocks[0].nbt");
+        }
+        var payload = new NbtCompound();
+        payload.putString("id", "minecraft:chest");
+        rejectsStructure(nbt -> nbt.getList("blocks").orElseThrow().getCompound(0).orElseThrow().put("nbt", payload), "blocks[0].nbt");
+        var empty = structure(1, 3, 1, "minecraft:stone");
+        empty.put("blocks", new NbtList());
+        empty.putString("entities", "wrong even without blocks");
+        rejects(empty, "entities");
     }
 
     @Test
@@ -246,7 +471,7 @@ class SchematicPlanImporterTest {
         structure.put("size", new NbtList());
         structure.put("palette", new NbtList());
         structure.put("blocks", new NbtList());
-        rejects(structure, "structure");
+        rejects(structure, "size");
         rejects(new NbtCompound(), "shape");
         var doubleWrapper = new NbtCompound();
         var innerWrapper = new NbtCompound();
@@ -331,12 +556,55 @@ class SchematicPlanImporterTest {
     }
 
     private Path copyFixture(String filename) throws IOException {
+        return copyFixture("grounded-single-lane.schem", filename);
+    }
+
+    private Path copyFixture(String resource, String filename) throws IOException {
         var path = temporary.resolve(filename);
-        try (var source = getClass().getResourceAsStream("/schematic/grounded-single-lane.schem")) {
+        try (var source = getClass().getResourceAsStream("/schematic/" + resource)) {
             assertNotNull(source, "checked-in fixture must be on the test classpath");
             Files.copy(source, path);
         }
         return path;
+    }
+
+    private void rejectsStructure(Consumer<NbtCompound> mutate, String context) throws Exception {
+        var nbt = structure(1, 1, 1, "minecraft:stone");
+        mutate.accept(nbt);
+        rejects(nbt, context);
+    }
+
+    private static NbtCompound structure(int width, int height, int depth, String state) {
+        var nbt = new NbtCompound();
+        nbt.put("size", intList(width, height, depth));
+        nbt.put("palette", nbtList(structureState(state)));
+        nbt.put("blocks", nbtList(structureBlock(0, 0, 0, 0)));
+        return nbt;
+    }
+
+    private static NbtCompound structureState(String name) {
+        var state = new NbtCompound();
+        state.putString("Name", name);
+        return state;
+    }
+
+    private static NbtCompound structureBlock(int state, int x, int y, int z) {
+        var block = new NbtCompound();
+        block.putInt("state", state);
+        block.put("pos", intList(x, y, z));
+        return block;
+    }
+
+    private static NbtList intList(int... values) {
+        var list = new NbtList();
+        for (int value : values) list.add(NbtInt.of(value));
+        return list;
+    }
+
+    private static NbtList nbtList(NbtElement... elements) {
+        var list = new NbtList();
+        list.addAll(Arrays.asList(elements));
+        return list;
     }
 
     private static NbtCompound schematic(int width, int height, int length, String state, byte[] data) {

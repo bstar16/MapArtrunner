@@ -10,7 +10,7 @@
 
 **Spec:** `docs/superpowers/specs/2026-10-28-v2-reliability-design.md`; parent `docs/superpowers/plans/2026-10-28-v2-reliability-plan.md`, Task 6d. Source/API evidence: `.superpowers/sdd/2026-10-28-v2-schematic-import/research.md`.
 
-**Status:** Adopted on28October2026 after controller self-review, fresh independent architecture review and scoped incorporation approval. Whole6c is accepted in draftPR251 at dad5b1768e0ebf10b8273bf1adf407223a33ba4c (production reviewed at17a87ac). Task1 Sponge import is implemented and independently accepted; Tasks2–5 remain pending. The verification paragraph below records actual execution; plan approval alone is not evidence.
+**Status:** Adopted on28October2026 after controller self-review, fresh independent architecture review and scoped incorporation approval. Whole6c is accepted in draftPR251 at dad5b1768e0ebf10b8273bf1adf407223a33ba4c (production reviewed at17a87ac). Tasks1–2 Sponge/structure import are implemented and independently accepted; Tasks3–5 remain pending. The verification paragraph below records actual execution; plan approval alone is not evidence.
 
 ## Global constraints
 
@@ -69,10 +69,12 @@ Verified: source69f47f7 plus narrow fix0dd5903 passed independent spec/quality r
 
 **Interfaces:** completes `importPlan(Path)` for both reference payload shapes, using the same final validation/order/fingerprint path.
 
-- [ ] Author real compressed structure NBT with dimensions 18×3×5, occupied Y=1 only, records deliberately out of order, and literal required cells: stone (0,1,0), X-axis oak_log (17,1,0), stone (1,1,2), oak_log (16,1,2), stone (3,1,4). Use native `axis=x` for both oak logs; record exact fixture provenance. Expected ordered positions: (0,1,0),(17,1,0),(16,1,2),(1,1,2),(3,1,4), IDs 0..4; counts stone=3/oak_log=2 and relative regions (0,0)=3/(1,0)=2.
-- [ ] Write failing `importsCheckedInStructure`, `structureAndSpongeHaveSameNormalizedPlan` and `rejectsMalformedStructure`. Assert padded dimensions/Y retained, air gaps do not toggle row direction, complete properties and item resolution via native `asItem()` (not assumed block-ID=item-ID). Build a temporary equivalent Sponge representation of the asymmetric fixture and compare exact targets/fingerprint; permute structure records/palette indices/properties and preserve equality.
-- [ ] Test wrong size/pos lengths/types, duplicate positions including air, missing/negative/out-of-range state, bad Properties, out-of-bounds entries, alternate palettes, multiple occupied Y and valid empty blocks list. Run focused tests red, implement the structure decoder using slice 1 normalization, rerun focused and full Fabric units green.
-- [ ] Review and commit; both formats are required before calling parent 6d complete.
+- [x] Author real compressed structure NBT with dimensions 18×3×5, occupied Y=1 only, records deliberately out of order, and literal required cells: stone (0,1,0), X-axis oak_log (17,1,0), stone (1,1,2), oak_log (16,1,2), stone (3,1,4). Use native `axis=x` for both oak logs; record exact fixture provenance. Expected ordered positions: (0,1,0),(17,1,0),(16,1,2),(1,1,2),(3,1,4), IDs 0..4; counts stone=3/oak_log=2 and relative regions (0,0)=3/(1,0)=2.
+- [x] Write failing `importsCheckedInStructure`, `structureAndSpongeHaveSameNormalizedPlan` and `rejectsMalformedStructure`. Assert padded dimensions/Y retained, air gaps do not toggle row direction, complete properties and item resolution via native `asItem()` (not assumed block-ID=item-ID). Build a temporary equivalent Sponge representation of the asymmetric fixture and compare exact targets/fingerprint; permute structure records/palette indices/properties and preserve equality.
+- [x] Test wrong size/pos lengths/types, duplicate positions including air, missing/negative/out-of-range state, bad Properties, out-of-bounds entries, alternate palettes, multiple occupied Y and valid empty blocks list. Run focused tests red, implement the structure decoder using slice 1 normalization, rerun focused and full Fabric units green.
+- [x] Review and commit; both formats are required before calling parent 6d complete.
+
+Verified: three-file source24b9c0d passed fresh independent spec/quality review with no findings. Real174-byte asymmetric structure fixture was independently decoded and checked against literal dimensions/coordinates/full states/materials/regions. Actual runtime RED executed19 cases/6 missing-decoder/context failures; focused GREEN19 and final full Fabric206 across5 fresh suites had zero failures/errors/skips, native exit0. Allthree source/fixture hashes matched the settled run. Both formats share validation/order/hash; sparse MAX_INT-width tests do not allocate by declared volume. One test-authoring constructor compile failure and its stale14-case XML were retained separately and excluded from runtime evidence. No core/game/remap/v1 rerun or imported physical-placement acceptance is claimed here.
 
 ### Task 3 — Bind existing lane/fault expectations to coordinates (4 files)
 

@@ -5,10 +5,13 @@ import com.mapartrunner.core.model.BuildPlan.*;
 import com.mapartrunner.fabric.runtime.WorldEvidenceReader;
 import com.mojang.brigadier.StringReader;
 import com.mojang.brigadier.exceptions.CommandSyntaxException;
+import net.minecraft.block.BlockState;
 import net.minecraft.command.argument.BlockArgumentParser;
 import net.minecraft.item.Items;
 import net.minecraft.nbt.*;
 import net.minecraft.registry.Registries;
+import net.minecraft.state.property.Property;
+import net.minecraft.util.Identifier;
 
 import java.io.DataOutputStream;
 import java.io.IOException;
@@ -22,6 +25,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Locale;
@@ -66,7 +70,7 @@ public final class SchematicPlanImporter {
                 || root.contains("Palette") || root.contains("BlockData");
         boolean structure = root.contains("size") || root.contains("palette") || root.contains("blocks");
         if (sponge && structure) throw invalid(source, "shape", "ambiguous Sponge and structure schemas");
-        if (structure) throw invalid(source, "shape", "structure schema is not supported yet");
+        if (structure) return structure(root, source);
         if (!sponge) throw invalid(source, "shape", "unsupported schematic shape");
         return sponge(root, source);
     }
@@ -74,12 +78,7 @@ public final class SchematicPlanImporter {
     private static BuildPlan sponge(NbtCompound root, Path source) throws IOException {
         var dimensions = new GridSize(dimension(root, "Width", source), dimension(root, "Height", source),
                 dimension(root, "Length", source));
-        int volume;
-        try {
-            volume = Math.multiplyExact(Math.multiplyExact(dimensions.width(), dimensions.height()), dimensions.depth());
-        } catch (ArithmeticException e) {
-            throw new IllegalArgumentException(source + ": volume: dimensions exceed dense integer indexing", e);
-        }
+        int volume = volume(dimensions, source);
         for (String field : List.of("Entities", "BlockEntities", "TileEntities")) {
             if (root.contains(field) && (!(root.get(field) instanceof NbtList list) || !list.isEmpty())) {
                 throw invalid(source, field, "must be an empty entity compound list; payloads are unsupported");
@@ -102,7 +101,6 @@ public final class SchematicPlanImporter {
         }
         var targets = new ArrayList<Target>();
         int cursor = 0;
-        int occupiedY = -1;
         for (int index = 0; index < volume; index++) {
             String field = "BlockData[" + index + "]";
             int paletteId;
@@ -122,16 +120,109 @@ public final class SchematicPlanImporter {
             }
             var entry = palette.get(paletteId);
             if (entry == null) throw invalid(source, field, "unknown or negative palette index " + paletteId);
-            if (!entry.air()) {
-                int y = index / (dimensions.width() * dimensions.depth());
-                if (occupiedY != -1 && occupiedY != y) throw invalid(source, field, "multiple occupied Y planes are unsupported");
-                occupiedY = y;
-                var position = new GridPos(index % dimensions.width(), y, (index / dimensions.width()) % dimensions.depth());
-                targets.add(new Target(0, position, entry.block()));
-            }
+            if (entry.air()) continue;
+            var position = new GridPos(index % dimensions.width(), index / (dimensions.width() * dimensions.depth()),
+                    (index / dimensions.width()) % dimensions.depth());
+            addTarget(targets, position, entry, source, field);
         }
         if (bytes != null && cursor != bytes.length) throw invalid(source, "BlockData", "trailing bytes after " + volume + " cells");
         return normalize(dimensions, targets);
+    }
+
+    private static BuildPlan structure(NbtCompound root, Path source) throws IOException {
+        int[] size = intTriple(root.get("size"), source, "size");
+        for (int axis = 0; axis < size.length; axis++) {
+            if (size[axis] <= 0) throw invalid(source, "size[" + axis + "]", "dimension must be positive");
+        }
+        var dimensions = new GridSize(size[0], size[1], size[2]);
+        volume(dimensions, source);
+        if (root.contains("entities") && (!(root.get("entities") instanceof NbtList entities) || !entities.isEmpty())) {
+            throw invalid(source, "entities", "must be an empty entity list; payloads are unsupported");
+        }
+        if (!(root.get("palette") instanceof NbtList entries) || entries.isEmpty()) {
+            throw invalid(source, "palette", "required nonempty list");
+        }
+        var palette = new ArrayList<PaletteEntry>();
+        for (int index = 0; index < entries.size(); index++) {
+            String field = "palette[" + index + "]";
+            if (!(entries.get(index) instanceof NbtCompound entry)) throw invalid(source, field, "required compound");
+            if (!(entry.get("Name") instanceof NbtString name)) throw invalid(source, field + ".Name", "required block identifier string");
+            var id = Identifier.tryParse(name.value());
+            var block = id == null ? null : Registries.BLOCK.getOptionalValue(id).orElse(null);
+            if (block == null) throw invalid(source, field + ".Name", "unknown or invalid block identifier " + name.value());
+            var state = block.getDefaultState();
+            if (entry.contains("Properties")) {
+                if (!(entry.get("Properties") instanceof NbtCompound properties)) {
+                    throw invalid(source, field + ".Properties", "required compound");
+                }
+                for (var tag : properties.entrySet()) {
+                    String propertyField = field + ".Properties." + tag.getKey();
+                    var property = block.getStateManager().getProperty(tag.getKey());
+                    if (property == null) throw invalid(source, propertyField, "unknown block property");
+                    if (!(tag.getValue() instanceof NbtString value)) throw invalid(source, propertyField, "required string value");
+                    state = property(state, property, value.value(), source, propertyField);
+                }
+            }
+            palette.add(paletteEntry(state, source, field));
+        }
+        if (!(root.get("blocks") instanceof NbtList records)) throw invalid(source, "blocks", "required list");
+        var targets = new ArrayList<Target>();
+        var positions = new HashSet<GridPos>();
+        // Sparse records alone own iteration/storage; air still participates in validation and uniqueness.
+        for (int index = 0; index < records.size(); index++) {
+            String field = "blocks[" + index + "]";
+            if (!(records.get(index) instanceof NbtCompound record)) throw invalid(source, field, "required compound");
+            if (!(record.get("state") instanceof NbtInt state) || state.intValue() < 0 || state.intValue() >= palette.size()) {
+                throw invalid(source, field + ".state", "required INT referencing a palette entry");
+            }
+            int[] pos = intTriple(record.get("pos"), source, field + ".pos");
+            if (pos[0] < 0 || pos[0] >= size[0] || pos[1] < 0 || pos[1] >= size[1] || pos[2] < 0 || pos[2] >= size[2]) {
+                throw invalid(source, field + ".pos", "position outside source dimensions");
+            }
+            var position = new GridPos(pos[0], pos[1], pos[2]);
+            if (!positions.add(position)) throw invalid(source, field + ".pos", "duplicate position " + position);
+            if (record.contains("nbt") && (!(record.get("nbt") instanceof NbtCompound nbt) || !nbt.isEmpty())) {
+                throw invalid(source, field + ".nbt", "must be an empty compound; block-entity payloads are unsupported");
+            }
+            addTarget(targets, position, palette.get(state.intValue()), source, field);
+        }
+        return normalize(dimensions, targets);
+    }
+
+    private static int[] intTriple(NbtElement element, Path source, String field) {
+        if (!(element instanceof NbtList list) || list.size() != 3) throw invalid(source, field, "required list of three INTs");
+        int[] values = new int[3];
+        for (int axis = 0; axis < values.length; axis++) {
+            if (!(list.get(axis) instanceof NbtInt number)) throw invalid(source, field + "[" + axis + "]", "required INT");
+            values[axis] = number.intValue();
+        }
+        return values;
+    }
+
+    private static int volume(GridSize dimensions, Path source) {
+        try {
+            return Math.multiplyExact(Math.multiplyExact(dimensions.width(), dimensions.height()), dimensions.depth());
+        } catch (ArithmeticException e) {
+            throw new IllegalArgumentException(source + ": volume: dimensions exceed dense integer indexing", e);
+        }
+    }
+
+    private static <T extends Comparable<T>> BlockState property(BlockState state, Property<T> property, String value,
+                                                                Path source, String field) {
+        return state.with(property, property.parse(value).orElseThrow(() -> invalid(source, field, "invalid property value " + value)));
+    }
+
+    private static PaletteEntry paletteEntry(BlockState state, Path source, String field) {
+        if (!state.isAir() && state.getBlock().asItem() == Items.AIR) throw invalid(source, field, "non-air block has no placement item");
+        return new PaletteEntry(state.isAir(), WorldEvidenceReader.blockSpec(state));
+    }
+
+    private static void addTarget(List<Target> targets, GridPos position, PaletteEntry entry, Path source, String field) {
+        if (entry.air()) return;
+        if (!targets.isEmpty() && targets.getFirst().relativePos().y() != position.y()) {
+            throw invalid(source, field, "multiple occupied Y planes are unsupported");
+        }
+        targets.add(new Target(0, position, entry.block()));
     }
 
     private static int dimension(NbtCompound root, String field, Path source) {
@@ -159,10 +250,7 @@ public final class SchematicPlanImporter {
             try {
                 var state = BlockArgumentParser.block(Registries.BLOCK, reader, false).blockState();
                 if (reader.canRead()) throw invalid(source, field, "trailing block-state text at " + reader.getCursor());
-                if (!state.isAir() && state.getBlock().asItem() == Items.AIR) {
-                    throw invalid(source, field, "non-air block has no placement item");
-                }
-                palette.put(number.intValue(), new PaletteEntry(state.isAir(), WorldEvidenceReader.blockSpec(state)));
+                palette.put(number.intValue(), paletteEntry(state, source, field));
             } catch (CommandSyntaxException e) {
                 throw new IllegalArgumentException(source + ": " + field + ": " + e.getMessage(), e);
             }
