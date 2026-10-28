@@ -33,6 +33,9 @@ loom {
     }
 }
 
+sourceSets.test.resources.srcDir rootProject.file('test-fixtures')
+sourceSets.gametest.resources.srcDir rootProject.file('test-fixtures')
+
 tasks.named('test', Test) {
     workingDir = layout.buildDirectory.dir('run/unitTest').get().asFile
     doFirst {

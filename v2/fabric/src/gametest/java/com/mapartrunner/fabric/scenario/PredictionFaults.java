@@ -75,7 +75,8 @@ public final class PredictionFaults {
     record Barrier(BuildEngine.TickDecision decision, int decisionIdentity, BarrierState before,
                    Optional<BarrierState> paused, BarrierState after) { }
     private record Scope(MinecraftServer server, ClientWorld world, ClientPlayNetworkHandler handler,
-                         ClientConnection connection, UUID runId, Path save, int age, Mode mode) { }
+                         ClientConnection connection, UUID runId, Path save, int age, Mode mode,
+                         String planFingerprint, int targetId) { }
     record StateIdentity(RunLifecycle.Context context, int targetId, GridPos target, String save,
                          int server, int world, int handler, int connection, int armedAge) { }
     record NativeState(String state, boolean pending, int managerSequence, int age, long eligible, int selected, int usable) { }
@@ -86,18 +87,18 @@ public final class PredictionFaults {
                          List<StateEvent> events, List<IncomingState> incoming, Optional<ImportEvent> imported) { }
 
     static void arm(MinecraftClient client, MinecraftServer ownedServer, Path ownedSave, UUID runId) {
-        arm(client,ownedServer,ownedSave,runId,Mode.RESPONSE);
+        arm(client,ownedServer,ownedSave,runId,Mode.RESPONSE,null);
     }
 
-    static void armObservation(MinecraftClient client, MinecraftServer ownedServer, Path ownedSave, UUID runId) {
-        arm(client,ownedServer,ownedSave,runId,Mode.OBSERVATION);
+    static void armObservation(MinecraftClient client, MinecraftServer ownedServer, Path ownedSave, UUID runId, BuildPlan plan) {
+        arm(client,ownedServer,ownedSave,runId,Mode.OBSERVATION,plan);
     }
 
-    static void armComputed(MinecraftClient client, MinecraftServer ownedServer, Path ownedSave, UUID runId, boolean resume) {
-        arm(client,ownedServer,ownedSave,runId,resume?Mode.COMPUTED_PAUSE_RESUME:Mode.COMPUTED_STOP);
+    static void armComputed(MinecraftClient client, MinecraftServer ownedServer, Path ownedSave, UUID runId, BuildPlan plan, boolean resume) {
+        arm(client,ownedServer,ownedSave,runId,resume?Mode.COMPUTED_PAUSE_RESUME:Mode.COMPUTED_STOP,plan);
     }
 
-    private static void arm(MinecraftClient client, MinecraftServer ownedServer, Path ownedSave, UUID runId, Mode mode) {
+    private static void arm(MinecraftClient client, MinecraftServer ownedServer, Path ownedSave, UUID runId, Mode mode, BuildPlan plan) {
         requireThread(client);
         if(scope!=null || failure!=null) throw new IllegalStateException("Fault already active or failed");
         var game=FabricLoader.getInstance().getGameDir().toAbsolutePath().normalize();
@@ -117,11 +118,21 @@ public final class PredictionFaults {
         }
         if(!withinWindow(0,0) || !withinWindow(WINDOW,0) || withinWindow(WINDOW+1,0) || withinWindow(-1,0))
             throw new AssertionError("Fault window boundary self-check failed");
+        int targetId=-1;
+        String fingerprint=null;
+        if(mode==Mode.OBSERVATION || mode==Mode.COMPUTED_STOP || mode==Mode.COMPUTED_PAUSE_RESUME) {
+            if(plan==null || !plan.fingerprint().equals(state.context().orElseThrow().planFingerprint()))
+                throw new IllegalStateException("Refused fault plan fingerprint");
+            try { targetId=SingleLaneFixture.targetId(plan,new GridPos(11,0,0)); }
+            catch(IllegalArgumentException missing) { throw new IllegalStateException("Refused fault target coordinate",missing); }
+            fingerprint=plan.fingerprint();
+        }
+        var next=new Scope(ownedServer,client.world,handler,handler.getConnection(),runId,save,client.player.age,mode,fingerprint,targetId);
         responses.clear();
         omissions.clear(); omissionLatched=false; barrier=null; transitioning=false; fresh.clear();
         stateStage=StateStage.INACTIVE; stateIdentity=null; n1=-1; n2=-1; ordinal=0;
         stateEvents.clear(); incomingStates.clear(); importEvent=null;
-        scope=new Scope(ownedServer,client.world,handler,handler.getConnection(),runId,save,client.player.age,mode);
+        scope=next; // Publish only the fully bound scope, after validation and per-run evidence reset.
     }
 
     /** Called at the original incoming INVOKE, after vanilla main-thread dispatch; never queues or replays a response. */
@@ -162,9 +173,9 @@ public final class PredictionFaults {
             throw new AssertionError(failure);
         }
         var engine=MapArtClient.status().engine();
-        if(!omissionLatched && !engine.pendingTargetIds().contains(55)) return original;
+        if(!omissionLatched && !engine.pendingTargetIds().contains(owned.targetId())) return original;
         omissionLatched=true;
-        var removed=original.stream().filter(o -> o.targetId()==55).findFirst().orElseThrow();
+        var removed=original.stream().filter(o -> o.targetId()==owned.targetId()).findFirst().orElseThrow();
         var support=captured.supportObservation().cells().get(new GridPos(11,0,0));
         if(support==null || removed.evidence()!=support.evidence() || !removed.observedState().equals(support.state())
                 || omissions.size()>=WINDOW*10) {
@@ -173,8 +184,8 @@ public final class PredictionFaults {
         }
         var returned=new ArrayList<>(original);
         returned.remove(removed);
-        if(returned.size()!=59 || returned.stream().anyMatch(o -> o.targetId()==55)) {
-            fail("Observation conversion did not omit only55");
+        if(returned.size()!=59 || returned.stream().anyMatch(o -> o.targetId()==owned.targetId())) {
+            fail("Observation conversion did not omit only"+owned.targetId());
             throw new AssertionError(failure);
         }
         omissions.add(new Omission(omissions.size()+1,client.player.age,engine.eligibleTicks(),engine.lifecycle().phase().name(),
@@ -200,7 +211,7 @@ public final class PredictionFaults {
             return;
         }
         if(decision.runId().filter(owned.runId()::equals).isEmpty() || decision.snapshot().lifecycle().phase()!=Phase.RUNNING
-                || decision.owner()!=BuildEngine.ControlOwner.NATIVE || decision.placement().filter(p -> p.targetId()==55).isEmpty()
+                || decision.owner()!=BuildEngine.ControlOwner.NATIVE || decision.placement().filter(p -> p.targetId()==owned.targetId()).isEmpty()
                 || decision.movement().filter(m -> m.forward() || m.back() || m.strafe()!=MovementPolicy.Strafe.NONE).isEmpty()) return;
         var before=barrierState(client);
         demand(before.status().engine().equals(decision.snapshot()) && before.status().controlOwner()==BuildEngine.ControlOwner.NATIVE
@@ -272,8 +283,8 @@ public final class PredictionFaults {
 
     static void clear() {
         requireThread(MinecraftClient.getInstance());
-        stateStage=StateStage.INACTIVE;
         scope=null; // Invalidate before disposing native owners; immutable response evidence survives cleanup.
+        stateStage=StateStage.INACTIVE;
     }
 
     private static void check(MinecraftClient client) {
@@ -285,6 +296,7 @@ public final class PredictionFaults {
                 || client.player==null || client.player.getEntityWorld()!=owned.world()
                 || !owned.server().getSavePath(WorldSavePath.ROOT).toAbsolutePath().normalize().equals(owned.save())
                 || state.context().isEmpty() || !state.context().orElseThrow().runId().equals(owned.runId())
+                || (owned.planFingerprint()!=null && !state.context().orElseThrow().planFingerprint().equals(owned.planFingerprint()))
                 || (state.phase()!=Phase.RUNNING && state.phase()!=Phase.TERMINAL
                     && !(transitioning && owned.mode()==Mode.COMPUTED_PAUSE_RESUME && state.phase()==Phase.PAUSED))
                 || (computed(owned) && barrier==null && state.phase()!=Phase.RUNNING)
@@ -308,8 +320,8 @@ public final class PredictionFaults {
 
     private static void fail(String detail) {
         if(failure==null) failure=detail;
-        stateStage=StateStage.INACTIVE;
         scope=null;
+        stateStage=StateStage.INACTIVE;
     }
 
     private static boolean stateMode(Scope owned) { return owned.mode()==Mode.STATE || owned.mode()==Mode.REPEATED_STATE; }
@@ -321,12 +333,12 @@ public final class PredictionFaults {
         var target=plan.targets().stream().filter(t -> t.id()==targetId).findFirst().orElseThrow();
         var relative=target.relativePos(); var origin=context.origin();
         var pos=new BlockPos(Math.addExact(origin.x(),relative.x()),Math.addExact(origin.y(),relative.y()),Math.addExact(origin.z(),relative.z()));
-        if(!plan.fingerprint().equals(context.planFingerprint()) || targetId!=0 || !pos.equals(new BlockPos(0,65,0))
+        if(!plan.fingerprint().equals(context.planFingerprint()) || !relative.equals(new GridPos(0,0,0)) || !pos.equals(new BlockPos(0,65,0))
                 || client.world==null || client.world.getChunkManager().getChunk(0,0,ChunkStatus.FULL,false)==null
                 || !client.world.getBlockState(pos).isAir()
                 || ((PendingPredictionView)((ClientWorldPendingUpdateAccessor)client.world).mapart$getPendingUpdateManager()).mapart$hasPendingPrediction(pos))
             throw new IllegalStateException("Refused state plan/target/initial chunk/air/prediction");
-        arm(client,server,save,runId,repeated?Mode.REPEATED_STATE:Mode.STATE);
+        arm(client,server,save,runId,repeated?Mode.REPEATED_STATE:Mode.STATE,null);
         stateIdentity=new StateIdentity(context,targetId,new GridPos(pos.getX(),pos.getY(),pos.getZ()),scope.save().toString(),
                 System.identityHashCode(server),System.identityHashCode(client.world),System.identityHashCode(scope.handler()),
                 System.identityHashCode(scope.connection()),client.player.age);

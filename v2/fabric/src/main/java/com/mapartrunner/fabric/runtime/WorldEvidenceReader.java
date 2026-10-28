@@ -96,7 +96,7 @@ public final class WorldEvidenceReader {
         return new SupportSample(pending ? PREDICTED : OBSERVED, Optional.of(blockSpec(loadedState)));
     }
 
-    static BlockSpec blockSpec(BlockState state) {
+    public static BlockSpec blockSpec(BlockState state) {
         var properties = new HashMap<String, String>();
         for (var property : state.getProperties()) addProperty(properties, state, property);
         return new BlockSpec(Registries.BLOCK.getId(state.getBlock()).toString(), properties);

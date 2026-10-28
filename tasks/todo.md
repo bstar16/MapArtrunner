@@ -11,8 +11,8 @@ Implementation approved on 28 October 2026, using task-by-task agents and indepe
 - [x] 6a. Implement [expected-target ledger](../docs/superpowers/plans/2026-10-28-v2-placement-ledger.md)
 - [x] 6b. Implement [native lane movement](../docs/superpowers/plans/2026-10-28-v2-native-movement.md)
 - [x] 6c. Integrate [tick effects and control ownership](../docs/superpowers/plans/2026-10-28-v2-tick-boundary.md)
-- [ ] 6d. Import a real schematic into the neutral plan
-- [ ] Checkpoint B: real one-lane build verified against server world
+- [x] 6d. Import a real schematic into the neutral plan
+- [x] Checkpoint B: real one-lane build verified against server world
 - [ ] 7. Automate two-lane setup, reset and rerun
 - [ ] 8. Implement complete traversal, resume and cleanup
 - [ ] 9. Add persistent inspect/reset workflow

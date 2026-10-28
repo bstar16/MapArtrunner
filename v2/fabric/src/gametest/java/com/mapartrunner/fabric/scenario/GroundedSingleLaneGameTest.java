@@ -10,6 +10,7 @@ import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientWorldEvents;
 import net.fabricmc.fabric.api.client.gametest.v1.FabricClientGameTest;
 import net.fabricmc.fabric.api.client.gametest.v1.context.ClientGameTestContext;
+import net.fabricmc.fabric.api.client.gametest.v1.screenshot.TestScreenshotOptions;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.network.ClientPlayNetworkHandler;
@@ -22,6 +23,12 @@ import java.util.List;
 /** Fresh managed worlds; observers never drive production or call gametest contexts. */
 public final class GroundedSingleLaneGameTest implements FabricClientGameTest {
     @Override public void runTest(ClientGameTestContext context) {
+        try { SingleLaneFixture.verifyCoordinateLookup(); }
+        catch(AssertionError error) {
+            try { context.takeScreenshot(TestScreenshotOptions.of("coordinate-lookup-failure").disableCounterPrefix()); }
+            catch(RuntimeException | Error capture) { error.addSuppressed(capture); }
+            throw error;
+        }
         var watch = new Watch();
         ClientTickEvents.START_CLIENT_TICK.register(client -> watch.record(client, "START"));
         ClientTickEvents.END_CLIENT_TICK.register(client -> watch.record(client, "END"));
