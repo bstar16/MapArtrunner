@@ -2,7 +2,6 @@ package com.mapartrunner.core.run;
 
 import com.mapartrunner.core.model.BuildPlan;
 import com.mapartrunner.core.model.BuildPlan.Target;
-import com.mapartrunner.core.movement.MovementPolicy;
 import com.mapartrunner.core.movement.MovementPolicy.*;
 import com.mapartrunner.core.placement.PlacementLedger;
 import com.mapartrunner.core.placement.PlacementObservation;
@@ -13,7 +12,7 @@ import com.mapartrunner.core.traversal.LanePlanner;
 import java.util.*;
 
 /**
- * Single-threaded one-lane coordinator. The adapter owns effects and their generation barrier;
+ * Single-threaded forward-build coordinator. The adapter owns effects and their generation barrier;
  * this owner issues immutable decisions, never client keys or claims of server acknowledgement.
  */
 public final class BuildEngine {
@@ -25,11 +24,10 @@ public final class BuildEngine {
     private static final int RUN_LIMIT = 1200;
 
     private final RunLifecycle lifecycle = new RunLifecycle();
-    private final MovementPolicy movementPolicy = new MovementPolicy();
     private BuildPlan plan;
     private Settings settings;
     private PlacementLedger ledger;
-    private LaneEntry entry;
+    private ForwardTraversal traversal;
     private long lastTick = -1;
     private long eligibleTicks;
     private long verifyTicks;
@@ -49,7 +47,7 @@ public final class BuildEngine {
         // Create owners only after lifecycle validation. A fresh run replaces the entire prior summary.
         this.plan = plan; this.settings = settings;
         ledger = new PlacementLedger(plan); ledger.bindRun(context.runId());
-        entry = null; lastTick = -1; eligibleTicks = 0; verifyTicks = 0;
+        traversal = null; lastTick = -1; eligibleTicks = 0; verifyTicks = 0;
         verifyEnteredTick = -1; nextActionId = 0; effectResults = List.of(); terminalSummary = null;
         if (plan.targets().isEmpty()) {
             finish(Outcome.SUCCESS, Reason.NOTHING_TO_BUILD, List.of(), "The normalized plan is empty");
@@ -62,12 +60,7 @@ public final class BuildEngine {
             finish(Outcome.FAILED, Reason.UNSUPPORTED_PLAN, allIds(), unsupported.getMessage());
             return;
         }
-        if (lanes.size() != 1) {
-            finish(Outcome.FAILED, Reason.UNSUPPORTED_PLAN, allIds(), "This milestone requires exactly one flat lane");
-            return;
-        }
-        entry = new LaneEntry(lanes.getFirst(), Stage.ENTER_POSITION, 0, 0, 0, 0, 0,
-                ledger.pendingTargetIds(), settings.constantSprint());
+        traversal = new ForwardTraversal(lanes, plan.dimensions(), settings.constantSprint());
     }
 
     /** Pause retains the ledger and every movement counter; the adapter invalidates/releases effects. */
@@ -83,7 +76,8 @@ public final class BuildEngine {
 
     public Snapshot snapshot() {
         if (terminalSummary != null) return terminalSummary;
-        return new Snapshot(lifecycle.snapshot(), eligibleTicks, verifyTicks, Optional.ofNullable(entry),
+        return new Snapshot(lifecycle.snapshot(), eligibleTicks, verifyTicks,
+                Optional.ofNullable(traversal).map(ForwardTraversal::snapshot),
                 ledger == null ? List.of() : unfinishedIds(), ledger == null ? Set.of() : ledger.pendingTargetIds(),
                 Optional.empty(), effectResults);
     }
@@ -109,13 +103,16 @@ public final class BuildEngine {
         boolean wasVerifying = state.activity().orElseThrow() == Activity.VERIFY;
         if (wasVerifying) verifyTicks++;
         Optional<MovementIntent> movement = Optional.empty();
-        if (!wasVerifying && input.player().isPresent()) {
-            PlayerObservation player = input.player().orElseThrow();
-            LaneEntry currentEntry = new LaneEntry(entry.lane(), entry.stage(), entry.stageElapsedTicks(),
-                    entry.entryElapsedTicks(), entry.consecutiveYawAlignedTicks(), entry.supportHoldTicks(),
-                    entry.yawHoldTicks(), ledger.pendingTargetIds(), entry.constantSprint());
-            MovementIntent result = movementPolicy.decide(player, currentEntry, input.support());
-            if (state.activity().orElseThrow() == Activity.APPROACH) {
+        if (!wasVerifying) {
+            var advanced = input.player().isPresent()
+                    ? traversal.advance(input.player().orElseThrow(), input.support(), ledger.pendingTargetIds())
+                    : traversal.advanceWithoutPlayer();
+            if (advanced.transitionExpired()) {
+                finish(Outcome.FAILED, Reason.TRANSITION_TIMEOUT, unresolvedIds(), "Transition exhausted 120 active callbacks");
+                return currentDecision(input.tick(), Optional.empty(), Optional.empty());
+            }
+            MovementIntent result = advanced.movement().orElse(null);
+            if (result != null && state.activity().orElseThrow() == Activity.APPROACH) {
                 // The single policy result owns the local envelope, not physical staging safety.
                 if (result.failure() == Failure.BELOW_BUILD_PLANE || result.failure() == Failure.OUTSIDE_CORRIDOR) {
                     finish(Outcome.FAILED, Reason.COARSE_TRAVEL_UNAVAILABLE, unresolvedIds(), "Native entry requires unavailable coarse travel");
@@ -123,17 +120,17 @@ public final class BuildEngine {
                 }
                 lifecycle.updateActivity(input.runId(), Activity.BUILD);
             }
-            // Store every returned counter once. Evidence/issuance never resets 6b's independent clocks.
-            entry = new LaneEntry(entry.lane(), result.nextStage(), result.nextStageElapsedTicks(),
-                    result.nextEntryElapsedTicks(), result.nextYawAlignedTicks(), result.nextSupportHoldTicks(),
-                    result.nextYawHoldTicks(), ledger.pendingTargetIds(), entry.constantSprint());
-            if (result.status() == Status.FAILED) {
+            if (result != null && result.status() == Status.FAILED) {
                 finish(Outcome.FAILED, Reason.MOVEMENT_FAILED, unresolvedIds(), result.failure().name());
                 return currentDecision(input.tick(), Optional.empty(), Optional.empty());
             }
-            if (result.status() == Status.COMPLETE) {
+            if (advanced.forwardComplete()) {
                 lifecycle.updateActivity(input.runId(), Activity.VERIFY); verifyEnteredTick = input.tick();
-            } else movement = Optional.of(result);
+            } else {
+                if (result != null) lifecycle.updateActivity(input.runId(),
+                        traversal.snapshot().substage() == ForwardTraversal.Substage.LANE ? Activity.BUILD : Activity.SHIFT);
+                if (result != null && result.status() != Status.COMPLETE) movement = Optional.of(result);
+            }
         }
 
         boolean verifying = lifecycle.snapshot().activity().orElseThrow() == Activity.VERIFY;
@@ -179,13 +176,22 @@ public final class BuildEngine {
         Optional<PlacementIntent> placement = Optional.empty();
         if (input.player().isPresent()) {
             PlayerObservation player = input.player().orElseThrow();
+            boolean shifting = lifecycle.snapshot().activity().orElseThrow() == Activity.SHIFT;
+            var lane = traversal.snapshot().entry().lane();
+            double center = lane.direction().lateralCoordinate(lane.start().x(), lane.start().z())
+                    * lane.direction().lateralStrafeSign();
+            Comparator<Target> order = verifying
+                    ? Comparator.comparingDouble((Target t) -> distance(t, player)).thenComparingInt(Target::id)
+                    : shifting ? Comparator.comparingInt((Target t) -> shiftPriority(t, player))
+                    .thenComparingInt(t -> bucket(t, player)).thenComparingDouble(t -> Math.abs(lateral(t) - center))
+                    .thenComparingDouble(this::lateral).thenComparingInt(Target::id)
+                    : Comparator.comparingInt((Target t) -> bucket(t, player))
+                    .thenComparingDouble(this::lateral).thenComparingInt(Target::id);
             Optional<Target> selected = ledger.unfinishedTargets().stream()
                     .filter(t -> input.availability().get(t.id()) == PlacementAvailability.READY)
                     .filter(t -> retryReady(t, current))
-                    .filter(t -> verifying || bucket(t, player) < 3)
-                    .min(verifying ? Comparator.comparingDouble((Target t) -> distance(t, player)).thenComparingInt(Target::id)
-                            : Comparator.comparingInt((Target t) -> bucket(t, player))
-                            .thenComparingDouble(t -> lateral(t)).thenComparingInt(Target::id));
+                    .filter(t -> verifying || bucket(t, player) < 3 || shifting && transitionRegionContains(t))
+                    .min(order);
             if (selected.isPresent()) {
                 int id = selected.orElseThrow().id(); long action = nextActionId++;
                 if (!ledger.recordIssuedAttempt(input.runId(), action, id, input.tick(), eligibleTicks)) return invariantFailure(input.tick());
@@ -201,7 +207,7 @@ public final class BuildEngine {
         Map<Integer, PlacementObservation> accepted = new HashMap<>();
         for (var o : input.observations()) {
             if (counts.get(o.targetId()) == 1 && o.runId().equals(input.runId()) && o.tick() == input.tick()
-                    && entry.lane().expectedFloor().containsTargetId(o.targetId()) && ledger.observe(o)) accepted.put(o.targetId(), o);
+                    && traversal.snapshot().entry().lane().expectedFloor().containsTargetId(o.targetId()) && ledger.observe(o)) accepted.put(o.targetId(), o);
         }
         return accepted;
     }
@@ -209,7 +215,7 @@ public final class BuildEngine {
     private List<PlacementEffectResult> correlatedResults(List<PlacementEffectResult> results) {
         UUID runId = lifecycle.snapshot().context().orElseThrow().runId();
         return results.stream().filter(r -> r.runId().equals(runId)
-                && entry.lane().expectedFloor().containsTargetId(r.targetId()))
+                && traversal.snapshot().entry().lane().expectedFloor().containsTargetId(r.targetId()))
                 .filter(r -> ledger.latestAttempt(r.targetId()).filter(a -> a.actionId() == r.actionId()
                         && a.tick() == r.tick()).isPresent()).distinct().toList();
     }
@@ -226,20 +232,36 @@ public final class BuildEngine {
     }
 
     private int bucket(Target target, PlayerObservation player) {
-        var direction = entry.lane().direction();
+        var direction = traversal.snapshot().entry().lane().direction();
         double delta = (direction.progressCoordinate(target.relativePos().x(), target.relativePos().z())
                 - Math.floor(direction.progressCoordinate(player.x(), player.z()))) * direction.forwardSign();
         return delta == 0 ? 0 : delta == 1 ? 1 : delta == -1 ? 2 : 3;
     }
 
     private double lateral(Target target) {
-        var direction = entry.lane().direction();
+        var direction = traversal.snapshot().entry().lane().direction();
         return direction.lateralCoordinate(target.relativePos().x(), target.relativePos().z()) * direction.lateralStrafeSign();
     }
 
     private double distance(Target target, PlayerObservation player) {
         double dx = target.relativePos().x() + .5 - player.x(), dz = target.relativePos().z() + .5 - player.z();
         return dx * dx + dz * dz;
+    }
+
+    private boolean transitionRegionContains(Target target) {
+        return traversal.snapshot().transitionRegion().filter(r -> target.relativePos().x() >= r.minX()
+                && target.relativePos().x() <= r.maxX() && target.relativePos().z() >= r.minZ()
+                && target.relativePos().z() <= r.maxZ()).isPresent();
+    }
+
+    private int shiftPriority(Target target, PlayerObservation player) {
+        int bucket = bucket(target, player);
+        return transitionRegionContains(target) ? switch (bucket) {
+            case 1 -> 0;
+            case 0 -> 1;
+            case 2 -> 2;
+            default -> 4;
+        } : 3;
     }
 
     private List<Integer> finalMissingIds(Map<Integer, PlacementObservation> current) {
@@ -263,9 +285,17 @@ public final class BuildEngine {
         // Invalidate routing first, capture immutable diagnostics, then discard mutable owners.
         // The adapter must invalidate its captured generation and release controls before effects.
         lifecycle.stop(outcome);
+        if (traversal != null) {
+            var state = traversal.snapshot(); var entry = state.entry();
+            detail += "; laneIndex=" + state.laneIndex() + ", substage=" + state.substage()
+                    + ", transitionTicks=" + state.transitionTicks() + ", stage=" + entry.stage()
+                    + ", stageElapsedTicks=" + entry.stageElapsedTicks() + ", entryElapsedTicks=" + entry.entryElapsedTicks()
+                    + ", consecutiveYawAlignedTicks=" + entry.consecutiveYawAlignedTicks()
+                    + ", supportHoldTicks=" + entry.supportHoldTicks() + ", yawHoldTicks=" + entry.yawHoldTicks();
+        }
         terminalSummary = new Snapshot(lifecycle.snapshot(), eligibleTicks, verifyTicks, Optional.empty(),
                 unfinishedIds(), Set.of(), Optional.of(new Diagnostic(reason, ids, detail)), effectResults);
-        entry = null; ledger = null; plan = null; settings = null;
+        traversal = null; ledger = null; plan = null; settings = null;
     }
 
     private TickDecision currentDecision(long tick, Optional<MovementIntent> movement, Optional<PlacementIntent> placement) {
@@ -281,7 +311,7 @@ public final class BuildEngine {
     public enum EffectStatus { ACCEPTED, REJECTED, UNAVAILABLE, STALE }
     public enum ControlOwner { NONE, NATIVE, TRAVEL }
     public enum Reason { NOTHING_TO_BUILD, UNSUPPORTED_PLAN, COARSE_TRAVEL_UNAVAILABLE, BINDING_LOST,
-        MOVEMENT_FAILED, PENDING_EVIDENCE_TIMEOUT, ATTEMPTS_EXHAUSTED, VERIFY_TIMEOUT, RUN_TIMEOUT,
+        MOVEMENT_FAILED, TRANSITION_TIMEOUT, PENDING_EVIDENCE_TIMEOUT, ATTEMPTS_EXHAUSTED, VERIFY_TIMEOUT, RUN_TIMEOUT,
         CANCELLED, VERIFIED, INVARIANT_FAILURE }
 
     /** Reserved slots and sprint belong to the same immutable adapter/run settings snapshot. */
@@ -317,15 +347,16 @@ public final class BuildEngine {
     /** Empty runId is an ignored callback, not a current-run request to release controls. */
     public record TickDecision(Optional<UUID> runId, long tick, ControlOwner owner, Optional<MovementIntent> movement,
                                Optional<PlacementIntent> placement, Snapshot snapshot) { }
-    public record Snapshot(RunLifecycle.Snapshot lifecycle, long eligibleTicks, long verifyTicks, Optional<LaneEntry> laneEntry,
+    public record Snapshot(RunLifecycle.Snapshot lifecycle, long eligibleTicks, long verifyTicks, Optional<ForwardTraversal.Snapshot> traversal,
                            List<Integer> unfinishedTargetIds, Set<Integer> pendingTargetIds, Optional<Diagnostic> diagnostic,
                            List<PlacementEffectResult> effectResults) {
         public Snapshot {
-            Objects.requireNonNull(lifecycle, "lifecycle"); Objects.requireNonNull(laneEntry, "laneEntry");
+            Objects.requireNonNull(lifecycle, "lifecycle"); Objects.requireNonNull(traversal, "traversal");
             Objects.requireNonNull(diagnostic, "diagnostic");
             unfinishedTargetIds = List.copyOf(unfinishedTargetIds); pendingTargetIds = Set.copyOf(pendingTargetIds);
             effectResults = List.copyOf(effectResults);
         }
+        public Optional<LaneEntry> laneEntry() { return traversal.map(ForwardTraversal.Snapshot::entry); }
     }
     public record Diagnostic(Reason reason, List<Integer> targetIds, String detail) {
         public Diagnostic {

@@ -390,14 +390,18 @@ class FabricBuildAdapterTest {
         assertNotEquals(old, h.start()); assertTrue(h.adapter.status().failure().isEmpty());
     }
 
-    @Test void emptyPlanAndUnsupportedPlanNeverAcquireControls() {
+    @Test void emptyPlanNeverAcquiresAndMultiLaneStartsBeforeAcquisition() {
         var h = new Harness(12);
         h.adapter.start(new BuildPlan("empty", new GridSize(1, 1, 1), List.of()), ORIGIN, Settings.defaults());
         assertEquals(Reason.NOTHING_TO_BUILD, h.adapter.status().engine().diagnostic().orElseThrow().reason());
+        h.adapter.tick(); assertTrue(h.events.isEmpty());
         h.adapter.start(new BuildPlan("two lanes", new GridSize(12, 1, 10),
                 List.of(new Target(7, new GridPos(0, 0, 0), STONE), new Target(8, new GridPos(0, 0, 9), STONE))), ORIGIN, Settings.defaults());
-        assertEquals(Reason.UNSUPPORTED_PLAN, h.adapter.status().engine().diagnostic().orElseThrow().reason());
-        h.adapter.tick(); assertTrue(h.events.isEmpty());
+        assertEquals(Phase.RUNNING, h.adapter.status().engine().lifecycle().phase());
+        assertEquals(Activity.APPROACH, h.adapter.status().engine().lifecycle().activity().orElseThrow());
+        assertEquals(NONE, h.adapter.status().controlOwner()); assertTrue(h.events.isEmpty());
+        h.adapter.tick();
+        assertEquals(1, h.captures); assertEquals(NATIVE, h.adapter.status().controlOwner());
     }
 
     @Test void activeStartRefusalDoesNotAlterCurrentRunOrKeys() {
