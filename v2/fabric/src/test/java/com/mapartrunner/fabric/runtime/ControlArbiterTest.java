@@ -161,6 +161,29 @@ class ControlArbiterTest {
     }
 
     @Test
+    void revokedBindingCannotAcquireDuringCleanupOrChangeFreshNativeControls() {
+        Binding oldBinding = arbiter.bindRun(runId);
+        Lease oldLease = acquire(oldBinding, NATIVE);
+        arbiter.apply(oldLease, ALL);
+        sink.onEvent = event -> {
+            assertEquals(NONE, arbiter.owner());
+            assertEquals(AcquireStatus.STALE, arbiter.acquire(oldBinding, NATIVE).status());
+            assertEquals(AcquireStatus.STALE, arbiter.acquire(oldBinding, TRAVEL).status());
+            assertFalse(arbiter.apply(oldLease, ALL));
+            assertFalse(arbiter.release(oldLease));
+        };
+        sink.events.clear();
+        Binding fresh = arbiter.bindRun(UUID.randomUUID());
+        assertEquals(cleanupEvents(NATIVE), sink.events); assertAllReleased();
+        sink.onEvent = event -> { };
+        Lease current = acquire(fresh, NATIVE);
+        arbiter.apply(current, only(Control.LEFT));
+        sink.events.clear(); assertStale(oldBinding, oldLease);
+        assertTrue(sink.events.isEmpty()); assertEquals(NATIVE, arbiter.owner());
+        for (Control control : Control.values()) assertEquals(control == Control.LEFT, sink.keys.get(control));
+    }
+
+    @Test
     void foreignArbiterTokensNeverAffectTheCurrentOwner() {
         ControlArbiter foreign = new ControlArbiter(new RecordingSink());
         Binding otherBinding = foreign.bindRun(runId);

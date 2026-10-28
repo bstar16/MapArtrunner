@@ -7,8 +7,7 @@ import com.mapartrunner.core.run.RunLifecycle.*;
 import com.mapartrunner.fabric.MapArtClient;
 import com.mapartrunner.fabric.runtime.FabricBuildAdapter;
 import com.mapartrunner.fabric.schematic.SchematicPlanImporter;
-import com.mapartrunner.fabric.scenario.GroundedSingleLaneGameTest.*;
-import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import com.mapartrunner.fabric.scenario.ScenarioObserver.*;
 import net.fabricmc.fabric.api.client.gametest.v1.FabricClientGameTest;
 import net.fabricmc.fabric.api.client.gametest.v1.context.ClientGameTestContext;
 import net.fabricmc.fabric.api.client.gametest.v1.context.TestSingleplayerContext;
@@ -60,7 +59,7 @@ public final class SchematicImportGameTest implements FabricClientGameTest {
     private static final int WAIT=ClientGameTestContext.DEFAULT_TIMEOUT;
     private static final GridPos ORIGIN=new GridPos(0,65,0);
     private static final BuildEngine.Settings SETTINGS=new BuildEngine.Settings(2,5,false,1);
-    private final Watch watch=new Watch();
+    private Watch watch;
     private ClientGameTestContext context;
     private Path artifacts;
     private TestSingleplayerContext world;
@@ -77,6 +76,7 @@ public final class SchematicImportGameTest implements FabricClientGameTest {
 
     @Override public void runTest(ClientGameTestContext context) {
         this.context=context;
+        watch=context.computeOnClient(ScenarioObserver::install);
         var game=FabricLoader.getInstance().getGameDir().toAbsolutePath().normalize();
         require(game.getParent().getFileName().toString().equals("run")
                 && game.getParent().getParent().getFileName().toString().equals("build"),"Unmanaged import game directory: "+game);
@@ -86,8 +86,6 @@ public final class SchematicImportGameTest implements FabricClientGameTest {
         Throwable primary=null;
         try {
             var air=metadata();
-            ClientTickEvents.START_CLIENT_TICK.register(client -> watch.record(client,"START"));
-            ClientTickEvents.END_CLIENT_TICK.register(client -> watch.record(client,"END"));
             autoJump=context.computeOnClient(client -> client.options.getAutoJump().getValue());
             context.runOnClient(client -> client.options.getAutoJump().setValue(false));
             world=context.worldBuilder().create();

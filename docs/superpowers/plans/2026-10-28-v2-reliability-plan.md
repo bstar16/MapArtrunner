@@ -164,6 +164,8 @@ Verified at859019b after independent task and whole-6d Spec PASS/Quality Approve
 
 ## Task 7: Automate two-lane setup, reset, and rerun
 
+Execute the independently reviewed [two-lane/reset plan](2026-10-28-v2-two-lane-reset.md), starting from accepted Checkpoint B at85ab1c7. Its bounded native forward/SHIFT prerequisite is needed for two actual lanes; full smart resume/reverse traversal remains Task 8. Keep each source/data/test/documentation slice within five paths and preserve the existing suite.
+
 **Dependencies:** 6. **Files:** add `v2/test-fixtures/grounded-two-lane/` data/schematic, `.../gametest/.../ScenarioRunner.java`, `.../GroundedSmokeGameTest.java`, `scripts/test-v2.ps1`, and update `v2/docs/testing.md`. Keep fixture files and executable changes in separately reviewable slices if the file count exceeds five.
 
 **Interfaces:** `ScenarioRunner.reset(ScenarioDefinition definition)`, `run(ScenarioDefinition definition)`, `assertResult(ScenarioResult result)`. Definitions carry bounded region/apron, starting player/inventory/chests, schematic/origin/settings, expected world and finite budget. Definitions are data; the Fabric fixture adapter performs version-specific setup.

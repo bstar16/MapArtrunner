@@ -9,7 +9,7 @@ import com.mapartrunner.fabric.runtime.FabricBuildAdapter;
 import com.mapartrunner.fabric.mixin.ClientWorldPendingUpdateAccessor;
 import com.mapartrunner.fabric.prediction.PendingPredictionView;
 import net.minecraft.util.math.BlockPos;
-import com.mapartrunner.fabric.scenario.GroundedSingleLaneGameTest.Pose;
+import com.mapartrunner.fabric.scenario.ScenarioObserver.Pose;
 import com.mapartrunner.core.model.BuildPlan.GridPos;
 import com.mapartrunner.core.movement.MovementPolicy.SupportSample;
 import com.mapartrunner.core.placement.PlacementObservation;
