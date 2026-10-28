@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** Adopted on 28 October 2026 after fresh independent Spec PASS and Architecture/Quality Approved preflight. Prerequisite 6c/6d/Checkpoint B is accepted and published at `85ab1c73a5d801c93d8c469ea83c61925a116ac5`, tree `c1e9b14d1413673a101368a0e4d98981fb0ebed2`; both exact-head hosted checks pass. Tasks 1–4 and the separate P2 diagnostic correction are independently approved. The corrected existing17-case native regression passes; actual two-lane/reset acceptance remains pending in the later fixture/runner slices. Execute through task agents and independent reviews, retaining all required proof.
+**Status:** Adopted on 28 October 2026 after fresh independent Spec PASS and Architecture/Quality Approved preflight. Prerequisite 6c/6d/Checkpoint B is accepted and published at `85ab1c73a5d801c93d8c469ea83c61925a116ac5`, tree `c1e9b14d1413673a101368a0e4d98981fb0ebed2`; both exact-head hosted checks pass. Tasks1–4 and the separate P2 diagnostic correction are independently approved, including the corrected existing17-case native regression. Tasks5–6 have independently reviewed compiled source admission after their corrective rounds; actual Java preflight/import, native two-lane/reset and repeatability acceptance remain Task7/F4 obligations. Execute through task agents and independent reviews, retaining all required proof.
 
 **Goal:** Run a real imported two-lane build through one finite Windows command, with an actual dirty production failure followed by two independently validated successful builds in the same owned world.
 
@@ -126,6 +126,8 @@ Verified: observer source `db9b1f42d235868bfd77e2984a18ee2fdb01ed04` passed inde
 - [ ] Validate canonical full definition with sorted positions/slots/properties and raw numeric values; hash the full expansion, not a seed name. Compile with `./gradlew.bat -p v2 :fabric:compileGametestJava --no-daemon --console=plain`; inspect imported dimensions/coordinate map through existing importer tests or the later provider, stating which actually executed. Review and commit `test(v2): add complete two-lane fixture data`.
 
 ### Task 6 — F3: implement guarded reset and independently observed start (2 paths)
+
+**Source admission:** Complete after independent review and corrective round1. The fixed runner compiles; exact saves-parent authority precedes native creation, unused close performs no writes, and independent guarded cleanup preserves the primary error. Always-active checks and actual filesystem/native close/refusal, strict physics, complete inventory/menu synchronization and repeated-start evidence must execute in F4. Unchecked execution steps remain required; compilation is not runtime acceptance.
 
 **Files:** create `G/ScenarioRunner.java`; modify `G/ScenarioDefinition.java` only for concrete neutral values consumed here.
 
