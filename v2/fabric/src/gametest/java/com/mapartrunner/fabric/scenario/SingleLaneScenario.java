@@ -17,8 +17,11 @@ import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.block.Blocks;
 import net.minecraft.client.gui.screen.GameMenuScreen;
 import net.minecraft.client.world.ClientWorld;
+import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.network.ClientPlayerEntity;
 import net.minecraft.client.network.ClientPlayNetworkHandler;
 import net.minecraft.network.ClientConnection;
+import net.minecraft.server.MinecraftServer;
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
@@ -28,9 +31,12 @@ import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.ChunkPos;
 import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.Hand;
+import net.minecraft.util.WorldSavePath;
 import net.minecraft.world.GameMode;
 import net.minecraft.world.TeleportTarget;
 import net.minecraft.world.World;
+import net.minecraft.world.chunk.ChunkStatus;
+import net.minecraft.world.gen.chunk.FlatChunkGenerator;
 
 import java.io.IOException;
 import java.io.PrintWriter;
@@ -176,6 +182,33 @@ final class SingleLaneScenario {
     }
 
     private void setup() {
+        var ownedServer = world.getServer().computeOnServer(server -> {
+            require(server.getOverworld().getSeed() == 1, "Fixture seed is not 1: " + server.getOverworld().getSeed());
+            require(server.getOverworld().getChunkManager().getChunkGenerator() instanceof FlatChunkGenerator, "Fixture is not FLAT");
+            return server;
+        });
+        final Path ownedSave;
+        try {
+            ownedSave = world.getWorldSave().getSaveDirectory().toRealPath();
+            var saves = FabricLoader.getInstance().getGameDir().resolve("saves").toRealPath();
+            require(ownedSave.startsWith(saves) && !ownedSave.equals(saves)
+                    && ownedServer.getSavePath(WorldSavePath.ROOT).toRealPath().equals(ownedSave), "Unowned fixture save: " + ownedSave);
+        } catch (IOException error) { throw new UncheckedIOException(error); }
+        // Bind this creation before writes; closeOwned clears these only after native disposal.
+        var ownedPlayer = context.computeOnClient(client -> {
+            require(client.getServer() == ownedServer && client.world != null && client.world.getRegistryKey().equals(World.OVERWORLD)
+                    && client.player != null && client.player.getEntityWorld() == client.world
+                    && client.getNetworkHandler() != null, "Missing owned fixture client binding");
+            bound = client.world; boundHandler = client.getNetworkHandler(); boundConnection = boundHandler.getConnection();
+            require(boundConnection.isOpen(), "Closed owned fixture connection");
+            return client.player;
+        });
+        var before = context.computeOnClient(client -> {
+            requireFixtureBinding(client, ownedServer, ownedPlayer);
+            return fixtureProblem(client.world);
+        });
+        note("FIXTURE BEFORE writes; save=" + ownedSave + "; consistent FLAT/seed=1; problem=" + before);
+        require(before != null, "Fresh owned fixture unexpectedly ready before writes");
         world.getServer().runOnServer(server -> {
             var level = server.getOverworld();
             require(level.getSeed() == 1, "Fixture seed is not 1: " + level.getSeed());
@@ -203,27 +236,39 @@ final class SingleLaneScenario {
             p.getInventory().markDirty(); p.currentScreenHandler.sendContentUpdates();
             require(p.teleport(level,.5,66,2.5,java.util.Set.of(),0,60,false), "Setup teleport rejected");
         });
-        context.runOnClient(client -> client.player.getInventory().setSelectedSlot(fixture.selected()));
-        context.waitFor(client -> client.player != null && client.interactionManager != null && client.currentScreen == null
-                && !client.isPaused() && client.interactionManager.getCurrentGameMode() == GameMode.SURVIVAL
-                && client.player.squaredDistanceTo(.5,66,2.5) < .0001 && Math.abs(client.player.getYaw()) < .01
-                && client.player.getInventory().getSelectedSlot()==fixture.selected() && client.player.getInventory().getStack(0).isOf(Items.STONE)
-                && client.player.getInventory().getStack(0).getCount()==7 && client.player.getInventory().getStack(1).isOf(fixture.usableItem())
-                && client.player.getInventory().getStack(1).getCount()==fixture.stock() && client.player.isOnGround(), WAIT);
         context.runOnClient(client -> {
-            bound = client.world;
-            boundHandler=client.getNetworkHandler(); boundConnection=boundHandler.getConnection();
+            requireFixtureBinding(client, ownedServer, ownedPlayer);
+            client.player.getInventory().setSelectedSlot(fixture.selected());
+        });
+        final int waited;
+        try {
+            waited = context.waitFor(client -> {
+                requireFixtureBinding(client, ownedServer, ownedPlayer);
+                return client.interactionManager != null && client.currentScreen == null
+                        && !client.isPaused() && client.interactionManager.getCurrentGameMode() == GameMode.SURVIVAL
+                        && client.player.squaredDistanceTo(.5,66,2.5) < .0001 && Math.abs(client.player.getYaw()) < .01
+                        && client.player.getInventory().getSelectedSlot()==fixture.selected() && client.player.getInventory().getStack(0).isOf(Items.STONE)
+                        && client.player.getInventory().getStack(0).getCount()==7 && client.player.getInventory().getStack(1).isOf(fixture.usableItem())
+                        && client.player.getInventory().getStack(1).getCount()==fixture.stock() && client.player.isOnGround()
+                        && fixtureProblem(client.world) == null;
+            }, WAIT);
+        } catch (RuntimeException | Error primary) {
+            try {
+                note("FIXTURE readiness failed; waitFor did not return; budgetTicks=" + WAIT + "; before=" + before
+                        + "; " + context.computeOnClient(client -> fixtureDiagnostic(client, ownedServer, ownedPlayer)));
+            } catch (RuntimeException | Error diagnostic) { primary.addSuppressed(diagnostic); }
+            throw primary;
+        }
+        context.runOnClient(client -> {
+            requireFixtureBinding(client, ownedServer, ownedPlayer);
             clientReach = client.player.getBlockInteractionRange();
             require(!client.player.getAbilities().flying && !client.player.getAbilities().allowFlying, "Not ordinary survival");
-            for (int x=-2;x<=13;x++) for (int z=-2;z<=6;z++) {
-                require(client.world.getBlockState(new BlockPos(x,64,z)).isOf(Blocks.BEDROCK), "Client floor mismatch");
-                boolean stone = initiallyStone(x,z);
-                require(stone ? client.world.getBlockState(new BlockPos(x,65,z)).isOf(Blocks.STONE)
-                        : client.world.getBlockState(new BlockPos(x,65,z)).isAir(), "Client initial target/apron mismatch");
-                for (int y=66;y<=70;y++) require(client.world.getBlockState(new BlockPos(x,y,z)).isAir(), "Client clearance mismatch");
-            }
+            var problem = fixtureProblem(client.world);
+            require(problem == null, "Client fixture mismatch: " + problem);
             for (int slot=2;slot<client.player.getInventory().size();slot++) require(client.player.getInventory().getStack(slot).isEmpty(), "Client extra inventory");
         });
+        note("FIXTURE READY; elapsedTicks=" + waited + "; before=" + before + "; "
+                + context.computeOnClient(client -> fixtureDiagnostic(client, ownedServer, ownedPlayer)));
         serverReach = world.getServer().computeOnServer(server -> {
             var p = server.getPlayerManager().getPlayerList().getFirst();
             require(p.interactionManager.getGameMode()==GameMode.SURVIVAL && !p.getAbilities().flying
@@ -244,6 +289,39 @@ final class SingleLaneScenario {
         context.waitTicks(3);
         note("INITIAL VALIDATED: survival; seed=1; player=.5,66,2.5; yaw=0; selected="+fixture.selected()+"; matching stone sentinel=7; usable="
                 + fixture.usableItem()+fixture.stock() + "; measured clientReach=" + clientReach + "; serverReach=" + serverReach);
+    }
+
+    private void requireFixtureBinding(MinecraftClient client, MinecraftServer ownedServer, ClientPlayerEntity ownedPlayer) {
+        require(client.getServer() == ownedServer && client.world == bound && client.player == ownedPlayer
+                && ownedPlayer.getEntityWorld() == bound && client.getNetworkHandler() == boundHandler
+                && boundHandler.getConnection() == boundConnection && boundConnection.isOpen(), "Owned fixture binding replaced");
+    }
+
+    private String fixtureProblem(ClientWorld level) {
+        if (level == null) return "world=null; expected owned overworld";
+        for (int x=-1;x<=0;x++) for (int z=-1;z<=0;z++)
+            if (level.getChunkManager().getChunk(x,z,ChunkStatus.FULL,false) == null)
+                return "chunk=" + x + "," + z + "; expected=FULL; actual=unloaded";
+        for (int x=-2;x<=13;x++) for (int z=-2;z<=6;z++) for (int y=64;y<=70;y++) {
+            var pos = new BlockPos(x,y,z);
+            var actual = level.getBlockState(pos);
+            var expected = y==64 ? Blocks.BEDROCK : y==65 && initiallyStone(x,z) ? Blocks.STONE : Blocks.AIR;
+            if (!(expected == Blocks.AIR ? actual.isAir() : actual.isOf(expected)))
+                return "chunk=" + (x>>4) + "," + (z>>4) + "; pos=" + pos + "; expected=" + expected.getDefaultState() + "; actual=" + actual;
+        }
+        return null;
+    }
+
+    private String fixtureDiagnostic(MinecraftClient client, MinecraftServer ownedServer, ClientPlayerEntity ownedPlayer) {
+        var chunks = new StringBuilder();
+        for (int x=-1;x<=0;x++) for (int z=-1;z<=0;z++) chunks.append(x).append(',').append(z).append('=')
+                .append(client.world != null && client.world.getChunkManager().getChunk(x,z,ChunkStatus.FULL,false) != null).append(';');
+        return "serverMatches=" + (client.getServer()==ownedServer) + "; world=" + System.identityHashCode(client.world)
+                + "; ownedWorld=" + System.identityHashCode(bound) + "; dimension=" + (client.world==null?null:client.world.getRegistryKey())
+                + "; playerMatches=" + (client.player==ownedPlayer) + "; playerWorldMatches=" + (ownedPlayer.getEntityWorld()==bound)
+                + "; handlerMatches=" + (client.getNetworkHandler()==boundHandler)
+                + "; connectionMatches=" + (client.getNetworkHandler()!=null && client.getNetworkHandler().getConnection()==boundConnection)
+                + "; connectionOpen=" + boundConnection.isOpen() + "; FULL chunks=" + chunks + "; problem=" + fixtureProblem(client.world);
     }
 
     private void start() {

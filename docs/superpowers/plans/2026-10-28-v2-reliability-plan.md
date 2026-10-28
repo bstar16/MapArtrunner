@@ -144,9 +144,9 @@ Execute the reviewed [focused tick-boundary plan](2026-10-28-v2-tick-boundary.md
 
 - [x] Test stop/pause/world loss releasing controls, old effect rejection, native/travel exclusivity, and accepted placement remaining pending.
 - [x] Wire native inputs, item selection and actual placement effects. Preserve correct yaw/head/body behavior and report unavailable observations honestly.
-- [x] Execute a real single-lane game test with sufficient inventory, assert server blocks independently, and deliberately withhold a confirmation to prove it cannot falsely pass. Commit.
+- [x] Execute a real single-lane game test with sufficient inventory, assert server blocks independently, and deliberately withhold a confirmation to prove it cannot falsely pass. Commit. The reopened normal-native-negative gate is satisfied by the current imported stack, not by relabeling the old crashed child.
 
-Verified: all twelve focused tasks and the independent whole-6c review passed at17a87ac0d73d3d364eca8723cd7d048afbc8077f (draft PR251). Fresh local core327+Fabric187=514 tests had zero failures/errors/skips; gametest compilation and release remap actually executed, with test hooks excluded. Real survival lane, lifecycle, held-response, sustained missing-observation, computed-decision invalidation and actual missing-state/latest-prediction proofs include independent server checks and a specific external negative plus separate full15-lane-case recovery. Both exact-head hosted checks pass. Production OBSERVED remains loaded-client/nonpending evidence, DELTA is compile-only, and known host/default-sprint/disconnect-hook/installed-release limits remain disclosed. This accepts a programmatic single lane; real import6d, full traversal/parity and replacement are still open.
+Verification: the original 6c source review and historical core327+Fabric187=514 results remain recorded at17a87ac (draft PR251). The later raw-child correction remains valid: old5efb was actual gamechild0xC0000409 despite outer1. New current-stack forced launch `efa4c27c-39b9-45f2-bfbc-8c1535461ee4` has the specific TARGET_CHUNK_RELOAD primary and genuine normal child1/outer1/no timeout, followed by separate unflagged recovery `857eb615-c525-4fe2-9953-fd4c4209b5c5` with all17 cases passing/normal0. Independent whole-6d review at859019b approved this evidence refresh and closes parent6c. Historical failures remain failures. OBSERVED is loaded-client/nonpending evidence, DELTA is compile-only, and broader traversal/parity/replacement gates remain pending.
 
 ### 6d. Import a real schematic into the neutral plan
 
@@ -154,11 +154,13 @@ Verified: all twelve focused tasks and the independent whole-6c review passed at
 
 **Interface:** `SchematicPlanImporter.importPlan(Path path)` returns the Task 3 `BuildPlan` with stable IDs, dimensions, block specifications and normalized fingerprint. File parsing/block registry conversion remain in Fabric; core has no file or registry access.
 
-- [ ] Port the reference loader's supported flat formats and traversal/material interpretation, with explicit errors for malformed/unsupported content. Exercise a real checked-in schematic, not only a constructed Java plan.
-- [ ] Verify target IDs/coordinates/dimensions and material resolution; all-air input must yield a nothing-to-build outcome without controls. Verify a modified input changes the fingerprint.
-- [ ] Run the actual single-lane fixture through import and production execution. Review and commit.
+- [x] Port the reference loader's supported flat formats and traversal/material interpretation, with explicit errors for malformed/unsupported content. Exercise a real checked-in schematic, not only a constructed Java plan.
+- [x] Verify target IDs/coordinates/dimensions and material resolution; all-air input must yield a nothing-to-build outcome without controls. Verify a modified input changes the fingerprint.
+- [x] Run the actual single-lane fixture through import and production execution. Review and commit.
 
 **Checkpoint B:** a real imported one-lane schematic builds through v2 production decisions. The ledger, not traversal completion, determines success.
+
+Verified at859019b after independent task and whole-6d Spec PASS/Quality Approved reviews. Both supported real compressed formats, full state/coordinate/material/hash metadata and actual empty SUCCESS/NOTHING_TO_BUILD passed; all17 managed cases passed in the separate final recovery. Focused19 and historical settled533 units, final native1/1/0, current release exclusion and exact limitations are recorded in [testing evidence](../../../v2/docs/testing.md#current-schematic-import-evidence). Normal commands, multi-lane reset, broad placement parity and replacement remain later tasks.
 
 ## Task 7: Automate two-lane setup, reset, and rerun
 
