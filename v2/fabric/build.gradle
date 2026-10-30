@@ -31,6 +31,10 @@ loom {
     runs.configureEach {
         runDir "build/run/${name}"
     }
+    runs.named('clientGameTest') {
+        property 'mapart.test.scenario', providers.gradleProperty('mapart.test.scenario').getOrElse('all')
+        property 'mapart.test.repeat', providers.gradleProperty('mapart.test.repeat').getOrElse('2')
+    }
 }
 
 sourceSets.test.resources.srcDir rootProject.file('test-fixtures')
