@@ -6,6 +6,10 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import com.mapartrunner.core.model.BuildPlan;
 import com.mapartrunner.core.model.BuildPlan.*;
+import com.mapartrunner.core.movement.MovementPolicy.PlayerObservation;
+import com.mapartrunner.core.movement.MovementPolicy.SupportObservation;
+import com.mapartrunner.core.run.BuildEngine;
+import com.mapartrunner.core.run.ForwardTraversal;
 import com.mapartrunner.core.traversal.LanePlanner;
 import com.mapartrunner.core.traversal.LanePlanner.*;
 import net.minecraft.Bootstrap;
@@ -154,6 +158,43 @@ class TraversalFixtureTest {
     }
 
     @Test
+    void scale128DataAndImportReceipts() throws Exception {
+        var expected = new ArrayList<Target>();
+        for (int z = 0; z < 128; z++) {
+            for (int step = 0; step < 128; step++) {
+                expected.add(new Target(expected.size(), new GridPos(z % 2 == 0 ? step : 127 - step, 0, z), STONE));
+            }
+        }
+        var centers = List.of(2, 7, 12, 17, 22, 27, 32, 37, 42, 47, 52, 57, 62,
+                67, 72, 77, 82, 87, 92, 97, 102, 107, 112, 117, 122, 125);
+        var missing = new HashSet<GridPos>();
+        centers.forEach(center -> missing.add(new GridPos(64, 0, center - 2)));
+        missing.add(new GridPos(0, 0, 0));
+        missing.add(new GridPos(127, 0, 127));
+        assertEquals(28, missing.size());
+        var plan = verify("traversal-scale-128", 128, 128, 129, 129, .5, 2.5,
+                expected, centers, missing, Set.of(), null,
+                "62646be30be46a1dee74b68a5c7c78a0da19f44cb096ee868cb5031f539598a1",
+                "2323eb38294fc2b357d6cbd8238e51bc10f77a06b4ce20f37d5dd9c697cc93f5",
+                "e3df3b474e658d012264b501e5afffb8c30af42b5b73dfc1d586aad83ac778ff");
+        assertEquals(16384, plan.targets().size());
+        var lanes = new LanePlanner().plan(plan, 2, 5);
+        assertEquals(new Corridor(0, 127, 123, 127), lanes.getLast().corridor());
+        for (var lane : lanes) {
+            assertSame(lanes.getFirst().expectedFloor(), lane.expectedFloor());
+            assertTrue(missing.contains(new GridPos(64, 0, lane.corridor().minZ())));
+        }
+        var unfinished = plan.targets().stream().filter(target -> missing.contains(target.relativePos())).toList();
+        assertEquals(28, unfinished.size());
+        var traversal = new ForwardTraversal(lanes, plan.dimensions(), false);
+        var selection = traversal.advance(new PlayerObservation(.5, 1, 2.5, -90),
+                new SupportObservation(Map.of()), Set.of(), unfinished);
+        assertEquals(ForwardTraversal.Pass.FORWARD, traversal.snapshot().pass());
+        assertEquals(0, traversal.snapshot().laneIndex());
+        assertEquals(lanes.getFirst(), selection.decisionInput().orElseThrow().lane(), "canonical lane 0/start selection");
+    }
+
+    @Test
     void receiptPreconditionsRejectUnsortedKeysPositionsAndInventory() {
         assertThrows(AssertionError.class, () -> assertSortedKeys(JsonParser.parseString("{\"z\":0,\"a\":0}")));
         var positions = JsonParser.parseString("[{\"position\":{\"x\":1,\"y\":0,\"z\":0}},"
@@ -216,9 +257,12 @@ class TraversalFixtureTest {
             assertEquals(expectedLateRemoval, definition.get("lateRemoval"), "closed late-removal metadata contract");
         }
         assertEquals("mapartrunner-" + name + "-v1", definition.get("schema").getAsString());
-        for (String inherited : List.of("settings", "physics", "budgets")) {
+        for (String inherited : List.of("settings", "physics")) {
             assertEquals(baseline.get(inherited), definition.get(inherited), inherited);
         }
+        var budgets = baseline.getAsJsonObject("budgets").deepCopy();
+        if (name.equals("traversal-scale-128")) budgets.addProperty("runTicks", 109468);
+        assertEquals(budgets, definition.get("budgets"), "bounded physics waitTick iterations; small fixtures retain 1200");
         var player = baseline.getAsJsonObject("player").deepCopy();
         player.add("position", JsonParser.parseString("{\"x\":" + playerX + ",\"y\":66.0,\"z\":" + playerZ + "}"));
         assertEquals(player, definition.get("player"), "complete inherited player/inventory/readiness contract");
@@ -241,6 +285,13 @@ class TraversalFixtureTest {
         assertEquals(fingerprint, schematic.get("normalizedFingerprint").getAsString());
         assertEquals(new GridSize(width, 1, depth), plan.dimensions());
         assertEquals(expected, plan.targets(), "importer IDs retain serpentine order, separate from JSON XYZ order");
+        if (name.equals("traversal-scale-128")) {
+            var settings = definition.getAsJsonObject("settings");
+            var fixtureSettings = new BuildEngine.Settings(settings.get("halfWidth").getAsInt(), settings.get("stride").getAsInt(),
+                    settings.get("constantSprint").getAsBoolean(), settings.get("reservedHotbarSlots").getAsInt());
+            // Eligible callbacks and physics waitTick iterations are separate budgets, neither a measured duration.
+            assertEquals(109468L, BuildEngine.runLimit(plan, fixtureSettings));
+        }
         var targetStates = new HashMap<GridPos, BlockSpec>();
         for (Target target : expected) targetStates.put(target.relativePos(), target.block());
         assertEquals(targetStates, blocks(schematic.getAsJsonArray("expectedTargets")));
@@ -267,12 +318,14 @@ class TraversalFixtureTest {
         assertEquals(new GridPos(maxX, 70, maxZ), position(region.getAsJsonObject("max")));
         var worldBlocks = blocks(world.getAsJsonArray("blocks"));
         assertEquals((maxX + 3) * 7 * (maxZ + 3), worldBlocks.size());
+        var seededTargets = new HashSet<>(targetStates.keySet());
+        seededTargets.removeAll(missing);
         int seeded = 0;
         for (int x = -2; x <= maxX; x++) {
             for (int y = 64; y <= 70; y++) {
                 for (int z = -2; z <= maxZ; z++) {
                     var relative = new GridPos(x, y - 65, z);
-                    boolean stone = targetStates.containsKey(relative) && !missing.contains(relative);
+                    boolean stone = seededTargets.contains(relative);
                     String id = y == 64 ? "minecraft:bedrock"
                             : stone || nonTargetSupport.contains(relative) ? "minecraft:stone" : "minecraft:air";
                     assertEquals(new BlockSpec(id, Map.of()), worldBlocks.get(new GridPos(x, y, z)),
