@@ -29,7 +29,7 @@ public final class GroundedSmokeGameTest implements FabricClientGameTest {
         }
         try { runner.close(); }
         catch (RuntimeException | Error error) { if (failure==null) failure=error; else failure.addSuppressed(error); }
-        try { runner.invocationOutcome(failure); }
+        try { runner.invocationOutcome(failure,2); }
         catch (RuntimeException | Error error) { if (failure==null) failure=error; else failure.addSuppressed(error); }
         if (failure instanceof Error error) throw error;
         if (failure!=null) throw (RuntimeException)failure;

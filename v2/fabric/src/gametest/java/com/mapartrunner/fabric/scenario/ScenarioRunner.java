@@ -190,6 +190,7 @@ final class ScenarioRunner implements AutoCloseable {
         verifySuccessOracleGuards();
         verifySupportGuards();
         verifyCloseGuards();
+        verifyInvocationOutcomeGuards();
         var restores=new int[1];
         var check = r.evidence.resolve("archive-self-check-" + token);
         checkedDirectory(r, check);
@@ -1033,11 +1034,46 @@ final class ScenarioRunner implements AutoCloseable {
         assertedSuccesses.add(result);
     }
 
-    void invocationOutcome(Throwable failure) {
+    private static void verifyInvocationOutcomeGuards() {
+        var dirty=UUID.randomUUID();
+        for (int expected:List.of(1,2)) {
+            require(invocationSucceeded(expected,expected+1,expected,expected,true,dirty,dirty),
+                    "Valid expected counted-run total rejected: "+expected);
+            for (int delta:List.of(-1,1)) {
+                require(!invocationSucceeded(expected,expected+1+delta,expected,expected,true,dirty,dirty),
+                        "Missing/extra owned start accepted");
+                require(!invocationSucceeded(expected,expected+1,expected+delta,expected,true,dirty,dirty),
+                        "Missing/extra counted start accepted");
+                require(!invocationSucceeded(expected,expected+1,expected,expected+delta,true,dirty,dirty),
+                        "Missing/extra counted assertion accepted");
+            }
+            require(!invocationSucceeded(expected,expected+1,expected,expected,false,dirty,dirty),
+                    "Invocation without normal close accepted");
+            require(!invocationSucceeded(expected,expected+1,expected,expected,true,null,null)
+                            && !invocationSucceeded(expected,expected+1,expected,expected,true,dirty,null)
+                            && !invocationSucceeded(expected,expected+1,expected,expected,true,dirty,UUID.randomUUID()),
+                    "Invocation without exact dirty-response release accepted");
+        }
+        for (int expected:List.of(-1,0,3))
+            require(!invocationSucceeded(expected,expected+1,expected,expected,true,dirty,dirty),
+                    "Out-of-range expected counted-run total accepted: "+expected);
+        require(!invocationSucceeded(2,2,1,1,true,dirty,dirty),"Requested two counted runs accepted only one");
+    }
+
+    private static boolean invocationSucceeded(int expectedCountedRuns, int ownedStarts, int countedStarts,
+                                               int assertedSuccesses, boolean normalClose, UUID dirtyResponseRun,
+                                               UUID releasedFailedRun) {
+        return expectedCountedRuns>=1 && expectedCountedRuns<=2 && normalClose
+                && ownedStarts==expectedCountedRuns+1 && countedStarts==expectedCountedRuns
+                && assertedSuccesses==expectedCountedRuns
+                && dirtyResponseRun!=null && dirtyResponseRun.equals(releasedFailedRun);
+    }
+
+    void invocationOutcome(Throwable failure, int expectedCountedRuns) {
         Throwable outcome=failure;
-        if (outcome==null && !(normalClose && runs.size()==3 && countedStarts==2 && assertedSuccesses.size()==2
-                && dirtyResponseRun!=null && dirtyResponseRun.equals(releasedFailedRun)))
-            outcome=new AssertionError("Invocation PASS lacks three starts/two assertions/normal close");
+        if (outcome==null && !invocationSucceeded(expectedCountedRuns,runs.size(),countedStarts,assertedSuccesses.size(),
+                normalClose,dirtyResponseRun,releasedFailedRun))
+            outcome=new AssertionError("Invocation PASS lacks expected starts/assertions/normal close");
         var result=new JsonObject(); result.addProperty("status",outcome==null?"PASS":"FAIL");
         result.addProperty("invocation",invocation.toString()); result.addProperty("normalClose",normalClose);
         result.addProperty("ownedSave",save==null?null:save.toString());
