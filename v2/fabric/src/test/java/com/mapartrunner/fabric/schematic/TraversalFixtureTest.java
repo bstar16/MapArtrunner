@@ -21,6 +21,7 @@ import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
@@ -59,6 +60,46 @@ class TraversalFixtureTest {
     }
 
     @Test
+    void reverseOddDataAndImportReceipts() throws Exception {
+        verify("traversal-reverse-odd", 12, 15, 13, 16, 0.5, 2.5, 3,
+                Set.of(new GridPos(0, 0, 0)), JsonParser.parseString("""
+                {
+                  "arm": {
+                    "laneId": 2, "pass": "FORWARD", "stage": "WALK",
+                    "playerX": {"comparison": ">=", "value": 8.0},
+                    "requireBeyondActualInteractionRange": true
+                  },
+                  "relativeTarget": {"x": 6, "y": 0, "z": 5},
+                  "requiredForwardLaneIdsBeforeCleanup": [0, 1, 2],
+                  "testCreatedReplacement": false
+                }
+                """).getAsJsonObject(),
+                "e87c400b443e7e55b87e9aa5b04d44b34dcb27eeeefb8def1e4ece43f2b30bfc",
+                "b64b033937d160bc2385840b851a82c0a3fe3dd66ff68bcfc1965ed4f3039c48",
+                "8a70a76a79075bc381eb3f2bb479b939027398e62599468c07e3e91f85ee0cc6");
+    }
+
+    @Test
+    void reverseEvenDataAndImportReceipts() throws Exception {
+        verify("traversal-reverse-even", 12, 20, 13, 21, 0.5, 2.5, 4,
+                Set.of(new GridPos(0, 0, 0)), JsonParser.parseString("""
+                {
+                  "arm": {
+                    "laneId": 3, "pass": "FORWARD", "stage": "WALK",
+                    "playerX": {"comparison": "<=", "value": 3.5},
+                    "requireBeyondActualInteractionRange": true
+                  },
+                  "relativeTarget": {"x": 6, "y": 0, "z": 5},
+                  "requiredForwardLaneIdsBeforeCleanup": [0, 1, 2, 3],
+                  "testCreatedReplacement": false
+                }
+                """).getAsJsonObject(),
+                "09ead26cc29971b81d9d536a5122c66cf2eef393a629a8f654e8307ac5796fe2",
+                "536f67248eb87506353a3e2486126936f5b4ba5140e733fcb806ea59a7193f3b",
+                "4c18b40851d6f7becfa4e9e88710dbf5c57f774706a897b56293930417dc1db4");
+    }
+
+    @Test
     void receiptPreconditionsRejectUnsortedKeysPositionsAndInventory() {
         assertThrows(AssertionError.class, () -> assertSortedKeys(JsonParser.parseString("{\"z\":0,\"a\":0}")));
         var positions = JsonParser.parseString("[{\"position\":{\"x\":1,\"y\":0,\"z\":0}},"
@@ -71,6 +112,13 @@ class TraversalFixtureTest {
     private void verify(String name, int width, int depth, int maxX, int maxZ,
                         double playerX, double playerZ, int laneCount, Set<GridPos> missing,
                         String definitionHash, String sourceHash, String fingerprint) throws Exception {
+        verify(name, width, depth, maxX, maxZ, playerX, playerZ, laneCount, missing, null,
+                definitionHash, sourceHash, fingerprint);
+    }
+
+    private void verify(String name, int width, int depth, int maxX, int maxZ,
+                        double playerX, double playerZ, int laneCount, Set<GridPos> missing,
+                        JsonObject expectedLateRemoval, String definitionHash, String sourceHash, String fingerprint) throws Exception {
         var definition = definition("/" + name + "/definition.json");
         assertSortedKeys(definition);
         assertPositionOrder(definition.getAsJsonObject("world").getAsJsonArray("blocks"));
@@ -80,7 +128,14 @@ class TraversalFixtureTest {
         assertEquals(definitionHash, sha256(definition.toString().getBytes(StandardCharsets.UTF_8)));
 
         var baseline = definition("/grounded-two-lane/definition.json");
-        assertEquals(baseline.keySet(), definition.keySet());
+        if (expectedLateRemoval == null) {
+            assertEquals(baseline.keySet(), definition.keySet());
+        } else {
+            var keys = new HashSet<>(baseline.keySet());
+            keys.add("lateRemoval");
+            assertEquals(keys, definition.keySet());
+            assertEquals(expectedLateRemoval, definition.get("lateRemoval"), "closed late-removal metadata contract");
+        }
         assertEquals("mapartrunner-" + name + "-v1", definition.get("schema").getAsString());
         for (String inherited : List.of("settings", "physics", "budgets")) {
             assertEquals(baseline.get(inherited), definition.get(inherited), inherited);
@@ -155,8 +210,14 @@ class TraversalFixtureTest {
         assertEquals(baseline.getAsJsonObject("expectedResult").keySet(), result.keySet());
         assertEquals(width * depth, result.get("targets").getAsInt());
         assertEquals(seeded, result.get("seededTargets").getAsInt());
-        assertEquals(missing.size(), result.get("placements").getAsInt());
-        assertEquals(128 - missing.size(), result.get("usableRemainder").getAsInt());
+        if (expectedLateRemoval == null) {
+            assertEquals(missing.size(), result.get("placements").getAsInt());
+            assertEquals(128 - missing.size(), result.get("usableRemainder").getAsInt());
+        } else {
+            int placements = missing.size() + 1;
+            assertEquals(placements, result.get("placements").getAsInt());
+            assertEquals(128 - placements, result.get("usableRemainder").getAsInt());
+        }
         assertEquals(7, result.get("reservedRemainder").getAsInt());
 
         var lanes = new LanePlanner().plan(plan, 2, 5);
@@ -171,6 +232,22 @@ class TraversalFixtureTest {
             assertEquals(new Corridor(0, width - 1, Math.max(0, center - 2), Math.min(depth - 1, center + 2)), lane.corridor());
             assertEquals(targetStates.keySet(), lane.expectedFloor().targetsByPosition().keySet());
             for (Target target : expected) assertEquals(target, lane.expectedFloor().targetsByPosition().get(target.relativePos()));
+        }
+        if (expectedLateRemoval != null) {
+            var target = position(definition.getAsJsonObject("lateRemoval").getAsJsonObject("relativeTarget"));
+            assertFalse(missing.contains(target), "late removal must not influence initial smart selection");
+            assertEquals(STONE, targetStates.get(target));
+            assertEquals(STONE, worldBlocks.get(new GridPos(target.x(), 65 + target.y(), target.z())));
+            assertEquals(List.of(1), lanes.stream().filter(lane -> target.x() >= lane.corridor().minX()
+                    && target.x() <= lane.corridor().maxX() && target.z() >= lane.corridor().minZ()
+                    && target.z() <= lane.corridor().maxZ()).map(Lane::id).toList());
+            for (var lane : lanes) {
+                assertTrue(Math.abs(target.z() - lane.start().z()) > 1,
+                        "removal avoids centerline and neighboring walking support cells");
+                assertTrue(Math.abs(target.x() - lane.start().x()) > 1
+                        && Math.abs(target.x() - lane.end().x()) > 1,
+                        "removal avoids end-transition walking support cells");
+            }
         }
     }
 
