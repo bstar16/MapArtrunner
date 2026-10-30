@@ -19,6 +19,65 @@ class ForwardTraversalTest {
     private static final BlockSpec AIR = new BlockSpec("minecraft:air", Map.of());
     private static final SupportObservation UNKNOWN = new SupportObservation(Map.of());
 
+    @Test void uncoveredUsefulTargetCannotBecomeCompletion() {
+        var plan = plan(10);
+        var lanes = new LanePlanner().plan(plan, 2, 5);
+        var owner = new ForwardTraversal(List.of(lanes.getFirst()), plan.dimensions(), true);
+        var outside = plan.targets().stream().filter(t -> t.relativePos().z() == 7).findFirst().orElseThrow();
+        var result = owner.advance(new PlayerObservation(.5, 1, 2.5, -90), UNKNOWN, Set.of(), List.of(outside));
+        assertTrue(result.uncoveredTargets()); assertFalse(result.traversalComplete());
+        assertTrue(result.movement().isEmpty()); assertTrue(result.decisionInput().isEmpty());
+        assertEquals(Pass.SELECTING, owner.snapshot().pass());
+    }
+
+    @Test void selectedDecisionInputRetainsGeometryAndPreFailureCounters() {
+        var plan = plan(10); var lanes = new LanePlanner().plan(plan, 2, 5);
+        var owner = new ForwardTraversal(lanes, plan.dimensions(), true);
+        assertTrue(owner.advanceWithoutPlayer().decisionInput().isEmpty());
+        var target = plan.targets().stream().filter(t -> t.relativePos().equals(new GridPos(6, 0, 7))).findFirst().orElseThrow();
+        var player = new PlayerObservation(6.5, 1, 7.5, 90);
+        var selected = owner.advance(player, UNKNOWN, Set.of(), List.of(target));
+        var canonical = lanes.get(1);
+        var partial = new Lane(1, Direction.WEST, new GridPos(6, 0, 7), new GridPos(0, 0, 7),
+                canonical.corridor(), canonical.expectedFloor());
+        assertEquals(new LaneEntry(partial, Stage.ENTER_POSITION, 0, 0, 0, 0, 0, Set.of(), true),
+                selected.decisionInput().orElseThrow());
+        assertEquals(1, owner.snapshot().laneIndex());
+        assertEquals(Stage.ENTER_YAW, owner.snapshot().entry().stage());
+        owner.advance(player, UNKNOWN, Set.of(), List.of(target));
+        owner.advance(player, UNKNOWN, Set.of(), List.of(target));
+        var missing = observed(plan, AIR);
+        for (int i = 0; i < 39; i++) owner.advance(player, missing, Set.of(), List.of(target));
+        var before = owner.snapshot().entry();
+        assertEquals(39, before.supportHoldTicks());
+        var failed = owner.advance(player, missing, Set.of(), List.of(target));
+        assertEquals(Failure.SUPPORT_TIMEOUT, failed.movement().orElseThrow().failure());
+        assertEquals(before, failed.decisionInput().orElseThrow());
+        assertEquals(partial, failed.decisionInput().orElseThrow().lane());
+        assertEquals(0, failed.movement().orElseThrow().nextSupportHoldTicks());
+        assertEquals(0, owner.snapshot().entry().supportHoldTicks());
+        assertEquals(new GridPos(11, 0, 7), canonical.start());
+    }
+
+    @Test void partialEntryStillContinuesThroughCleanCanonicalLanes() {
+        var plan = plan(10); var lanes = new LanePlanner().plan(plan, 2, 5);
+        var owner = new ForwardTraversal(lanes, plan.dimensions(), true);
+        var target = plan.targets().stream().filter(t -> t.relativePos().equals(new GridPos(6, 0, 2))).findFirst().orElseThrow();
+        var floor = observed(plan, STONE);
+        owner.advance(new PlayerObservation(6.5, 1, 2.5, -90), floor, Set.of(), List.of(target));
+        assertEquals(new GridPos(6, 0, 2), owner.snapshot().entry().lane().start());
+        assertEquals(new GridPos(0, 0, 2), lanes.getFirst().start());
+        advance(owner, new GridPos(6, 0, 2), Direction.EAST, floor, Set.of());
+        advance(owner, new GridPos(6, 0, 2), Direction.EAST, floor, Set.of());
+        advance(owner, lanes.getFirst().end(), Direction.EAST, floor, Set.of());
+        ready(owner, lanes.getFirst().end(), Direction.EAST, floor, Set.of());
+        ready(owner, lanes.getFirst().end(), Direction.SOUTH, floor, Set.of());
+        owner.advance(new PlayerObservation(11.5, 1, 7.5, 0), floor, Set.of(), List.of());
+        assertEquals(Substage.NEXT_ENTRY, owner.snapshot().substage());
+        assertEquals(lanes.get(1), owner.snapshot().entry().lane());
+        assertEquals(new GridPos(11, 0, 7), owner.snapshot().entry().lane().start());
+    }
+
     @Test void movementDebtSurvivesHoldsAbsenceAndEntryUntilNextLaneIsReady() {
         var plan = plan(10); var lanes = new LanePlanner().plan(plan, 2, 5);
         var owner = new ForwardTraversal(lanes, plan.dimensions(), true);
@@ -34,7 +93,7 @@ class ForwardTraversalTest {
             assertEquals(10, owner.snapshot().walkNoProgressTicks());
         }
         for (int i = 0; i < 3; i++) {
-            var held = owner.advance(new PlayerObservation(.5, 1, 2.5, 0), floor, Set.of());
+            var held = owner.advance(new PlayerObservation(.5, 1, 2.5, 0), floor, Set.of(), plan.targets());
             assertEquals(Status.HOLDING_YAW, held.movement().orElseThrow().status());
             assertEquals(i + 1, owner.snapshot().entry().yawHoldTicks());
             assertEquals(10, owner.snapshot().walkNoProgressTicks());
@@ -42,7 +101,7 @@ class ForwardTraversalTest {
         advance(owner, lanes.getFirst().start(), Direction.EAST, floor, Set.of());
         assertEquals(11, owner.snapshot().walkNoProgressTicks());
         advance(owner, lanes.getFirst().end(), Direction.EAST, floor, Set.of());
-        owner.advance(new PlayerObservation(11, 1, 2.5, -90), floor, Set.of());
+        owner.advance(new PlayerObservation(11, 1, 2.5, -90), floor, Set.of(), plan.targets());
         assertEquals(11, owner.snapshot().walkNoProgressTicks());
         ready(owner, lanes.getFirst().end(), Direction.EAST, floor, Set.of());
         ready(owner, lanes.getFirst().end(), Direction.SOUTH, floor, Set.of());
@@ -53,16 +112,16 @@ class ForwardTraversalTest {
             assertEquals(11, owner.snapshot().walkNoProgressTicks());
         }
         advance(owner, lanes.get(1).start(), Direction.SOUTH, floor, Set.of());
-        owner.advance(new PlayerObservation(11, 1, 7.5, 90), floor, Set.of());
+        owner.advance(new PlayerObservation(11, 1, 7.5, 90), floor, Set.of(), plan.targets());
         assertEquals(Substage.NEXT_ENTRY, owner.snapshot().substage());
         assertEquals(11, owner.snapshot().walkNoProgressTicks());
         ready(owner, lanes.get(1).start(), Direction.WEST, floor, Set.of());
         assertEquals(0, owner.snapshot().walkNoProgressTicks());
         for (int i = 0; i < 39; i++) advance(owner, lanes.get(1).start(), Direction.WEST, floor, Set.of());
         assertEquals(39, owner.snapshot().walkNoProgressTicks());
-        owner.advance(new PlayerObservation(11.25, 1, 7.5, 90), floor, Set.of());
+        owner.advance(new PlayerObservation(11.25, 1, 7.5, 90), floor, Set.of(), plan.targets());
         assertEquals(0, owner.snapshot().walkNoProgressTicks());
-        owner.advance(new PlayerObservation(11.375, 1, 7.5, 90), floor, Set.of());
+        owner.advance(new PlayerObservation(11.375, 1, 7.5, 90), floor, Set.of(), plan.targets());
         assertEquals(1, owner.snapshot().walkNoProgressTicks());
     }
 
@@ -77,7 +136,7 @@ class ForwardTraversalTest {
             int limit = guard == 0 ? 40 : guard == 3 ? 20 : 80;
             for (int i = 0; i < limit; i++) {
                 var result = owner.advance(new PlayerObservation(.75, 1, 2.5, guard == 3 ? 0 : -90),
-                        guard == 3 ? floor : guard == 1 ? UNKNOWN : observed(plan, AIR), pending);
+                        guard == 3 ? floor : guard == 1 ? UNKNOWN : observed(plan, AIR), pending, plan.targets());
                 assertFalse(result.walkStalled());
                 assertEquals(39, owner.snapshot().walkNoProgressTicks());
                 var movement = result.movement().orElseThrow();
@@ -90,7 +149,7 @@ class ForwardTraversalTest {
         var floor = observed(plan, STONE);
         ready(owner, lanes.getFirst().start(), Direction.EAST, floor, Set.of());
         for (int i = 0; i < 39; i++) advance(owner, lanes.getFirst().start(), Direction.EAST, floor, Set.of());
-        owner.advance(new PlayerObservation(.75, 1, 2.5, -90), UNKNOWN, Set.of());
+        owner.advance(new PlayerObservation(.75, 1, 2.5, -90), UNKNOWN, Set.of(), plan.targets());
         var stalled = advance(owner, lanes.getFirst().start(), Direction.EAST, floor, Set.of());
         assertTrue(stalled.walkStalled());
         assertEquals(40, owner.snapshot().walkNoProgressTicks());
@@ -109,7 +168,7 @@ class ForwardTraversalTest {
         var support = observed(plan, STONE);
         var pending = ids(plan);
         var initial = owner.snapshot();
-        assertEquals(Pass.FORWARD, initial.pass());
+        assertEquals(Pass.SELECTING, initial.pass());
         assertEquals(0, initial.walkNoProgressTicks());
         assertEquals(new LaneEntry(lanes.getFirst(), Stage.ENTER_POSITION, 0, 0, 0, 0, 0, Set.of(), true), initial.entry());
         assertFalse(owner.advanceWithoutPlayer().walkStalled());
@@ -331,13 +390,13 @@ class ForwardTraversalTest {
         var owner = new ForwardTraversal(lanes, plan.dimensions(), true);
         var support = observed(plan, STONE);
         ready(owner, lanes.getFirst().start(), Direction.EAST, support, Set.of());
-        owner.advance(new PlayerObservation(12.0, 1, 2.5, -90), support, Set.of());
-        var endpoint = owner.advance(new PlayerObservation(12.0, 1, 2.5, -90), support, Set.of()).movement().orElseThrow();
+        owner.advance(new PlayerObservation(12.0, 1, 2.5, -90), support, Set.of(), plan.targets());
+        var endpoint = owner.advance(new PlayerObservation(12.0, 1, 2.5, -90), support, Set.of(), plan.targets()).movement().orElseThrow();
         assertTrue(endpoint.back());
         assertFalse(endpoint.forward());
         assertEquals(Strafe.NONE, endpoint.strafe());
         ready(owner, lanes.getFirst().end(), Direction.EAST, support, Set.of());
-        var south = owner.advance(new PlayerObservation(12.0, 1, 2.5, 0), support, Set.of()).movement().orElseThrow();
+        var south = owner.advance(new PlayerObservation(12.0, 1, 2.5, 0), support, Set.of(), plan.targets()).movement().orElseThrow();
         assertEquals(Strafe.RIGHT, south.strafe());
         assertFalse(south.forward());
         assertFalse(south.back());
@@ -384,7 +443,8 @@ class ForwardTraversalTest {
 
     private static ForwardTraversal.Advance advance(ForwardTraversal owner, GridPos position, Direction direction,
                                                      SupportObservation support, Set<Integer> pending) {
-        return owner.advance(new PlayerObservation(position.x() + .5, 1, position.z() + .5, direction.yawDegrees()), support, pending);
+        return owner.advance(new PlayerObservation(position.x() + .5, 1, position.z() + .5, direction.yawDegrees()), support, pending,
+                List.copyOf(owner.snapshot().entry().lane().expectedFloor().targetsByPosition().values()));
     }
 
     private static Set<Integer> ids(BuildPlan plan) {

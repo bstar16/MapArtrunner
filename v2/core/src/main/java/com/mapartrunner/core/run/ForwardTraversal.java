@@ -2,11 +2,13 @@ package com.mapartrunner.core.run;
 
 import com.mapartrunner.core.model.BuildPlan.GridPos;
 import com.mapartrunner.core.model.BuildPlan.GridSize;
+import com.mapartrunner.core.model.BuildPlan.Target;
 import com.mapartrunner.core.movement.MovementPolicy;
 import com.mapartrunner.core.movement.MovementPolicy.*;
 import com.mapartrunner.core.traversal.LanePlanner.*;
 
 import java.util.List;
+import java.util.Comparator;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
@@ -34,17 +36,22 @@ public final class ForwardTraversal {
         this.constantSprint = constantSprint;
         if (this.lanes.isEmpty()) throw new IllegalArgumentException("Forward traversal requires a lane");
         state = new Snapshot(0, Substage.LANE, fresh(this.lanes.getFirst(), 0, Set.of(), constantSprint),
-                0, Optional.empty(), Pass.FORWARD, 0);
+                0, Optional.empty(), Pass.SELECTING, 0);
     }
 
     public Snapshot snapshot() { return state; }
 
-    public Advance advance(PlayerObservation player, SupportObservation support, Set<Integer> pendingTargetIds) {
+    public Advance advance(PlayerObservation player, SupportObservation support, Set<Integer> pendingTargetIds,
+                           List<Target> unfinishedTargets) {
         Objects.requireNonNull(player, "player");
         Objects.requireNonNull(support, "support");
-        if (forwardComplete) return new Advance(Optional.empty(), true, false, false);
-        if (transitionExpired()) return new Advance(Optional.empty(), false, true, false);
-        if (state.walkNoProgressTicks() >= WALK_NO_PROGRESS_LIMIT) return new Advance(Optional.empty(), false, false, true);
+        Objects.requireNonNull(unfinishedTargets, "unfinishedTargets");
+        if (state.pass() == Pass.SELECTING && !select(player, unfinishedTargets)) {
+            return new Advance(Optional.empty(), false, false, false, true, Optional.empty());
+        }
+        if (forwardComplete) return new Advance(Optional.empty(), true, false, false, false, Optional.empty());
+        if (transitionExpired()) return new Advance(Optional.empty(), false, true, false, false, Optional.empty());
+        if (state.walkNoProgressTicks() >= WALK_NO_PROGRESS_LIMIT) return new Advance(Optional.empty(), false, false, true, false, Optional.empty());
         LaneEntry prior = state.entry();
         var input = new LaneEntry(prior.lane(), prior.stage(), prior.stageElapsedTicks(), prior.entryElapsedTicks(),
                 prior.consecutiveYawAlignedTicks(), prior.supportHoldTicks(), prior.yawHoldTicks(),
@@ -113,19 +120,65 @@ public final class ForwardTraversal {
                 }
             }
         }
-        return new Advance(Optional.of(result), forwardComplete, false, state.walkNoProgressTicks() >= WALK_NO_PROGRESS_LIMIT);
+        return new Advance(Optional.of(result), forwardComplete, false, state.walkNoProgressTicks() >= WALK_NO_PROGRESS_LIMIT,
+                false, Optional.of(input));
     }
 
     /** Missing player data consumes only the existing transition total, never policy counters. */
     public Advance advanceWithoutPlayer() {
-        if (forwardComplete) return new Advance(Optional.empty(), true, false, false);
-        if (transitionExpired()) return new Advance(Optional.empty(), false, true, false);
-        if (state.walkNoProgressTicks() >= WALK_NO_PROGRESS_LIMIT) return new Advance(Optional.empty(), false, false, true);
+        if (forwardComplete) return new Advance(Optional.empty(), true, false, false, false, Optional.empty());
+        if (transitionExpired()) return new Advance(Optional.empty(), false, true, false, false, Optional.empty());
+        if (state.walkNoProgressTicks() >= WALK_NO_PROGRESS_LIMIT) return new Advance(Optional.empty(), false, false, true, false, Optional.empty());
         if (state.substage() != Substage.LANE) {
             state = new Snapshot(state.laneIndex(), state.substage(), state.entry(),
                     state.transitionTicks() + 1, state.transitionRegion(), state.pass(), state.walkNoProgressTicks());
         }
-        return new Advance(Optional.empty(), false, false, false);
+        return new Advance(Optional.empty(), false, false, false, false, Optional.empty());
+    }
+
+    private boolean select(PlayerObservation player, List<Target> unfinished) {
+        if (unfinished.stream().anyMatch(t -> lanes.stream().noneMatch(l -> covers(l, t)))) return false;
+        Lane selected = lanes.getFirst();
+        int selectedIndex = 0;
+        if (!unfinished.isEmpty() && unfinished.size() != selected.expectedFloor().targetsByPosition().size()) {
+            double bestDistance = Double.POSITIVE_INFINITY;
+            boolean bestPartial = false;
+            for (int index = 0; index < lanes.size(); index++) {
+                Lane lane = lanes.get(index);
+                var earliest = unfinished.stream().filter(t -> covers(lane, t)).min(Comparator.comparingDouble(t ->
+                        lane.direction().progressCoordinate(t.relativePos().x(), t.relativePos().z()) * lane.direction().forwardSign()));
+                if (earliest.isEmpty()) continue;
+                GridPos target = earliest.orElseThrow().relativePos();
+                GridPos start = lane.direction().alongX() ? new GridPos(target.x(), lane.start().y(), lane.start().z())
+                        : new GridPos(lane.start().x(), lane.start().y(), target.z());
+                var partial = new Lane(lane.id(), lane.direction(), start, lane.end(), lane.corridor(), lane.expectedFloor());
+                for (int candidate = 0; candidate < 2; candidate++) {
+                    Lane entry = candidate == 0 ? lane : partial;
+                    double dx = entry.start().x() + .5 - player.x(), dy = entry.start().y() + 1.0 - player.y();
+                    double dz = entry.start().z() + .5 - player.z();
+                    double distance = Math.sqrt(dx * dx + dy * dy + dz * dz);
+                    if (distance + 16.0 < bestDistance || Math.abs(distance - bestDistance) <= 16.0
+                            && (index < selectedIndex || index == selectedIndex && candidate == 1 && !bestPartial)) {
+                        selected = entry; selectedIndex = index; bestDistance = distance; bestPartial = candidate == 1;
+                    }
+                }
+            }
+        }
+        forwardComplete = unfinished.isEmpty();
+        // Select only before the first policy call; the clipped entry never replaces a canonical lane.
+        state = new Snapshot(selectedIndex, state.substage(), fresh(selected, state.entry().supportHoldTicks(),
+                state.entry().pendingTargetIds(), constantSprint), state.transitionTicks(), state.transitionRegion(),
+                forwardComplete ? Pass.COMPLETE : Pass.FORWARD, state.walkNoProgressTicks());
+        return true;
+    }
+
+    private static boolean covers(Lane lane, Target target) {
+        GridPos p = target.relativePos();
+        Corridor c = lane.corridor();
+        double progress = lane.direction().progressCoordinate(p.x(), p.z()) * lane.direction().forwardSign();
+        return p.y() == lane.start().y() && p.x() >= c.minX() && p.x() <= c.maxX() && p.z() >= c.minZ() && p.z() <= c.maxZ()
+                && progress >= lane.direction().progressCoordinate(lane.start().x(), lane.start().z()) * lane.direction().forwardSign()
+                && progress <= lane.direction().progressCoordinate(lane.end().x(), lane.end().z()) * lane.direction().forwardSign();
     }
 
     private boolean transitionExpired() {
@@ -156,5 +209,6 @@ public final class ForwardTraversal {
     public record Snapshot(int laneIndex, Substage substage, LaneEntry entry, int transitionTicks,
                            Optional<Corridor> transitionRegion, Pass pass, int walkNoProgressTicks) { }
 
-    public record Advance(Optional<MovementIntent> movement, boolean traversalComplete, boolean transitionExpired, boolean walkStalled) { }
+    public record Advance(Optional<MovementIntent> movement, boolean traversalComplete, boolean transitionExpired, boolean walkStalled,
+                          boolean uncoveredTargets, Optional<LaneEntry> decisionInput) { }
 }

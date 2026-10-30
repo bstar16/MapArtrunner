@@ -893,7 +893,7 @@ class BuildEngineTest {
     static Harness verifyHarness() {
         var h = new Harness(plan(2, 5, target(7, 0, 0), target(100, 1, 4)));
         h.observations = h.scan(STONE); h.step(); h.observations = List.of();
-        h.step(); h.step(); h.step(); return h;
+        return h;
     }
     static BuildPlan plan(int width, int depth, Target... targets) {
         return new BuildPlan("plan", new GridSize(width, 1, depth), List.of(targets));

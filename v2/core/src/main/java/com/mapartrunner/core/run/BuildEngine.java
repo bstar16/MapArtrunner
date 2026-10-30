@@ -124,10 +124,13 @@ public final class BuildEngine {
         if (wasVerifying) verifyTicks++;
         Optional<MovementIntent> movement = Optional.empty();
         if (!wasVerifying) {
-            LaneEntry decisionInput = traversal.snapshot().entry();
             var advanced = input.player().isPresent()
-                    ? traversal.advance(input.player().orElseThrow(), input.support(), ledger.pendingTargetIds())
+                    ? traversal.advance(input.player().orElseThrow(), input.support(), ledger.pendingTargetIds(), traversalTargets(current))
                     : traversal.advanceWithoutPlayer();
+            if (advanced.uncoveredTargets()) {
+                finish(Outcome.FAILED, Reason.INVARIANT_FAILURE, unresolvedIds(), "Unfinished targets lack canonical lane coverage");
+                return currentDecision(input.tick(), Optional.empty(), Optional.empty());
+            }
             if (advanced.transitionExpired()) {
                 finish(Outcome.FAILED, Reason.TRANSITION_TIMEOUT, unresolvedIds(), "Transition exhausted 120 active callbacks");
                 return currentDecision(input.tick(), Optional.empty(), Optional.empty());
@@ -137,13 +140,13 @@ public final class BuildEngine {
                 // The single policy result owns the local envelope, not physical staging safety.
                 if (result.failure() == Failure.BELOW_BUILD_PLANE || result.failure() == Failure.OUTSIDE_CORRIDOR) {
                     finish(Outcome.FAILED, Reason.COARSE_TRAVEL_UNAVAILABLE, unresolvedIds(),
-                            "Native entry requires unavailable coarse travel", decisionInput);
+                            "Native entry requires unavailable coarse travel", advanced.decisionInput().orElseThrow());
                     return currentDecision(input.tick(), Optional.empty(), Optional.empty());
                 }
                 lifecycle.updateActivity(input.runId(), Activity.BUILD);
             }
             if (result != null && result.status() == Status.FAILED) {
-                finish(Outcome.FAILED, Reason.MOVEMENT_FAILED, unresolvedIds(), result.failure().name(), decisionInput);
+                finish(Outcome.FAILED, Reason.MOVEMENT_FAILED, unresolvedIds(), result.failure().name(), advanced.decisionInput().orElseThrow());
                 return currentDecision(input.tick(), Optional.empty(), Optional.empty());
             }
             if (advanced.walkStalled()) {
@@ -225,6 +228,15 @@ public final class BuildEngine {
             }
         }
         return currentDecision(input.tick(), movement, placement);
+    }
+
+    private List<Target> traversalTargets(Map<Integer, PlacementObservation> current) {
+        var unfinished = new HashSet<>(ledger.unfinishedTargets());
+        return plan.targets().stream().filter(t -> {
+            var sample = current.get(t.id());
+            return unfinished.contains(t) || sample == null || sample.evidence() != Evidence.OBSERVED
+                    || !sample.observedState().orElseThrow().equals(t.block());
+        }).toList();
     }
 
     private Map<Integer, PlacementObservation> routeObservations(TickInput input) {
