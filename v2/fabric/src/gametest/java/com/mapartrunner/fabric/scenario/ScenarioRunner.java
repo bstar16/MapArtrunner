@@ -15,6 +15,7 @@ import com.mapartrunner.fabric.mixin.ClientWorldPendingUpdateAccessor;
 import com.mapartrunner.fabric.prediction.PendingPredictionView;
 import com.mapartrunner.fabric.runtime.FabricBuildAdapter;
 import com.mapartrunner.fabric.runtime.WorldEvidenceReader;
+import com.mapartrunner.fabric.scenario.TraversalCapture.*;
 import net.fabricmc.fabric.api.client.gametest.v1.context.ClientGameTestContext;
 import net.fabricmc.fabric.api.client.gametest.v1.context.TestSingleplayerContext;
 import net.fabricmc.fabric.api.client.gametest.v1.screenshot.TestScreenshotOptions;
@@ -24,6 +25,9 @@ import net.minecraft.block.Blocks;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.network.ClientPlayerEntity;
 import net.minecraft.client.network.ClientPlayNetworkHandler;
+import net.minecraft.client.texture.NativeImage;
+import net.minecraft.client.util.ScreenshotRecorder;
+import net.minecraft.client.render.RenderTickCounter;
 import net.minecraft.client.world.ClientWorld;
 import net.minecraft.entity.attribute.DefaultAttributeContainer;
 import net.minecraft.entity.attribute.EntityAttribute;
@@ -55,11 +59,19 @@ import net.minecraft.world.gen.chunk.FlatChunkGenerator;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.io.BufferedWriter;
+import java.io.OutputStreamWriter;
+import java.io.Writer;
+import java.io.PrintWriter;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.*;
+import java.awt.image.BufferedImage;
+import javax.imageio.ImageIO;
+import javax.imageio.stream.MemoryCacheImageOutputStream;
+import java.util.concurrent.CompletableFuture;
 
 /** Closed-profile fixture owner. No production reset API and no observation-time repairs. */
 final class ScenarioRunner implements AutoCloseable {
@@ -82,7 +94,12 @@ final class ScenarioRunner implements AutoCloseable {
     private record Side(JsonObject state, int age, long time, int serverTick, List<String> problems) { }
     private record Checkpoint(Side client, Side server, FabricBuildAdapter.Status status) { }
     private record Prior(FabricBuildAdapter.Status status, List<ScenarioObserver.Sample> samples,
-                         PredictionFaults.Snapshot fault, PredictionFaults.StateSnapshot stateFault) { }
+                         PredictionFaults.Snapshot fault, PredictionFaults.StateSnapshot stateFault,
+                         TraversalCapture.Sealed traversal) {
+        Prior(FabricBuildAdapter.Status status,List<ScenarioObserver.Sample> samples,PredictionFaults.Snapshot fault,PredictionFaults.StateSnapshot stateFault) {
+            this(status,samples,fault,stateFault,null);
+        }
+    }
     private final String supportSelector=System.getenv("MAPART_TWO_LANE_SUPPORT_CASE");
     private final SupportCase supportCase=SupportCase.parse(supportSelector);
     private final ClientGameTestContext context;
@@ -123,6 +140,18 @@ final class ScenarioRunner implements AutoCloseable {
     private Checkpoint priorCountedStart;
     private PredictionFaults.SupportArmIdentity supportArm;
     private boolean supportReceipt;
+    // Constructor diagnostics spend the first pre-UUID budget; first start adopts it without renewal.
+    private TraversalCapture capture;
+    private OutputBudget outputs;
+    private Limits captureLimits;
+    private Sealed sealed;
+    private boolean compactCommitted;
+    private boolean commitMarker;
+    private Throwable compactArchiveFailure;
+    private final EnumSet<CheckpointKind> playerCheckpoints=EnumSet.noneOf(CheckpointKind.class);
+    private List<GridPos> regionOrder=List.of();
+    private Map<GridPos,BuildPlan.BlockSpec> finalTargets=Map.of();
+    private int scalarOrdinal;
 
     ScenarioRunner(ClientGameTestContext context, ScenarioObserver.Watch watch, int expectedCountedRuns) {
         this(context,watch,expectedCountedRuns,ScenarioDefinition.Fixture.TWO_LANE);
@@ -135,6 +164,7 @@ final class ScenarioRunner implements AutoCloseable {
         this.expectedCountedRuns=expectedCountedRuns;
         this.context = Objects.requireNonNull(context); this.watch = Objects.requireNonNull(watch);
         roots = roots(); // Read-only loaded-module authority precedes evidence/world creation.
+        try {
         callerAutoJump = context.computeOnClient(c -> {
             require(c.world == null && c.getServer() == null && c.player == null,
                     "Runner must create its own world; cannot adopt an open world");
@@ -146,19 +176,37 @@ final class ScenarioRunner implements AutoCloseable {
                     "Preworld release refusal mutated fault/core/world");
             return c.options.getAutoJump().getValue();
         });
-        verifyResetGuards();
-        artifacts = roots.evidence.resolve("two-lane-" + invocation);
-        checkedDirectory(roots, artifacts);
+        if(baseline()) {
+            verifyResetGuards();
+            artifacts=roots.evidence.resolve("two-lane-"+invocation);
+            checkedDirectory(roots,artifacts);
+        } else {
+            artifacts=roots.evidence.resolve("two-lane-"+invocation);
+            checkedDirectory(roots,artifacts);
+            initializeCompactBudget(1);
+            verifyResetGuards();
+        }
         System.out.println(baseline()?"MapArtRunner two-lane artifacts: " + artifacts:"MapArtRunner "+fixture+" artifacts: "+artifacts);
         verifyResourceCopies();
         verifyFilesystemGuards();
+        } catch(RuntimeException | Error error) {
+            if(!baseline() && outputs!=null) retainConstructorFailure(outputs,error);
+            throw error;
+        }
+    }
+
+    private void initializeCompactBudget(int ordinal) {
+        var budgets=profileDefinition.data().getAsJsonObject("budgets");
+        captureLimits=Limits.forRun(i(budgets,"runTicks"),i(budgets,"releaseTicks"),fixture.targetCount,profileDefinition.worldCells().size());
+        var directory=artifacts.resolve("capture-"+ordinal); checkedDirectory(roots,directory);
+        try { outputs=new OutputBudget(directory,captureLimits); }
+        catch(IOException error) { throw new UncheckedIOException(error); }
     }
 
     private boolean baseline() { return fixture==ScenarioDefinition.Fixture.TWO_LANE; }
 
     /** F4 calls before world creation; these are always-active checks, never Java assert. */
     static void verifyResetGuards() {
-        TraversalAssertions.verifyGuards();
         var r = roots();
         var d = ScenarioDefinition.load();
         var token = UUID.randomUUID();
@@ -209,6 +257,7 @@ final class ScenarioRunner implements AutoCloseable {
         var restores=new int[1];
         var check = r.evidence.resolve("archive-self-check-" + token);
         checkedDirectory(r, check);
+        TraversalAssertions.verifyGuards(check.resolve("capture-guards"));
         rejected("archive failure aborts restoration", () -> archiveThenRestore(() -> {
             writeNew(r, check.resolve("incomplete.txt"), "retained injected archive failure");
             throw new UncheckedIOException(new IOException("fixture archive-write injection"));
@@ -248,14 +297,14 @@ final class ScenarioRunner implements AutoCloseable {
                     guardedWorldCreation(candidate,candidate.saves,candidate.saves,creation);
                     require(callbacks[0]==1,"Valid native filesystem failed creation-boundary positive control");
                 }
-                writeNew(roots,artifacts.resolve("filesystem-"+kind+".txt"),"actualWindows=true; saves="+candidate.saves
+                writeHeader(artifacts.resolve("filesystem-"+kind+".txt"),"actualWindows=true; saves="+candidate.saves
                         +"; noFollowExists="+Files.exists(candidate.saves,LinkOption.NOFOLLOW_LINKS)
                         +"; followsDirectory="+Files.isDirectory(candidate.saves)+"; creationBoundaryCallbacks="+callbacks[0]+"; "+nativeOutput);
             }
             verifyEvidenceInventory();
             context.runOnClient(c -> {
                 requireUncreatedClient(c);
-                writeNew(roots,artifacts.resolve("native-level-storage-before-world.txt"),c.getLevelStorage().getSavesDirectory().toAbsolutePath().toString());
+                writeHeader(artifacts.resolve("native-level-storage-before-world.txt"),c.getLevelStorage().getSavesDirectory().toAbsolutePath().toString());
             });
         } catch (IOException e) { throw new UncheckedIOException(e); }
         catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new IllegalStateException(e); }
@@ -317,7 +366,7 @@ final class ScenarioRunner implements AutoCloseable {
         proof.addProperty("finalBytesRetainedAt",fixture.resolve("right/same.bin").toString());
         proof.add("first",new Gson().toJsonTree(first)); proof.add("second",new Gson().toJsonTree(second));
         proof.add("afterSameLengthChange",new Gson().toJsonTree(changed));
-        writeNew(roots,artifacts.resolve("evidence-inventory-selfcheck.json"),new GsonBuilder().setPrettyPrinting().create().toJson(proof));
+        writeHeader(artifacts.resolve("evidence-inventory-selfcheck.json"),new GsonBuilder().setPrettyPrinting().create().toJson(proof));
         System.out.println("ScenarioRunner no-follow evidence inventory self-checks passed");
     }
 
@@ -339,7 +388,7 @@ final class ScenarioRunner implements AutoCloseable {
                 if(name.equals("definition.json")) profileDefinition.requireValues(fixture,profileDefinition.definitionHash(),
                         JsonParser.parseString(new String(raw,StandardCharsets.UTF_8)).getAsJsonObject());
                 else require(profileDefinition.sourceMatches(raw),"Source differs from immutable admitted bytes");
-                writeNew(roots,artifacts.resolve("resource-"+name+".txt"),"source="+source+"; loaded="+resource
+                writeHeader(artifacts.resolve("resource-"+name+".txt"),"source="+source+"; loaded="+resource
                         +"; size="+raw.length+"; sha256="+HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(raw)));
             } catch (java.net.URISyntaxException | IOException e) { throw new IllegalStateException(e); }
             catch (NoSuchAlgorithmException e) { throw new AssertionError(e); }
@@ -348,6 +397,9 @@ final class ScenarioRunner implements AutoCloseable {
 
     void reset(ScenarioDefinition definition) {
         preflight(definition); // Stale authority cannot invalidate readiness, stop, or archive.
+        require(baseline() || compactArchiveFailure==null,"Reset refuses an earlier failed compact archive");
+        require(baseline() || outputs.failure().isEmpty() && (resetOrdinal==0 || capture!=null),
+                "Reset refuses failed output or renewal of an unadopted compact budget");
         if(baseline() && !supportReceipt) {
             writeNew(roots,artifacts.resolve("support-coverage.txt"),"invocation="+invocation+"; definition="+definition.definitionHash()
                     +"; case="+supportCase.label()+"; selector="+(supportSelector==null?"absent":supportSelector)
@@ -378,22 +430,39 @@ final class ScenarioRunner implements AutoCloseable {
             MapArtClient.stop();
             requireReleased(c);
             // Copy before clear/arm: both owners retain diagnostics across stop.
-            return new Prior(MapArtClient.status(), watch.copy(), PredictionFaults.snapshot(), PredictionFaults.stateSnapshot());
+            if(!baseline() && capture!=null && sealed==null) { prepareCompactSeal(); sealed=watch.sealTraversal(); }
+            return new Prior(MapArtClient.status(), baseline()?watch.copy():List.of(), PredictionFaults.snapshot(), PredictionFaults.stateSnapshot(),sealed);
         });
         var stage = artifacts.resolve("reset-" + (++resetOrdinal));
-        archiveThenRestore(() -> archive(stage, prior), () -> {
+        archiveThenRestore(() -> {
+            if(baseline() || capture!=null) archive(stage,prior);
+            else {
+                checkedDirectory(roots,stage);
+                scalar("initial-reset.txt","New owned world; no prior owned run/trace to discard; constructor budget remains open for actual start");
+            }
+        }, () -> {
             int consumed=release ? releaseForReset(stage,prior) : 0;
             context.runOnClient(c -> { requireClient(c); PredictionFaults.clear(); watch.clear(); });
+            if(!baseline()) {
+                boolean priorRun=capture!=null;
+                capture=null; sealed=null; compactCommitted=false; commitMarker=false; playerCheckpoints.clear(); scalarOrdinal=0;
+                if(priorRun) initializeCompactBudget(resetOrdinal);
+                regionOrder=definition.worldCells().keySet().stream().sorted(Comparator.comparingInt(GridPos::x)
+                        .thenComparingInt(GridPos::y).thenComparingInt(GridPos::z)).toList();
+            }
             restore(definition);
             plan = definition.importPlan(stage.resolve("retained-source.schem"));
-            writeNew(roots,stage.resolve("imported-plan.txt"),"definitionSha256="+definition.definitionHash()
+            if(baseline()) writeNew(roots,stage.resolve("imported-plan.txt"),"definitionSha256="+definition.definitionHash()
                     +"; dimensions="+plan.dimensions()+"; fingerprint="+plan.fingerprint()+"; targetCount="+plan.targets().size()+"\n"
                     +String.join("\n",plan.targets().stream().map(Object::toString).toList())+"\n");
+            else scalar("imported-plan.txt","definition="+definition.definitionHash()+"; dimensions="+plan.dimensions()
+                    +"; fingerprint="+plan.fingerprint()+"; targets="+plan.targets().size());
             var source = definition.data().getAsJsonObject("schematic");
             origin = grid(source.getAsJsonObject("origin"));
             var s = definition.data().getAsJsonObject("settings");
             settings = new BuildEngine.Settings(i(s,"halfWidth"), i(s,"stride"), b(s,"constantSprint"), i(s,"reservedHotbarSlots"));
             admitted = definition;
+            if(!baseline()) finalTargets=TraversalAssertions.expectedWorldTargets(definition,plan.targets());
             awaitStable(stage,consumed);
             ready = true; // Only two independent advancing post-physics checkpoints grant start authority.
         });
@@ -401,6 +470,7 @@ final class ScenarioRunner implements AutoCloseable {
 
     private UUID start(ScenarioDefinition definition, boolean counted) {
         preflight(definition);
+        require(baseline() || compactArchiveFailure==null,"Start refuses an earlier failed compact archive");
         require(ready && admitted != null && definition.definitionHash().equals(admitted.definitionHash()),
                 "Run requires this invocation's successful reset");
         require(counted ? countedStarts<i(definition.data().getAsJsonObject("budgets"),"repeatMaximum") : runs.isEmpty(),
@@ -410,6 +480,7 @@ final class ScenarioRunner implements AutoCloseable {
         UUID started=context.computeOnClient(c -> {
             requireClient(c); requireReleased(c);
             var now = readClient(c, true);
+            if(!baseline()) now=withRegion(now,region(c.player,true,"prestart-client"));
             require(now.problems.isEmpty() && now.state.equals(stable.client.state), "Start state changed without physics");
             UUID fresh = MapArtClient.start(plan, origin, settings);
             require(runs.add(fresh), "Facade reused a run UUID");
@@ -417,7 +488,12 @@ final class ScenarioRunner implements AutoCloseable {
             require(bound.runId().equals(fresh) && bound.planFingerprint().equals(plan.fingerprint())
                     && bound.origin().equals(origin) && bound.settingsFingerprint().equals(settings.fingerprint())
                     && bound.dimension().equals("minecraft:overworld"), "Facade bound another start request");
-            watch.arm(c, plan);
+            if(baseline()) watch.arm(c, plan);
+            else {
+                try { capture=new TraversalCapture(outputs.root(),fresh,captureLimits,Set.of(),outputs); }
+                catch(IOException error) { throw new UncheckedIOException(error); }
+                watch.armTraversal(c,plan,capture);
+            }
             if(baseline() && counted && supportCase==SupportCase.CONTROLLED) {
                 supportArm=PredictionFaults.armSupportAvailability(c,server,save,fresh,plan,settings,watch).identity();
                 verifySupportArmRefusals(c,fresh);
@@ -749,6 +825,132 @@ final class ScenarioRunner implements AutoCloseable {
         return new Live(local.sample,local.client,remote,local.fault,local.pending,local.nativeSequence,local.nativeIdentities);
     }
 
+    private record TraversalPoll(MotionFrame end,long ordinal,TraversalCapture.Pose client,int keys,int sequence,
+                                 Phase phase,Outcome outcome,BuildEngine.Reason reason,long eligible,long verify,
+                                 int pending,int unfinished,BuildEngine.ControlOwner owner,ServerFrame server) { }
+
+    private static Physics physics(PlayerEntity p) {
+        return new Physics(p.isOnGround(),p.hasNoGravity(),p.hasNoDrag(),p.isJumping(),p.hasVehicle(),p.isInFluid(),p.isTouchingWater(),
+                p.isSubmergedInWater(),p.isInLava(),p.isClimbing(),p.isGliding(),p.isSwimming(),p.isSneaking(),p.isUsingItem(),
+                !p.getStatusEffects().isEmpty(),p.fallDistance,p.getFinalGravity());
+    }
+
+    private static List<Boolean> keys(MinecraftClient c) {
+        var o=c.options;
+        return List.of(o.forwardKey.isPressed(),o.backKey.isPressed(),o.leftKey.isPressed(),o.rightKey.isPressed(),o.jumpKey.isPressed(),
+                o.sneakKey.isPressed(),o.sprintKey.isPressed(),o.useKey.isPressed(),o.attackKey.isPressed());
+    }
+
+    /** TEST polls do not observe targets or advance core; server facts follow a separately observed client ordinal. */
+    private TraversalPoll traversalPoll() {
+        var local=context.computeOnClient(c->{
+            requireClient(c); var p=c.player; var v=p.getVelocity(); var eye=p.getEyePos();
+            var status=MapArtClient.status(); var e=status.engine(); var lifecycle=e.lifecycle();
+            require(lifecycle.context().orElseThrow().runId().equals(capture.runId()) && status.failure().isEmpty(),"Compact poll lost run/adapter identity");
+            int controls=0; var keys=keys(c); for(int k=0;k<keys.size();k++) if(keys.get(k)) controls|=1<<k;
+            var pose=new TraversalCapture.Pose(p.getX(),p.getY(),p.getZ(),v.x,v.y,v.z,eye.x,eye.y,eye.z,p.age,c.world.getTime(),
+                    p.getYaw(),p.headYaw,p.bodyYaw,p.getAbilities().flying,p.isSprinting(),p.getInventory().getSelectedSlot(),
+                    p.getInventory().getStack(0).getCount(),p.getInventory().getStack(1).getCount()+p.getInventory().getStack(2).getCount(),
+                    p.getBlockInteractionRange(),physics(p));
+            return new TraversalPoll(capture.latestEnd().orElse(null),capture.latestClientOrdinal(),pose,controls,
+                    ((ClientWorldPendingUpdateAccessor)c.world).mapart$getPendingUpdateManager().getSequence(),lifecycle.phase(),lifecycle.outcome().orElse(null),
+                    e.diagnostic().map(BuildEngine.Diagnostic::reason).orElse(null),e.eligibleTicks(),e.verifyTicks(),e.pendingTargetIds().size(),e.unfinishedTargetIds().size(),status.controlOwner(),null);
+        });
+        var remote=world.getServer().computeOnServer(s->{
+            requireServer(s); var p=serverPlayer; var v=p.getVelocity();
+            return new ServerFrame(0,capture.runId(),System.identityHashCode(server),System.identityHashCode(serverPlayer),
+                    System.identityHashCode(s),System.identityHashCode(p),s==server,p==serverPlayer,s.getTicks(),serverWorld.getTime(),p.age,
+                    p.getX(),p.getY(),p.getZ(),v.x,v.y,v.z,p.getYaw(),p.getAbilities().flying,p.isSprinting(),p.getInventory().getSelectedSlot(),
+                    p.getInventory().getStack(0).getCount(),p.getInventory().getStack(1).getCount()+p.getInventory().getStack(2).getCount(),
+                    p.getPlayerInput().equals(PlayerInput.DEFAULT)?0:1,local.ordinal,p.getBlockInteractionRange(),physics(p),null,null);
+        });
+        var appended=context.computeOnClient(c->{
+            requireClient(c);
+            var frame=new ServerFrame(capture.nextOrdinal(),remote.runId(),remote.originalServer(),remote.originalPlayer(),remote.server(),remote.player(),
+                    remote.serverMatches(),remote.playerMatches(),remote.serverTick(),remote.worldTime(),remote.age(),remote.x(),remote.y(),remote.z(),
+                    remote.vx(),remote.vy(),remote.vz(),remote.yaw(),remote.flying(),remote.sprinting(),remote.selectedSlot(),remote.reserved(),remote.usable(),
+                    remote.controls(),remote.followsClientOrdinal(),remote.interactionReach(),remote.physics(),null,null);
+            capture.append(frame); return frame;
+        });
+        return new TraversalPoll(local.end,local.ordinal,local.client,local.keys,local.sequence,local.phase,local.outcome,local.reason,
+                local.eligible,local.verify,local.pending,local.unfinished,local.owner,appended);
+    }
+
+    private record RegionCheck(int count,long mismatches,String hash) { }
+
+    private Side withRegion(Side side,RegionCheck region) {
+        side.state.add("region",new Gson().toJsonTree(region));
+        var errors=new ArrayList<>(side.problems);
+        if(region.count!=admitted.worldCells().size() || region.mismatches!=0) errors.add("Owned region incomplete/mismatched: "+region);
+        return new Side(side.state,side.age,side.time,side.serverTick,List.copyOf(errors));
+    }
+
+    /** No getter may turn an absent FULL chunk into construction evidence. Each mismatch is charged before I/O. */
+    private RegionCheck region(PlayerEntity player,boolean initial,String name) {
+        var level=player.getEntityWorld(); long mismatches=0; int count=0;
+        try(var writer=new BufferedWriter(new OutputStreamWriter(outputs.open(OutputKind.REGION,name+".txt"),StandardCharsets.UTF_8))) {
+            var digest=MessageDigest.getInstance("SHA-256");
+            writer.write("actual separate "+(player instanceof ServerPlayerEntity?"SERVER":"CLIENT_TEST")+" read; age="+player.age
+                    +"; worldTime="+level.getTime()+"; serverTick="+(player instanceof ServerPlayerEntity?server.getTicks():-1)+"\n");
+            for(var position:regionOrder) {
+                count++; var at=new BlockPos(position.x(),position.y(),position.z());
+                var expected=initial?admitted.worldCells().get(position):finalTargets.getOrDefault(position,admitted.worldCells().get(position));
+                boolean loaded=level.getChunkManager().getChunk(Math.floorDiv(at.getX(),16),Math.floorDiv(at.getZ(),16),ChunkStatus.FULL,false)!=null;
+                String actual="UNKNOWN"; boolean blockEntity=false; boolean matches=false;
+                if(loaded) {
+                    var state=WorldEvidenceReader.blockSpec(level.getBlockState(at));
+                    blockEntity=level.getBlockEntity(at)!=null;
+                    actual=state.id()+new TreeMap<>(state.properties()).toString();
+                    matches=!blockEntity && state.equals(expected);
+                }
+                var value=position.x()+","+position.y()+","+position.z()+"="+actual+";loaded="+loaded+";blockEntity="+(loaded?blockEntity:"UNKNOWN")+"\n";
+                digest.update(value.getBytes(StandardCharsets.UTF_8));
+                if(!matches) { mismatches++; writer.write("mismatch "+value.stripTrailing()+"; expected="+expected.id()+new TreeMap<>(expected.properties())+"\n"); }
+            }
+            var result=new RegionCheck(count,mismatches,HexFormat.of().formatHex(digest.digest()));
+            writer.write("complete="+(count==regionOrder.size())+"; cells="+count+"; mismatches="+mismatches+"; sha256="+result.hash+"\n");
+            return result;
+        } catch(IOException error) { throw new UncheckedIOException(error); }
+        catch(NoSuchAlgorithmException error) { throw new AssertionError(error); }
+    }
+
+    private Checkpoint fullPlayerCheckpoint(CheckpointKind kind) {
+        require(playerCheckpoints.add(kind),"Duplicate full player checkpoint: "+kind);
+        var local=context.computeOnClient(c->{
+            requireClient(c); var side=readClient(c,false);
+            return new FullLocal(side,MapArtClient.status(),capture==null?-1:capture.latestClientOrdinal());
+        });
+        var remote=world.getServer().computeOnServer(s->{ requireServer(s); return readPlayer(serverPlayer,false,s.getTicks()); });
+        var checkpoint=new Checkpoint(local.side,remote,local.status);
+        var json=evidence(checkpoint);
+        json.addProperty("requestedKind",kind.name()); json.addProperty("run",capture==null?null:capture.runId().toString());
+        json.addProperty("causalClientOrdinal",local.ordinal);
+        json.addProperty("actualPhase","separate CLIENT_TEST then SERVER reads; not observer END or simultaneous");
+        json.addProperty("originalFullScanPresent",capture!=null && capture.hasCheckpoint(kind));
+        scalar("player-"+kind.name()+".json",json.toString());
+        return checkpoint;
+    }
+
+    private record FullLocal(Side side,FabricBuildAdapter.Status status,long ordinal) { }
+
+    private void verifyFinalCompact(Checkpoint finalState) {
+        require(finalState.client.state.get("pendingOwnedCount").getAsInt()==0,"Final owned native predictions remain");
+        TraversalAssertions.requireRemovalReceipts(admitted,List.of());
+        for(var side:List.of(finalState.client,finalState.server)) {
+            var before=side==finalState.client?stable.client:stable.server;
+            requireStock(side.state.getAsJsonArray("inventory"),before.state.getAsJsonArray("inventory"),admitted.finalUsable());
+            require(side.state.get("mode").getAsString().equals("SURVIVAL") && side.state.get("abilities").equals(before.state.get("abilities"))
+                    && side.state.get("cursorAndCrafting").equals(before.state.get("cursorAndCrafting")) && b(side.state,"playerHandler")
+                    && side.state.getAsJsonArray("boundedEntities").isEmpty(),"Final complete player/menu/entities differ");
+        }
+        require(finalState.client.state.get("inventory").equals(finalState.server.state.get("inventory"))
+                && finalState.client.state.get("selectedSlot").equals(finalState.server.state.get("selectedSlot")),"Final client/server complete stock differs");
+        var local=context.computeOnClient(c->{ requireClient(c); return region(c.player,false,"final-client"); });
+        var remote=world.getServer().computeOnServer(s->{ requireServer(s); return region(serverPlayer,false,"final-server"); });
+        require(local.count==regionOrder.size() && remote.count==regionOrder.size() && local.mismatches==0 && remote.mismatches==0
+                && local.hash.equals(remote.hash),"Independent final full-state region mismatch: "+local+" / "+remote);
+    }
+
     private void verifyLiveRefusals() {
         verifyReleaseRefusal("running",server,save,context.computeOnClient(c -> MapArtClient.status().engine().lifecycle().context().orElseThrow().runId()));
         Live before=live();
@@ -869,6 +1071,7 @@ final class ScenarioRunner implements AutoCloseable {
     }
 
     void captureFailure(Throwable error) {
+        if(!baseline()) { captureCompactFailure(error); return; }
         capture(error,() -> writeNew(roots,artifacts.resolve("failure.txt"),trace(error)));
         capture(error,() -> writeNew(roots,artifacts.resolve("failure-state.json"),failureMetadata(invocation,resetOrdinal,
                 world!=null,admitted,plan,origin,settings,ready,runs,previous,observedHash,
@@ -882,8 +1085,8 @@ final class ScenarioRunner implements AutoCloseable {
             });
             if (failureLiveAvailable(true,admitted,plan,origin,settings))
                 capture(error,() -> writeNew(roots,artifacts.resolve("failure-live.txt"),live().toString()));
-            capture(error,() -> writeNew(roots,artifacts.resolve("failure-observer.txt"),context.computeOnClient(c -> watch.copy()).stream()
-                    .map(ScenarioObserver.Sample::line).reduce("",(a,b) -> a+b+"\n")));
+            capture(error,() -> writeLinesNew(artifacts.resolve("failure-observer.txt"),
+                    context.computeOnClient(c -> watch.copy()).stream().map(ScenarioObserver.Sample::line)::iterator));
         }
         // Capture errors are present here; later try-with-resources close errors remain in the outer log.
         capture(error,() -> writeNew(roots,artifacts.resolve("failure-after-capture.txt"),trace(error)));
@@ -931,6 +1134,316 @@ final class ScenarioRunner implements AutoCloseable {
         var text=new java.io.StringWriter(); error.printStackTrace(new java.io.PrintWriter(text)); return text.toString();
     }
 
+    private void scalar(String name,String text) {
+        try(var writer=new BufferedWriter(new OutputStreamWriter(outputs.open(OutputKind.SCALAR,name),StandardCharsets.UTF_8))) {
+            writer.write(text); writer.write('\n');
+        } catch(IOException error) { throw new UncheckedIOException(error); }
+    }
+
+    private void writeHeader(Path target,String text) {
+        if(baseline()) { writeNew(roots,target,text); return; }
+        var name="header-"+target.getFileName();
+        scalar(name,text);
+        copyCompact(outputs.root().resolve(name),target);
+    }
+
+    /** Throwable writes fail at the real byte cap; never construct a whole trace or swallow PrintWriter I/O failure. */
+    private static void writeDiagnostic(OutputBudget budget,String name,Throwable failure) {
+        try(var bytes=budget.open(OutputKind.SCALAR,name); var utf8=new OutputStreamWriter(bytes,StandardCharsets.UTF_8)) {
+            var streaming=new Writer() {
+                @Override public void write(char[] value,int offset,int length) {
+                    try { utf8.write(value,offset,length); } catch(IOException error) { throw new UncheckedIOException(error); }
+                }
+                @Override public void write(String value,int offset,int length) {
+                    for(int end=offset+length; offset<end;) {
+                        int count=Math.min(1024,end-offset);
+                        try { utf8.write(value,offset,count); } catch(IOException error) { throw new UncheckedIOException(error); }
+                        offset+=count;
+                    }
+                }
+                @Override public void flush() {
+                    try { utf8.flush(); } catch(IOException error) { throw new UncheckedIOException(error); }
+                }
+                @Override public void close() { flush(); }
+            };
+            var printer=new PrintWriter(streaming);
+            failure.printStackTrace(printer); printer.flush();
+        } catch(IOException error) { throw new UncheckedIOException(error); }
+    }
+
+    private static void requireCompleteOutputs(OutputBudget budget) {
+        require(budget.failure().isEmpty() && budget.seal().complete(),"Incomplete output prefix; reset/rearm/normal close refused");
+    }
+
+    private static void retainConstructorFailure(OutputBudget budget,Throwable primary) {
+        capture(primary,()->writeDiagnostic(budget,"constructor-failure.txt",primary));
+        capture(primary,budget::seal); // No Runner reaches the caller on constructor failure; this owner must close its prefix.
+    }
+
+    static void verifyDiagnosticGuards(Path directory) {
+        var limits=Limits.forRun(1,0,0,1);
+        try {
+            var early=new OutputBudget(directory.resolve("pre-facade"),limits);
+            var original=new IllegalStateException("owned failure before world admission/facade start");
+            writeDiagnostic(early,"early-failure.txt",original);
+            var prefix=early.root().resolve("early-failure.txt"); var digest=fileHash(prefix); long spent=early.scalarBytes();
+            var adopted=new TraversalCapture(early.root(),UUID.randomUUID(),limits,Set.of(),early);
+            require(early.scalarBytes()==spent && fileHash(prefix).equals(digest),"Facade adoption renewed/spoiled early diagnostic bytes");
+            var complete=adopted.seal(); adopted.requireSealedForClear();
+            require(complete.complete() && complete.outputs().scalarBytes()>=spent
+                    && complete.outputs().receipts().stream().anyMatch(r->r.path().equals(prefix) && r.hash().equals(digest)),
+                    "Pre-world diagnostic ownership lost at actual capture adoption");
+            var constructor=new OutputBudget(directory.resolve("constructor-failure"),limits);
+            var beforeWorld=new IllegalStateException("failure before owned world/facade creation");
+            retainConstructorFailure(constructor,beforeWorld);
+            require(constructor.seal().complete() && constructor.receipts().stream().anyMatch(r->r.path().getFileName().toString().equals("constructor-failure.txt"))
+                    && !Files.exists(constructor.root().resolve("COMMITTED")),"Constructor failure lost closed prefix or invented commit");
+            rejected("closed constructor failure budget cannot be adopted",()->{
+                try { new TraversalCapture(constructor.root(),UUID.randomUUID(),limits,Set.of(),constructor); }
+                catch(IOException error) { throw new UncheckedIOException(error); }
+            });
+            var oversized=new OutputBudget(directory.resolve("oversized-text"),limits);
+            var primary=new IllegalStateException("x".repeat(1048577));
+            retainConstructorFailure(oversized,primary);
+            var outputCause=oversized.failure().orElseThrow();
+            require(Arrays.stream(primary.getSuppressed()).anyMatch(e->e==outputCause || e.getCause()==outputCause),
+                    "Constructor output failure replaced/lost original primary/suppressed cause");
+            verifyRefusedDiagnostic(oversized);
+
+            var pixels=new OutputBudget(directory.resolve("png-pixels"),limits);
+            try(var nativeImage=new NativeImage(2,2,false)) {
+                int[] colors={0xffff0000,0x8000ff00,0x400000ff,0x00ffffff};
+                for(int k=0;k<colors.length;k++) nativeImage.setColorArgb(k%2,k/2,colors[k]);
+                var image=imageArgb(nativeImage);
+                try {
+                    writePng(pixels,"failure.png",image,false);
+                    var decoded=ImageIO.read(pixels.root().resolve("failure.png").toFile());
+                    require(decoded!=null && decoded.getWidth()==2 && decoded.getHeight()==2,"Owned PNG did not round-trip");
+                    try { for(int k=0;k<colors.length;k++) require(decoded.getRGB(k%2,k/2)==colors[k],"PNG ARGB/alpha/orientation changed"); }
+                    finally { decoded.flush(); }
+                } finally { image.flush(); }
+            }
+            requireCompleteOutputs(pixels);
+            for(var size:List.of(new int[]{854,480,320,179},new int[]{1366,768,320,179},
+                    new int[]{1280,720,320,180},new int[]{480,854,101,180},new int[]{2,2,2,2})) {
+                try(var nativeImage=new NativeImage(size[0],size[1],true)) {
+                    var reduced=imageArgb(nativeImage);
+                    try { require(reduced.getWidth()==size[2] && reduced.getHeight()==size[3]
+                            && reduced.getWidth()>0 && reduced.getWidth()<=320 && reduced.getHeight()>0 && reduced.getHeight()<=180,
+                            "Actual failure-image helper changed bounded geometry/no-upscale: "+Arrays.toString(size)); }
+                    finally { reduced.flush(); }
+                }
+            }
+            var noisy=new BufferedImage(768,512,BufferedImage.TYPE_INT_ARGB); var random=new Random(314159);
+            for(int y=0;y<noisy.getHeight();y++) for(int x=0;x<noisy.getWidth();x++) noisy.setRGB(x,y,random.nextInt());
+            var imageBudget=new OutputBudget(directory.resolve("oversized-png"),limits);
+            try { rejected("oversized encoded PNG",()->writePng(imageBudget,"failure.png",noisy,false)); }
+            finally { noisy.flush(); }
+            verifyRefusedDiagnostic(imageBudget);
+            System.out.println("ScenarioRunner same-helper pre-facade/adoption/text/PNG guards passed; not native screenshot evidence");
+        } catch(IOException error) { throw new UncheckedIOException(error); }
+    }
+
+    private static void verifyRefusedDiagnostic(OutputBudget budget) {
+        var first=budget.failure().orElseThrow(); var retained=budget.seal();
+        require(!retained.complete() && budget.failure().orElseThrow()==first && budget.scalarBytes()>0 && budget.scalarBytes()<=1048576,
+                "Oversized diagnostic lost first cause/bounded prefix");
+        var restores=new int[1];
+        rejected("incomplete diagnostic cannot commit/restore",()->archiveThenRestore(()->{
+            requireCompleteOutputs(budget);
+            try { Files.writeString(budget.root().resolve("COMMITTED"),"must never be reached"); }
+            catch(IOException error) { throw new UncheckedIOException(error); }
+        },()->restores[0]++));
+        require(restores[0]==0 && !Files.exists(budget.root().resolve("COMMITTED")),"Oversized diagnostic reached uncharged COMMITTED/restore");
+        rejected("failed pre-facade budget cannot be adopted",()->{
+            try { new TraversalCapture(budget.root(),UUID.randomUUID(),Limits.forRun(1,0,0,1),Set.of(),budget); }
+            catch(IOException error) { throw new UncheckedIOException(error); }
+        });
+        require(budget.failure().orElseThrow()==first,"Refused adoption replaced diagnostic first cause");
+    }
+
+    private void prepareCompactSeal() {
+        if(outputs!=null && !commitMarker && outputs.failure().isEmpty()) {
+            scalar("commit-marker.txt","archive complete; invocation="+invocation+"; run="+(capture==null?"pre-start":capture.runId()));
+            commitMarker=true;
+        }
+    }
+
+    private void sealCompact() {
+        if(sealed!=null) return;
+        prepareCompactSeal();
+        if(capture!=null) sealed=context.computeOnClient(c -> { requireClient(c); return watch.sealTraversal(); });
+        else if(outputs!=null) outputs.seal();
+    }
+
+    private void captureCompactFailure(Throwable primary) {
+        if(world!=null) capture(primary,()->context.runOnClient(c->{ requireClient(c); MapArtClient.stop(); requireReleased(c); }));
+        if(outputs!=null && sealed==null && outputs.failure().isEmpty() && admitted!=null && plan!=null) {
+            capture(primary,()->fullPlayerCheckpoint(CheckpointKind.FAILURE));
+            capture(primary,()->context.runOnClient(c->{ requireClient(c); region(c.player,false,"failure-client"); }));
+            capture(primary,()->world.getServer().runOnServer(s->{ requireServer(s); region(serverPlayer,false,"failure-server"); }));
+        }
+        if(sealed==null && outputs.failure().isEmpty()) capture(primary,()->writeDiagnostic(outputs,"failure-trace.txt",primary));
+        capture(primary,this::sealCompact);
+        if(outputs!=null) capture(primary,()->{
+            try(var writer=new BufferedWriter(new OutputStreamWriter(outputs.openPostSealFailure("failure-"+(++scalarOrdinal)+".txt"),StandardCharsets.UTF_8))) {
+                writer.write(compactFailureMetadata(primary).toString()); writer.write('\n');
+            } catch(IOException error) { throw new UncheckedIOException(error); }
+        });
+        if(world!=null) {
+            try { captureFailureImage(); }
+            catch(RuntimeException | Error error) {
+                compactArchiveFailure=retain(compactArchiveFailure,error); retain(primary,error);
+            }
+            capture(primary,()->archiveCompact(artifacts.resolve("failure-archive-"+resetOrdinal),sealed));
+        }
+    }
+
+    private static BufferedImage imageArgb(NativeImage image) {
+        int sourceWidth=image.getWidth(),sourceHeight=image.getHeight();
+        require(sourceWidth>0 && sourceHeight>0,"Failure image dimensions must be positive");
+        int width=sourceWidth,height=sourceHeight;
+        if(width>320 || height>180) {
+            if((long)sourceWidth*180>=(long)sourceHeight*320) { width=320; height=Math.max(1,(int)((long)sourceHeight*320/sourceWidth)); }
+            else { height=180; width=Math.max(1,(int)((long)sourceWidth*180/sourceHeight)); }
+        }
+        var result=new BufferedImage(width,height,BufferedImage.TYPE_INT_ARGB);
+        try {
+            for(int y=0;y<height;y++) for(int x=0;x<width;x++)
+                result.setRGB(x,y,image.getColorArgb((int)((2L*x+1)*sourceWidth/(2L*width)),(int)((2L*y+1)*sourceHeight/(2L*height))));
+            return result;
+        } catch(RuntimeException | Error error) { result.flush(); throw error; }
+    }
+
+    /** Binary PNG explicitly spends the existing SCALAR/failure-diagnostic reserve; no file or disk cache precedes admission. */
+    private static void writePng(OutputBudget budget,String name,BufferedImage image,boolean postSeal) {
+        var encoders=ImageIO.getImageWritersByFormatName("PNG");
+        require(encoders.hasNext(),"PNG failure encoder unavailable"); var encoder=encoders.next();
+        try(var bytes=postSeal?budget.openPostSealFailure(name):budget.open(OutputKind.SCALAR,name);
+            var output=new MemoryCacheImageOutputStream(bytes)) {
+            encoder.setOutput(output); encoder.write(image); output.flush();
+        } catch(IOException error) { throw new UncheckedIOException(error); }
+        finally { encoder.dispose(); }
+    }
+
+    private record CapturedImage(BufferedImage pixels,int nativeWidth,int nativeHeight) { }
+
+    private void captureFailureImage() {
+        require(outputs.failure().isEmpty(),"Owned failure PNG unavailable: diagnostic reservation already failed");
+        var future=new CompletableFuture<CapturedImage>();
+        int[] source=context.computeOnClient(c->{
+            requireClient(c);
+            var buffer=c.getFramebuffer(); int width=buffer.textureWidth, height=buffer.textureHeight;
+            require(width>0 && height>0,"Owned failure framebuffer unavailable");
+            c.gameRenderer.render(RenderTickCounter.ONE,true);
+            ScreenshotRecorder.takeScreenshot(buffer,image->{
+                try(image) {
+                    var pixels=imageArgb(image);
+                    if(!future.complete(new CapturedImage(pixels,image.getWidth(),image.getHeight()))) pixels.flush();
+                } catch(RuntimeException | Error error) { future.completeExceptionally(error); }
+            });
+            return new int[]{width,height};
+        });
+        for(int tick=0;!future.isDone() && tick<20;tick++) context.waitTick();
+        if(!future.isDone()) { future.cancel(false); throw new IllegalStateException("Owned failure PNG callback timeout after20 ticks"); }
+        var captured=future.join(); // Gametest thread; completion was checked without blocking the render/client thread.
+        var image=captured.pixels();
+        try {
+            writePng(outputs,"failure.png",image,true);
+            try(var writer=new BufferedWriter(new OutputStreamWriter(outputs.openPostSealFailure("failure-image.json"),StandardCharsets.UTF_8))) {
+                writer.write("{\"payload\":\"binary PNG\",\"reservation\":\"existing SCALAR/failure-diagnostic bytes\",\"file\":\"failure.png\","
+                        +"\"source\":\"owned framebuffer callback after stop/seal; rendered tickDelta1; not observer END\","
+                        +"\"framebufferWidth\":"+source[0]+",\"framebufferHeight\":"+source[1]+",\"downscale\":1"
+                        +",\"nativeImageWidth\":"+captured.nativeWidth()+",\"nativeImageHeight\":"+captured.nativeHeight()
+                        +",\"reduction\":\"nearest pixel centers; aspect fit320x180; integer floor/minimum1; no upscale\""
+                        +",\"width\":"+image.getWidth()+",\"height\":"+image.getHeight()+"}\n");
+            } catch(IOException error) { throw new UncheckedIOException(error); }
+        } finally { image.flush(); }
+    }
+
+    private JsonObject compactFailureMetadata(Throwable primary) {
+        var value=new JsonObject();
+        value.addProperty("invocation",invocation.toString()); value.addProperty("resetOrdinal",resetOrdinal);
+        value.addProperty("ready",ready); value.addProperty("ownedWorld",world!=null);
+        value.addProperty("admittedDefinitionHash",admitted==null?null:admitted.definitionHash());
+        value.addProperty("planFingerprint",plan==null?null:plan.fingerprint()); value.addProperty("origin",origin==null?null:origin.toString());
+        value.addProperty("settings",settings==null?null:settings.fingerprint());
+        value.addProperty("observedStableStartHash",observedHash);
+        value.addProperty("heldStateProvenance","Held admission/hash may predate this reset; not-ready does not establish operation timing or a current passing scan");
+        value.add("ownedRunIds",new Gson().toJsonTree(runs.stream().map(UUID::toString).sorted().toList()));
+        value.addProperty("captureRun",capture==null?null:capture.runId().toString());
+        value.addProperty("previousResultRun",previous==null?null:previous.runId().toString());
+        value.addProperty("sealedEvents",sealed==null?null:sealed.events().toString());
+        value.addProperty("sealedHash",sealed==null?null:sealed.eventHash());
+        value.addProperty("sealedCount",sealed==null?null:sealed.eventCount()); value.addProperty("sealedBytes",sealed==null?null:sealed.eventBytes());
+        value.addProperty("sealedComplete",sealed!=null && sealed.complete());
+        value.addProperty("failure",primary.getClass().getName());
+        var message=String.valueOf(primary.getMessage()); value.addProperty("message",message.substring(0,Math.min(2048,message.length())));
+        value.addProperty("originalMessageChars",message.length()); value.addProperty("messageTruncated",message.length()>2048);
+        value.addProperty("imageAvailability",world==null?"No owned world image available":"Owned failure PNG attempted after seal; actual closed-byte/hash receipt required");
+        value.addProperty("suppressedCount",primary.getSuppressed().length);
+        value.addProperty("readProvenance",sealed==null?"Current guarded pre-seal reads attempted where available":"Immutable sealed prefix; no post-seal scan fabricated");
+        return value;
+    }
+
+    private void archiveCompact(Path stage,Sealed trace) {
+        try { archiveCompactFiles(stage,trace); }
+        catch(RuntimeException | Error error) { compactArchiveFailure=retain(compactArchiveFailure,error); throw error; }
+    }
+
+    private void archiveCompactFiles(Path stage,Sealed trace) {
+        checkedDirectory(roots,stage);
+        if(outputs!=null) {
+            if(trace==null) { prepareCompactSeal(); outputs.seal(); }
+            var paths=new LinkedHashSet<Path>();
+            if(trace!=null) {
+                try {
+                    require(Files.size(trace.events())==trace.eventBytes() && fileHash(trace.events()).equals(trace.eventHash()),"Original sealed event bytes changed");
+                    for(var checkpoint:trace.checkpoints().values()) if(checkpoint.bytes()>=0 && checkpoint.hash()!=null)
+                        require(Files.size(checkpoint.path())==checkpoint.bytes() && fileHash(checkpoint.path()).equals(checkpoint.hash()),"Original checkpoint prefix changed");
+                    require(Files.size(trace.outputs().manifest())==trace.outputs().manifestBytes()
+                            && fileHash(trace.outputs().manifest()).equals(trace.outputs().manifestHash()),"Original output manifest changed");
+                } catch(IOException error) { throw new UncheckedIOException(error); }
+                paths.add(trace.events());
+                for(var checkpoint:trace.checkpoints().values()) paths.add(checkpoint.path()); // Incomplete entries are owned raw bytes, never parsed as scans.
+            }
+            for(var receipt:outputs.receipts()) {
+                try { require(Files.size(receipt.path())==receipt.bytes() && fileHash(receipt.path()).equals(receipt.hash()),"Owned closed output changed"); }
+                catch(IOException error) { throw new UncheckedIOException(error); }
+            }
+            paths.addAll(outputs.ownedFiles());
+            for(var source:paths) copyCompact(source,stage.resolve(source.getFileName()));
+        }
+        require(trace==null || trace.complete(),"Incomplete sealed trace archived; reset/rearm/owned close refused");
+        requireCompleteOutputs(outputs);
+        require(compactArchiveFailure==null,"Earlier archive failure forbids reset/rearm/normal close");
+        require(commitMarker,"Missing owned commit marker");
+        copyCompact(outputs.root().resolve("commit-marker.txt"),stage.resolve("COMMITTED"));
+        try(var file=java.nio.channels.FileChannel.open(stage.resolve("COMMITTED"),StandardOpenOption.WRITE)) { file.force(true); }
+        catch(IOException error) { throw new UncheckedIOException(error); }
+        compactCommitted=true;
+    }
+
+    private void copyCompact(Path from,Path to) {
+        checkRoots(roots);
+        require(outputs!=null && from.toAbsolutePath().normalize().equals(from) && from.getParent().equals(outputs.root())
+                && real(from).equals(from) && Files.isRegularFile(from,LinkOption.NOFOLLOW_LINKS)
+                && real(to.getParent()).equals(to.getParent()) && to.startsWith(artifacts),"Owned trace archive copy escaped");
+        try {
+            var before=fileHash(from); Files.copy(from,to);
+            try(var file=java.nio.channels.FileChannel.open(to,StandardOpenOption.WRITE)) { file.force(true); }
+            require(Files.size(from)==Files.size(to) && before.equals(fileHash(to)) && before.equals(fileHash(from)),"Owned archive bytes changed during copy");
+        } catch(IOException error) { throw new UncheckedIOException(error); }
+    }
+
+    private static String fileHash(Path path) throws IOException {
+        try {
+            var digest=MessageDigest.getInstance("SHA-256");
+            try(var input=Files.newInputStream(path)) { var bytes=new byte[8192]; int count; while((count=input.read(bytes))!=-1) digest.update(bytes,0,count); }
+            return HexFormat.of().formatHex(digest.digest());
+        } catch(NoSuchAlgorithmException error) { throw new AssertionError(error); }
+    }
+
     ScenarioResult run(ScenarioDefinition definition) {
         UUID id = start(definition,true);
         var stage=artifacts.resolve("success-"+countedStarts+"-"+id);
@@ -950,19 +1463,26 @@ final class ScenarioRunner implements AutoCloseable {
         double clientReach=context.computeOnClient(c -> { requireClient(c); return c.player.getBlockInteractionRange(); });
         double serverReach=world.getServer().computeOnServer(s -> { requireServer(s); return serverPlayer.getBlockInteractionRange(); });
         require(Double.isFinite(clientReach) && clientReach>0 && Double.isFinite(serverReach) && serverReach>0,"Invalid actual interaction reach");
-        writeNew(roots,stage.resolve("start.txt"),"run="+id+"; definition="+definition.definitionHash()+"; observedStart="+observedHash
-                +"; clientReach="+clientReach+"; serverReach="+serverReach+"; actualStart="+evidence(stable));
-        if (priorCountedStart!=null) writeNew(roots,stage.resolve("start-comparison.txt"),"previousObservedHash="
+        var startText="run="+id+"; definition="+definition.definitionHash()+"; observedStart="+observedHash
+                +"; clientReach="+clientReach+"; serverReach="+serverReach+"; actualStart="+evidence(stable);
+        if(baseline()) writeNew(roots,stage.resolve("start.txt"),startText); else scalar("start.txt",startText);
+        if (priorCountedStart!=null) {
+            var comparison="previousObservedHash="
                 +assertedSuccesses.getLast().observedStableStartHash()+"; currentObservedHash="+observedHash
-                +"; rawDelta="+deltas(priorCountedStart,stable)+"; both starts independently passed readiness; byte equality is not required");
+                +"; rawDelta="+deltas(priorCountedStart,stable)+"; both starts independently passed readiness; byte equality is not required";
+            if(baseline()) writeNew(roots,stage.resolve("start-comparison.txt"),comparison); else scalar("start-comparison.txt",comparison);
+        }
         priorCountedStart=stable;
-        var checkpoints=new ArrayList<Live>();
-        Live current=live(), shiftStart=null, resumed=null;
-        checkpoints.add(current);
+        List<Live> checkpoints=baseline()?new ArrayList<>():null;
+        Live current=baseline()?live():null, shiftStart=null, resumed=null;
+        if(baseline()) checkpoints.add(current);
+        TraversalPoll poll=baseline()?null:traversalPoll();
+        if(!baseline()) fullPlayerCheckpoint(CheckpointKind.INITIAL);
         boolean paused=false;
         int budget = i(definition.data().getAsJsonObject("budgets"),"runTicks");
-        writeNew(roots,stage.resolve("fixture-profile.txt"),"fixture="+fixture+"; physicsRunTicks="+budget
-                +"; productionEligibleAllowance="+BuildEngine.runLimit(plan,settings)+"; targets="+plan.targets().size());
+        var profileText="fixture="+fixture+"; physicsRunTicks="+budget
+                +"; productionEligibleAllowance="+BuildEngine.runLimit(plan,settings)+"; targets="+plan.targets().size();
+        if(baseline()) writeNew(roots,stage.resolve("fixture-profile.txt"),profileText); else scalar("fixture-profile.txt",profileText);
         for (int tick=0; tick<budget; tick++) {
             context.waitTick();
             if(baseline() && supportCase==SupportCase.CONTROLLED) context.runOnClient(c -> {
@@ -981,10 +1501,16 @@ final class ScenarioRunner implements AutoCloseable {
                     writeNew(roots,stage.resolve("support-gate-release.txt"),released+"\nactual equal-END/double-release/same-UUID-rearm refusals preserved gate/core");
                 });
             });
-            current=live(); checkpoints.add(current);
-            writeNew(roots,stage.resolve("physics-"+tick+".txt"),current.toString());
-            requireRun(current.sample,id);
-            if (current.sample.status().engine().lifecycle().phase()==Phase.TERMINAL) break;
+            if(baseline()) {
+                current=live(); checkpoints.add(current);
+                writeNew(roots,stage.resolve("physics-"+tick+".txt"),current.toString());
+                requireRun(current.sample,id);
+            } else {
+                poll=traversalPoll();
+                if(capture.hasCheckpoint(CheckpointKind.FIRST_VERIFY) && !playerCheckpoints.contains(CheckpointKind.FIRST_VERIFY))
+                    fullPlayerCheckpoint(CheckpointKind.FIRST_VERIFY);
+            }
+            if ((baseline()?current.sample.status().engine().lifecycle().phase():poll.phase)==Phase.TERMINAL) break;
             if (baseline() && substage(current.sample,ForwardTraversal.Substage.SHIFT)) {
                 if (shiftStart==null) shiftStart=current;
                 if (countedStarts==1 && !paused && nativeForward(current.sample)
@@ -997,15 +1523,15 @@ final class ScenarioRunner implements AutoCloseable {
                 }
             }
         }
-        var terminal=current.sample.status().engine();
-        var samples=context.computeOnClient(c -> watch.copy());
-        writeNew(roots,stage.resolve("observer-before-assertions.txt"),samples.stream().map(ScenarioObserver.Sample::line).reduce("",(a,b) -> a+b+"\n"));
+        var terminal=baseline()?current.sample.status().engine():context.computeOnClient(c->{ requireClient(c); return MapArtClient.status().engine(); });
+        List<ScenarioObserver.Sample> samples=baseline()?context.computeOnClient(c -> watch.copy()):List.of();
+        if(baseline()) writeLinesNew(stage.resolve("observer-before-assertions.txt"),samples.stream().map(ScenarioObserver.Sample::line)::iterator);
         require(terminal.lifecycle().phase()==Phase.TERMINAL && terminal.lifecycle().outcome().orElse(null)==Outcome.SUCCESS,
-                "Counted run did not reach SUCCESS within "+budget+" real ticks: "+terminal);
+                "Counted run did not reach SUCCESS within "+budget+" real ticks"+(baseline()?": "+terminal:"; compact prefix retained"));
         require(terminal.diagnostic().orElseThrow().reason()==BuildEngine.Reason.VERIFIED
                         && terminal.diagnostic().orElseThrow().detail().equals("Later current full-plan OBSERVED scan matched every expected state")
                         && terminal.unfinishedTargetIds().isEmpty() && terminal.pendingTargetIds().isEmpty(),
-                "SUCCESS lacks exact VERIFIED/ALL_CONFIRMED export: "+terminal);
+                "SUCCESS lacks exact VERIFIED/ALL_CONFIRMED export"+(baseline()?": "+terminal:"; compact prefix retained"));
         if(baseline()) {
             require(countedStarts!=1 || paused,"First success never reached the required actual SHIFT pause");
             verifyTraversal(id,checkpoints,samples,clientReach,serverReach,resumed,stage);
@@ -1016,6 +1542,7 @@ final class ScenarioRunner implements AutoCloseable {
                 verifySupport(id,samples,stage);
             }
         }
+        if(baseline()) {
         var accepted=samples.stream().flatMap(s -> s.status().engine().effectResults().stream())
                 .filter(e -> e.status()==BuildEngine.EffectStatus.ACCEPTED).distinct().toList();
         requireAcceptedFeedback(id,plan.targets(),accepted);
@@ -1028,9 +1555,13 @@ final class ScenarioRunner implements AutoCloseable {
         require(success.status().engine().eligibleTicks()>samples.stream().filter(s -> s.phase().equals("END") && s.tick()==verifyFrame)
                 .findFirst().orElseThrow().status().engine().eligibleTicks(),"VERIFY did not precede an advancing SUCCESS decision");
         checkCurrentScan(id,current.sample.tick(),plan.targets(),current.sample.observations());
+        } else fullPlayerCheckpoint(CheckpointKind.TERMINAL);
         Live released=current;
+        TraversalPoll releasedPoll=poll;
         for (int tick=0;tick<20;tick++) {
+            if(!baseline() && tick==19) context.runOnClient(c->{ requireClient(c); watch.requestReleaseEnd(); });
             context.waitTick();
+            if(baseline()) {
             Live next=live(); requireRun(next.sample,id);
             context.runOnClient(ScenarioRunner::requireReleased);
             require(next.sample.status().engine().equals(terminal) && next.nativeSequence==current.nativeSequence,
@@ -1038,15 +1569,38 @@ final class ScenarioRunner implements AutoCloseable {
             requirePhysics(released,next);
             writeNew(roots,stage.resolve("release-"+tick+".txt"),next.toString());
             released=next;
+            } else {
+                var next=traversalPoll();
+                context.runOnClient(ScenarioRunner::requireReleased);
+                require(next.phase==Phase.TERMINAL && next.outcome==Outcome.SUCCESS && next.reason==BuildEngine.Reason.VERIFIED
+                        && next.eligible==poll.eligible && next.verify==poll.verify && next.pending==0 && next.unfinished==0
+                        && next.sequence==poll.sequence && next.keys==0 && next.owner==BuildEngine.ControlOwner.NONE,
+                        "Compact terminal release changed engine/controls/native issuance");
+                require(next.client.age()>releasedPoll.client.age() && next.client.worldTime()>releasedPoll.client.worldTime()
+                        && next.server.age()>releasedPoll.server.age() && next.server.worldTime()>releasedPoll.server.worldTime()
+                        && next.server.serverTick()>releasedPoll.server.serverTick(),"Compact release lacks independent real physics");
+                releasedPoll=next;
+            }
         }
+        if(baseline()) {
         require(released.sample.tick()>current.sample.tick(),"Final current scan did not advance observer time");
         checkCurrentScan(id,released.sample.tick(),plan.targets(),released.sample.observations());
         writeNew(roots,stage.resolve("release-summary.txt"),"first="+current+"\nlast="+released);
-        writeNew(roots,stage.resolve("observer-after-release.txt"),context.computeOnClient(c -> watch.copy()).stream()
-                .map(ScenarioObserver.Sample::line).reduce("",(a,b) -> a+b+"\n"));
+        if(baseline()) writeLinesNew(stage.resolve("observer-after-release.txt"),context.computeOnClient(c -> watch.copy()).stream()
+                .map(ScenarioObserver.Sample::line)::iterator);
         verifyFinalState(released,stage);
+        } else {
+            verifyFinalCompact(fullPlayerCheckpoint(CheckpointKind.RELEASE_END));
+            scalar("result-"+id+".txt","run="+id+"; outcome=SUCCESS; reason=VERIFIED; definition="+definition.definitionHash()
+                    +"; observedStart="+observedHash+"; originalTerminalEligible="+terminal.eligibleTicks()+"; releaseTicks=20");
+            context.runOnClient(c->{ requireClient(c); MapArtClient.stop(); requireReleased(c); });
+            sealCompact();
+            TraversalAssertions.verify(sealed,plan,fixture);
+            archiveCompact(stage.resolve("sealed"),sealed);
+            copyCompact(outputs.root().resolve("result-"+id+".txt"),artifacts.resolve("result-"+id+".txt"));
+        }
         previous = new ScenarioResult(id, terminal, definition.definitionHash(), observedHash, List.of(), artifacts);
-        writeNew(roots, artifacts.resolve("result-" + id + ".txt"), previous.toString());
+        if(baseline()) writeNew(roots, artifacts.resolve("result-" + id + ".txt"), previous.toString());
         return previous;
     }
 
@@ -1055,7 +1609,7 @@ final class ScenarioRunner implements AutoCloseable {
         require(result != null && result==previous && runs.contains(result.runId()) && result.artifacts().equals(artifacts)
                 && admitted != null && result.definitionHash().equals(admitted.definitionHash()), "Foreign result");
         require(result.mismatches().isEmpty() && result.terminal().lifecycle().outcome().orElse(null)==Outcome.SUCCESS,
-                "Scenario failed: " + result);
+                "Scenario failed: " + (baseline()?result:result.runId()));
         require(assertedSuccesses.stream().noneMatch(r -> r.runId().equals(result.runId())),"Duplicate counted assertion");
         assertedSuccesses.add(result);
     }
@@ -1127,14 +1681,46 @@ final class ScenarioRunner implements AutoCloseable {
             entry.addProperty("definitionHash",success.definitionHash()); entry.addProperty("observedStableStartHash",success.observedStableStartHash());
             entry.addProperty("resultFile","result-"+success.runId()+".txt"); successes.add(entry);
         }
-        result.add("successes",successes); result.addProperty("failure",outcome==null?null:trace(outcome));
-        try { writeNew(roots,artifacts.resolve("invocation-result.json"),result.toString()); }
+        result.add("successes",successes);
+        if(baseline()) result.addProperty("failure",outcome==null?null:trace(outcome));
+        else result.add("failure",outcome==null?JsonNull.INSTANCE:compactFailureMetadata(outcome));
+        try { writeInvocationFile(artifacts.resolve("invocation-result.json"),result.toString()); }
         catch (RuntimeException | Error error) { outcome=retain(outcome,error); }
-        try { writeNew(roots,artifacts.resolve("scenario.log"),(outcome==null?"PASS":"FAIL")+" invocation="+invocation
-                +"; normalClose="+normalClose+"; results=invocation-result.json\n"+(outcome==null?"":trace(outcome))); }
+        try { writeInvocationFile(artifacts.resolve("scenario.log"),(outcome==null?"PASS":"FAIL")+" invocation="+invocation
+                +"; normalClose="+normalClose+"; results=invocation-result.json\n"+(outcome==null?"":baseline()?trace(outcome):"original failure/prefix retained; bounded details in invocation-result.json and failure-trace.txt")); }
         catch (RuntimeException | Error error) { outcome=retain(outcome,error); }
+        if(!baseline() && outputs!=null) {
+            try { archiveLateSidecars(); } catch(RuntimeException | Error error) { outcome=retain(outcome,error); }
+        }
         if (failure==null && outcome instanceof Error error) throw error;
         if (failure==null && outcome!=null) throw (RuntimeException)outcome;
+    }
+
+    private void writeInvocationFile(Path target,String text) {
+        if(baseline()) { writeNew(roots,target,text); return; }
+        outputs.seal();
+        try(var writer=new BufferedWriter(new OutputStreamWriter(outputs.openPostSealFailure(target.getFileName().toString()),StandardCharsets.UTF_8))) {
+            writer.write(text);
+        } catch(IOException error) { throw new UncheckedIOException(error); }
+        copyCompact(outputs.root().resolve(target.getFileName()),target);
+    }
+
+    /** Late verdict/failure sidecars spend the same reserve; the original sealed receipt snapshot never changes. */
+    private void archiveLateSidecars() {
+        var original=sealed==null?outputs.seal():sealed.outputs();
+        var paths=new HashSet<Path>(); paths.add(original.manifest());
+        original.receipts().forEach(r->paths.add(r.path()));
+        var metadata=new JsonArray();
+        for(var receipt:outputs.receipts()) if(!receipt.receipt().equals(original.manifest())) {
+            var row=new JsonObject(); row.addProperty("file",receipt.path().getFileName().toString());
+            row.addProperty("bytes",receipt.bytes()); row.addProperty("sha256",receipt.hash());
+            row.addProperty("receipt",receipt.receipt().getFileName().toString()); metadata.add(row);
+        }
+        try(var writer=new BufferedWriter(new OutputStreamWriter(outputs.openPostSealFailure("late-manifest.json"),StandardCharsets.UTF_8))) {
+            writer.write("{\"originalSealedManifest\":\""+original.manifest().getFileName()+"\",\"lateOutputs\":"+metadata+"}\n");
+        } catch(IOException error) { throw new UncheckedIOException(error); }
+        var destination=artifacts.resolve("late-sidecars"); checkedDirectory(roots,destination);
+        for(var path:outputs.ownedFiles()) if(!paths.contains(path)) copyCompact(path,destination.resolve(path.getFileName()));
     }
 
     private Live pauseShift(UUID id, Live before, Path stage, List<Live> checkpoints) {
@@ -1848,7 +2434,7 @@ final class ScenarioRunner implements AutoCloseable {
             clientWorld=c.world; clientPlayer=c.player; handler=c.getNetworkHandler(); connection=handler.getConnection();
             requireClient(c);
         });
-        writeNew(roots, artifacts.resolve("authority.txt"), "invocation=" + invocation + "; roots=" + roots + "; save=" + save
+        writeHeader(artifacts.resolve("authority.txt"), "invocation=" + invocation + "; roots=" + roots + "; save=" + save
                 + "; server=" + System.identityHashCode(server) + "; serverPlayer=" + System.identityHashCode(serverPlayer)
                 + "; clientWorld=" + System.identityHashCode(clientWorld) + "; clientPlayer=" + System.identityHashCode(clientPlayer)
                 + "; handler=" + System.identityHashCode(handler) + "; connection=" + System.identityHashCode(connection));
@@ -1900,9 +2486,10 @@ final class ScenarioRunner implements AutoCloseable {
     private void archive(Path stage, Prior prior) {
         preflight(admitted == null ? profileDefinition : admitted);
         checkedDirectory(roots, stage);
+        if(!baseline()) { archiveCompact(stage,prior.traversal); return; }
         writeNew(roots, stage.resolve("prior-result.txt"), String.valueOf(previous));
         writeNew(roots, stage.resolve("prior-status-transitions.txt"), prior.status.toString());
-        writeNew(roots, stage.resolve("prior-observer.txt"), prior.samples.stream().map(ScenarioObserver.Sample::line).reduce("", (a,b) -> a+b+"\n"));
+        writeLinesNew(stage.resolve("prior-observer.txt"),prior.samples.stream().map(ScenarioObserver.Sample::line)::iterator);
         writeNew(roots, stage.resolve("prior-fault.txt"), prior.fault + "\n" + prior.stateFault);
         writeNew(roots, stage.resolve("prior-mismatches.txt"), previous==null ? "no previous result" : previous.mismatches.toString());
         Path screenshot = context.takeScreenshot(TestScreenshotOptions.of("before-reset").withDestinationDir(stage).disableCounterPrefix());
@@ -1994,19 +2581,30 @@ final class ScenarioRunner implements AutoCloseable {
         for (int tick=consumed+1; tick<=budget; tick++) {
             context.waitTick();
             // waitTick returns in Fabric TEST; each callback finishes before the other is requested.
-            var client=context.computeOnClient(c -> { requireClient(c); return readClient(c,true); });
+            final int attempt=tick;
+            var client=context.computeOnClient(c -> {
+                requireClient(c); var side=readClient(c,true);
+                return baseline()?side:withRegion(side,region(c.player,true,"readiness-"+attempt+"-client"));
+            });
             var status=context.computeOnClient(c -> { requireClient(c); return MapArtClient.status(); });
-            var remote=world.getServer().computeOnServer(s -> { requireServer(s); return readPlayer(serverPlayer,true,s.getTicks()); });
+            var remote=world.getServer().computeOnServer(s -> {
+                requireServer(s); var side=readPlayer(serverPlayer,true,s.getTicks());
+                return baseline()?side:withRegion(side,region(serverPlayer,true,"readiness-"+attempt+"-server"));
+            });
             var checkpoint=new Checkpoint(client,remote,status);
-            writeNew(roots,stage.resolve("readiness-"+tick+".json"), evidence(checkpoint).toString());
+            if(baseline()) writeNew(roots,stage.resolve("readiness-"+tick+".json"), evidence(checkpoint).toString());
+            else scalar("readiness-"+tick+".json","clientAge="+client.age+"; clientTime="+client.time+"; serverAge="+remote.age
+                    +"; serverTime="+remote.time+"; serverTick="+remote.serverTick+"; clientProblems="+client.problems+"; serverProblems="+remote.problems);
             boolean passing=client.problems.isEmpty() && remote.problems.isEmpty();
             if (passing && previousCheckpoint!=null && advancing(previousCheckpoint,checkpoint)) {
                 var first=checkpointJson(previousCheckpoint); var second=checkpointJson(checkpoint);
                 observedHash=hash(second.toString()); stable=checkpoint;
-                writeNew(roots,stage.resolve("stable-start.json"), "{\"firstHash\":\""+hash(first.toString())+"\",\"secondHash\":\""+observedHash
-                        +"\",\"byteEqual\":"+first.equals(second)+",\"rawDelta\":"+deltas(previousCheckpoint,checkpoint)+",\"first\":"+evidence(previousCheckpoint)+",\"second\":"+evidence(checkpoint)+"}");
-                writeNew(roots,stage.resolve("readiness-budget.txt"),"releaseConsumed="+consumed+"; stableConsumed="+(tick-consumed)
-                        +"; totalConsumed="+tick+"; remaining="+(budget-tick)+"; sharedReadinessTicks="+budget);
+                var stableText="{\"firstHash\":\""+hash(first.toString())+"\",\"secondHash\":\""+observedHash
+                        +"\",\"byteEqual\":"+first.equals(second)+",\"rawDelta\":"+deltas(previousCheckpoint,checkpoint)+",\"first\":"+evidence(previousCheckpoint)+",\"second\":"+evidence(checkpoint)+"}";
+                var budgetText="releaseConsumed="+consumed+"; stableConsumed="+(tick-consumed)
+                        +"; totalConsumed="+tick+"; remaining="+(budget-tick)+"; sharedReadinessTicks="+budget;
+                if(baseline()) { writeNew(roots,stage.resolve("stable-start.json"),stableText); writeNew(roots,stage.resolve("readiness-budget.txt"),budgetText); }
+                else { scalar("stable-start.json",stableText); scalar("readiness-budget.txt",budgetText); }
                 return;
             }
             previousCheckpoint=passing ? checkpoint : null;
@@ -2017,15 +2615,15 @@ final class ScenarioRunner implements AutoCloseable {
     private Side readClient(MinecraftClient c, boolean initial) {
         var side=readPlayer(c.player,initial,-1); var errors=new ArrayList<>(side.problems);
         var state=side.state;
-        var sample=watch.sample(c,"TEST");
-        state.add("keys",new Gson().toJsonTree(sample.keys()));
+        var keys=baseline()?watch.sample(c,"TEST").keys():keys(c);
+        state.add("keys",new Gson().toJsonTree(keys));
         state.addProperty("paused",c.isPaused()); state.addProperty("screenOpen",c.currentScreen!=null);
         state.addProperty("autoJump",c.options.getAutoJump().getValue());
         state.addProperty("mode",c.interactionManager==null ? "missing" : c.interactionManager.getCurrentGameMode().name());
         state.addProperty("input",c.player.input.playerInput.toString());
         state.addProperty("lastInput",c.player.getLastPlayerInput().toString());
         state.addProperty("movementInput",c.player.input.getMovementInput().toString());
-        if (c.currentScreen!=null || c.isPaused() || c.options.getAutoJump().getValue() || sample.keys().stream().anyMatch(Boolean::booleanValue)
+        if (c.currentScreen!=null || c.isPaused() || c.options.getAutoJump().getValue() || keys.stream().anyMatch(Boolean::booleanValue)
                 || c.interactionManager==null || c.interactionManager.getCurrentGameMode()!=GameMode.SURVIVAL
                 || !c.player.input.playerInput.equals(PlayerInput.DEFAULT) || !c.player.getLastPlayerInput().equals(PlayerInput.DEFAULT)
                 || c.player.input.getMovementInput().lengthSquared()!=0) errors.add("Client screen/options/mode/input/keys not neutral");
@@ -2039,14 +2637,17 @@ final class ScenarioRunner implements AutoCloseable {
         if (fault.active() || stateFault.active() || fault.failure().isPresent() || stateFault.failure().isPresent()) errors.add("Fixture fault active/failed");
         Object pending=((ClientWorldPendingUpdateAccessor)c.world).mapart$getPendingUpdateManager();
         require(pending instanceof PendingPredictionView, "Read-only scoped pending view unavailable");
-        var predicted=new JsonArray();
+        var predicted=new JsonArray(); int predictionCount=0;
         for (var cell:admitted.worldCells().keySet()) {
             var position=new BlockPos(cell.x(),cell.y(),cell.z());
-            if (((PendingPredictionView)pending).mapart$hasPendingPrediction(position)) predicted.add(position.toShortString());
+            if (((PendingPredictionView)pending).mapart$hasPendingPrediction(position)) {
+                predictionCount++; if(baseline()) predicted.add(position.toShortString());
+            }
         }
         state.add("pendingOwnedPositions",predicted);
         state.addProperty("predictionScope","all "+admitted.worldCells().size()+" authorized region positions; fixture-only interactions, sole player; no global queue claim");
-        if (!predicted.isEmpty()) errors.add("Owned predictions have not drained naturally");
+        if(!baseline()) state.addProperty("pendingOwnedCount",predictionCount);
+        if (predictionCount!=0) errors.add("Owned predictions have not drained naturally");
         return new Side(state,side.age,side.time,-1,List.copyOf(errors));
     }
 
@@ -2118,16 +2719,21 @@ final class ScenarioRunner implements AutoCloseable {
                 || p.isSubmergedInWater() || p.isInLava() || p.isClimbing() || p.isGliding() || p.isSwimming() || p.isSprinting()
                 || p.getAbilities().flying || p.isSneaking() || p.isUsingItem() || p.fallDistance!=0 || !p.getStatusEffects().isEmpty() || p.getAttributeBaseValue(EntityAttributes.GRAVITY)!=.08
                 || p.getAttributeValue(EntityAttributes.GRAVITY)!=.08 || p.getFinalGravity()!=.08) errors.add("Ordinary physics guards");
-        var support=new BlockPos((int)Math.floor(n(xyz,"x")),(int)Math.floor(n(xyz,"y"))-1,(int)Math.floor(n(xyz,"z")));
+        var support=baseline()?new BlockPos((int)Math.floor(n(xyz,"x")),(int)Math.floor(n(xyz,"y"))-1,(int)Math.floor(n(xyz,"z"))):p.getBlockPos().down();
         boolean loaded=level.getChunkManager().getChunk(Math.floorDiv(support.getX(),16),Math.floorDiv(support.getZ(),16),ChunkStatus.FULL,false)!=null;
+        if(!baseline() && !loaded) {
+            guards.addProperty("supportLoaded",false); guards.addProperty("support","UNKNOWN: unloaded FULL chunk");
+            errors.add("Loaded full-cube support/clearance unavailable");
+        } else {
         guards.addProperty("supportLoaded",loaded); guards.addProperty("support",level.getBlockState(support).toString());
         guards.addProperty("supportFullCube",level.getBlockState(support).isFullCube(level,support));
         guards.addProperty("supportingBlock",p.supportingBlockPos.toString()); guards.addProperty("supportedByStone",p.isSupportedBy(support));
         if (!loaded || !level.getBlockState(support).equals(Blocks.STONE.getDefaultState()) || !level.getBlockState(support).isFullCube(level,support)
                 || !p.isSupportedBy(support) || !level.getBlockState(support.up()).isAir() || !level.getBlockState(support.up(2)).isAir()) errors.add("Loaded full-cube support/clearance");
+        }
         actual.add("physicsGuards",guards);
         var blocks=new JsonArray();
-        for (var cell:admitted.worldCells().entrySet()) {
+        if(baseline()) for (var cell:admitted.worldCells().entrySet()) {
             var p0=cell.getKey(); var at=new BlockPos(p0.x(),p0.y(),p0.z());
             boolean chunk=level.getChunkManager().getChunk(Math.floorDiv(at.getX(),16),Math.floorDiv(at.getZ(),16),ChunkStatus.FULL,false)!=null;
             var found=level.getBlockState(at); blocks.add(at.toShortString()+"="+found+";loaded="+chunk+";blockEntity="+(level.getBlockEntity(at)!=null));
@@ -2159,7 +2765,9 @@ final class ScenarioRunner implements AutoCloseable {
             clocks.addProperty("age",sample.age); clocks.addProperty("worldTime",sample.time); clocks.addProperty("serverTick",sample.serverTick);
             clocks.add("problems",new Gson().toJsonTree(sample.problems)); out.add(side+"Checkpoint",clocks);
         }
-        out.addProperty("invocation",invocation.toString()); out.addProperty("productionStatus",cp.status.toString());
+        out.addProperty("invocation",invocation.toString());
+        out.addProperty("productionStatus",baseline()?cp.status.toString():"phase="+cp.status.engine().lifecycle().phase()
+                +"; owner="+cp.status.controlOwner()+"; eligible="+cp.status.engine().eligibleTicks()+"; verify="+cp.status.engine().verifyTicks());
         return out;
     }
 
@@ -2197,6 +2805,7 @@ final class ScenarioRunner implements AutoCloseable {
 
     @Override public void close() {
         if (closed) return;
+        if(!baseline()) { closeCompact(); return; }
         closeOwned(world!=null,
                 () -> preflight(admitted==null?profileDefinition:admitted),
                 () -> {
@@ -2234,6 +2843,35 @@ final class ScenarioRunner implements AutoCloseable {
                     writeNew(roots,artifacts.resolve("world-closed.txt"),"WORLD CLOSED normally; invocation="+invocation+"; save="+save+"; runs="+runs);
                 }); // Keep identities through native close, even if an earlier cleanup failed.
         closed=true;
+        normalClose=true;
+    }
+
+    private void closeCompact() {
+        if(world==null) { sealCompact(); requireCompleteOutputs(outputs); closed=true; normalClose=true; return; }
+        preflight(admitted==null?profileDefinition:admitted);
+        Throwable first=null; boolean archived=false;
+        try {
+            ready=false;
+            context.runOnClient(c->{ requireClient(c); MapArtClient.stop(); requireReleased(c); });
+            sealCompact();
+            archiveCompact(artifacts.resolve("close-archive-"+resetOrdinal),sealed);
+            archived=compactCommitted;
+        } catch(RuntimeException | Error error) { first=retain(first,error); }
+        // Caller-owned options can be restored even when evidence must retain world/watch identities.
+        try {
+            context.runOnClient(c->{ requireClient(c); if(optionsOwned) { c.options.getAutoJump().setValue(callerAutoJump); optionsOwned=false; } });
+        } catch(RuntimeException | Error error) { first=retain(first,error); }
+        if(archived) {
+            try {
+                preflight(admitted==null?profileDefinition:admitted);
+                context.runOnClient(c->{ requireClient(c); PredictionFaults.clear(); watch.clear(); watch.closeWorld(); });
+                world.close(); closed=true;
+                writeInvocationFile(artifacts.resolve("world-closed.txt"),"WORLD CLOSED normally; invocation="+invocation+"; save="+save+"; runs="+runs);
+            } catch(RuntimeException | Error error) { first=retain(first,error); }
+        }
+        if(first instanceof Error error) throw error;
+        if(first!=null) throw (RuntimeException)first;
+        require(closed,"Compact close did not reach committed owned world close");
         normalClose=true;
     }
 
@@ -2455,6 +3093,12 @@ final class ScenarioRunner implements AutoCloseable {
         checkRoots(r); require(real(file.getParent()).equals(file.getParent()) && file.startsWith(r.evidence),"Archive write escaped");
         try { Files.writeString(file,text,StandardCharsets.UTF_8,StandardOpenOption.CREATE_NEW); }
         catch (IOException e) { throw new UncheckedIOException(e); }
+    }
+    private void writeLinesNew(Path file,Iterable<String> lines) {
+        checkRoots(roots); require(real(file.getParent()).equals(file.getParent()) && file.startsWith(roots.evidence),"Archive write escaped");
+        try(var writer=Files.newBufferedWriter(file,StandardCharsets.UTF_8,StandardOpenOption.CREATE_NEW)) {
+            for(var line:lines) { writer.write(line); writer.write('\n'); }
+        } catch(IOException error) { throw new UncheckedIOException(error); }
     }
     private static void copyNew(Roots r, Path from, Path to) {
         checkRoots(r); require(real(to.getParent()).equals(to.getParent()) && to.startsWith(r.evidence)
