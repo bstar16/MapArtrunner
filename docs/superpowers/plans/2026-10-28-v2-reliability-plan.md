@@ -170,13 +170,15 @@ Execute the independently reviewed [two-lane/reset plan](2026-10-28-v2-two-lane-
 
 **Interfaces:** `ScenarioRunner.reset(ScenarioDefinition definition)`, `run(ScenarioDefinition definition)`, `assertResult(ScenarioResult result)`. Definitions carry bounded region/apron, starting player/inventory/chests, schematic/origin/settings, expected world and finite budget. Definitions are data; the Fabric fixture adapter performs version-specific setup.
 
-- [ ] Restore every part of the starting state and assert its fixture hash before launch; cancel/archive the prior run first. Refuse unmanaged worlds/regions.
-- [ ] Build two lanes with sufficient materials through the real production entry point and assert exact server targets, terminal result, and released controls.
-- [ ] Implement `scripts/test-v2.ps1 -Scenario grounded-two-lane -Repeat 2`; resolve JDK locally without a hardcoded user path or persistent environment edits.
-- [ ] Run twice back-to-back, including a failed-first-run case. Preserve each run's metadata, mismatch list, logs and failure screenshot. Confirm a wrong expected block yields a nonzero outcome.
-- [ ] Review and commit.
+- [x] Restore every part of the starting state and assert its fixture hash before launch; cancel/archive the prior run first. Refuse unmanaged worlds/regions.
+- [x] Build two lanes with sufficient materials through the real production entry point and assert exact server targets, terminal result, and released controls.
+- [x] Implement `scripts/test-v2.ps1 -Scenario grounded-two-lane -Repeat 2`; resolve JDK locally without a hardcoded user path or persistent environment edits.
+- [x] Run twice back-to-back, including a failed-first-run case. Preserve each run's metadata, mismatch list, logs and failure screenshot. Confirm a wrong expected block yields a nonzero outcome.
+- [x] Review and commit.
 
 **Pass:** a developer can reset and repeat the same build without manual world cleanup or command pasting.
+
+Verified at `79372cf412c4e1f88e5b51489cd50aab8594ab82` after task reviews and the whole-child SPEC PASS / QUALITY APPROVE review with no actionable findings (retained `final-review.md`, SHA256 `63c981b01ba45bba5ec8b1005272d1f9c0809bd57e270ecbfbe7be769be036bb`). Separate controlled/ordinary support gates, public selected1/default2 transport, selected2 baseline, exact ordinary wrong-block FAIL/1 and genuinely separate full recovery are accepted. [Testing evidence](../../../v2/docs/testing.md#current-two-lane-forward-and-reset-evidence) records identities, current-state/physics assertions, old17 preservation, retained failures and limits. This is bounded two-lane forward/reset acceptance; full-map traversal budgets, resume/reverse, inspect, genuine refill and broader parity remain later gates. V1 and all retained evidence remain available.
 
 ## Task 8: Add complete traversal, resume, and reverse cleanup
 
