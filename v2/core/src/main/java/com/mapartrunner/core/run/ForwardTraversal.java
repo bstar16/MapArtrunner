@@ -32,7 +32,7 @@ public final class ForwardTraversal {
         this.constantSprint = constantSprint;
         if (this.lanes.isEmpty()) throw new IllegalArgumentException("Forward traversal requires a lane");
         state = new Snapshot(0, Substage.LANE, fresh(this.lanes.getFirst(), 0, Set.of(), constantSprint),
-                0, Optional.empty());
+                0, Optional.empty(), Pass.FORWARD, 0);
     }
 
     public Snapshot snapshot() { return state; }
@@ -40,8 +40,8 @@ public final class ForwardTraversal {
     public Advance advance(PlayerObservation player, SupportObservation support, Set<Integer> pendingTargetIds) {
         Objects.requireNonNull(player, "player");
         Objects.requireNonNull(support, "support");
-        if (forwardComplete) return new Advance(Optional.empty(), true, false);
-        if (transitionExpired()) return new Advance(Optional.empty(), false, true);
+        if (forwardComplete) return new Advance(Optional.empty(), true, false, false);
+        if (transitionExpired()) return new Advance(Optional.empty(), false, true, false);
         LaneEntry prior = state.entry();
         var input = new LaneEntry(prior.lane(), prior.stage(), prior.stageElapsedTicks(), prior.entryElapsedTicks(),
                 prior.consecutiveYawAlignedTicks(), prior.supportHoldTicks(), prior.yawHoldTicks(),
@@ -51,7 +51,7 @@ public final class ForwardTraversal {
         var entry = new LaneEntry(input.lane(), result.nextStage(), result.nextStageElapsedTicks(),
                 result.nextEntryElapsedTicks(), result.nextYawAlignedTicks(), result.nextSupportHoldTicks(),
                 result.nextYawHoldTicks(), input.pendingTargetIds(), input.constantSprint());
-        state = new Snapshot(state.laneIndex(), state.substage(), entry, ticks, state.transitionRegion());
+        state = new Snapshot(state.laneIndex(), state.substage(), entry, ticks, state.transitionRegion(), state.pass(), state.walkNoProgressTicks());
         switch (state.substage()) {
             case LANE -> {
                 if (result.status() == Status.COMPLETE) {
@@ -64,7 +64,7 @@ public final class ForwardTraversal {
                         // COMPLETE did not evaluate support; retain its input hold across the handoff.
                         state = new Snapshot(state.laneIndex(), Substage.ENDPOINT,
                                 fresh(point, input.supportHoldTicks(), input.pendingTargetIds(), false),
-                                0, Optional.of(transitionRegion(old.end(), next.start())));
+                                0, Optional.of(transitionRegion(old.end(), next.start())), state.pass(), state.walkNoProgressTicks());
                     }
                 }
             }
@@ -75,7 +75,7 @@ public final class ForwardTraversal {
                     var shift = new Lane(old.id(), direction(start, end), start, end,
                             state.transitionRegion().orElseThrow(), old.expectedFloor());
                     state = new Snapshot(state.laneIndex(), Substage.SHIFT,
-                            fresh(shift, entry.supportHoldTicks(), entry.pendingTargetIds(), false), ticks, state.transitionRegion());
+                            fresh(shift, entry.supportHoldTicks(), entry.pendingTargetIds(), false), ticks, state.transitionRegion(), state.pass(), state.walkNoProgressTicks());
                 }
             }
             case SHIFT -> {
@@ -83,7 +83,7 @@ public final class ForwardTraversal {
                     int next = state.laneIndex() + 1;
                     // The cardinal segment's COMPLETE also bypassed footprint evaluation.
                     state = new Snapshot(next, Substage.NEXT_ENTRY,
-                            fresh(lanes.get(next), input.supportHoldTicks(), input.pendingTargetIds(), false), ticks, state.transitionRegion());
+                            fresh(lanes.get(next), input.supportHoldTicks(), input.pendingTargetIds(), false), ticks, state.transitionRegion(), state.pass(), state.walkNoProgressTicks());
                 }
             }
             case NEXT_ENTRY -> {
@@ -91,22 +91,22 @@ public final class ForwardTraversal {
                     var walking = new LaneEntry(entry.lane(), entry.stage(), entry.stageElapsedTicks(), entry.entryElapsedTicks(),
                             entry.consecutiveYawAlignedTicks(), entry.supportHoldTicks(), entry.yawHoldTicks(),
                             entry.pendingTargetIds(), constantSprint);
-                    state = new Snapshot(state.laneIndex(), Substage.LANE, walking, 0, Optional.empty());
+                    state = new Snapshot(state.laneIndex(), Substage.LANE, walking, 0, Optional.empty(), state.pass(), state.walkNoProgressTicks());
                 }
             }
         }
-        return new Advance(Optional.of(result), forwardComplete, false);
+        return new Advance(Optional.of(result), forwardComplete, false, false);
     }
 
     /** Missing player data consumes only the existing transition total, never policy counters. */
     public Advance advanceWithoutPlayer() {
-        if (forwardComplete) return new Advance(Optional.empty(), true, false);
-        if (transitionExpired()) return new Advance(Optional.empty(), false, true);
+        if (forwardComplete) return new Advance(Optional.empty(), true, false, false);
+        if (transitionExpired()) return new Advance(Optional.empty(), false, true, false);
         if (state.substage() != Substage.LANE) {
             state = new Snapshot(state.laneIndex(), state.substage(), state.entry(),
-                    state.transitionTicks() + 1, state.transitionRegion());
+                    state.transitionTicks() + 1, state.transitionRegion(), state.pass(), state.walkNoProgressTicks());
         }
-        return new Advance(Optional.empty(), false, false);
+        return new Advance(Optional.empty(), false, false, false);
     }
 
     private boolean transitionExpired() {
@@ -130,10 +130,12 @@ public final class ForwardTraversal {
         throw new IllegalArgumentException("Lane transition must be cardinal");
     }
 
+    public enum Pass { SELECTING, FORWARD, REVERSE, COMPLETE }
+
     public enum Substage { LANE, ENDPOINT, SHIFT, NEXT_ENTRY }
 
     public record Snapshot(int laneIndex, Substage substage, LaneEntry entry, int transitionTicks,
-                           Optional<Corridor> transitionRegion) { }
+                           Optional<Corridor> transitionRegion, Pass pass, int walkNoProgressTicks) { }
 
-    public record Advance(Optional<MovementIntent> movement, boolean forwardComplete, boolean transitionExpired) { }
+    public record Advance(Optional<MovementIntent> movement, boolean traversalComplete, boolean transitionExpired, boolean walkStalled) { }
 }

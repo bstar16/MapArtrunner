@@ -1659,7 +1659,7 @@ final class ScenarioRunner implements AutoCloseable {
         var lane=new com.mapartrunner.core.traversal.LanePlanner.Lane(0,com.mapartrunner.core.traversal.LanePlanner.Direction.SOUTH,
                 new GridPos(11,0,2),new GridPos(11,0,7),new com.mapartrunner.core.traversal.LanePlanner.Corridor(9,13,0,9),floor);
         var entry=new com.mapartrunner.core.movement.MovementPolicy.LaneEntry(lane,Stage.WALK,0,0,0,hold,0,pending,false);
-        var traversal=new ForwardTraversal.Snapshot(0,ForwardTraversal.Substage.SHIFT,entry,20,Optional.of(lane.corridor()));
+        var traversal=new ForwardTraversal.Snapshot(0,ForwardTraversal.Substage.SHIFT,entry,20,Optional.of(lane.corridor()),ForwardTraversal.Pass.FORWARD,0);
         var engine=new BuildEngine.Snapshot(new com.mapartrunner.core.run.RunLifecycle.Snapshot(Phase.RUNNING,Optional.of(run),Optional.of(Activity.SHIFT),Optional.empty()),
                 frame,0,Optional.of(traversal),plan.targets().stream().map(BuildPlan.Target::id).toList(),pending,Optional.empty(),effects);
         var pose=new ScenarioObserver.Pose(x,66,z,Vec3d.ZERO,new Vec3d(x,67.62,z),(int)frame,frame,0,0,0,false,false,1,7,64);
@@ -1764,14 +1764,14 @@ final class ScenarioRunner implements AutoCloseable {
         var plan=new BuildPlan("selfcheck",new BuildPlan.GridSize(12,1,10),targets);
         var lane=new com.mapartrunner.core.traversal.LanePlanner().plan(plan,2,5).getFirst();
         var entry=new com.mapartrunner.core.movement.MovementPolicy.LaneEntry(lane,Stage.WALK,0,0,0,3,0,Set.of(2),false);
-        var traversal=new ForwardTraversal.Snapshot(0,ForwardTraversal.Substage.SHIFT,entry,21,Optional.of(lane.corridor()));
+        var traversal=new ForwardTraversal.Snapshot(0,ForwardTraversal.Substage.SHIFT,entry,21,Optional.of(lane.corridor()),ForwardTraversal.Pass.FORWARD,0);
         var before=new BuildEngine.Snapshot(lifecycle,33,0,Optional.of(traversal),List.of(2),Set.of(2),Optional.empty(),List.of());
         var after=new BuildEngine.Snapshot(lifecycle,33,0,Optional.of(traversal),List.of(),Set.of(),Optional.empty(),
                 List.of(new BuildEngine.PlacementEffectResult(id,1,2,31,BuildEngine.EffectStatus.ACCEPTED)));
         require(retainedProgress(before,after),"Legitimate paused ledger confirmation rejected");
         require(!retainedProgress(before,new BuildEngine.Snapshot(lifecycle,34,0,Optional.of(traversal),List.of(),Set.of(),Optional.empty(),List.of()))
                 && !retainedProgress(before,new BuildEngine.Snapshot(lifecycle,33,0,Optional.of(new ForwardTraversal.Snapshot(0,
-                        ForwardTraversal.Substage.SHIFT,entry,0,Optional.of(lane.corridor()))),List.of(),Set.of(),Optional.empty(),List.of())),
+                        ForwardTraversal.Substage.SHIFT,entry,0,Optional.of(lane.corridor()),ForwardTraversal.Pass.FORWARD,0)),List.of(),Set.of(),Optional.empty(),List.of())),
                 "Pause clock/traversal renewal accepted");
         System.out.println("ScenarioRunner success-oracle same-helper self-checks passed; native scenario remains separate");
     }

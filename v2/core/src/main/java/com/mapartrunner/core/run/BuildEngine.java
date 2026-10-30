@@ -146,7 +146,7 @@ public final class BuildEngine {
                 finish(Outcome.FAILED, Reason.MOVEMENT_FAILED, unresolvedIds(), result.failure().name(), decisionInput);
                 return currentDecision(input.tick(), Optional.empty(), Optional.empty());
             }
-            if (advanced.forwardComplete()) {
+            if (advanced.traversalComplete()) {
                 lifecycle.updateActivity(input.runId(), Activity.VERIFY); verifyEnteredTick = input.tick();
             } else {
                 if (result != null) lifecycle.updateActivity(input.runId(),

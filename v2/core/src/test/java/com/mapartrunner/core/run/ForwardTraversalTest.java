@@ -4,6 +4,7 @@ import com.mapartrunner.core.model.BuildPlan;
 import com.mapartrunner.core.model.BuildPlan.*;
 import com.mapartrunner.core.movement.MovementPolicy.*;
 import com.mapartrunner.core.placement.PlacementObservation.Evidence;
+import com.mapartrunner.core.run.ForwardTraversal.Pass;
 import com.mapartrunner.core.run.ForwardTraversal.Substage;
 import com.mapartrunner.core.traversal.LanePlanner;
 import com.mapartrunner.core.traversal.LanePlanner.*;
@@ -17,6 +18,69 @@ class ForwardTraversalTest {
     private static final BlockSpec STONE = new BlockSpec("minecraft:stone", Map.of());
     private static final BlockSpec AIR = new BlockSpec("minecraft:air", Map.of());
     private static final SupportObservation UNKNOWN = new SupportObservation(Map.of());
+
+    @Test
+    void passDiagnosticsRetainForwardGeometryAndCounters() {
+        BuildPlan plan = plan(10);
+        var lanes = new LanePlanner().plan(plan, 2, 5);
+        var owner = new ForwardTraversal(lanes, plan.dimensions(), true);
+        var support = observed(plan, STONE);
+        var pending = ids(plan);
+        var initial = owner.snapshot();
+        assertEquals(Pass.FORWARD, initial.pass());
+        assertEquals(0, initial.walkNoProgressTicks());
+        assertEquals(new LaneEntry(lanes.getFirst(), Stage.ENTER_POSITION, 0, 0, 0, 0, 0, Set.of(), true), initial.entry());
+        assertFalse(owner.advanceWithoutPlayer().walkStalled());
+        assertEquals(initial, owner.snapshot());
+
+        assertFalse(advance(owner, lanes.getFirst().start(), Direction.EAST, support, pending).walkStalled());
+        assertEquals(Pass.FORWARD, owner.snapshot().pass());
+        assertEquals(0, owner.snapshot().walkNoProgressTicks());
+        assertEquals(new LaneEntry(lanes.getFirst(), Stage.ENTER_YAW, 0, 1, 0, 0, 0, pending, true), owner.snapshot().entry());
+        assertFalse(advance(owner, lanes.getFirst().start(), Direction.EAST, support, pending).walkStalled());
+        assertFalse(advance(owner, lanes.getFirst().start(), Direction.EAST, support, pending).walkStalled());
+        assertFalse(advance(owner, lanes.getFirst().end(), Direction.EAST, support, pending).walkStalled());
+        var endpoint = owner.snapshot();
+        assertEquals(Pass.FORWARD, endpoint.pass());
+        assertEquals(0, endpoint.walkNoProgressTicks());
+        assertEquals(Substage.ENDPOINT, endpoint.substage());
+        assertEquals(0, endpoint.transitionTicks());
+        Lane first = lanes.getFirst();
+        var point = new Lane(first.id(), first.direction(), first.end(), first.end(), first.corridor(), first.expectedFloor());
+        assertEquals(new LaneEntry(point, Stage.ENTER_POSITION, 0, 0, 0, 0, 0, pending, false), endpoint.entry());
+        var region = new Corridor(10, 11, 1, 8);
+        assertEquals(Optional.of(region), endpoint.transitionRegion());
+        assertFalse(owner.advanceWithoutPlayer().walkStalled());
+        assertEquals(Pass.FORWARD, owner.snapshot().pass());
+        assertEquals(0, owner.snapshot().walkNoProgressTicks());
+        assertEquals(endpoint.entry(), owner.snapshot().entry());
+        assertEquals(1, owner.snapshot().transitionTicks());
+
+        ready(owner, first.end(), Direction.EAST, support, pending);
+        var shift = owner.snapshot();
+        assertEquals(Pass.FORWARD, shift.pass());
+        assertEquals(0, shift.walkNoProgressTicks());
+        assertEquals(Substage.SHIFT, shift.substage());
+        assertEquals(4, shift.transitionTicks());
+        var south = new Lane(first.id(), Direction.SOUTH, first.end(), lanes.get(1).start(), region, first.expectedFloor());
+        assertEquals(new LaneEntry(south, Stage.ENTER_POSITION, 0, 0, 0, 0, 0, pending, false), shift.entry());
+        ready(owner, south.start(), Direction.SOUTH, support, pending);
+        assertFalse(advance(owner, south.end(), Direction.SOUTH, support, pending).walkStalled());
+        assertEquals(Pass.FORWARD, owner.snapshot().pass());
+        assertEquals(0, owner.snapshot().walkNoProgressTicks());
+        assertEquals(Substage.NEXT_ENTRY, owner.snapshot().substage());
+        assertEquals(8, owner.snapshot().transitionTicks());
+        assertEquals(new LaneEntry(lanes.get(1), Stage.ENTER_POSITION, 0, 0, 0, 0, 0, pending, false), owner.snapshot().entry());
+
+        ready(owner, south.end(), Direction.WEST, support, pending);
+        assertEquals(Pass.FORWARD, owner.snapshot().pass());
+        assertEquals(0, owner.snapshot().walkNoProgressTicks());
+        assertEquals(Substage.LANE, owner.snapshot().substage());
+        assertEquals(1, owner.snapshot().laneIndex());
+        assertEquals(0, owner.snapshot().transitionTicks());
+        assertTrue(owner.snapshot().transitionRegion().isEmpty());
+        assertEquals(new LaneEntry(lanes.get(1), Stage.WALK, 0, 0, 0, 0, 0, pending, true), owner.snapshot().entry());
+    }
 
     @Test
     void forwardScheduleUsesSharedFloorAndCompleteEntry() {
@@ -44,8 +108,8 @@ class ForwardTraversalTest {
                 assertEquals(Status.WALKING, walk.movement().orElseThrow().status());
                 assertTrue(walk.movement().orElseThrow().sprint());
                 var complete = advance(owner, lane.end(), lane.direction(), support, pending);
-                assertEquals(index == lanes.size() - 1, complete.forwardComplete());
-                if (complete.forwardComplete()) break;
+                assertEquals(index == lanes.size() - 1, complete.traversalComplete());
+                if (complete.traversalComplete()) break;
 
                 assertEquals(Substage.ENDPOINT, owner.snapshot().substage());
                 assertEquals(0, owner.snapshot().transitionTicks());
@@ -70,7 +134,7 @@ class ForwardTraversalTest {
                 ready(owner, shift.start(), shift.direction(), support, pending);
                 assertFalse(advance(owner, shift.start(), shift.direction(), support, pending)
                         .movement().orElseThrow().sprint());
-                assertFalse(advance(owner, shift.end(), shift.direction(), support, pending).forwardComplete());
+                assertFalse(advance(owner, shift.end(), shift.direction(), support, pending).traversalComplete());
                 assertEquals(Substage.NEXT_ENTRY, owner.snapshot().substage());
                 assertEquals(index + 1, owner.snapshot().laneIndex());
                 assertEquals(lanes.get(index + 1), owner.snapshot().entry().lane());
@@ -81,7 +145,7 @@ class ForwardTraversalTest {
                 assertTrue(owner.snapshot().transitionRegion().isEmpty());
                 assertEquals(pending, owner.snapshot().entry().pendingTargetIds());
             }
-            assertTrue(owner.advanceWithoutPlayer().forwardComplete());
+            assertTrue(owner.advanceWithoutPlayer().traversalComplete());
         }
     }
 
@@ -171,7 +235,7 @@ class ForwardTraversalTest {
                 var expired = repeat == 0 ? advance(owner, owner.snapshot().entry().lane().start(),
                         owner.snapshot().entry().lane().direction(), support, pending) : owner.advanceWithoutPlayer();
                 assertTrue(expired.transitionExpired());
-                assertFalse(expired.forwardComplete());
+                assertFalse(expired.traversalComplete());
                 assertTrue(expired.movement().isEmpty());
                 assertEquals(beforeExpiry, owner.snapshot());
             }
