@@ -21,7 +21,6 @@ public final class BuildEngine {
     private static final int RETRY_SPACING = 4;
     private static final int PENDING_LIMIT = 80;
     private static final int VERIFY_LIMIT = 80;
-    private static final int RUN_LIMIT = 1200;
 
     private final RunLifecycle lifecycle = new RunLifecycle();
     private BuildPlan plan;
@@ -30,6 +29,7 @@ public final class BuildEngine {
     private ForwardTraversal traversal;
     private long lastTick = -1;
     private long eligibleTicks;
+    private long activeRunLimit;
     private long verifyTicks;
     private long verifyEnteredTick = -1;
     private long nextActionId;
@@ -47,7 +47,7 @@ public final class BuildEngine {
         // Create owners only after lifecycle validation. A fresh run replaces the entire prior summary.
         this.plan = plan; this.settings = settings;
         ledger = new PlacementLedger(plan); ledger.bindRun(context.runId());
-        traversal = null; lastTick = -1; eligibleTicks = 0; verifyTicks = 0;
+        traversal = null; lastTick = -1; eligibleTicks = 0; activeRunLimit = 0; verifyTicks = 0;
         verifyEnteredTick = -1; nextActionId = 0; effectResults = List.of(); terminalSummary = null;
         if (plan.targets().isEmpty()) {
             finish(Outcome.SUCCESS, Reason.NOTHING_TO_BUILD, List.of(), "The normalized plan is empty");
@@ -55,12 +55,32 @@ public final class BuildEngine {
         }
         List<LanePlanner.Lane> lanes;
         try {
+            activeRunLimit = runLimit(plan, settings);
             lanes = new LanePlanner().plan(plan, settings.halfWidth(), settings.stride());
-        } catch (IllegalArgumentException unsupported) {
+        } catch (IllegalArgumentException | ArithmeticException unsupported) {
             finish(Outcome.FAILED, Reason.UNSUPPORTED_PLAN, allIds(), unsupported.getMessage());
             return;
         }
         traversal = new ForwardTraversal(lanes, plan.dimensions(), settings.constantSprint());
+    }
+
+    /** Frozen whole-run work allowance; reject unsupported work before allocating canonical lanes. */
+    public static long runLimit(BuildPlan plan, Settings settings) {
+        Objects.requireNonNull(plan, "plan"); Objects.requireNonNull(settings, "settings");
+        if (plan.targets().isEmpty()) return 0;
+        long corridorWidth = Math.addExact(Math.multiplyExact(2L, settings.halfWidth()), 1);
+        long maxZ = Math.subtractExact((long) plan.dimensions().depth(), 1);
+        long first = plan.dimensions().depth() <= corridorWidth ? Math.min(settings.halfWidth(), maxZ) : settings.halfWidth();
+        long last = plan.dimensions().depth() <= corridorWidth ? first : Math.subtractExact(maxZ, settings.halfWidth());
+        long lanes = Math.addExact(1, Math.addExact(Math.subtractExact(last, first), settings.stride() - 1L) / settings.stride());
+        long distance = Math.multiplyExact(lanes, plan.dimensions().width() - 1L);
+        long limit = Math.multiplyExact(3L, plan.targets().size());
+        limit = Math.addExact(limit, Math.multiplyExact(16L, distance));
+        limit = Math.addExact(limit, Math.multiplyExact(Math.addExact(lanes, 1), 52));
+        limit = Math.addExact(limit, Math.multiplyExact(Math.subtractExact(lanes, 1), 240));
+        limit = Math.addExact(limit, VERIFY_LIMIT);
+        if (limit > Integer.MAX_VALUE) throw new IllegalArgumentException("Run allowance exceeds " + Integer.MAX_VALUE + " active callbacks");
+        return Math.max(1200, limit);
     }
 
     /** Pause retains the ledger and every movement counter; the adapter invalidates/releases effects. */
@@ -160,8 +180,8 @@ public final class BuildEngine {
             finish(Outcome.FAILED, Reason.VERIFY_TIMEOUT, finalMissingIds(current), "No valid full current final scan within " + VERIFY_LIMIT + " VERIFY callbacks");
             return currentDecision(input.tick(), Optional.empty(), Optional.empty());
         }
-        if (eligibleTicks >= RUN_LIMIT) {
-            finish(Outcome.FAILED, Reason.RUN_TIMEOUT, unresolvedIds(), "Run reached " + RUN_LIMIT + " active callbacks");
+        if (eligibleTicks >= activeRunLimit) {
+            finish(Outcome.FAILED, Reason.RUN_TIMEOUT, unresolvedIds(), "Run reached " + activeRunLimit + " active callbacks");
             return currentDecision(input.tick(), Optional.empty(), Optional.empty());
         }
         for (Target target : ledger.unfinishedTargets()) {
@@ -303,7 +323,7 @@ public final class BuildEngine {
         }
         terminalSummary = new Snapshot(lifecycle.snapshot(), eligibleTicks, verifyTicks, Optional.empty(),
                 unfinishedIds(), Set.of(), Optional.of(new Diagnostic(reason, ids, detail, traversalDetail)), effectResults);
-        traversal = null; ledger = null; plan = null; settings = null;
+        traversal = null; ledger = null; plan = null; settings = null; activeRunLimit = 0;
     }
 
     private TickDecision currentDecision(long tick, Optional<MovementIntent> movement, Optional<PlacementIntent> placement) {

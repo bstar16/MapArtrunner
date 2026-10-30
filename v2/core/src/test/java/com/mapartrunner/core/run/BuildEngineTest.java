@@ -745,7 +745,9 @@ class BuildEngineTest {
             var d = h.step(); assertRunning(d);
             assertTrue(d.placement().isEmpty()); assertTrue(d.movement().isEmpty());
         }
-        assertReason(h.step(), Reason.RUN_TIMEOUT);
+        var failed = h.step();
+        assertReason(failed, Reason.RUN_TIMEOUT);
+        assertEquals("Run reached 1200 active callbacks", failed.snapshot().diagnostic().orElseThrow().detail());
         assertEquals(1200, h.engine.snapshot().eligibleTicks());
     }
 
