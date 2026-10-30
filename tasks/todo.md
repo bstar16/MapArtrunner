@@ -14,7 +14,7 @@ Implementation approved on 28 October 2026, using task-by-task agents and indepe
 - [x] 6d. Import a real schematic into the neutral plan
 - [x] Checkpoint B: real one-lane build verified against server world
 - [x] 7. Automate [two-lane setup, reset and rerun](../docs/superpowers/plans/2026-10-28-v2-two-lane-reset.md)
-- [ ] 8. Implement complete traversal, resume and cleanup
+- [ ] 8. Implement [complete traversal, resume and cleanup](../docs/superpowers/plans/2026-10-30-v2-complete-traversal.md)
 - [ ] 9. Add persistent inspect/reset workflow
 - [ ] 10. Implement inventory demand and genuine refill
 - [ ] 11. Implement isolated recovery

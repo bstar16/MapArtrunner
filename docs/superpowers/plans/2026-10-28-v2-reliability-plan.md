@@ -182,6 +182,8 @@ Verified at `79372cf412c4e1f88e5b51489cd50aab8594ab82` after task reviews and th
 
 ## Task 8: Add complete traversal, resume, and reverse cleanup
 
+Execute the independently reviewed [complete-traversal plan](2026-10-30-v2-complete-traversal.md). Its work-bound and no-progress prerequisites preserve small-fixture limits while allowing honest full-map traversal; resume, reverse entry, scale capture and launch contracts remain separately reviewed slices. Adoption does not close the source/native gates below.
+
 **Dependencies:** 7. **Likely files:** core traversal policy, core placement ledger query, production engine scheduling, corresponding unit tests, and a dedicated game-test class. Split resume and reverse entry into separate PRs.
 
 **Contracts:** selection may choose a nearby lane, but all other unfinished target IDs remain scheduled. Reverse lane skipping must calculate the full chosen entry position. Reuse the v1 deterministic five-wide serpentine geometry and preserve direction-relative corrections.
