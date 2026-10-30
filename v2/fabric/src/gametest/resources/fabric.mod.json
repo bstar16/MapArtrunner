@@ -9,7 +9,8 @@
     "fabric-client-gametest": [
       "com.mapartrunner.fabric.scenario.EnvironmentProbeGameTest",
       "com.mapartrunner.fabric.scenario.GroundedSingleLaneGameTest",
-      "com.mapartrunner.fabric.scenario.SchematicImportGameTest"
+      "com.mapartrunner.fabric.scenario.SchematicImportGameTest",
+      "com.mapartrunner.fabric.scenario.GroundedSmokeGameTest"
     ]
   },
   "depends": {

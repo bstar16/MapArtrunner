@@ -3,6 +3,6 @@
   "minVersion": "0.8.7",
   "package": "com.mapartrunner.fabric.scenario.mixin",
   "compatibilityLevel": "JAVA_21",
-  "client": ["WithheldActionResponseMixin", "WithheldObservationMixin", "ComputedDecisionBarrierMixin", "WithheldBlockStateMixin", "TestAudioShutdownMixin", "TestThreadRegistrationMixin"],
+  "client": ["WithheldActionResponseMixin", "WithheldObservationMixin", "WithheldPlacementAvailabilityMixin", "ComputedDecisionBarrierMixin", "WithheldBlockStateMixin", "TestAudioShutdownMixin", "TestThreadRegistrationMixin"],
   "injectors": { "defaultRequire": 1 }
 }

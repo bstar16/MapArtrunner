@@ -18,6 +18,7 @@ import com.mapartrunner.fabric.runtime.WorldEvidenceReader.CapturedEvidence;
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.network.ClientPlayNetworkHandler;
+import net.minecraft.client.network.ClientPlayerEntity;
 import net.minecraft.client.world.ClientWorld;
 import net.minecraft.network.ClientConnection;
 import net.minecraft.server.MinecraftServer;
@@ -35,6 +36,10 @@ import net.minecraft.world.chunk.ChunkStatus;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.LinkedHashMap;
+import java.util.Collections;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -46,7 +51,8 @@ public final class PredictionFaults {
     private static final List<Response> responses = new ArrayList<>();
     private static final List<Omission> omissions = new ArrayList<>();
     private static boolean omissionLatched;
-    private enum Mode { RESPONSE, OBSERVATION, COMPUTED_STOP, COMPUTED_PAUSE_RESUME, STATE, REPEATED_STATE }
+    private enum Mode { RESPONSE, OBSERVATION, COMPUTED_STOP, COMPUTED_PAUSE_RESUME, STATE, REPEATED_STATE, SUPPORT_AVAILABILITY }
+    private static SupportAvailabilitySnapshot support;
     private static Barrier barrier;
     private static boolean transitioning;
     private static final List<BuildEngine.TickDecision> fresh = new ArrayList<>();
@@ -69,14 +75,35 @@ public final class PredictionFaults {
     record Omission(int conversion, int playerAge, long eligibleTick, String phase, String activity,
                     PlacementObservation removed, SupportSample originalSupport, List<Integer> returnedIds) { }
     record Snapshot(boolean active, Optional<String> failure, List<Response> responses,
-                    boolean omissionLatched, List<Omission> omissions, Optional<Barrier> barrier, List<BuildEngine.TickDecision> fresh) { }
+                    boolean omissionLatched, List<Omission> omissions, Optional<Barrier> barrier, List<BuildEngine.TickDecision> fresh,
+                    Optional<SupportAvailabilitySnapshot> support) { }
     record Yaw(float yaw, float head, float body, float last, float lastHead, float lastBody) { }
     record BarrierState(Pose pose, Yaw yaw, List<Boolean> keys, FabricBuildAdapter.Status status, boolean air, boolean pending) { }
     record Barrier(BuildEngine.TickDecision decision, int decisionIdentity, BarrierState before,
                    Optional<BarrierState> paused, BarrierState after) { }
-    private record Scope(MinecraftServer server, ClientWorld world, ClientPlayNetworkHandler handler,
+    private record Scope(MinecraftClient client, MinecraftServer server, ClientWorld world, ClientPlayerEntity player,
+                         String dimension, ClientPlayNetworkHandler handler,
                          ClientConnection connection, UUID runId, Path save, int age, Mode mode,
-                         String planFingerprint, int targetId) { }
+                         String planFingerprint, int targetId, SupportLive support) { }
+    private record SupportLive(BuildPlan plan, BuildEngine.Settings settings, ScenarioObserver.Watch watch) { }
+    enum SupportState { ARMED, RELEASED, CANCELLED, FAILED }
+    record SupportArmIdentity(UUID arm, RunLifecycle.Context context, String save, int server, int world, int player,
+                              int handler, int connection, int targetId, GridPos target, BuildPlan.BlockSpec expected,
+                              int armedAge, long armedEligible) { }
+    record SupportPose(double x,double y,double z,double velocityX,double velocityY,double velocityZ,
+                       double eyeX,double eyeY,double eyeZ,int age,long worldTime,float yaw,float headYaw,float bodyYaw,
+                       boolean flying,boolean sprinting,int selectedSlot,int reserved,int usable) {
+        static SupportPose of(Pose p) {
+            return new SupportPose(p.x(),p.y(),p.z(),p.velocity().x,p.velocity().y,p.velocity().z,p.eyes().x,p.eyes().y,p.eyes().z,
+                    p.age(),p.worldTime(),p.yaw(),p.headYaw(),p.bodyYaw(),p.flying(),p.sprinting(),p.selectedSlot(),p.reserved(),p.usable());
+        }
+    }
+    record SupportCapture(RunLifecycle.Context context, int targetId, BuildEngine.PlacementAvailability original,
+                          BuildEngine.PlacementAvailability returned, SupportPose pose, long eligibleBefore) { }
+    record SupportAvailabilitySnapshot(SupportArmIdentity identity, SupportState state, boolean cleanupAcknowledged,
+                                       Optional<String> firstCause, boolean ownsFailure, int captures,
+                                       Optional<SupportCapture> firstReady, Optional<SupportCapture> latest,
+                                       Optional<String> heldEnd) { }
     record StateIdentity(RunLifecycle.Context context, int targetId, GridPos target, String save,
                          int server, int world, int handler, int connection, int armedAge) { }
     record NativeState(String state, boolean pending, int managerSequence, int age, long eligible, int selected, int usable) { }
@@ -99,8 +126,19 @@ public final class PredictionFaults {
     }
 
     private static void arm(MinecraftClient client, MinecraftServer ownedServer, Path ownedSave, UUID runId, Mode mode, BuildPlan plan) {
+        arm(client,ownedServer,ownedSave,runId,mode,plan,null,null);
+    }
+
+    private static void requireArmable(boolean active,String shared,SupportAvailabilitySnapshot retained,UUID runId) {
+        if(active || shared!=null || retained!=null && (!retained.cleanupAcknowledged() && retained.state()==SupportState.FAILED
+                || retained.identity().context().runId().equals(runId)))
+            throw new IllegalStateException("Fault already active, failed or consumed for this run");
+    }
+
+    private static void arm(MinecraftClient client, MinecraftServer ownedServer, Path ownedSave, UUID runId, Mode mode,
+                            BuildPlan plan, SupportLive live, SupportAvailabilitySnapshot armed) {
         requireThread(client);
-        if(scope!=null || failure!=null) throw new IllegalStateException("Fault already active or failed");
+        requireArmable(scope!=null,failure,support,runId); // Never reset evidence before the unresolved-failure barrier.
         var game=FabricLoader.getInstance().getGameDir().toAbsolutePath().normalize();
         var save=ownedSave.toAbsolutePath().normalize();
         var state=MapArtClient.status().engine().lifecycle();
@@ -127,12 +165,339 @@ public final class PredictionFaults {
             catch(IllegalArgumentException missing) { throw new IllegalStateException("Refused fault target coordinate",missing); }
             fingerprint=plan.fingerprint();
         }
-        var next=new Scope(ownedServer,client.world,handler,handler.getConnection(),runId,save,client.player.age,mode,fingerprint,targetId);
+        if(mode==Mode.SUPPORT_AVAILABILITY) {
+            targetId=armed.identity().targetId(); fingerprint=plan.fingerprint();
+        }
+        var next=new Scope(client,ownedServer,client.world,client.player,client.world.getRegistryKey().getValue().toString(),
+                handler,handler.getConnection(),runId,save,client.player.age,mode,fingerprint,targetId,live);
         responses.clear();
         omissions.clear(); omissionLatched=false; barrier=null; transitioning=false; fresh.clear();
         stateStage=StateStage.INACTIVE; stateIdentity=null; n1=-1; n2=-1; ordinal=0;
         stateEvents.clear(); incomingStates.clear(); importEvent=null;
+        support=armed;
+        if(armed!=null) { stateAge=armed.identity().armedAge(); stateEligible=armed.identity().armedEligible(); }
         scope=next; // Publish only the fully bound scope, after validation and per-run evidence reset.
+    }
+
+    static SupportAvailabilitySnapshot armSupportAvailability(MinecraftClient client,MinecraftServer server,Path save,
+            UUID runId,BuildPlan plan,BuildEngine.Settings settings,ScenarioObserver.Watch watch) {
+        requireThread(client);
+        requireArmable(scope!=null,failure,support,runId);
+        var status=MapArtClient.status(); var engine=status.engine();
+        var run=engine.lifecycle().context().orElseThrow();
+        int id=SingleLaneFixture.targetId(plan,new GridPos(11,0,5));
+        var target=plan.targets().stream().filter(t -> t.id()==id).findFirst().orElseThrow();
+        var at=new GridPos(run.origin().x()+11,run.origin().y(),run.origin().z()+5);
+        if(!run.runId().equals(runId) || !run.planFingerprint().equals(plan.fingerprint())
+                || !run.settingsFingerprint().equals(settings.fingerprint()) || !settings.equals(new BuildEngine.Settings(2,5,false,1))
+                || !at.equals(new GridPos(11,65,5)) || !target.block().equals(new BuildPlan.BlockSpec("minecraft:stone",Map.of()))
+                || engine.lifecycle().phase()!=Phase.RUNNING || engine.eligibleTicks()!=0 || engine.pendingTargetIds().contains(id)
+                || status.controlOwner()!=BuildEngine.ControlOwner.NONE || !allReleased(keys(client))
+                || watch==null || !watch.copy().isEmpty() || client.world==null || client.player==null
+                || client.getNetworkHandler()==null || !loaded(client.world,at) || !unbuilt(client,at))
+            throw new IllegalStateException("Refused support initial plan/target/settings/Watch/controls/air");
+        var initial=watch.sample(client,"SUPPORT_ARM");
+        var observation=initial.observations().stream().filter(o -> o.targetId()==id).toList();
+        if(!initial.originalWorld() || observation.size()!=1 || !observation.getFirst().runId().equals(runId)
+                || observation.getFirst().tick()!=initial.tick() || observation.getFirst().evidence()!=PlacementObservation.Evidence.OBSERVED
+                || !observation.getFirst().observedState().equals(Optional.of(new BuildPlan.BlockSpec("minecraft:air",Map.of()))))
+            throw new IllegalStateException("Refused support Watch/current OBSERVED air");
+        var identity=new SupportArmIdentity(UUID.randomUUID(),run,save.toAbsolutePath().normalize().toString(),
+                System.identityHashCode(server),System.identityHashCode(client.world),System.identityHashCode(client.player),
+                System.identityHashCode(client.getNetworkHandler()),System.identityHashCode(client.getNetworkHandler().getConnection()),
+                id,at,target.block(),client.player.age,engine.eligibleTicks());
+        var armed=new SupportAvailabilitySnapshot(identity,SupportState.ARMED,false,Optional.empty(),false,0,
+                Optional.empty(),Optional.empty(),Optional.empty());
+        arm(client,server,save,runId,Mode.SUPPORT_AVAILABILITY,plan,new SupportLive(plan,settings,watch),armed);
+        return support;
+    }
+
+    private static void requireSupportBarrier(SupportAvailabilitySnapshot retained,UUID runId) {
+        if(retained!=null && retained.state()==SupportState.FAILED && !retained.cleanupAcknowledged()
+                && retained.identity().context().runId().equals(runId))
+            throw new IllegalStateException(retained.firstCause().orElseThrow());
+    }
+
+    private static boolean supportActive(Mode mode,SupportAvailabilitySnapshot retained,UUID runId) {
+        requireSupportBarrier(retained,runId);
+        return mode==Mode.SUPPORT_AVAILABILITY;
+    }
+
+    /** Public-producer RETURN only: actual observations/support and the native placement action remain untouched. */
+    public static Map<Integer,BuildEngine.PlacementAvailability> gateSupportAvailability(MinecraftClient client,BuildPlan plan,
+            RunLifecycle.Context run,BuildEngine.Settings settings,Map<Integer,BuildEngine.PlacementAvailability> original) {
+        var owned=scope;
+        if(!supportActive(owned==null?null:owned.mode(),support,run.runId())) return original;
+        requireThread(client);
+        requireSupportArguments(client,plan,run,settings,owned); // Foreign callbacks must not invalidate the current owner.
+        check(client);
+        requireSupportBarrier(support,run.runId());
+        try {
+            var result=filterSupportMap(original,plan,owned.targetId());
+            if(support.captures()>=WINDOW*10) throw new IllegalStateException("Support capture event bound exceeded");
+            var capture=new SupportCapture(run,owned.targetId(),original.get(owned.targetId()),result.get(owned.targetId()),
+                    SupportPose.of(pose(client)),MapArtClient.status().engine().eligibleTicks());
+            support=new SupportAvailabilitySnapshot(support.identity(),SupportState.ARMED,false,Optional.empty(),false,
+                    support.captures()+1,support.firstReady().isEmpty() && capture.original()==BuildEngine.PlacementAvailability.READY
+                        ? Optional.of(capture) : support.firstReady(),Optional.of(capture),Optional.empty());
+            return result;
+        } catch(RuntimeException | Error error) {
+            fail("Support availability: "+error.getMessage());
+            requireSupportBarrier(support,run.runId());
+            throw error;
+        }
+    }
+
+    private static Map<Integer,BuildEngine.PlacementAvailability> filterSupportMap(Map<Integer,BuildEngine.PlacementAvailability> original,
+            BuildPlan plan,int targetId) {
+        var ids=plan.targets().stream().map(BuildPlan.Target::id).collect(java.util.stream.Collectors.toSet());
+        if(original==null || !ids.contains(targetId) || !original.keySet().equals(ids) || original.values().stream().anyMatch(Objects::isNull))
+            throw new IllegalStateException("Malformed original availability target map");
+        if(original.get(targetId)!=BuildEngine.PlacementAvailability.READY) return original;
+        var result=new LinkedHashMap<>(original);
+        result.put(targetId,BuildEngine.PlacementAvailability.NO_VALID_HIT);
+        return Collections.unmodifiableMap(result);
+    }
+
+    private static void requireSupportArguments(MinecraftClient client,BuildPlan plan,RunLifecycle.Context run,
+            BuildEngine.Settings settings,Scope owned) {
+        if(client!=owned.client() || !owned.runId().equals(run.runId()) || !support.identity().context().equals(run)
+                || !owned.support().plan().equals(plan) || !owned.support().settings().equals(settings))
+            throw new IllegalStateException("Refused foreign support availability arguments");
+    }
+
+    private static boolean loaded(ClientWorld world,GridPos target) {
+        return world.getChunkManager().getChunk(Math.floorDiv(target.x(),16),Math.floorDiv(target.z(),16),ChunkStatus.FULL,false)!=null;
+    }
+
+    private static boolean unbuilt(MinecraftClient client,GridPos target) {
+        var pos=new BlockPos(target.x(),target.y(),target.z());
+        return client.world.getBlockState(pos).isAir() && !((PendingPredictionView)((ClientWorldPendingUpdateAccessor)client.world)
+                .mapart$getPendingUpdateManager()).mapart$hasPendingPrediction(pos);
+    }
+
+    private static List<Boolean> keys(MinecraftClient client) {
+        var o=client.options;
+        return List.of(o.forwardKey.isPressed(),o.backKey.isPressed(),o.leftKey.isPressed(),o.rightKey.isPressed(),
+                o.jumpKey.isPressed(),o.sneakKey.isPressed(),o.sprintKey.isPressed(),o.useKey.isPressed(),o.attackKey.isPressed());
+    }
+
+    private static boolean allReleased(List<Boolean> keys) { return keys.size()==9 && keys.stream().noneMatch(Boolean::booleanValue); }
+
+    /** Called atomically after waitTick; only an actual retained latest END can consume this one-use gate. */
+    static SupportAvailabilitySnapshot releaseSupportAvailability(MinecraftClient client,MinecraftServer server,Path save,
+            UUID runId,ScenarioObserver.Sample heldEnd) {
+        requireThread(client);
+        var owned=scope;
+        if(owned==null || owned.mode()!=Mode.SUPPORT_AVAILABILITY || !owned.runId().equals(runId)
+                || server!=owned.server() || save==null || !save.toAbsolutePath().normalize().equals(owned.save()))
+            throw new IllegalStateException("Refused inactive/foreign support release");
+        requireSupportArguments(client,owned.support().plan(),MapArtClient.status().engine().lifecycle().context().orElseThrow(),
+                owned.support().settings(),owned);
+        var samples=owned.support().watch().copy();
+        if(!supportHold(support,heldEnd,samples,MapArtClient.status(),pose(client),keys(client)))
+            throw new IllegalStateException("Refused premature/stale/nonretained support release");
+        check(client);
+        requireSupportBarrier(support,runId);
+        support=finishSupport(support,SupportState.RELEASED,Optional.of(heldEnd.line()));
+        scope=null; // Publish consumed immutable evidence before dropping the sole live native/Watch owner.
+        return support;
+    }
+
+    static Optional<ScenarioObserver.Sample> supportHold(MinecraftClient client,UUID runId) {
+        requireThread(client);
+        if(scope==null || scope.mode()!=Mode.SUPPORT_AVAILABILITY || !scope.runId().equals(runId)) return Optional.empty();
+        check(client);
+        requireSupportBarrier(support,runId);
+        var samples=scope.support().watch().copy();
+        var last=samples.stream().filter(s -> s.phase().equals("END")).reduce((a,b) -> b).orElse(null);
+        return supportHold(support,last,samples,MapArtClient.status(),pose(client),keys(client)) ? Optional.of(last) : Optional.empty();
+    }
+
+    private static boolean supportHold(SupportAvailabilitySnapshot gate,ScenarioObserver.Sample held,
+            List<ScenarioObserver.Sample> retained,FabricBuildAdapter.Status current,Pose currentPose,List<Boolean> currentKeys) {
+        if(gate==null || gate.state()!=SupportState.ARMED || gate.firstReady().isEmpty() || gate.latest().isEmpty()
+                || held==null || !held.phase().equals("END") || !held.originalWorld() || held.paused() || held.pose()==null
+                || retained.stream().filter(s -> s.phase().equals("END")).reduce((a,b) -> b).orElse(null)!=held
+                || !held.status().equals(current) || !held.pose().equals(currentPose) || !held.keys().equals(currentKeys)
+                || !allReleased(held.keys()) || !allReleased(currentKeys)
+                || held.worldIdentity()!=gate.identity().world() || held.status().controlOwner()!=BuildEngine.ControlOwner.NATIVE
+                || held.status().failure().isPresent() || held.status().engine().lifecycle().phase()!=Phase.RUNNING
+                || !held.status().engine().lifecycle().context().orElseThrow().equals(gate.identity().context())) return false;
+        var t=held.status().engine().traversal().orElse(null);
+        if(t==null || t.substage()!=com.mapartrunner.core.run.ForwardTraversal.Substage.SHIFT
+                || t.entry().stage()!=MovementPolicy.Stage.WALK || t.entry().supportHoldTicks()<=0
+                || !t.entry().lane().direction().name().equals("SOUTH")
+                || Math.abs(net.minecraft.util.math.MathHelper.wrapDegrees(held.pose().yaw()))>1.5) return false;
+        var origin=gate.identity().context().origin(); var target=gate.identity().target();
+        var expected=t.entry().lane().expectedFloor().targetsByPosition().get(new GridPos(target.x()-origin.x(),
+                target.y()-origin.y(),target.z()-origin.z()));
+        if(expected==null || expected.id()!=gate.identity().targetId() || !expected.block().equals(gate.identity().expected())
+                || target.y()-origin.y()!=t.entry().lane().start().y()
+                || target.z()-origin.z()!=(int)Math.floor(held.pose().z()-origin.z())+1
+                || !ScenarioRunner.southFootprint(held.pose().x()-origin.x(),t.entry().lane().start().x()).contains(target.x()-origin.x())
+                || held.status().engine().pendingTargetIds().contains(expected.id())) return false;
+        var observations=held.observations().stream().filter(o -> o.targetId()==expected.id()).toList();
+        var ready=gate.latest().orElseThrow();
+        return observations.size()==1 && observations.getFirst().runId().equals(gate.identity().context().runId())
+                && observations.getFirst().tick()==held.tick() && observations.getFirst().evidence()==PlacementObservation.Evidence.OBSERVED
+                && observations.getFirst().observedState().equals(Optional.of(new BuildPlan.BlockSpec("minecraft:air",Map.of())))
+                && ready.original()==BuildEngine.PlacementAvailability.READY && ready.returned()==BuildEngine.PlacementAvailability.NO_VALID_HIT
+                && ready.context().equals(gate.identity().context()) && ready.targetId()==expected.id()
+                && ready.eligibleBefore()+1==held.status().engine().eligibleTicks() && ready.pose().equals(SupportPose.of(held.pose()));
+    }
+
+    private static SupportAvailabilitySnapshot finishSupport(SupportAvailabilitySnapshot gate,SupportState state,Optional<String> held) {
+        return new SupportAvailabilitySnapshot(gate.identity(),state,gate.cleanupAcknowledged(),gate.firstCause(),gate.ownsFailure(),
+                gate.captures(),gate.firstReady(),gate.latest(),held);
+    }
+
+    private static SupportAvailabilitySnapshot failedSupport(SupportAvailabilitySnapshot gate,String detail,boolean ownsFailure) {
+        if(gate.state()==SupportState.FAILED) return gate;
+        return new SupportAvailabilitySnapshot(gate.identity(),SupportState.FAILED,false,Optional.of(detail),ownsFailure,
+                gate.captures(),gate.firstReady(),gate.latest(),gate.heldEnd());
+    }
+
+    static void cancelSupportAvailabilityForClose(MinecraftClient client,MinecraftServer server,Path save,UUID runId,
+            SupportArmIdentity issued) {
+        requireThread(client);
+        var gate=support; var status=MapArtClient.status(); var run=status.engine().lifecycle().context().orElse(null);
+        requireSupportClose(gate,issued,runId,run,status.engine().lifecycle().phase(),status.controlOwner(),keys(client),
+                scope==null?null:scope.runId(),scope!=null && scope.mode()==Mode.SUPPORT_AVAILABILITY);
+        if(server==null || server!=client.getServer() || System.identityHashCode(server)!=issued.server()
+                || save==null || !save.toAbsolutePath().normalize().toString().equals(issued.save())
+                || !server.getSavePath(WorldSavePath.ROOT).toAbsolutePath().normalize().toString().equals(issued.save())
+                || client.world==null || System.identityHashCode(client.world)!=issued.world()
+                || client.player==null || System.identityHashCode(client.player)!=issued.player() || client.player.getEntityWorld()!=client.world
+                || client.getNetworkHandler()==null || System.identityHashCode(client.getNetworkHandler())!=issued.handler()
+                || client.getNetworkHandler().getWorld()!=client.world
+                || System.identityHashCode(client.getNetworkHandler().getConnection())!=issued.connection()
+                || !client.getNetworkHandler().getConnection().isOpen()
+                || !client.world.getRegistryKey().getValue().toString().equals(issued.context().dimension()))
+            throw new IllegalStateException("Refused support close identity/native terminal/released authority");
+        if(gate.state()==SupportState.FAILED) {
+            support=acknowledgeSupport(gate,issued);
+            failure=retireSupportFailure(gate,failure);
+        } else if(gate.state()==SupportState.ARMED) support=finishSupport(gate,SupportState.CANCELLED,gate.heldEnd());
+        scope=null;
+    }
+
+    private static void requireSupportClose(SupportAvailabilitySnapshot gate,SupportArmIdentity issued,UUID requested,
+            RunLifecycle.Context current,Phase phase,BuildEngine.ControlOwner owner,List<Boolean> keys,UUID activeRun,boolean activeSupport) {
+        if(gate==null || issued!=gate.identity() || !issued.context().runId().equals(requested) || !issued.context().equals(current)
+                || activeRun!=null && (!activeSupport || !activeRun.equals(requested))
+                || phase!=Phase.TERMINAL || owner!=BuildEngine.ControlOwner.NONE || !allReleased(keys))
+            throw new IllegalStateException("Refused support close identity/run/terminal/released state");
+    }
+
+    private static String retireSupportFailure(SupportAvailabilitySnapshot gate,String shared) {
+        return gate.ownsFailure() && shared==gate.firstCause().orElseThrow() ? null : shared;
+    }
+
+    private static SupportAvailabilitySnapshot acknowledgeSupport(SupportAvailabilitySnapshot gate,SupportArmIdentity issued) {
+        if(issued!=gate.identity() || gate.state()!=SupportState.FAILED) throw new IllegalStateException("Refused failure acknowledgment identity/state");
+        if(gate.cleanupAcknowledged()) return gate;
+        return new SupportAvailabilitySnapshot(issued,SupportState.FAILED,true,gate.firstCause(),gate.ownsFailure(),gate.captures(),
+                gate.firstReady(),gate.latest(),gate.heldEnd());
+    }
+
+    /** Synthetic immutable facts exercise these same policies; owned native authority still requires the real world. */
+    static void verifySupportGuards(BuildPlan plan,ScenarioObserver.Sample held) {
+        supportRequire(java.util.Arrays.stream(SupportPose.class.getDeclaredFields()).allMatch(f -> f.getType().isPrimitive()),
+                "Terminal support pose retains native objects");
+        var run=held.status().engine().lifecycle().context().orElseThrow(); var id=run.runId();
+        int target=SingleLaneFixture.targetId(plan,new GridPos(11,0,5));
+        var stone=new BuildPlan.BlockSpec("minecraft:stone",Map.of());
+        var identity=new SupportArmIdentity(UUID.randomUUID(),run,"synthetic-save",1,held.worldIdentity(),2,3,4,target,
+                new GridPos(11,65,5),stone,held.pose().age(),0);
+        var capture=new SupportCapture(run,target,BuildEngine.PlacementAvailability.READY,BuildEngine.PlacementAvailability.NO_VALID_HIT,
+                SupportPose.of(held.pose()),held.status().engine().eligibleTicks()-1);
+        var armed=new SupportAvailabilitySnapshot(identity,SupportState.ARMED,false,Optional.empty(),false,1,
+                Optional.of(capture),Optional.of(capture),Optional.empty());
+        var original=new LinkedHashMap<Integer,BuildEngine.PlacementAvailability>();
+        for(var value:plan.targets()) original.put(value.id(),BuildEngine.PlacementAvailability.READY);
+        var originalCopy=new LinkedHashMap<>(original);
+        var filtered=filterSupportMap(original,plan,target);
+        supportRequire(filtered!=original && original.equals(originalCopy) && filtered.size()==original.size()
+                && filtered.keySet().equals(original.keySet()) && filtered.get(target)==BuildEngine.PlacementAvailability.NO_VALID_HIT
+                && filtered.entrySet().stream().allMatch(e -> e.getKey()==target || e.getValue()==original.get(e.getKey())),"Support one-cell map filter");
+        refusedSupport(() -> filtered.put(target,BuildEngine.PlacementAvailability.READY));
+        for(var value:BuildEngine.PlacementAvailability.values()) if(value!=BuildEngine.PlacementAvailability.READY) {
+            var unavailable=new LinkedHashMap<>(original); unavailable.put(target,value);
+            supportRequire(filterSupportMap(unavailable,plan,target)==unavailable,"Non-READY map identity");
+        }
+        refusedSupport(() -> filterSupportMap(original,plan,999));
+        var missing=new LinkedHashMap<>(original); missing.remove(target);
+        refusedSupport(() -> filterSupportMap(missing,plan,target));
+        var malformed=new LinkedHashMap<>(original); malformed.put(target,null);
+        refusedSupport(() -> filterSupportMap(malformed,plan,target));
+        for(var mode:Mode.values()) if(mode!=Mode.SUPPORT_AVAILABILITY)
+            supportRequire(!supportActive(mode,null,id),"Old-mode support passthrough");
+        supportRequire(!supportActive(null,null,id),"Never-armed passthrough");
+        supportRequire(supportHold(armed,held,List.of(held),held.status(),held.pose(),held.keys()),"Exact retained support hold");
+        var equal=new ScenarioObserver.Sample(held.tick(),held.phase(),held.worldIdentity(),held.originalWorld(),held.pose(),held.keys(),held.paused(),held.status(),held.observations());
+        supportRequire(equal.equals(held) && equal!=held && !supportHold(armed,equal,List.of(held),held.status(),held.pose(),held.keys()),"Equal reconstruction authorized release");
+        supportRequire(!supportHold(armed,held,List.of(held,equal),held.status(),held.pose(),held.keys()),"Stale END authorized release");
+        var test=new ScenarioObserver.Sample(held.tick(),"TEST",held.worldIdentity(),true,held.pose(),held.keys(),false,held.status(),held.observations());
+        supportRequire(!supportHold(armed,test,List.of(test),test.status(),test.pose(),test.keys()),"TEST poll authorized release");
+        for(int key=0;key<9;key++) {
+            var pressed=new ArrayList<>(held.keys()); pressed.set(key,true);
+            var keyed=new ScenarioObserver.Sample(held.tick(),held.phase(),held.worldIdentity(),true,held.pose(),List.copyOf(pressed),false,held.status(),held.observations());
+            supportRequire(!supportHold(armed,keyed,List.of(keyed),keyed.status(),keyed.pose(),keyed.keys()),"Pressed key authorized release: "+key);
+        }
+        for(var bad:List.of(new SupportCapture(run,target,BuildEngine.PlacementAvailability.OUT_OF_REACH,BuildEngine.PlacementAvailability.OUT_OF_REACH,capture.pose(),capture.eligibleBefore()),
+                new SupportCapture(run,target,BuildEngine.PlacementAvailability.READY,BuildEngine.PlacementAvailability.NO_VALID_HIT,capture.pose(),capture.eligibleBefore()-1))) {
+            var gate=new SupportAvailabilitySnapshot(identity,SupportState.ARMED,false,Optional.empty(),false,2,Optional.of(capture),Optional.of(bad),Optional.empty());
+            supportRequire(!supportHold(gate,held,List.of(held),held.status(),held.pose(),held.keys()),"NonREADY/stale capture authorized release");
+        }
+        var p=held.pose(); var laterPose=new Pose(p.x(),p.y(),p.z(),p.velocity(),p.eyes(),p.age()+1,p.worldTime(),p.yaw(),p.headYaw(),p.bodyYaw(),
+                p.flying(),p.sprinting(),p.selectedSlot(),p.reserved(),p.usable());
+        supportRequire(!supportHold(armed,held,List.of(held),held.status(),laterPose,held.keys()),"Intervening native age authorized stale END");
+        var noReady=new SupportAvailabilitySnapshot(identity,SupportState.ARMED,false,Optional.empty(),false,1,Optional.empty(),Optional.of(capture),Optional.empty());
+        supportRequire(!supportHold(noReady,held,List.of(held),held.status(),held.pose(),held.keys()),"No original READY authorized release");
+        for(String entry:List.of("snapshot/check","stateSnapshot/check","withhold/check","availability/check","clear")) {
+            var failed=failedSupport(armed,"first cause: "+entry,true);
+            supportRequire(failed.state()==SupportState.FAILED && !failed.cleanupAcknowledged()
+                    && failedSupport(failed,"secondary",false)==failed,"First support cause changed");
+            refusedSupport(() -> supportActive(null,failed,id));
+            supportRequire(!supportActive(null,failed,UUID.randomUUID()),"Failed A poisoned unrelated B availability");
+            for(var mode:Mode.values()) refusedSupport(() -> requireArmable(false,null,failed,UUID.randomUUID()));
+            refusedSupport(() -> requireSupportBarrier(failed,id));
+            supportRequire(!supportHold(failed,held,List.of(held),held.status(),held.pose(),held.keys()),"FAILED released as healthy");
+            var reconstructed=new SupportArmIdentity(identity.arm(),identity.context(),identity.save(),identity.server(),identity.world(),identity.player(),
+                    identity.handler(),identity.connection(),identity.targetId(),identity.target(),identity.expected(),identity.armedAge(),identity.armedEligible());
+            supportRequire(reconstructed.equals(identity) && reconstructed!=identity,"Identity reconstruction fixture");
+            refusedSupport(() -> acknowledgeSupport(failed,reconstructed));
+            requireSupportClose(failed,identity,id,run,Phase.TERMINAL,BuildEngine.ControlOwner.NONE,held.keys(),null,false);
+            refusedSupport(() -> requireSupportClose(failed,reconstructed,id,run,Phase.TERMINAL,BuildEngine.ControlOwner.NONE,held.keys(),null,false));
+            refusedSupport(() -> requireSupportClose(failed,identity,UUID.randomUUID(),run,Phase.TERMINAL,BuildEngine.ControlOwner.NONE,held.keys(),null,false));
+            refusedSupport(() -> requireSupportClose(failed,identity,id,run,Phase.RUNNING,BuildEngine.ControlOwner.NONE,held.keys(),null,false));
+            refusedSupport(() -> requireSupportClose(failed,identity,id,run,Phase.TERMINAL,BuildEngine.ControlOwner.NATIVE,held.keys(),null,false));
+            refusedSupport(() -> requireSupportClose(failed,identity,id,run,Phase.TERMINAL,BuildEngine.ControlOwner.NONE,held.keys(),UUID.randomUUID(),true));
+            refusedSupport(() -> requireSupportClose(failed,identity,id,run,Phase.TERMINAL,BuildEngine.ControlOwner.NONE,held.keys(),id,false));
+            var acknowledged=acknowledgeSupport(failed,identity);
+            supportRequire(acknowledged.state()==SupportState.FAILED && acknowledged.cleanupAcknowledged()
+                    && acknowledged.firstCause().equals(failed.firstCause()) && acknowledged.latest().equals(failed.latest())
+                    && acknowledgeSupport(acknowledged,identity)==acknowledged && !supportActive(null,acknowledged,id),"Failure acknowledgment hid cause/evidence");
+            refusedSupport(() -> requireArmable(false,null,acknowledged,id));
+            requireArmable(false,null,acknowledged,UUID.randomUUID());
+            refusedSupport(() -> requireArmable(false,"another mode failure",acknowledged,UUID.randomUUID()));
+            supportRequire(retireSupportFailure(failed,failed.firstCause().orElseThrow())==null
+                    && retireSupportFailure(failed,"another mode failure").equals("another mode failure")
+                    && retireSupportFailure(failedSupport(armed,"unowned",false),"unowned").equals("unowned"),"Support cleanup retired unrelated failure");
+        }
+        for(var state:List.of(SupportState.RELEASED,SupportState.CANCELLED)) {
+            var terminal=finishSupport(armed,state,Optional.of(held.line()));
+            supportRequire(!supportActive(null,terminal,id) && !supportHold(terminal,held,List.of(held),held.status(),held.pose(),held.keys()),"Consumed support re-released");
+            refusedSupport(() -> requireArmable(false,null,terminal,id));
+        }
+        System.out.println("PredictionFaults support same-helper synthetic guards passed; native shared-entry/close authority remains separate");
+    }
+
+    private static void supportRequire(boolean condition,String detail) { if(!condition) throw new AssertionError(detail); }
+    private static void refusedSupport(Runnable action) {
+        try { action.run(); } catch(IllegalStateException | IllegalArgumentException | UnsupportedOperationException expected) { return; }
+        throw new AssertionError("Synthetic support policy accepted refused input");
     }
 
     /** Called at the original incoming INVOKE, after vanilla main-thread dispatch; never queues or replays a response. */
@@ -257,12 +622,17 @@ public final class PredictionFaults {
         var p=c.player; var o=c.options;
         var keys=List.of(o.forwardKey.isPressed(),o.backKey.isPressed(),o.leftKey.isPressed(),o.rightKey.isPressed(),
                 o.jumpKey.isPressed(),o.sneakKey.isPressed(),o.sprintKey.isPressed(),o.useKey.isPressed(),o.attackKey.isPressed());
-        var pose=new Pose(p.getX(),p.getY(),p.getZ(),p.getVelocity(),p.getEyePos(),p.age,c.world.getTime(),p.getYaw(),p.headYaw,p.bodyYaw,
-                p.getAbilities().flying,p.isSprinting(),p.getInventory().getSelectedSlot(),p.getInventory().getStack(0).getCount(),p.getInventory().getStack(1).getCount());
+        var pose=pose(c);
         var yaw=new Yaw(p.getYaw(),p.headYaw,p.bodyYaw,p.lastYaw,p.lastHeadYaw,p.lastBodyYaw);
         boolean pending=((PendingPredictionView)((ClientWorldPendingUpdateAccessor)c.world).mapart$getPendingUpdateManager())
                 .mapart$hasPendingPrediction(new BlockPos(11,65,0));
         return new BarrierState(pose,yaw,keys,MapArtClient.status(),c.world.getBlockState(new BlockPos(11,65,0)).isAir(),pending);
+    }
+
+    private static Pose pose(MinecraftClient c) {
+        var p=c.player;
+        return new Pose(p.getX(),p.getY(),p.getZ(),p.getVelocity(),p.getEyePos(),p.age,c.world.getTime(),p.getYaw(),p.headYaw,p.bodyYaw,
+                p.getAbilities().flying,p.isSprinting(),p.getInventory().getSelectedSlot(),p.getInventory().getStack(0).getCount(),p.getInventory().getStack(1).getCount());
     }
 
     private static void released(BarrierState state) {
@@ -278,16 +648,72 @@ public final class PredictionFaults {
         var client=MinecraftClient.getInstance();
         requireThread(client);
         check(client);
-        return new Snapshot(scope!=null,Optional.ofNullable(failure),List.copyOf(responses),omissionLatched,List.copyOf(omissions),Optional.ofNullable(barrier),List.copyOf(fresh));
+        return resetSnapshot();
+    }
+
+    /** Reset refusal checks must not invoke check(), which invalidates stale diagnostic scopes. */
+    static Snapshot resetSnapshot() {
+        requireThread(MinecraftClient.getInstance());
+        return new Snapshot(scope!=null,Optional.ofNullable(failure),List.copyOf(responses),omissionLatched,List.copyOf(omissions),Optional.ofNullable(barrier),List.copyOf(fresh),Optional.ofNullable(support));
+    }
+
+    static void validateResponsesForReset(MinecraftClient client, MinecraftServer ownedServer, Path ownedSave, UUID failedRunId) {
+        requireThread(client);
+        var owned=scope;
+        if(owned==null || owned.mode()!=Mode.RESPONSE || failure!=null)
+            throw new IllegalStateException("Reset release requires an active healthy RESPONSE scope");
+        var status=MapArtClient.status(); var state=status.engine().lifecycle(); var o=client.options;
+        if(client!=owned.client() || ownedServer!=owned.server() || client.getServer()!=owned.server()
+                || ownedSave==null || !ownedSave.toAbsolutePath().normalize().equals(owned.save())
+                || !owned.server().getSavePath(WorldSavePath.ROOT).toAbsolutePath().normalize().equals(owned.save())
+                || client.world!=owned.world() || client.player!=owned.player()
+                || client.player.getEntityWorld()!=owned.world() || client.getNetworkHandler()!=owned.handler()
+                || owned.handler().getWorld()!=owned.world() || owned.handler().getConnection()!=owned.connection()
+                || !owned.connection().isOpen() || !owned.world().getRegistryKey().getValue().toString().equals(owned.dimension())
+                || state.phase()!=Phase.TERMINAL || state.outcome().orElse(null)!=RunLifecycle.Outcome.FAILED
+                || state.context().isEmpty() || !owned.runId().equals(failedRunId)
+                || !state.context().orElseThrow().runId().equals(failedRunId)
+                || !state.context().orElseThrow().dimension().equals(owned.dimension())
+                || status.controlOwner()!=BuildEngine.ControlOwner.NONE
+                || List.of(o.forwardKey,o.backKey,o.leftKey,o.rightKey,o.jumpKey,o.sneakKey,o.sprintKey,o.useKey,o.attackKey)
+                    .stream().anyMatch(k -> k.isPressed())
+                || client.isPaused() || client.currentScreen!=null || !withinWindow(client.player.age,owned.age())
+                || responses.isEmpty() || responses.size()>WINDOW
+                || responses.stream().anyMatch(r -> !r.runId().equals(owned.runId()) || !r.save().equals(owned.save().toString())
+                    || !withinWindow(r.playerAge(),owned.age()) || !withinWindow(client.player.age,r.playerAge())))
+            throw new IllegalStateException("Refused reset RESPONSE binding/run/controls/window");
+    }
+
+    static List<Response> releaseResponsesForReset(MinecraftClient client, MinecraftServer ownedServer, Path ownedSave, UUID failedRunId) {
+        validateResponsesForReset(client,ownedServer,ownedSave,failedRunId);
+        var owned=scope; var captured=List.copyOf(responses);
+        scope=null; // Consume before native reentry: reconciliation may partially mutate then throw; never retry.
+        for(var record:captured) owned.world().handlePlayerActionResponse(record.sequence());
+        return captured;
     }
 
     static void clear() {
         requireThread(MinecraftClient.getInstance());
+        if(scope!=null && scope.mode()==Mode.SUPPORT_AVAILABILITY) {
+            fail("Unexpected clear of active support availability");
+            throw new IllegalStateException(support.firstCause().orElseThrow());
+        }
+        if(support!=null && support.state()==SupportState.FAILED && !support.cleanupAcknowledged())
+            throw new IllegalStateException(support.firstCause().orElseThrow());
         scope=null; // Invalidate before disposing native owners; immutable response evidence survives cleanup.
         stateStage=StateStage.INACTIVE;
     }
 
     private static void check(MinecraftClient client) {
+        var owned=scope;
+        try { checkBound(client); }
+        catch(RuntimeException | Error error) {
+            if(owned==null || owned.mode()!=Mode.SUPPORT_AVAILABILITY) throw error;
+            fail("Owned support check: "+error.getMessage());
+        }
+    }
+
+    private static void checkBound(MinecraftClient client) {
         var owned=scope;
         if(owned==null) return;
         var state=MapArtClient.status().engine().lifecycle();
@@ -311,6 +737,17 @@ public final class PredictionFaults {
             if(client.player.age<stateAge || eligible<stateEligible) fail("State diagnostic clock moved backwards");
             else { stateAge=client.player.age; stateEligible=eligible; }
         }
+        else if(owned.mode()==Mode.SUPPORT_AVAILABILITY) {
+            var gate=support; var id=gate.identity(); var engine=MapArtClient.status().engine();
+            if(client!=owned.client() || client.player!=owned.player() || owned.handler().getWorld()!=owned.world()
+                    || !state.context().orElseThrow().equals(id.context()) || state.phase()!=Phase.RUNNING
+                    || !owned.world().getRegistryKey().getValue().toString().equals(id.context().dimension())
+                    || !loaded(owned.world(),id.target()) || !unbuilt(client,id.target()) || engine.pendingTargetIds().contains(id.targetId()))
+                fail("Owned support binding/context/loaded unbuilt target lost");
+            else if(client.player.age<stateAge || engine.eligibleTicks()<stateEligible)
+                fail("Support diagnostic clock moved backwards");
+            else { stateAge=client.player.age; stateEligible=engine.eligibleTicks(); }
+        }
     }
 
     private static boolean withinWindow(int age,int initialAge) {
@@ -319,6 +756,13 @@ public final class PredictionFaults {
     }
 
     private static void fail(String detail) {
+        if(scope!=null && scope.mode()==Mode.SUPPORT_AVAILABILITY) {
+            support=failedSupport(support,detail,failure==null); // First cause/barrier precede disposal on EVERY shared failure route.
+            if(failure==null) failure=support.firstCause().orElseThrow();
+            scope=null;
+            stateStage=StateStage.INACTIVE;
+            return;
+        }
         if(failure==null) failure=detail;
         scope=null;
         stateStage=StateStage.INACTIVE;
@@ -328,7 +772,7 @@ public final class PredictionFaults {
 
     static void armState(MinecraftClient client,MinecraftServer server,Path save,UUID runId,BuildPlan plan,int targetId,boolean repeated) {
         requireThread(client);
-        if(scope!=null || failure!=null) throw new IllegalStateException("Fault already active or failed");
+        requireArmable(scope!=null,failure,support,runId);
         var context=MapArtClient.status().engine().lifecycle().context().orElseThrow();
         var target=plan.targets().stream().filter(t -> t.id()==targetId).findFirst().orElseThrow();
         var relative=target.relativePos(); var origin=context.origin();
