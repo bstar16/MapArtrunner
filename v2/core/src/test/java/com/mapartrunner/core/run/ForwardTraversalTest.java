@@ -248,7 +248,9 @@ class ForwardTraversalTest {
                 var walk = advance(owner, lane.start(), lane.direction(), support, pending);
                 assertEquals(Status.WALKING, walk.movement().orElseThrow().status());
                 assertTrue(walk.movement().orElseThrow().sprint());
-                var complete = advance(owner, lane.end(), lane.direction(), support, pending);
+                var complete = owner.advance(new PlayerObservation(lane.end().x() + .5, 1, lane.end().z() + .5,
+                        lane.direction().yawDegrees()), support, pending,
+                        index == lanes.size() - 1 ? List.of() : plan.targets());
                 assertEquals(index == lanes.size() - 1, complete.traversalComplete());
                 if (complete.traversalComplete()) break;
 

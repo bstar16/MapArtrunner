@@ -14,7 +14,7 @@ import java.util.Optional;
 import java.util.Set;
 
 /**
- * Owns forward entry, transition and supported-walk counters, advancing once per eligible callback. Creation
+ * Owns forward/reverse entry, transition and supported-walk counters, advancing once per eligible callback. Creation
  * starts a fresh schedule; pause retains this owner without advancing it. The run owner captures
  * diagnostics and releases effects before discarding it on stop, failure or world replacement.
  */
@@ -27,7 +27,9 @@ public final class ForwardTraversal {
     private final boolean constantSprint;
     private final MovementPolicy policy = new MovementPolicy();
     private Snapshot state;
-    private boolean forwardComplete;
+    private boolean traversalComplete;
+    // Frozen until arrival; physical laneIndex descends through adjacent checkpoints toward it.
+    private int reverseTargetIndex = -1;
     private double walkCreditedCoordinate;
 
     public ForwardTraversal(List<Lane> lanes, GridSize dimensions, boolean constantSprint) {
@@ -49,7 +51,7 @@ public final class ForwardTraversal {
         if (state.pass() == Pass.SELECTING && !select(player, unfinishedTargets)) {
             return new Advance(Optional.empty(), false, false, false, true, Optional.empty());
         }
-        if (forwardComplete) return new Advance(Optional.empty(), true, false, false, false, Optional.empty());
+        if (traversalComplete) return new Advance(Optional.empty(), true, false, false, false, Optional.empty());
         if (transitionExpired()) return new Advance(Optional.empty(), false, true, false, false, Optional.empty());
         if (state.walkNoProgressTicks() >= WALK_NO_PROGRESS_LIMIT) return new Advance(Optional.empty(), false, false, true, false, Optional.empty());
         LaneEntry prior = state.entry();
@@ -58,10 +60,13 @@ public final class ForwardTraversal {
                 pendingTargetIds, prior.constantSprint());
         MovementIntent result = policy.decide(player, input, support);
         int walkTicks = state.walkNoProgressTicks();
-        if (state.substage() == Substage.LANE) {
+        if (state.substage() == Substage.LANE || state.substage() == Substage.TRANSIT) {
             double coordinate = input.lane().direction().progressCoordinate(player.x(), player.z())
                     * input.lane().direction().forwardSign();
-            if (result.status() == Status.READY_TO_WALK) walkCreditedCoordinate = coordinate;
+            if (result.status() == Status.READY_TO_WALK) {
+                walkCreditedCoordinate = coordinate;
+                walkTicks = 0;
+            }
             if (result.status() == Status.WALKING) {
                 if (coordinate - walkCreditedCoordinate >= .25) {
                     walkCreditedCoordinate = coordinate;
@@ -69,47 +74,64 @@ public final class ForwardTraversal {
                 } else walkTicks++;
             }
         }
-        int ticks = state.substage() == Substage.LANE ? 0 : state.transitionTicks() + 1;
+        int ticks = inHop() ? state.transitionTicks() + 1 : 0;
         var entry = new LaneEntry(input.lane(), result.nextStage(), result.nextStageElapsedTicks(),
                 result.nextEntryElapsedTicks(), result.nextYawAlignedTicks(), result.nextSupportHoldTicks(),
                 result.nextYawHoldTicks(), input.pendingTargetIds(), input.constantSprint());
+        // COMPLETE bypasses support evaluation; its zero output cannot clear unresolved history.
+        if (result.status() == Status.COMPLETE) entry = new LaneEntry(entry.lane(), entry.stage(),
+                entry.stageElapsedTicks(), entry.entryElapsedTicks(), entry.consecutiveYawAlignedTicks(),
+                input.supportHoldTicks(), entry.yawHoldTicks(), entry.pendingTargetIds(), entry.constantSprint());
         state = new Snapshot(state.laneIndex(), state.substage(), entry, ticks, state.transitionRegion(), state.pass(), walkTicks);
         switch (state.substage()) {
             case LANE -> {
                 if (result.status() == Status.COMPLETE) {
-                    if (state.laneIndex() == lanes.size() - 1) {
-                        forwardComplete = true;
+                    if (state.pass() == Pass.REVERSE) {
+                        selectReverse(state.laneIndex() - 1, input.lane().end(), input, unfinishedTargets);
+                    } else if (state.laneIndex() == lanes.size() - 1) {
+                        selectReverse(state.laneIndex(), input.lane().end(), input, unfinishedTargets);
                     } else {
-                        Lane old = input.lane();
-                        Lane next = lanes.get(state.laneIndex() + 1);
-                        var point = new Lane(old.id(), old.direction(), old.end(), old.end(), old.corridor(), old.expectedFloor());
-                        // COMPLETE did not evaluate support; retain its input hold across the handoff.
-                        state = new Snapshot(state.laneIndex(), Substage.ENDPOINT,
-                                fresh(point, input.supportHoldTicks(), input.pendingTargetIds(), false),
-                                0, Optional.of(transitionRegion(old.end(), next.start())), state.pass(), state.walkNoProgressTicks());
+                        beginHop(input.lane().end(), input);
                     }
+                } else if (state.pass() == Pass.REVERSE && result.status() == Status.READY_TO_WALK
+                        && unfinishedTargets.stream().noneMatch(t -> covers(state.entry().lane(), t))) {
+                    selectReverse(state.laneIndex() - 1, entry.lane().start(), entry, unfinishedTargets);
                 }
+            }
+            case TRANSIT -> {
+                if (result.status() == Status.COMPLETE) beginHop(input.lane().end(), input);
             }
             case ENDPOINT -> {
                 if (result.status() == Status.READY_TO_WALK) {
-                    Lane old = lanes.get(state.laneIndex());
-                    GridPos start = old.end(), end = lanes.get(state.laneIndex() + 1).start();
-                    var shift = new Lane(old.id(), direction(start, end), start, end,
-                            state.transitionRegion().orElseThrow(), old.expectedFloor());
+                    GridPos start = input.lane().start(), end = nextCheckpoint(start.x());
+                    var shift = new Lane(input.lane().id(), direction(start, end), start, end,
+                            state.transitionRegion().orElseThrow(), input.lane().expectedFloor());
                     state = new Snapshot(state.laneIndex(), Substage.SHIFT,
                             fresh(shift, entry.supportHoldTicks(), entry.pendingTargetIds(), false), ticks, state.transitionRegion(), state.pass(), state.walkNoProgressTicks());
                 }
             }
             case SHIFT -> {
                 if (result.status() == Status.COMPLETE) {
-                    int next = state.laneIndex() + 1;
+                    int next = state.laneIndex() + (state.pass() == Pass.REVERSE ? -1 : 1);
+                    Lane nextLane = lanes.get(next);
+                    if (state.pass() == Pass.REVERSE) nextLane = next == reverseTargetIndex ? reversed(next)
+                            : new Lane(nextLane.id(), Direction.NORTH, input.lane().end(), input.lane().end(),
+                            nextLane.corridor(), nextLane.expectedFloor());
                     // The cardinal segment's COMPLETE also bypassed footprint evaluation.
                     state = new Snapshot(next, Substage.NEXT_ENTRY,
-                            fresh(lanes.get(next), input.supportHoldTicks(), input.pendingTargetIds(), false), ticks, state.transitionRegion(), state.pass(), state.walkNoProgressTicks());
+                            fresh(nextLane, input.supportHoldTicks(), input.pendingTargetIds(), false), ticks, state.transitionRegion(), state.pass(), state.walkNoProgressTicks());
                 }
             }
             case NEXT_ENTRY -> {
                 if (result.status() == Status.READY_TO_WALK) {
+                    if (state.pass() == Pass.REVERSE && state.laneIndex() > reverseTargetIndex) {
+                        beginHop(entry.lane().start(), entry);
+                        break;
+                    }
+                    if (state.pass() == Pass.REVERSE && unfinishedTargets.stream().noneMatch(t -> covers(state.entry().lane(), t))) {
+                        selectReverse(state.laneIndex() - 1, entry.lane().start(), entry, unfinishedTargets);
+                        break;
+                    }
                     // Rebase only after actual destination entry; holds and entry jitter retain the old debt.
                     walkCreditedCoordinate = entry.lane().direction().progressCoordinate(player.x(), player.z())
                             * entry.lane().direction().forwardSign();
@@ -120,16 +142,16 @@ public final class ForwardTraversal {
                 }
             }
         }
-        return new Advance(Optional.of(result), forwardComplete, false, state.walkNoProgressTicks() >= WALK_NO_PROGRESS_LIMIT,
+        return new Advance(Optional.of(result), traversalComplete, false, state.walkNoProgressTicks() >= WALK_NO_PROGRESS_LIMIT,
                 false, Optional.of(input));
     }
 
     /** Missing player data consumes only the existing transition total, never policy counters. */
     public Advance advanceWithoutPlayer() {
-        if (forwardComplete) return new Advance(Optional.empty(), true, false, false, false, Optional.empty());
+        if (traversalComplete) return new Advance(Optional.empty(), true, false, false, false, Optional.empty());
         if (transitionExpired()) return new Advance(Optional.empty(), false, true, false, false, Optional.empty());
         if (state.walkNoProgressTicks() >= WALK_NO_PROGRESS_LIMIT) return new Advance(Optional.empty(), false, false, true, false, Optional.empty());
-        if (state.substage() != Substage.LANE) {
+        if (inHop()) {
             state = new Snapshot(state.laneIndex(), state.substage(), state.entry(),
                     state.transitionTicks() + 1, state.transitionRegion(), state.pass(), state.walkNoProgressTicks());
         }
@@ -164,12 +186,64 @@ public final class ForwardTraversal {
                 }
             }
         }
-        forwardComplete = unfinished.isEmpty();
+        traversalComplete = unfinished.isEmpty();
         // Select only before the first policy call; the clipped entry never replaces a canonical lane.
         state = new Snapshot(selectedIndex, state.substage(), fresh(selected, state.entry().supportHoldTicks(),
                 state.entry().pendingTargetIds(), constantSprint), state.transitionTicks(), state.transitionRegion(),
-                forwardComplete ? Pass.COMPLETE : Pass.FORWARD, state.walkNoProgressTicks());
+                traversalComplete ? Pass.COMPLETE : Pass.FORWARD, state.walkNoProgressTicks());
         return true;
+    }
+
+    private void selectReverse(int ceiling, GridPos source, LaneEntry prior, List<Target> unfinished) {
+        reverseTargetIndex = ceiling;
+        while (reverseTargetIndex >= 0) {
+            Lane candidate = lanes.get(reverseTargetIndex);
+            if (unfinished.stream().anyMatch(t -> covers(candidate, t))) break;
+            reverseTargetIndex--;
+        }
+        if (reverseTargetIndex < 0) {
+            traversalComplete = true;
+            state = new Snapshot(state.laneIndex(), state.substage(), state.entry(), 0,
+                    Optional.empty(), Pass.COMPLETE, state.walkNoProgressTicks());
+            return;
+        }
+        Lane selected = reversed(reverseTargetIndex);
+        state = new Snapshot(state.laneIndex(), state.substage(), state.entry(), 0,
+                Optional.empty(), Pass.REVERSE, state.walkNoProgressTicks());
+        if (reverseTargetIndex == state.laneIndex()) {
+            state = new Snapshot(state.laneIndex(), Substage.LANE,
+                    fresh(selected, prior.supportHoldTicks(), prior.pendingTargetIds(), constantSprint),
+                    0, Optional.empty(), Pass.REVERSE, 0);
+        } else if (source.x() != selected.start().x()) {
+            var end = new GridPos(selected.start().x(), source.y(), source.z());
+            Lane canonical = lanes.get(state.laneIndex());
+            var transit = new Lane(canonical.id(), direction(source, end), source, end,
+                    canonical.corridor(), canonical.expectedFloor());
+            state = new Snapshot(state.laneIndex(), Substage.TRANSIT,
+                    fresh(transit, prior.supportHoldTicks(), prior.pendingTargetIds(), false),
+                    0, Optional.empty(), Pass.REVERSE, state.walkNoProgressTicks());
+        } else beginHop(source, prior);
+    }
+
+    private Lane reversed(int index) {
+        Lane lane = lanes.get(index);
+        Direction reverse = lane.direction() == Direction.EAST ? Direction.WEST : Direction.EAST;
+        return new Lane(lane.id(), reverse, lane.end(), lane.start(), lane.corridor(), lane.expectedFloor());
+    }
+
+    private GridPos nextCheckpoint(int x) {
+        if (state.pass() == Pass.FORWARD) return lanes.get(state.laneIndex() + 1).start();
+        GridPos next = lanes.get(state.laneIndex() - 1).start();
+        return new GridPos(x, next.y(), next.z());
+    }
+
+    private void beginHop(GridPos source, LaneEntry prior) {
+        var point = new Lane(lanes.get(state.laneIndex()).id(), prior.lane().direction(), source, source,
+                lanes.get(state.laneIndex()).corridor(), prior.lane().expectedFloor());
+        // Only a completed destination entry (or the preceding X WALK) can begin another hop clock.
+        state = new Snapshot(state.laneIndex(), Substage.ENDPOINT,
+                fresh(point, prior.supportHoldTicks(), prior.pendingTargetIds(), false), 0,
+                Optional.of(transitionRegion(source, nextCheckpoint(source.x()))), state.pass(), state.walkNoProgressTicks());
     }
 
     private static boolean covers(Lane lane, Target target) {
@@ -182,7 +256,11 @@ public final class ForwardTraversal {
     }
 
     private boolean transitionExpired() {
-        return state.substage() != Substage.LANE && state.transitionTicks() >= TRANSITION_LIMIT;
+        return inHop() && state.transitionTicks() >= TRANSITION_LIMIT;
+    }
+
+    private boolean inHop() {
+        return state.substage() == Substage.ENDPOINT || state.substage() == Substage.SHIFT || state.substage() == Substage.NEXT_ENTRY;
     }
 
     private static LaneEntry fresh(Lane lane, int supportHoldTicks, Set<Integer> pendingTargetIds, boolean sprint) {
@@ -204,7 +282,7 @@ public final class ForwardTraversal {
 
     public enum Pass { SELECTING, FORWARD, REVERSE, COMPLETE }
 
-    public enum Substage { LANE, ENDPOINT, SHIFT, NEXT_ENTRY }
+    public enum Substage { LANE, TRANSIT, ENDPOINT, SHIFT, NEXT_ENTRY }
 
     public record Snapshot(int laneIndex, Substage substage, LaneEntry entry, int transitionTicks,
                            Optional<Corridor> transitionRegion, Pass pass, int walkNoProgressTicks) { }

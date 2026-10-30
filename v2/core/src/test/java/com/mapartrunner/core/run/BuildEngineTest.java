@@ -160,7 +160,8 @@ class BuildEngineTest {
     void pendingTimeoutPreservesCanonicalCauseInBuildAndVerify(int width) {
         var h = new Harness(plan(width, 5, target(7, 0, 0)));
         h.available.put(7, PlacementAvailability.READY); h.step();
-        for (int i = 0; i < 79; i++) {
+        if (width == 2) { h.step(); h.step(); h.step(); finishWidthTwoReverse(h); }
+        for (int i = 0; i < (width == 2 ? 72 : 79); i++) {
             if (width == 12 && i >= 20) h.at(new PlayerObservation(.5 + .25 * (i / 20), 1, 2.5, -90));
             assertRunning(h.step());
         }
@@ -282,6 +283,7 @@ class BuildEngineTest {
         h.at(new PlayerObservation(11.5, 1, 7.5, 90)); h.ready();
         assertEquals(Activity.BUILD, h.engine.snapshot().lifecycle().activity().orElseThrow());
         h.at(new PlayerObservation(.5, 1, 7.5, 90));
+        h.observations = h.scan(STONE);
         var last = h.step();
         assertEquals(Activity.VERIFY, last.snapshot().lifecycle().activity().orElseThrow());
         assertEquals(ControlOwner.NONE, last.owner());
@@ -603,6 +605,7 @@ class BuildEngineTest {
         var h = new Harness(new BuildPlan("stairs", new GridSize(2, 1, 5),
                 List.of(new Target(7, new GridPos(0, 0, 0), stair))));
         h.ready(); h.step();
+        finishWidthTwoReverse(h);
         h.available.put(7, PlacementAvailability.READY);
         h.observations = List.of(observation(h, 7, h.nextTick,
                 new BlockSpec("minecraft:oak_stairs", Map.of("facing", "west")), Evidence.OBSERVED));
@@ -707,6 +710,10 @@ class BuildEngineTest {
         }
         h.at(new PlayerObservation(11.5, 1, 2.5, -90));
         h.observations = List.of(observation(h, 7, h.nextTick, STONE, evidence));
+        h.step();
+        assertEquals(ForwardTraversal.Pass.REVERSE, h.engine.snapshot().traversal().orElseThrow().pass());
+        h.at(new PlayerObservation(11.5, 1, 2.5, 90)); h.ready();
+        h.at(new PlayerObservation(.5, 1, 2.5, 90));
         var completion = h.step();
         assertEquals(Activity.VERIFY, completion.snapshot().lifecycle().activity().orElseThrow());
         assertTrue(completion.placement().isEmpty());
@@ -747,7 +754,8 @@ class BuildEngineTest {
     @Test void genuineFinalScanAtPendingBoundaryCanSucceed() {
         var h = new Harness(plan(2, 5, target(7, 0, 0)));
         h.available.put(7, PlacementAvailability.READY); h.step();
-        for (int i = 0; i < 79; i++) h.step();
+        h.step(); h.step(); h.step(); finishWidthTwoReverse(h);
+        for (int i = 0; i < 72; i++) h.step();
         h.observations = h.scan(STONE);
         assertEquals(Outcome.SUCCESS, h.step().snapshot().lifecycle().outcome().orElseThrow());
     }
@@ -811,6 +819,7 @@ class BuildEngineTest {
     @Test void missingIssuedOuterTargetFailsAfterTraversalDespiteOtherConfirmedTargets() {
         var h = new Harness(plan(2, 5, target(7, 0, 0), target(100, 1, 4)));
         h.available.put(7, PlacementAvailability.READY); h.step();
+        h.step(); h.step(); h.step(); finishWidthTwoReverse(h);
         while (h.engine.snapshot().lifecycle().phase() == Phase.RUNNING) {
             h.observations = List.of(observation(h, 100, h.nextTick, STONE, Evidence.OBSERVED));
             h.step();
@@ -848,7 +857,8 @@ class BuildEngineTest {
 
     @Test void verifyLeftoversUseDistanceThenStableIdWithMovementReleased() {
         var h = new Harness(plan(2, 5, target(100, 0, 0), target(7, 0, 4)));
-        h.ready(); h.step(); h.available.replaceAll((id, value) -> PlacementAvailability.READY);
+        h.ready(); h.step(); finishWidthTwoReverse(h);
+        h.available.replaceAll((id, value) -> PlacementAvailability.READY);
         var first = h.step(); assertEquals(7, first.placement().orElseThrow().targetId());
         assertEquals(ControlOwner.NONE, first.owner()); assertTrue(first.movement().isEmpty());
         assertEquals(100, h.step().placement().orElseThrow().targetId());
@@ -870,8 +880,8 @@ class BuildEngineTest {
     @Test void validFinalResultAtBothRun1200AndVerify80Wins() {
         var h = new Harness(plan(2, 5, target(7, 0, 0)));
         h.player = Optional.empty();
-        for (int i = 0; i < 1116; i++) h.step();
-        h.at(new PlayerObservation(.5, 1, 2.5, -90)); h.ready(); h.step();
+        for (int i = 0; i < 1112; i++) h.step();
+        h.at(new PlayerObservation(.5, 1, 2.5, -90)); h.ready(); h.step(); finishWidthTwoReverse(h);
         assertEquals(1120, h.engine.snapshot().eligibleTicks());
         for (int i = 0; i < 79; i++) h.step();
         h.observations = h.scan(STONE);
@@ -883,8 +893,11 @@ class BuildEngineTest {
     @Test void pendingWinsVerifyAndRunTimeoutWhenAllDue() {
         var h = new Harness(plan(2, 5, target(7, 0, 0)));
         h.player = Optional.empty();
-        for (int i = 0; i < 1116; i++) h.step();
-        h.at(new PlayerObservation(.5, 1, 2.5, -90)); h.ready();
+        for (int i = 0; i < 1112; i++) h.step();
+        h.at(new PlayerObservation(.5, 1, 2.5, -90)); h.ready(); h.step();
+        h.at(new PlayerObservation(1.5, 1, 2.5, 90)); h.ready();
+        assertEquals(ForwardTraversal.Pass.REVERSE, h.engine.snapshot().traversal().orElseThrow().pass());
+        assertEquals(Stage.WALK, h.engine.snapshot().laneEntry().orElseThrow().stage());
         h.available.put(7, PlacementAvailability.READY); h.step(); // issue at1120, enter verify
         for (int i = 0; i < 79; i++) h.step();
         assertReason(h.step(), Reason.PENDING_EVIDENCE_TIMEOUT);
@@ -894,6 +907,20 @@ class BuildEngineTest {
         var h = new Harness(plan(2, 5, target(7, 0, 0), target(100, 1, 4)));
         h.observations = h.scan(STONE); h.step(); h.observations = List.of();
         return h;
+    }
+    static void finishWidthTwoReverse(Harness h) {
+        var reverse = h.engine.snapshot().traversal().orElseThrow();
+        assertEquals(ForwardTraversal.Pass.REVERSE, reverse.pass());
+        assertEquals(ForwardTraversal.Substage.LANE, reverse.substage());
+        assertEquals(new GridPos(1, 0, 2), reverse.entry().lane().start());
+        assertEquals(new GridPos(0, 0, 2), reverse.entry().lane().end());
+        assertEquals(com.mapartrunner.core.traversal.LanePlanner.Direction.WEST, reverse.entry().lane().direction());
+        h.at(new PlayerObservation(1.5, 1, 2.5, 90)); h.ready();
+        assertEquals(Stage.WALK, h.engine.snapshot().laneEntry().orElseThrow().stage());
+        var complete = h.step();
+        assertEquals(Activity.VERIFY, complete.snapshot().lifecycle().activity().orElseThrow());
+        assertEquals(0, complete.snapshot().verifyTicks());
+        assertEquals(ControlOwner.NONE, complete.owner()); assertTrue(complete.movement().isEmpty());
     }
     static BuildPlan plan(int width, int depth, Target... targets) {
         return new BuildPlan("plan", new GridSize(width, 1, depth), List.of(targets));
