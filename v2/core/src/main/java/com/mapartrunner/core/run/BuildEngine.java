@@ -146,6 +146,10 @@ public final class BuildEngine {
                 finish(Outcome.FAILED, Reason.MOVEMENT_FAILED, unresolvedIds(), result.failure().name(), decisionInput);
                 return currentDecision(input.tick(), Optional.empty(), Optional.empty());
             }
+            if (advanced.walkStalled()) {
+                finish(Outcome.FAILED, Reason.WALK_NO_PROGRESS, unresolvedIds(), "Supported walking made no quarter-block progress for 40 decisions");
+                return currentDecision(input.tick(), Optional.empty(), Optional.empty());
+            }
             if (advanced.traversalComplete()) {
                 lifecycle.updateActivity(input.runId(), Activity.VERIFY); verifyEnteredTick = input.tick();
             } else {
@@ -339,7 +343,7 @@ public final class BuildEngine {
     public enum EffectStatus { ACCEPTED, REJECTED, UNAVAILABLE, STALE }
     public enum ControlOwner { NONE, NATIVE, TRAVEL }
     public enum Reason { NOTHING_TO_BUILD, UNSUPPORTED_PLAN, COARSE_TRAVEL_UNAVAILABLE, BINDING_LOST,
-        MOVEMENT_FAILED, TRANSITION_TIMEOUT, PENDING_EVIDENCE_TIMEOUT, ATTEMPTS_EXHAUSTED, VERIFY_TIMEOUT, RUN_TIMEOUT,
+        MOVEMENT_FAILED, TRANSITION_TIMEOUT, WALK_NO_PROGRESS, PENDING_EVIDENCE_TIMEOUT, ATTEMPTS_EXHAUSTED, VERIFY_TIMEOUT, RUN_TIMEOUT,
         CANCELLED, VERIFIED, INVARIANT_FAILURE }
 
     /** Reserved slots and sprint belong to the same immutable adapter/run settings snapshot. */

@@ -12,12 +12,13 @@ import java.util.Optional;
 import java.util.Set;
 
 /**
- * Owns forward entry and transition counters, advancing once per eligible callback. Creation
+ * Owns forward entry, transition and supported-walk counters, advancing once per eligible callback. Creation
  * starts a fresh schedule; pause retains this owner without advancing it. The run owner captures
  * diagnostics and releases effects before discarding it on stop, failure or world replacement.
  */
 public final class ForwardTraversal {
     private static final int TRANSITION_LIMIT = 120;
+    private static final int WALK_NO_PROGRESS_LIMIT = 40;
 
     private final List<Lane> lanes;
     private final GridSize dimensions;
@@ -25,6 +26,7 @@ public final class ForwardTraversal {
     private final MovementPolicy policy = new MovementPolicy();
     private Snapshot state;
     private boolean forwardComplete;
+    private double walkCreditedCoordinate;
 
     public ForwardTraversal(List<Lane> lanes, GridSize dimensions, boolean constantSprint) {
         this.lanes = List.copyOf(lanes);
@@ -42,16 +44,29 @@ public final class ForwardTraversal {
         Objects.requireNonNull(support, "support");
         if (forwardComplete) return new Advance(Optional.empty(), true, false, false);
         if (transitionExpired()) return new Advance(Optional.empty(), false, true, false);
+        if (state.walkNoProgressTicks() >= WALK_NO_PROGRESS_LIMIT) return new Advance(Optional.empty(), false, false, true);
         LaneEntry prior = state.entry();
         var input = new LaneEntry(prior.lane(), prior.stage(), prior.stageElapsedTicks(), prior.entryElapsedTicks(),
                 prior.consecutiveYawAlignedTicks(), prior.supportHoldTicks(), prior.yawHoldTicks(),
                 pendingTargetIds, prior.constantSprint());
         MovementIntent result = policy.decide(player, input, support);
+        int walkTicks = state.walkNoProgressTicks();
+        if (state.substage() == Substage.LANE) {
+            double coordinate = input.lane().direction().progressCoordinate(player.x(), player.z())
+                    * input.lane().direction().forwardSign();
+            if (result.status() == Status.READY_TO_WALK) walkCreditedCoordinate = coordinate;
+            if (result.status() == Status.WALKING) {
+                if (coordinate - walkCreditedCoordinate >= .25) {
+                    walkCreditedCoordinate = coordinate;
+                    walkTicks = 0;
+                } else walkTicks++;
+            }
+        }
         int ticks = state.substage() == Substage.LANE ? 0 : state.transitionTicks() + 1;
         var entry = new LaneEntry(input.lane(), result.nextStage(), result.nextStageElapsedTicks(),
                 result.nextEntryElapsedTicks(), result.nextYawAlignedTicks(), result.nextSupportHoldTicks(),
                 result.nextYawHoldTicks(), input.pendingTargetIds(), input.constantSprint());
-        state = new Snapshot(state.laneIndex(), state.substage(), entry, ticks, state.transitionRegion(), state.pass(), state.walkNoProgressTicks());
+        state = new Snapshot(state.laneIndex(), state.substage(), entry, ticks, state.transitionRegion(), state.pass(), walkTicks);
         switch (state.substage()) {
             case LANE -> {
                 if (result.status() == Status.COMPLETE) {
@@ -88,20 +103,24 @@ public final class ForwardTraversal {
             }
             case NEXT_ENTRY -> {
                 if (result.status() == Status.READY_TO_WALK) {
+                    // Rebase only after actual destination entry; holds and entry jitter retain the old debt.
+                    walkCreditedCoordinate = entry.lane().direction().progressCoordinate(player.x(), player.z())
+                            * entry.lane().direction().forwardSign();
                     var walking = new LaneEntry(entry.lane(), entry.stage(), entry.stageElapsedTicks(), entry.entryElapsedTicks(),
                             entry.consecutiveYawAlignedTicks(), entry.supportHoldTicks(), entry.yawHoldTicks(),
                             entry.pendingTargetIds(), constantSprint);
-                    state = new Snapshot(state.laneIndex(), Substage.LANE, walking, 0, Optional.empty(), state.pass(), state.walkNoProgressTicks());
+                    state = new Snapshot(state.laneIndex(), Substage.LANE, walking, 0, Optional.empty(), state.pass(), 0);
                 }
             }
         }
-        return new Advance(Optional.of(result), forwardComplete, false, false);
+        return new Advance(Optional.of(result), forwardComplete, false, state.walkNoProgressTicks() >= WALK_NO_PROGRESS_LIMIT);
     }
 
     /** Missing player data consumes only the existing transition total, never policy counters. */
     public Advance advanceWithoutPlayer() {
         if (forwardComplete) return new Advance(Optional.empty(), true, false, false);
         if (transitionExpired()) return new Advance(Optional.empty(), false, true, false);
+        if (state.walkNoProgressTicks() >= WALK_NO_PROGRESS_LIMIT) return new Advance(Optional.empty(), false, false, true);
         if (state.substage() != Substage.LANE) {
             state = new Snapshot(state.laneIndex(), state.substage(), state.entry(),
                     state.transitionTicks() + 1, state.transitionRegion(), state.pass(), state.walkNoProgressTicks());
