@@ -14,6 +14,7 @@ import com.mapartrunner.fabric.MapArtClient;
 import com.mapartrunner.fabric.mixin.ClientWorldPendingUpdateAccessor;
 import com.mapartrunner.fabric.prediction.PendingPredictionView;
 import com.mapartrunner.fabric.runtime.FabricBuildAdapter;
+import com.mapartrunner.fabric.runtime.WorldEvidenceReader;
 import net.fabricmc.fabric.api.client.gametest.v1.context.ClientGameTestContext;
 import net.fabricmc.fabric.api.client.gametest.v1.context.TestSingleplayerContext;
 import net.fabricmc.fabric.api.client.gametest.v1.screenshot.TestScreenshotOptions;
@@ -60,7 +61,7 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.*;
 
-/** Fixed two-lane fixture owner. No production reset API and no observation-time repairs. */
+/** Closed-profile fixture owner. No production reset API and no observation-time repairs. */
 final class ScenarioRunner implements AutoCloseable {
     private enum SupportCase {
         ORDINARY, CONTROLLED;
@@ -91,6 +92,8 @@ final class ScenarioRunner implements AutoCloseable {
     private final Path artifacts;
     private final boolean callerAutoJump;
     private final int expectedCountedRuns;
+    private final ScenarioDefinition.Fixture fixture;
+    private final ScenarioDefinition profileDefinition;
     private TestSingleplayerContext world;
     private MinecraftServer server;
     private ServerWorld serverWorld;
@@ -122,6 +125,12 @@ final class ScenarioRunner implements AutoCloseable {
     private boolean supportReceipt;
 
     ScenarioRunner(ClientGameTestContext context, ScenarioObserver.Watch watch, int expectedCountedRuns) {
+        this(context,watch,expectedCountedRuns,ScenarioDefinition.Fixture.TWO_LANE);
+    }
+
+    ScenarioRunner(ClientGameTestContext context,ScenarioObserver.Watch watch,int expectedCountedRuns,ScenarioDefinition.Fixture fixture) {
+        this.fixture=Objects.requireNonNull(fixture);
+        profileDefinition=ScenarioDefinition.load(fixture);
         require(validExpectedCount(expectedCountedRuns),"Expected counted-run total must be 1..2");
         this.expectedCountedRuns=expectedCountedRuns;
         this.context = Objects.requireNonNull(context); this.watch = Objects.requireNonNull(watch);
@@ -140,13 +149,16 @@ final class ScenarioRunner implements AutoCloseable {
         verifyResetGuards();
         artifacts = roots.evidence.resolve("two-lane-" + invocation);
         checkedDirectory(roots, artifacts);
-        System.out.println("MapArtRunner two-lane artifacts: " + artifacts);
+        System.out.println(baseline()?"MapArtRunner two-lane artifacts: " + artifacts:"MapArtRunner "+fixture+" artifacts: "+artifacts);
         verifyResourceCopies();
         verifyFilesystemGuards();
     }
 
+    private boolean baseline() { return fixture==ScenarioDefinition.Fixture.TWO_LANE; }
+
     /** F4 calls before world creation; these are always-active checks, never Java assert. */
     static void verifyResetGuards() {
+        TraversalAssertions.verifyGuards();
         var r = roots();
         var d = ScenarioDefinition.load();
         var token = UUID.randomUUID();
@@ -316,14 +328,17 @@ final class ScenarioRunner implements AutoCloseable {
     }
 
     private void verifyResourceCopies() {
-        for (String name:List.of("definition.json","grounded-two-lane.schem")) {
+        for (String name:List.of("definition.json",fixture.sourceName())) {
             try {
-                var source=roots.module.getParent().resolve("test-fixtures/grounded-two-lane").resolve(name);
-                var resource=Path.of(Objects.requireNonNull(ScenarioDefinition.class.getResource("/grounded-two-lane/"+name)).toURI());
-                require(real(resource).equals(roots.build.resolve("resources/gametest/grounded-two-lane").resolve(name)),
+                var source=roots.module.getParent().resolve("test-fixtures").resolve(fixture.directory).resolve(name);
+                var resource=Path.of(Objects.requireNonNull(ScenarioDefinition.class.getResource(profileDefinition.resourceDirectory()+name)).toURI());
+                require(real(resource).equals(roots.build.resolve("resources/gametest").resolve(fixture.directory).resolve(name)),
                         "Loaded fixture resource escaped processed gametest resources");
                 var raw=Files.readAllBytes(resource);
                 require(Arrays.equals(raw,Files.readAllBytes(source)),"Source/processed/loaded resource differs: "+name);
+                if(name.equals("definition.json")) profileDefinition.requireValues(fixture,profileDefinition.definitionHash(),
+                        JsonParser.parseString(new String(raw,StandardCharsets.UTF_8)).getAsJsonObject());
+                else require(profileDefinition.sourceMatches(raw),"Source differs from immutable admitted bytes");
                 writeNew(roots,artifacts.resolve("resource-"+name+".txt"),"source="+source+"; loaded="+resource
                         +"; size="+raw.length+"; sha256="+HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(raw)));
             } catch (java.net.URISyntaxException | IOException e) { throw new IllegalStateException(e); }
@@ -333,7 +348,7 @@ final class ScenarioRunner implements AutoCloseable {
 
     void reset(ScenarioDefinition definition) {
         preflight(definition); // Stale authority cannot invalidate readiness, stop, or archive.
-        if(!supportReceipt) {
+        if(baseline() && !supportReceipt) {
             writeNew(roots,artifacts.resolve("support-coverage.txt"),"invocation="+invocation+"; definition="+definition.definitionHash()
                     +"; case="+supportCase.label()+"; selector="+(supportSelector==null?"absent":supportSelector)
                     +"; expectedCounted="+expectedCountedRuns+"; meaning="+supportMeaning());
@@ -373,7 +388,7 @@ final class ScenarioRunner implements AutoCloseable {
             plan = definition.importPlan(stage.resolve("retained-source.schem"));
             writeNew(roots,stage.resolve("imported-plan.txt"),"definitionSha256="+definition.definitionHash()
                     +"; dimensions="+plan.dimensions()+"; fingerprint="+plan.fingerprint()+"; targetCount="+plan.targets().size()+"\n"
-                    +plan.targets().stream().map(Object::toString).reduce("",(a,b) -> a+b+"\n"));
+                    +String.join("\n",plan.targets().stream().map(Object::toString).toList())+"\n");
             var source = definition.data().getAsJsonObject("schematic");
             origin = grid(source.getAsJsonObject("origin"));
             var s = definition.data().getAsJsonObject("settings");
@@ -403,7 +418,7 @@ final class ScenarioRunner implements AutoCloseable {
                     && bound.origin().equals(origin) && bound.settingsFingerprint().equals(settings.fingerprint())
                     && bound.dimension().equals("minecraft:overworld"), "Facade bound another start request");
             watch.arm(c, plan);
-            if(counted && supportCase==SupportCase.CONTROLLED) {
+            if(baseline() && counted && supportCase==SupportCase.CONTROLLED) {
                 supportArm=PredictionFaults.armSupportAvailability(c,server,save,fresh,plan,settings,watch).identity();
                 verifySupportArmRefusals(c,fresh);
             }
@@ -436,6 +451,7 @@ final class ScenarioRunner implements AutoCloseable {
 
     /** The dirty prelude is separate from the two counted successes; every start retains its UUID. */
     void failedFirst(ScenarioDefinition definition) {
+        require(baseline(),"Failed-first RESPONSE prelude belongs only to TWO_LANE");
         UUID id = start(definition,false);
         Live initial = live();
         Live prior = initial;
@@ -720,8 +736,8 @@ final class ScenarioRunner implements AutoCloseable {
             requireClient(c); enforceActionScope();
             var pending=(PendingPredictionView)((ClientWorldPendingUpdateAccessor)c.world).mapart$getPendingUpdateManager();
             var positions=new ArrayList<String>();
-            for (var cell:admitted.data().getAsJsonObject("world").getAsJsonArray("blocks")) {
-                var at=pos(cell.getAsJsonObject().getAsJsonObject("position"));
+            for (var cell:admitted.worldCells().keySet()) {
+                var at=new BlockPos(cell.x(),cell.y(),cell.z());
                 if (pending.mapart$hasPendingPrediction(at)) positions.add(at.toShortString()+"="+c.world.getBlockState(at));
             }
             return new Live(watch.sample(c,"TEST"),readClient(c,false),null,PredictionFaults.snapshot(),List.copyOf(positions),
@@ -919,16 +935,18 @@ final class ScenarioRunner implements AutoCloseable {
         UUID id = start(definition,true);
         var stage=artifacts.resolve("success-"+countedStarts+"-"+id);
         checkedDirectory(roots,stage);
-        var armed=context.computeOnClient(c -> PredictionFaults.resetSnapshot().support());
-        require(supportCase==SupportCase.ORDINARY ? armed.isEmpty() : armed.filter(g -> g.state()==PredictionFaults.SupportState.ARMED
-                && g.identity()==supportArm && g.identity().context().runId().equals(id)).isPresent(),"Support receipt lacks actual selected mode authority");
-        writeNew(roots,stage.resolve("support-coverage.txt"),"invocation="+invocation+"; run="+id+"; ordinal="+countedStarts
-                +"; definition="+definition.definitionHash()+"; case="+supportCase.label()+"; gateArmed="+(supportCase==SupportCase.CONTROLLED)
-                +"; proof="+(supportCase==SupportCase.ORDINARY?"support-footprint-proof.txt":"support-proof.txt")
-                +"; meaning="+supportMeaning()+(supportCase==SupportCase.CONTROLLED
-                    ? "; importedCoordinate=(11,0,5); actualId="+armed.orElseThrow().identity().targetId()
-                        +"; arm=support-gate-arm.txt; release=support-gate-release.txt; observer=observer-before-assertions.txt" : ""));
-        if(supportCase==SupportCase.CONTROLLED) writeNew(roots,stage.resolve("support-gate-arm.txt"),armed.orElseThrow().toString());
+        if(baseline()) {
+            var armed=context.computeOnClient(c -> PredictionFaults.resetSnapshot().support());
+            require(supportCase==SupportCase.ORDINARY ? armed.isEmpty() : armed.filter(g -> g.state()==PredictionFaults.SupportState.ARMED
+                    && g.identity()==supportArm && g.identity().context().runId().equals(id)).isPresent(),"Support receipt lacks actual selected mode authority");
+            writeNew(roots,stage.resolve("support-coverage.txt"),"invocation="+invocation+"; run="+id+"; ordinal="+countedStarts
+                    +"; definition="+definition.definitionHash()+"; case="+supportCase.label()+"; gateArmed="+(supportCase==SupportCase.CONTROLLED)
+                    +"; proof="+(supportCase==SupportCase.ORDINARY?"support-footprint-proof.txt":"support-proof.txt")
+                    +"; meaning="+supportMeaning()+(supportCase==SupportCase.CONTROLLED
+                        ? "; importedCoordinate=(11,0,5); actualId="+armed.orElseThrow().identity().targetId()
+                            +"; arm=support-gate-arm.txt; release=support-gate-release.txt; observer=observer-before-assertions.txt" : ""));
+            if(supportCase==SupportCase.CONTROLLED) writeNew(roots,stage.resolve("support-gate-arm.txt"),armed.orElseThrow().toString());
+        }
         double clientReach=context.computeOnClient(c -> { requireClient(c); return c.player.getBlockInteractionRange(); });
         double serverReach=world.getServer().computeOnServer(s -> { requireServer(s); return serverPlayer.getBlockInteractionRange(); });
         require(Double.isFinite(clientReach) && clientReach>0 && Double.isFinite(serverReach) && serverReach>0,"Invalid actual interaction reach");
@@ -943,9 +961,11 @@ final class ScenarioRunner implements AutoCloseable {
         checkpoints.add(current);
         boolean paused=false;
         int budget = i(definition.data().getAsJsonObject("budgets"),"runTicks");
+        writeNew(roots,stage.resolve("fixture-profile.txt"),"fixture="+fixture+"; physicsRunTicks="+budget
+                +"; productionEligibleAllowance="+BuildEngine.runLimit(plan,settings)+"; targets="+plan.targets().size());
         for (int tick=0; tick<budget; tick++) {
             context.waitTick();
-            if(supportCase==SupportCase.CONTROLLED) context.runOnClient(c -> {
+            if(baseline() && supportCase==SupportCase.CONTROLLED) context.runOnClient(c -> {
                 requireClient(c);
                 PredictionFaults.supportHold(c,id).ifPresent(held -> {
                     var before=PredictionFaults.resetSnapshot(); var status=MapArtClient.status();
@@ -965,7 +985,7 @@ final class ScenarioRunner implements AutoCloseable {
             writeNew(roots,stage.resolve("physics-"+tick+".txt"),current.toString());
             requireRun(current.sample,id);
             if (current.sample.status().engine().lifecycle().phase()==Phase.TERMINAL) break;
-            if (substage(current.sample,ForwardTraversal.Substage.SHIFT)) {
+            if (baseline() && substage(current.sample,ForwardTraversal.Substage.SHIFT)) {
                 if (shiftStart==null) shiftStart=current;
                 if (countedStarts==1 && !paused && nativeForward(current.sample)
                         && moved(shiftStart,current,"z",.25,1) && (supportCase==SupportCase.ORDINARY
@@ -986,13 +1006,15 @@ final class ScenarioRunner implements AutoCloseable {
                         && terminal.diagnostic().orElseThrow().detail().equals("Later current full-plan OBSERVED scan matched every expected state")
                         && terminal.unfinishedTargetIds().isEmpty() && terminal.pendingTargetIds().isEmpty(),
                 "SUCCESS lacks exact VERIFIED/ALL_CONFIRMED export: "+terminal);
-        require(countedStarts!=1 || paused,"First success never reached the required actual SHIFT pause");
-        verifyTraversal(id,checkpoints,samples,clientReach,serverReach,resumed,stage);
-        if(supportCase==SupportCase.ORDINARY) verifyOrdinarySupport(id,samples,stage);
-        else {
-            require(context.computeOnClient(c -> PredictionFaults.resetSnapshot().support().orElseThrow().state())
-                    ==PredictionFaults.SupportState.RELEASED,"Controlled gate was not consumed by actual retained hold");
-            verifySupport(id,samples,stage);
+        if(baseline()) {
+            require(countedStarts!=1 || paused,"First success never reached the required actual SHIFT pause");
+            verifyTraversal(id,checkpoints,samples,clientReach,serverReach,resumed,stage);
+            if(supportCase==SupportCase.ORDINARY) verifyOrdinarySupport(id,samples,stage);
+            else {
+                require(context.computeOnClient(c -> PredictionFaults.resetSnapshot().support().orElseThrow().state())
+                        ==PredictionFaults.SupportState.RELEASED,"Controlled gate was not consumed by actual retained hold");
+                verifySupport(id,samples,stage);
+            }
         }
         var accepted=samples.stream().flatMap(s -> s.status().engine().effectResults().stream())
                 .filter(e -> e.status()==BuildEngine.EffectStatus.ACCEPTED).distinct().toList();
@@ -1005,7 +1027,7 @@ final class ScenarioRunner implements AutoCloseable {
                 && s.status().engine().lifecycle().outcome().orElse(null)==Outcome.SUCCESS).findFirst().orElseThrow();
         require(success.status().engine().eligibleTicks()>samples.stream().filter(s -> s.phase().equals("END") && s.tick()==verifyFrame)
                 .findFirst().orElseThrow().status().engine().eligibleTicks(),"VERIFY did not precede an advancing SUCCESS decision");
-        requireCurrentScan(id,current.sample.tick(),plan.targets(),current.sample.observations());
+        checkCurrentScan(id,current.sample.tick(),plan.targets(),current.sample.observations());
         Live released=current;
         for (int tick=0;tick<20;tick++) {
             context.waitTick();
@@ -1018,7 +1040,7 @@ final class ScenarioRunner implements AutoCloseable {
             released=next;
         }
         require(released.sample.tick()>current.sample.tick(),"Final current scan did not advance observer time");
-        requireCurrentScan(id,released.sample.tick(),plan.targets(),released.sample.observations());
+        checkCurrentScan(id,released.sample.tick(),plan.targets(),released.sample.observations());
         writeNew(roots,stage.resolve("release-summary.txt"),"first="+current+"\nlast="+released);
         writeNew(roots,stage.resolve("observer-after-release.txt"),context.computeOnClient(c -> watch.copy()).stream()
                 .map(ScenarioObserver.Sample::line).reduce("",(a,b) -> a+b+"\n"));
@@ -1029,12 +1051,18 @@ final class ScenarioRunner implements AutoCloseable {
     }
 
     void assertResult(ScenarioResult result) {
+        requireResultIdentity(result,previous,runs,artifacts,admitted);
         require(result != null && result==previous && runs.contains(result.runId()) && result.artifacts().equals(artifacts)
                 && admitted != null && result.definitionHash().equals(admitted.definitionHash()), "Foreign result");
         require(result.mismatches().isEmpty() && result.terminal().lifecycle().outcome().orElse(null)==Outcome.SUCCESS,
                 "Scenario failed: " + result);
         require(assertedSuccesses.stream().noneMatch(r -> r.runId().equals(result.runId())),"Duplicate counted assertion");
         assertedSuccesses.add(result);
+    }
+
+    static void requireResultIdentity(ScenarioResult result,ScenarioResult previous,Set<UUID> runs,Path artifacts,ScenarioDefinition admitted) {
+        require(result!=null && result==previous && runs.contains(result.runId()) && result.artifacts().equals(artifacts)
+                && admitted!=null && result.definitionHash().equals(admitted.definitionHash()),"Foreign result/run/fixture");
     }
 
     private static void verifyInvocationOutcomeGuards() {
@@ -1078,11 +1106,15 @@ final class ScenarioRunner implements AutoCloseable {
 
     void invocationOutcome(Throwable failure) {
         Throwable outcome=failure;
-        if (outcome==null && !invocationSucceeded(expectedCountedRuns,runs.size(),countedStarts,assertedSuccesses.size(),
-                normalClose,dirtyResponseRun,releasedFailedRun))
+        boolean succeeded=baseline() ? invocationSucceeded(expectedCountedRuns,runs.size(),countedStarts,assertedSuccesses.size(),
+                normalClose,dirtyResponseRun,releasedFailedRun)
+                : TraversalAssertions.invocationSucceeded(expectedCountedRuns,runs.size(),countedStarts,assertedSuccesses.size(),normalClose)
+                    && dirtyResponseRun==null && releasedFailedRun==null;
+        if (outcome==null && !succeeded)
             outcome=new AssertionError("Invocation PASS lacks expected starts/assertions/normal close");
         var result=new JsonObject(); result.addProperty("status",outcome==null?"PASS":"FAIL");
         result.addProperty("invocation",invocation.toString()); result.addProperty("normalClose",normalClose);
+        result.addProperty("fixture",fixture.name()); result.addProperty("expectedCountedRuns",expectedCountedRuns);
         result.addProperty("ownedSave",save==null?null:save.toString());
         result.addProperty("definitionHash",admitted==null?null:admitted.definitionHash());
         result.add("ownedRunIds",new Gson().toJsonTree(runs.stream().map(UUID::toString).sorted().toList()));
@@ -1421,6 +1453,11 @@ final class ScenarioRunner implements AutoCloseable {
         return result;
     }
 
+    private void checkCurrentScan(UUID id,long observerTick,List<BuildPlan.Target> targets,List<PlacementObservation> scan) {
+        if(baseline()) requireCurrentScan(id,observerTick,targets,scan);
+        else TraversalAssertions.requireCurrentScan(id,observerTick,targets,scan);
+    }
+
     private static void requireCurrentScan(UUID id,long observerTick,List<BuildPlan.Target> targets,List<PlacementObservation> scan) {
         var expected=new HashMap<Integer,BuildPlan.BlockSpec>();
         for (var target:targets) require(expected.put(target.id(),target.block())==null,"Duplicate imported target ID");
@@ -1435,10 +1472,16 @@ final class ScenarioRunner implements AutoCloseable {
     private void verifyFinalState(Live finalState,Path stage) {
         writeNew(roots,stage.resolve("independent-final.txt"),finalState.toString());
         require(finalState.pending.isEmpty(),"Final owned native predictions remain");
+        // No reverse profile may pass until Task13 supplies original causally validated removal receipts.
+        TraversalAssertions.requireRemovalReceipts(admitted,List.of());
+        int expectedUsable=admitted.finalUsable();
         for (var side:List.of(finalState.client,finalState.server)) {
             var baseline=side==finalState.client?stable.client:stable.server;
-            requireStock(side.state.getAsJsonArray("inventory"),baseline.state.getAsJsonArray("inventory"));
-            require(usable(side)==9 && side.state.get("mode").getAsString().equals("SURVIVAL")
+            if(baseline()) {
+                requireStock(side.state.getAsJsonArray("inventory"),baseline.state.getAsJsonArray("inventory"));
+                require(usable(side)==9,"Baseline final usable stock must remain literal9");
+            } else requireStock(side.state.getAsJsonArray("inventory"),baseline.state.getAsJsonArray("inventory"),expectedUsable);
+            require(usable(side)==expectedUsable && side.state.get("mode").getAsString().equals("SURVIVAL")
                     && side.state.get("abilities").equals(baseline.state.get("abilities"))
                     && side.state.get("cursorAndCrafting").equals(baseline.state.get("cursorAndCrafting"))
                     && b(side.state,"playerHandler") && side.state.getAsJsonArray("boundedEntities").isEmpty(),
@@ -1448,15 +1491,16 @@ final class ScenarioRunner implements AutoCloseable {
                 && finalState.client.state.get("selectedSlot").equals(finalState.server.state.get("selectedSlot")),
                 "Final client/server stack distribution or selected slot is not synchronized");
         var mismatches=world.getServer().computeOnServer(s -> {
-            requireServer(s); var errors=new ArrayList<String>(); var targets=new HashSet<BlockPos>();
-            for (var target:plan.targets()) targets.add(new BlockPos(origin.x()+target.relativePos().x(),origin.y()+target.relativePos().y(),origin.z()+target.relativePos().z()));
-            require(targets.size()==120,"Independent server target coordinates are not120 unique positions");
-            for (var cell:admitted.data().getAsJsonObject("world").getAsJsonArray("blocks")) {
-                var value=cell.getAsJsonObject(); var at=pos(value.getAsJsonObject("position"));
-                var expected=targets.contains(at)?Blocks.STONE.getDefaultState():block(value.getAsJsonObject("block"));
-                if ("1".equals(System.getenv("MAPART_TWO_LANE_WRONG_EXPECTED_BLOCK")) && at.equals(new BlockPos(0,65,0))) expected=Blocks.GOLD_BLOCK.getDefaultState();
+            requireServer(s); var errors=new ArrayList<String>();
+            var targets=TraversalAssertions.expectedWorldTargets(admitted,plan.targets());
+            if(baseline()) require(targets.size()==120,"Independent server target coordinates are not120 unique positions");
+            for(var cell:admitted.worldCells().entrySet()) {
+                var p=cell.getKey(); var at=new BlockPos(p.x(),p.y(),p.z());
+                var expected=targets.getOrDefault(p,cell.getValue());
+                if(baseline() && "1".equals(System.getenv("MAPART_TWO_LANE_WRONG_EXPECTED_BLOCK")) && at.equals(new BlockPos(0,65,0)))
+                    expected=WorldEvidenceReader.blockSpec(Blocks.GOLD_BLOCK.getDefaultState());
                 var actual=serverWorld.getBlockState(at);
-                if (!actual.equals(expected) || serverWorld.getBlockEntity(at)!=null
+                if (!WorldEvidenceReader.blockSpec(actual).equals(expected) || serverWorld.getBlockEntity(at)!=null
                         || serverWorld.getChunkManager().getChunk(Math.floorDiv(at.getX(),16),Math.floorDiv(at.getZ(),16),ChunkStatus.FULL,false)==null)
                     errors.add("Final server mismatch: "+at.toShortString()+"; expected="+expected+"; actual="+actual
                             +"; blockEntity="+serverWorld.getBlockEntity(at));
@@ -1469,7 +1513,9 @@ final class ScenarioRunner implements AutoCloseable {
         require(finalState.client.state.get("blocks").equals(finalState.server.state.get("blocks")),"Final client/server owned block states differ");
     }
 
-    private static void requireStock(JsonArray current,JsonArray baseline) {
+    private static void requireStock(JsonArray current,JsonArray baseline) { requireStock(current,baseline,9); }
+
+    static void requireStock(JsonArray current,JsonArray baseline,int expectedUsable) {
         require(current!=null && baseline!=null && current.size()==43 && baseline.size()==43,"Incomplete43-slot inventory/components");
         int total=0;
         for (int slot=0;slot<43;slot++) {
@@ -1483,7 +1529,8 @@ final class ScenarioRunner implements AutoCloseable {
                 total+=count;
             }
         }
-        require(total==9,"Final usable slots1+2 must total9: "+current);
+        require(total==expectedUsable,"Final usable slots1+2 must total"+expectedUsable+": "+current);
+        if(expectedUsable==9) require(total==9,"Final usable slots1+2 must total9: "+current);
     }
 
     private static void requireAcceptedFeedback(UUID id,List<BuildPlan.Target> targets,List<BuildEngine.PlacementEffectResult> feedback) {
@@ -1809,8 +1856,9 @@ final class ScenarioRunner implements AutoCloseable {
 
     private void preflight(ScenarioDefinition d) {
         Objects.requireNonNull(d);
-        guarded(invocation, invocation, roots, FabricLoader.getInstance().getGameDir(),
-                ScenarioDefinition.load().definitionHash(), d.definitionHash(), d.data(), () -> { });
+        profileDefinition.requireSame(d);
+        guarded(invocation, invocation, roots, FabricLoader.getInstance().getGameDir(),profileDefinition,fixture,
+                profileDefinition.definitionHash(), d.definitionHash(), d.data(), () -> { });
         require(!closed, "Invocation closed");
         if (admitted!=null) require(admitted.definitionHash().equals(d.definitionHash()), "Repeated start changed definition");
         if (world!=null) {
@@ -1850,7 +1898,7 @@ final class ScenarioRunner implements AutoCloseable {
     }
 
     private void archive(Path stage, Prior prior) {
-        preflight(admitted == null ? ScenarioDefinition.load() : admitted);
+        preflight(admitted == null ? profileDefinition : admitted);
         checkedDirectory(roots, stage);
         writeNew(roots, stage.resolve("prior-result.txt"), String.valueOf(previous));
         writeNew(roots, stage.resolve("prior-status-transitions.txt"), prior.status.toString());
@@ -1867,6 +1915,7 @@ final class ScenarioRunner implements AutoCloseable {
     private static void archiveThenRestore(Runnable archive, Runnable restore) { archive.run(); restore.run(); }
 
     private void restore(ScenarioDefinition d) {
+        preflight(d);
         var data=d.data(); var player=data.getAsJsonObject("player");
         world.getServer().runOnServer(s -> {
             requireServer(s);
@@ -1991,19 +2040,19 @@ final class ScenarioRunner implements AutoCloseable {
         Object pending=((ClientWorldPendingUpdateAccessor)c.world).mapart$getPendingUpdateManager();
         require(pending instanceof PendingPredictionView, "Read-only scoped pending view unavailable");
         var predicted=new JsonArray();
-        for (var cell:admitted.data().getAsJsonObject("world").getAsJsonArray("blocks")) {
-            var position=pos(cell.getAsJsonObject().getAsJsonObject("position"));
+        for (var cell:admitted.worldCells().keySet()) {
+            var position=new BlockPos(cell.x(),cell.y(),cell.z());
             if (((PendingPredictionView)pending).mapart$hasPendingPrediction(position)) predicted.add(position.toShortString());
         }
         state.add("pendingOwnedPositions",predicted);
-        state.addProperty("predictionScope","all 1568 authorized region positions; fixture-only interactions, sole player; no global queue claim");
+        state.addProperty("predictionScope","all "+admitted.worldCells().size()+" authorized region positions; fixture-only interactions, sole player; no global queue claim");
         if (!predicted.isEmpty()) errors.add("Owned predictions have not drained naturally");
         return new Side(state,side.age,side.time,-1,List.copyOf(errors));
     }
 
     private Side readPlayer(PlayerEntity p, boolean initial, int serverTick) {
         var errors=new ArrayList<String>(); var actual=new JsonObject();
-        var expected=admitted.data().getAsJsonObject("player"); var level=p.getEntityWorld();
+        var expected=admitted.playerData(); var level=p.getEntityWorld();
         actual.addProperty("dimension",level.getRegistryKey().getValue().toString());
         var xyz=expected.getAsJsonObject("position"); var rot=expected.getAsJsonObject("rotation");
         String[] components={"x","y","z","vx","vy","vz","yaw","headYaw","bodyYaw","pitch"};
@@ -2069,8 +2118,8 @@ final class ScenarioRunner implements AutoCloseable {
                 || p.isSubmergedInWater() || p.isInLava() || p.isClimbing() || p.isGliding() || p.isSwimming() || p.isSprinting()
                 || p.getAbilities().flying || p.isSneaking() || p.isUsingItem() || p.fallDistance!=0 || !p.getStatusEffects().isEmpty() || p.getAttributeBaseValue(EntityAttributes.GRAVITY)!=.08
                 || p.getAttributeValue(EntityAttributes.GRAVITY)!=.08 || p.getFinalGravity()!=.08) errors.add("Ordinary physics guards");
-        var support=new BlockPos(0,65,2);
-        boolean loaded=level.getChunkManager().getChunk(0,0,ChunkStatus.FULL,false)!=null;
+        var support=new BlockPos((int)Math.floor(n(xyz,"x")),(int)Math.floor(n(xyz,"y"))-1,(int)Math.floor(n(xyz,"z")));
+        boolean loaded=level.getChunkManager().getChunk(Math.floorDiv(support.getX(),16),Math.floorDiv(support.getZ(),16),ChunkStatus.FULL,false)!=null;
         guards.addProperty("supportLoaded",loaded); guards.addProperty("support",level.getBlockState(support).toString());
         guards.addProperty("supportFullCube",level.getBlockState(support).isFullCube(level,support));
         guards.addProperty("supportingBlock",p.supportingBlockPos.toString()); guards.addProperty("supportedByStone",p.isSupportedBy(support));
@@ -2078,11 +2127,11 @@ final class ScenarioRunner implements AutoCloseable {
                 || !p.isSupportedBy(support) || !level.getBlockState(support.up()).isAir() || !level.getBlockState(support.up(2)).isAir()) errors.add("Loaded full-cube support/clearance");
         actual.add("physicsGuards",guards);
         var blocks=new JsonArray();
-        for (var cell:admitted.data().getAsJsonObject("world").getAsJsonArray("blocks")) {
-            var value=cell.getAsJsonObject(); var at=pos(value.getAsJsonObject("position"));
+        for (var cell:admitted.worldCells().entrySet()) {
+            var p0=cell.getKey(); var at=new BlockPos(p0.x(),p0.y(),p0.z());
             boolean chunk=level.getChunkManager().getChunk(Math.floorDiv(at.getX(),16),Math.floorDiv(at.getZ(),16),ChunkStatus.FULL,false)!=null;
             var found=level.getBlockState(at); blocks.add(at.toShortString()+"="+found+";loaded="+chunk+";blockEntity="+(level.getBlockEntity(at)!=null));
-            if (!chunk || level.getBlockEntity(at)!=null || (initial && !found.equals(block(value.getAsJsonObject("block"))))) errors.add("Owned block/loaded/block entity " + at);
+            if (!chunk || level.getBlockEntity(at)!=null || (initial && !WorldEvidenceReader.blockSpec(found).equals(cell.getValue()))) errors.add("Owned block/loaded/block entity " + at);
         }
         actual.add("blocks",blocks); actual.add("containers",new JsonArray());
         var entities=level.getOtherEntities(p,regionBox(),e -> true);
@@ -2149,7 +2198,7 @@ final class ScenarioRunner implements AutoCloseable {
     @Override public void close() {
         if (closed) return;
         closeOwned(world!=null,
-                () -> preflight(admitted==null?ScenarioDefinition.load():admitted),
+                () -> preflight(admitted==null?profileDefinition:admitted),
                 () -> {
                     ready=false;
                     context.runOnClient(c -> {
@@ -2355,18 +2404,24 @@ final class ScenarioRunner implements AutoCloseable {
         } catch (java.net.URISyntaxException | IOException e) { throw new IllegalStateException("Cannot establish loaded-module authority",e); }
     }
 
-    private static void guarded(UUID owner, UUID token, Roots r, Path game, String expectedHash, String hash, JsonObject d, Runnable mutation) {
+    private static void guarded(UUID owner,UUID token,Roots r,Path game,String expectedHash,String hash,JsonObject d,Runnable mutation) {
+        guarded(owner,token,r,game,ScenarioDefinition.load(),ScenarioDefinition.Fixture.TWO_LANE,expectedHash,hash,d,mutation);
+    }
+
+    private static void guarded(UUID owner,UUID token,Roots r,Path game,ScenarioDefinition authority,ScenarioDefinition.Fixture fixture,
+                                String expectedHash,String hash,JsonObject d,Runnable mutation) {
         require(owner.equals(token),"Wrong invocation token"); checkRoots(r);
         require(game.toAbsolutePath().normalize().equals(r.game) && real(game).equals(r.game),"Wrong/redirected game path");
-        require(expectedHash.equals(hash),"Wrong definition hash");
-        require(d.equals(ScenarioDefinition.load().data()), "Wrong definition values");
+        require(expectedHash.equals(authority.definitionHash()) && expectedHash.equals(hash),"Wrong definition hash");
+        authority.requireValues(fixture,hash,d);
         var w=d.getAsJsonObject("world"); var region=w.getAsJsonObject("ownedRegion");
-        require(grid(region.getAsJsonObject("min")).equals(new GridPos(-2,64,-2))
-                && grid(region.getAsJsonObject("max")).equals(new GridPos(13,70,11)), "Region exceeds authority");
+        var min=authority.ownedMin(); var max=authority.ownedMax();
+        require(grid(region.getAsJsonObject("min")).equals(min) && grid(region.getAsJsonObject("max")).equals(max),"Region exceeds authority");
         require(w.getAsJsonArray("containers").isEmpty(),"Containers unsupported");
-        for (var cell:w.getAsJsonArray("blocks")) {
-            var at=pos(cell.getAsJsonObject().getAsJsonObject("position"));
-            require(at.getX()>=-2 && at.getX()<=13 && at.getY()>=64 && at.getY()<=70 && at.getZ()>=-2 && at.getZ()<=11,"Block outside authority");
+        for(var cell:w.getAsJsonArray("blocks")) {
+            var at=grid(cell.getAsJsonObject().getAsJsonObject("position"));
+            require(at.x()>=min.x() && at.x()<=max.x() && at.y()>=min.y() && at.y()<=max.y()
+                    && at.z()>=min.z() && at.z()<=max.z(),"Block outside authority");
         }
         mutation.run();
     }
@@ -2407,7 +2462,10 @@ final class ScenarioRunner implements AutoCloseable {
         try { Files.copy(from,to); } catch (IOException e) { throw new UncheckedIOException(e); }
     }
     private static Path real(Path path) { try { return path.toRealPath(); } catch (IOException e) { throw new UncheckedIOException(e); } }
-    private static Box regionBox() { return new Box(-2,64,-2,14,71,12); }
+    private Box regionBox() {
+        var min=profileDefinition.ownedMin(); var max=profileDefinition.ownedMax();
+        return new Box(min.x(),min.y(),min.z(),max.x()+1,max.y()+1,max.z()+1);
+    }
     private static GridPos grid(JsonObject p) { return new GridPos(i(p,"x"),i(p,"y"),i(p,"z")); }
     private static BlockPos pos(JsonObject p) { return new BlockPos(i(p,"x"),i(p,"y"),i(p,"z")); }
     private static int i(JsonObject o,String key) { return o.get(key).getAsInt(); }
