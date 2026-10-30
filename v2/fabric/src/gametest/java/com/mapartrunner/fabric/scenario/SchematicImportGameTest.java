@@ -75,6 +75,7 @@ public final class SchematicImportGameTest implements FabricClientGameTest {
     private int writtenSamples;
 
     @Override public void runTest(ClientGameTestContext context) {
+        if (!GroundedSmokeGameTest.selected("schematic-import")) return;
         this.context=context;
         watch=context.computeOnClient(ScenarioObserver::install);
         var game=FabricLoader.getInstance().getGameDir().toAbsolutePath().normalize();

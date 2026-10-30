@@ -90,6 +90,7 @@ final class ScenarioRunner implements AutoCloseable {
     private final Roots roots;
     private final Path artifacts;
     private final boolean callerAutoJump;
+    private final int expectedCountedRuns;
     private TestSingleplayerContext world;
     private MinecraftServer server;
     private ServerWorld serverWorld;
@@ -120,7 +121,9 @@ final class ScenarioRunner implements AutoCloseable {
     private PredictionFaults.SupportArmIdentity supportArm;
     private boolean supportReceipt;
 
-    ScenarioRunner(ClientGameTestContext context, ScenarioObserver.Watch watch) {
+    ScenarioRunner(ClientGameTestContext context, ScenarioObserver.Watch watch, int expectedCountedRuns) {
+        require(validExpectedCount(expectedCountedRuns),"Expected counted-run total must be 1..2");
+        this.expectedCountedRuns=expectedCountedRuns;
         this.context = Objects.requireNonNull(context); this.watch = Objects.requireNonNull(watch);
         roots = roots(); // Read-only loaded-module authority precedes evidence/world creation.
         callerAutoJump = context.computeOnClient(c -> {
@@ -333,7 +336,7 @@ final class ScenarioRunner implements AutoCloseable {
         if(!supportReceipt) {
             writeNew(roots,artifacts.resolve("support-coverage.txt"),"invocation="+invocation+"; definition="+definition.definitionHash()
                     +"; case="+supportCase.label()+"; selector="+(supportSelector==null?"absent":supportSelector)
-                    +"; expectedCounted=2; meaning="+supportMeaning());
+                    +"; expectedCounted="+expectedCountedRuns+"; meaning="+supportMeaning());
             supportReceipt=true;
         }
         boolean release = context.computeOnClient(c -> {
@@ -1060,16 +1063,20 @@ final class ScenarioRunner implements AutoCloseable {
         require(!invocationSucceeded(2,2,1,1,true,dirty,dirty),"Requested two counted runs accepted only one");
     }
 
+    private static boolean validExpectedCount(int expectedCountedRuns) {
+        return expectedCountedRuns>=1 && expectedCountedRuns<=2;
+    }
+
     private static boolean invocationSucceeded(int expectedCountedRuns, int ownedStarts, int countedStarts,
                                                int assertedSuccesses, boolean normalClose, UUID dirtyResponseRun,
                                                UUID releasedFailedRun) {
-        return expectedCountedRuns>=1 && expectedCountedRuns<=2 && normalClose
+        return validExpectedCount(expectedCountedRuns) && normalClose
                 && ownedStarts==expectedCountedRuns+1 && countedStarts==expectedCountedRuns
                 && assertedSuccesses==expectedCountedRuns
                 && dirtyResponseRun!=null && dirtyResponseRun.equals(releasedFailedRun);
     }
 
-    void invocationOutcome(Throwable failure, int expectedCountedRuns) {
+    void invocationOutcome(Throwable failure) {
         Throwable outcome=failure;
         if (outcome==null && !invocationSucceeded(expectedCountedRuns,runs.size(),countedStarts,assertedSuccesses.size(),
                 normalClose,dirtyResponseRun,releasedFailedRun))

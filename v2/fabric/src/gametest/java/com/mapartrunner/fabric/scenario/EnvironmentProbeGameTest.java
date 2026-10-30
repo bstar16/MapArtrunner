@@ -7,6 +7,7 @@ import net.fabricmc.fabric.api.client.gametest.v1.context.ClientGameTestContext;
 public final class EnvironmentProbeGameTest implements FabricClientGameTest {
     @Override
     public void runTest(ClientGameTestContext context) {
+        if (!GroundedSmokeGameTest.selected("environment-probe")) return;
         new ScenarioEnvironment(context).run();
     }
 }
