@@ -39,6 +39,64 @@ try {
         }
         $regressions | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $testRoot 'review-regressions.json')
     }
+    Run 'vanished owned PID tolerates stale enumeration without hiding other inventory failures' {
+        $originalUpdate=${function:Update-V2Processes}; $capture=@{Process=$null}; $proof=@{}
+        try {
+            Set-Item Function:Update-V2Processes -Value {
+                param($Job,$Records,$Handles,[switch]$Fast)
+                & $originalUpdate $Job $Records $Handles -Fast:$Fast
+                if (!$capture.Process) {
+                    $capture.Process=[Diagnostics.Process]::GetProcessById($process.Id)
+                    [void]$capture.Process.Handle
+                }
+            }
+            $outcome=Invoke-V2Supervisor -Worker { Start-Sleep -Milliseconds 300; exit 7 } -EvidenceRoot $testRoot -WorkingDirectory $repo -TimeoutMilliseconds 10000
+        } finally { Set-Item Function:Update-V2Processes -Value $originalUpdate }
+        try {
+            Assert ($outcome.WorkerExitCode -eq 7 -and $outcome.ExitCode -eq 7 -and $outcome.CleanupStatus -ceq 'settled') 'real owned race fixture did not exit7 and settle'
+            $lookup=$null
+            try { $unexpected=[Diagnostics.Process]::GetProcessById($outcome.WorkerPid); $unexpected.Dispose() }
+            catch { $lookup=$_ }
+            Assert ($lookup.Exception -is [Management.Automation.MethodInvocationException] -and
+                $lookup.Exception.InnerException.GetType() -eq [ArgumentException]) 'owned PID no longer has the expected vanished-process exception'
+            $proof.LookupType=$lookup.Exception.GetType().FullName; $proof.InnerType=$lookup.Exception.InnerException.GetType().FullName
+            $proof.OriginalEvidence=$outcome.Evidence; $proof.ActualExit=$capture.Process.ExitCode
+            # Deliberately stale enumeration of this real exited owned PID; it grants no native identity.
+            $stale=[pscustomobject]@{Pid=$outcome.WorkerPid;Calls=0}
+            $stale | Add-Member ScriptMethod Pids { $this.Calls++; @($this.Pid) }
+            $records=[Collections.Generic.List[object]]::new(); $handles=[Collections.Generic.List[object]]::new()
+            $record=($outcome.Processes | Where-Object Pid -EQ $outcome.WorkerPid).PSObject.Copy()
+            $record.ExitCode=$null; $record.ExitedUtc=$null; $record.ObservedExitUtc=$null
+            $handles.Add([pscustomobject]@{Process=$capture.Process;Record=$record})
+            Update-V2Processes $stale $records $handles
+            Assert (!$records.Count -and $record.ExitCode -eq 7 -and $record.ExitedUtc -and $record.ObservedExitUtc) 'vanished lookup lost held real exit/identity or fabricated a record'
+            $proof.StaleSnapshotCalls=$stale.Calls; $proof.HeldRecord=$record
+            $existingCim=Get-Item Function:Get-CimInstance -ErrorAction SilentlyContinue
+            $failures=[Collections.Generic.List[object]]::new()
+            try {
+                foreach ($fault in 'argument','access','identity') {
+                    Set-Item Function:Get-CimInstance -Value {
+                        param($ClassName,$Filter,$OperationTimeoutSec,$ErrorAction)
+                        if ($fault -ceq 'argument') { throw [ArgumentException]::new('Deliberate non-lookup argument failure') }
+                        if ($fault -ceq 'access') { throw [UnauthorizedAccessException]::new('Deliberate CIM access failure') }
+                        [pscustomobject]@{CreationDate=[DateTime]::UtcNow.AddDays(1)}
+                    }
+                    $live=[pscustomobject]@{Pid=$PID}; $live | Add-Member ScriptMethod Pids { @($this.Pid) }
+                    $failure=$null
+                    try { Update-V2Processes $live $records ([Collections.Generic.List[object]]::new()) } catch { $failure=$_ }
+                    Assert ($failure -and !$records.Count) "non-lookup inventory failure was swallowed: $fault"
+                    $failures.Add(@{Case=$fault;Type=$failure.Exception.GetType().FullName;Message=$failure.Exception.Message})
+                }
+            } finally {
+                if ($existingCim) { Set-Item Function:Get-CimInstance -Value $existingCim.ScriptBlock }
+                else { Remove-Item Function:Get-CimInstance }
+            }
+            $proof.NonLookupFailures=@($failures); $proof.Passed=$true
+        } finally {
+            $proof | ConvertTo-Json -Depth 8 | Set-Content (Join-Path $testRoot 'vanished-pid-race-proof.json')
+            if ($capture.Process) { $capture.Process.Dispose() }
+        }
+    }
     Run 'ordinary environment removes inherited launch identity' {
         $ordinary=New-V2Environment -Jdk ([pscustomobject]@{Home='C:/unused-jdk'})
         foreach ($name in 'MAPART_TEST_LAUNCH_ID','MAPART_TEST_LAUNCH_DIR') {

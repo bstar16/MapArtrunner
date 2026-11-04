@@ -352,7 +352,13 @@ function Update-V2Processes {
         if (@($Records | Where-Object { $_.Pid -eq $ownedId -and $null -eq $_.ExitCode }).Count) { continue }
         $process=$null
         try {
-            $process=[Diagnostics.Process]::GetProcessById($ownedId)
+            try { $process=[Diagnostics.Process]::GetProcessById($ownedId) }
+            catch {
+                # Job enumeration can briefly retain a vanished PID; only this lookup failure is harmless.
+                if ($_.Exception -is [Management.Automation.MethodInvocationException] -and
+                    $_.Exception.InnerException.GetType() -eq [ArgumentException]) { continue }
+                throw
+            }
             [void]$process.Handle
             $started=$process.StartTime.ToUniversalTime().ToString('o')
             $cim=$null
