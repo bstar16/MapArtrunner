@@ -18,7 +18,7 @@ import java.util.UUID;
 
 /** One owned world for the failed-first/reset/repeat scenario. */
 public final class GroundedSmokeGameTest implements FabricClientGameTest {
-    private static final List<String> PROVIDERS=List.of("environment-probe","single-lane","schematic-import","grounded-two-lane");
+    private static final List<String> PROVIDERS=List.of("environment-probe","single-lane","schematic-import","grounded-two-lane","grounded-traversal");
     private static final Selection REQUESTED=selection(System.getProperty("mapart.test.scenario"),System.getProperty("mapart.test.repeat"));
     private static boolean startPublished;
 
@@ -84,14 +84,14 @@ public final class GroundedSmokeGameTest implements FabricClientGameTest {
     private record Selection(String scenario,int repeat) {
         boolean includes(String provider) {
             if (!PROVIDERS.contains(provider)) throw new IllegalArgumentException("Unknown test provider: "+provider);
-            return scenario.equals("all") || provider.equals("grounded-two-lane");
+            return scenario.equals("all") || provider.equals(scenario);
         }
     }
 
     private static Selection selection(String scenario,String repeat) {
         if (scenario==null) scenario="all";
-        if (!scenario.equals("all") && !scenario.equals("grounded-two-lane"))
-            throw new IllegalArgumentException("Invalid mapart.test.scenario: "+scenario+"; expected all|grounded-two-lane");
+        if (!scenario.equals("all") && !scenario.equals("grounded-two-lane") && !scenario.equals("grounded-traversal"))
+            throw new IllegalArgumentException("Invalid mapart.test.scenario: "+scenario+"; expected all|grounded-two-lane|grounded-traversal");
         if (repeat==null) repeat="2";
         int count=switch (repeat) {
             case "1" -> 1;
@@ -102,19 +102,22 @@ public final class GroundedSmokeGameTest implements FabricClientGameTest {
     }
 
     private static void verifySelectionGuards() {
+        require(PROVIDERS.equals(List.of("environment-probe","single-lane","schematic-import","grounded-two-lane","grounded-traversal")),
+                "Registered provider set changed");
         var defaults=selection(null,null);
         require(defaults.scenario().equals("all") && defaults.repeat()==2,"Selection defaults changed");
         for (var provider:PROVIDERS) require(defaults.includes(provider),"Default omitted "+provider);
-        for (var scenario:List.of("all","grounded-two-lane")) for (var repeat:List.of("1","2")) {
+        for (var scenario:List.of("all","grounded-two-lane","grounded-traversal")) for (var repeat:List.of("1","2")) {
             var request=selection(scenario,repeat);
             require(request.repeat()==(repeat.equals("1")?1:2),"Wrong requested repeat");
             for (var provider:PROVIDERS)
-                require(request.includes(provider)==(scenario.equals("all") || provider.equals("grounded-two-lane")),
+                require(request.includes(provider)==(scenario.equals("all") || provider.equals(scenario)),
                         "Wrong provider selection: "+scenario+"/"+repeat+"/"+provider);
         }
-        require(selection("grounded-two-lane",null).repeat()==2 && selection(null,"1").includes("single-lane"),
+        require(selection("grounded-two-lane",null).repeat()==2 && selection("grounded-traversal",null).repeat()==2
+                        && selection(null,"1").includes("single-lane"),
                 "Independent selection defaults changed");
-        for (var scenario:List.of("","unknown","single-lane")) rejectsSelection(scenario,"2");
+        for (var scenario:List.of("","unknown","single-lane","GROUNDED-TRAVERSAL","grounded-traversal ")) rejectsSelection(scenario,"2");
         for (var repeat:List.of("","abc","0","-1","3","2147483648","01","+1","1.0")) rejectsSelection("all",repeat);
         try { defaults.includes("unknown"); }
         catch (IllegalArgumentException expected) { return; }

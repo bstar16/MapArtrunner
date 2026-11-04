@@ -3,9 +3,10 @@ package com.mapartrunner.fabric.scenario;
 import net.fabricmc.fabric.api.client.gametest.v1.FabricClientGameTest;
 import net.fabricmc.fabric.api.client.gametest.v1.context.ClientGameTestContext;
 
-/** Unregistered until the separately reviewed provider/selection slice. */
+/** Selected traversal variants share one managed runner across each variant's requested repeats. */
 public final class TraversalGameTest implements FabricClientGameTest {
     @Override public void runTest(ClientGameTestContext context) {
+        if (!GroundedSmokeGameTest.selected("grounded-traversal")) return;
         var watch=context.computeOnClient(ScenarioObserver::install);
         int repeats=GroundedSmokeGameTest.requestedRepeat();
         for(var fixture:ScenarioDefinition.Fixture.values()) {

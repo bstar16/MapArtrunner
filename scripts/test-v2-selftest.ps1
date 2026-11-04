@@ -154,6 +154,39 @@ try {
         Assert ($selected.Arguments -contains '-Pmapart.test.scenario=grounded-two-lane') 'scenario not forwarded'
         Assert ($selected.Arguments -contains '-Pmapart.test.repeat=1') 'repeat not forwarded'
     }
+    Run 'closed public traversal selection, five registrations and Java provider guards agree' {
+        $providers=@('environment-probe','single-lane','schematic-import','grounded-two-lane','grounded-traversal')
+        $scenarios=@('all','grounded-two-lane','grounded-traversal')
+        foreach ($command in @((Get-Command (Join-Path $PSScriptRoot 'test-v2.ps1')),(Get-Command New-V2Request))) {
+            $values=@($command.Parameters['Scenario'].Attributes | Where-Object { $_ -is [Management.Automation.ValidateSetAttribute] }).ValidValues
+            Assert (($values -join ',') -ceq ($scenarios -join ',')) 'public/function selector set differs'
+            Assert (!$command.Parameters.ContainsKey('InternalSupportCase')) 'controlled support exposed publicly'
+        }
+        foreach ($scenario in $scenarios) { foreach ($repeat in '1','2') {
+            . (Join-Path $PSScriptRoot 'test-v2.ps1') -Scenario $scenario -Repeat $repeat -EulaAccepted
+            $request=New-V2Request -Scenario $scenario -Repeat $repeat -EulaAccepted
+            Assert ($request.Scenario -ceq $scenario -and $request.Repeat -eq [int]$repeat) 'requested selection/repeat changed'
+            Assert (($request.Arguments -contains "-Pmapart.test.scenario=$scenario") -eq ($scenario -cne 'all')) 'scenario default/forwarding changed'
+            Assert (($request.Arguments -contains '-Pmapart.test.repeat=1') -eq ($repeat -ceq '1')) 'repeat default/forwarding changed'
+        } }
+        Reject { New-V2Request -Scenario grounded-traversal -WrongExpectedBlock -EulaAccepted } 'traversal negative accepted'
+        foreach ($invalid in 'GROUNDED-TRAVERSAL','grounded-traversal ','single-lane') {
+            Reject { New-V2Request -Scenario $invalid -EulaAccepted } 'noncanonical traversal selector accepted'
+            Reject { . (Join-Path $PSScriptRoot 'test-v2.ps1') -Scenario $invalid -EulaAccepted } 'public noncanonical traversal selector accepted'
+        }
+        $root=Join-Path $repo 'v2/fabric/src/gametest'
+        $manifest=Get-Content (Join-Path $root 'resources/fabric.mod.json') -Raw | ConvertFrom-Json
+        $expected=@('EnvironmentProbeGameTest','GroundedSingleLaneGameTest','SchematicImportGameTest','GroundedSmokeGameTest','TraversalGameTest')
+        Assert ((@($manifest.entrypoints.'fabric-client-gametest') -join ',') -ceq (($expected | ForEach-Object { 'com.mapartrunner.fabric.scenario.'+$_ }) -join ',')) 'test registrations missing, duplicated or reordered'
+        $java=Get-Content (Join-Path $root 'java/com/mapartrunner/fabric/scenario/GroundedSmokeGameTest.java') -Raw
+        $catalog=[regex]::Match($java,'PROVIDERS=List\.of\(([^;]+)\);').Groups[1].Value
+        Assert ((@([regex]::Matches($catalog,'"([^"]+)"') | ForEach-Object { $_.Groups[1].Value }) -join ',') -ceq ($providers -join ',')) 'Java provider catalog differs from registration'
+        $traversal=Get-Content (Join-Path $root 'java/com/mapartrunner/fabric/scenario/TraversalGameTest.java') -Raw
+        Assert ($traversal -match 'runTest\(ClientGameTestContext context\)\s*\{\s*if\s*\(!GroundedSmokeGameTest.selected\("grounded-traversal"\)\) return;') 'traversal selection is not before all fixture/world work'
+        Assert ($traversal.Contains('GroundedSmokeGameTest.requestedRepeat()')) 'traversal bypasses shared repeat getter'
+        @{Providers=$providers;Scenarios=$scenarios;Repeats=@(1,2);Registrations=$manifest.entrypoints.'fabric-client-gametest';JavaChecks='source guards; compilation separately; native execution pending'} |
+            ConvertTo-Json -Depth 4 | Set-Content (Join-Path $testRoot 'traversal-selection-proof.json')
+    }
     Run 'JDK requires both tools/version21; stale candidate fallback; explicit invalid; none' {
         $fake = Join-Path $testRoot 'fake-jdk'
         New-Item -ItemType Directory -Path (Join-Path $fake bin) | Out-Null
@@ -403,17 +436,20 @@ try {
         Assert ((Get-Content "$scenarios/two-lane-new/ordinary/sentinel.bin" -Raw).Trim() -eq 'owned sentinel') 'sentinel bytes changed'
         Reject { Copy-V2Evidence "$scenarios/two-lane-new/ordinary" "$archiveFixture/../escape" $archiveFixture $archiveFixture } 'destination escape accepted'
     }
-    Run 'frozen closed traversal calculation; current selectors unchanged' {
-        Assert ((Get-V2TimeoutMilliseconds all 2) -eq 600000) 'current all lengthened before traversal activation'
+    Run 'frozen closed traversal calculation includes all and rejects malformed admissions' {
+        Assert ((Get-V2TimeoutMilliseconds all 1) -eq 6433400) 'all repeat1 omits traversal deadline'
+        Assert ((Get-V2TimeoutMilliseconds all 2) -eq 12266800) 'all repeat2 omits traversal deadline'
         Assert ((Get-V2TimeoutMilliseconds grounded-two-lane 1) -eq 600000) 'baseline deadline changed'
+        Assert ((Get-V2TimeoutMilliseconds grounded-two-lane 2) -eq 600000) 'baseline repeat2 deadline changed'
         Assert ((Get-V2TimeoutMilliseconds grounded-traversal 1) -eq 6433400) 'future repeat1 deadline wrong'
         Assert ((Get-V2TimeoutMilliseconds grounded-traversal 2) -eq 12266800) 'future repeat2 deadline wrong'
-        foreach ($invalid in '0','-1','1.0','01','true','2147483648','99999999999999999999999999') {
+        foreach ($invalid in @($null,1200,$true,'','0','-1','1.0','01','true','1e3','+1200',' 1200','2147483648','99999999999999999999999999')) {
             Reject { Get-V2TraversalTimeoutMilliseconds @('1200','1200','1200','1200','1200','1200',$invalid) 2 } "invalid tick count accepted: $invalid"
         }
         Reject { Get-V2TraversalTimeoutMilliseconds @('2147483647','1200','1200','1200','1200','1200','1200') 2 } 'overflow total accepted'
         Reject { Get-V2TimeoutMilliseconds unknown 1 } 'unknown internal scenario accepted'
-        Reject { New-V2Request -Scenario grounded-traversal -EulaAccepted } 'traversal publicly activated early'
+        Reject { Get-V2TraversalTimeoutMilliseconds @('1200') 2 } 'incomplete fixed fixture set accepted'
+        Reject { Get-V2TraversalTimeoutMilliseconds @('1200','1200','1200','1200','1200','1200','1200') 3 } 'invalid budget repeat accepted'
     }
     function New-V2ReceiptWorker([string]$Change='', [int]$WorkMilliseconds=0, [switch]$RepeatReceipt) {
         $body=@'
@@ -441,7 +477,8 @@ $text=$receipt | ConvertTo-Json -Compress
             Set-Item Function:New-V2ProcessInfo -Value { $calls.Worker++; throw 'Unexpected worker construction in rejected support request.' }
             $cases=@(
                 @{Name='without-game';Game=$false}, @{Name='null-request';Change={ $request=$null }},
-                @{Name='all';Change={ $request.Scenario='all' }}, @{Name='scenario-case';Change={ $request.Scenario='GROUNDED-TWO-LANE' }},
+                @{Name='all';Change={ $request.Scenario='all' }}, @{Name='traversal';Change={ $request=New-V2Request -Scenario grounded-traversal -Repeat 2 -EulaAccepted }},
+                @{Name='scenario-case';Change={ $request.Scenario='GROUNDED-TWO-LANE' }},
                 @{Name='scenario-array';Change={ $request.Scenario=@('grounded-two-lane') }},
                 @{Name='repeat1';Change={ $request.Repeat=1 }}, @{Name='repeat-string';Change={ $request.Repeat='2' }},
                 @{Name='wrong-block';Change={ $request.WrongExpectedBlock=$true }}, @{Name='wrong-string';Change={ $request.WrongExpectedBlock='false' }},
@@ -610,6 +647,19 @@ Write-Output ('TRANSPORT='+(@{support=$env:MAPART_TWO_LANE_SUPPORT_CASE;launchId
                     $arguments.OwnedPids=@($Job.Pids()); $arguments.Handles=@()
                     Assert ((Read-V2StartReceipt @arguments).Status -ceq 'Pending') 'inventory lag was accepted/rejected'
                     $arguments.Handles=@($Handles)
+                    foreach ($scenario in 'all','grounded-two-lane','grounded-traversal') { foreach ($repeat in 1,2) {
+                        $arguments.Request=New-V2Request -Scenario $scenario -Repeat $repeat -EulaAccepted
+                        foreach ($provider in 'environment-probe','single-lane','schematic-import','grounded-two-lane','grounded-traversal') {
+                            $data.scenario=$scenario; $data.repeat=$repeat; $data.provider=$provider
+                            [IO.File]::WriteAllText($file,($data | ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
+                            $checked=Read-V2StartReceipt @arguments
+                            $expected=$(if ($scenario -ceq 'all' -or $scenario -ceq $provider) {'Accepted'} else {'Rejected'})
+                            $proof.Cases.Add(@{Name="provider/$scenario/$repeat/$provider";Status=$checked.Status;Reason=$checked.Reason})
+                            Assert ($checked.Status -ceq $expected) "first selected receipt admission differs: $scenario/$repeat/$provider"
+                        }
+                    } }
+                    $arguments.Request=$Request
+                    [IO.File]::WriteAllText($file,$valid,[Text.UTF8Encoding]::new($false))
                     Assert ((Read-V2StartReceipt @arguments).Status -ceq 'Accepted') 'first selected all provider rejected'
                 }
             }
@@ -621,12 +671,50 @@ Write-Output ('TRANSPORT='+(@{support=$env:MAPART_TWO_LANE_SUPPORT_CASE;launchId
     }
     Run 'acceptance ends startup without renewing frozen overall; repeated receipt cannot renew' {
         # Fresh PowerShell startup has a documented3s allowance; the work deliberately crosses it.
-        $success=Invoke-V2Supervisor -Worker (New-V2ReceiptWorker '' 3500) -Request (New-V2Request -EulaAccepted) -EvidenceRoot $testRoot -WorkingDirectory $repo -TimeoutMilliseconds 7000 -StartupMilliseconds 3000
+        $originalUpdate=${function:Update-V2Processes}; $laterProvider=@{Written=$false}
+        try {
+            Set-Item Function:Update-V2Processes -Value {
+                param($Job,$Records,$Handles,[switch]$Fast)
+                & $originalUpdate $Job $Records $Handles -Fast:$Fast
+                if (!$Fast -and $result.StartReceipt -and !$laterProvider.Written) {
+                    $later=$result.StartReceipt.PSObject.Copy(); $later.provider='grounded-traversal'
+                    [IO.File]::WriteAllText((Join-Path $evidence 'test-start.json'),($later | ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
+                    $laterProvider.Written=$true
+                }
+            }
+            $success=Invoke-V2Supervisor -Worker (New-V2ReceiptWorker '' 3500) -Request (New-V2Request -EulaAccepted) -EvidenceRoot $testRoot -WorkingDirectory $repo -TimeoutMilliseconds 7000 -StartupMilliseconds 3000
+        } finally { Set-Item Function:Update-V2Processes -Value $originalUpdate }
         Assert-V2Settled $success
         Assert ($success.ExitCode -eq 0 -and $success.StartupAcceptedElapsedMilliseconds -lt 3000 -and !$success.TimedOut) 'valid work beyond startup failed'
-        $overall=Invoke-V2Supervisor -Worker (New-V2ReceiptWorker '' 0 -RepeatReceipt) -Request (New-V2Request -EulaAccepted) -EvidenceRoot $testRoot -WorkingDirectory $repo -TimeoutMilliseconds 3500 -StartupMilliseconds 3000
+        Assert ($laterProvider.Written -and $success.StartReceipt.provider -ceq 'environment-probe') 'later all provider replaced first startup identity'
+        $repeated=@{Writes=0;AcceptedSamples=0;AcceptedElapsed=$null}
+        try {
+            Set-Item Function:Update-V2Processes -Value {
+                param($Job,$Records,$Handles,[switch]$Fast)
+                & $originalUpdate $Job $Records $Handles -Fast:$Fast
+                if (!$Fast) {
+                    $held=$Handles | Where-Object { $_.Record.Pid -eq $process.Id } | Select-Object -First 1
+                    Assert ($held -and !$held.Process.HasExited -and $Job.Pids() -contains $held.Record.Pid) 'phase-controlled receipt lost its live held dummy identity'
+                    if ($null -ne $result.StartupAcceptedElapsedMilliseconds) {
+                        if ($null -eq $repeated.AcceptedElapsed) { $repeated.AcceptedElapsed=$result.StartupAcceptedElapsedMilliseconds }
+                        Assert ($repeated.AcceptedElapsed -eq $result.StartupAcceptedElapsedMilliseconds -and $result.StartReceipt.provider -ceq 'environment-probe') 'repeated provider renewed/replaced acceptance'
+                        $repeated.AcceptedSamples++
+                    }
+                    # Dummy phase control uses the actual held worker, independent of cold PowerShell bootstrap.
+                    $data=@{schema='mapartrunner-test-start-v1';launchId=$launchId;pid=$held.Record.Pid
+                        startedUtc=([DateTimeOffset]::Parse($held.Record.StartedUtc).UtcDateTime.ToString('yyyy-MM-ddTHH:mm:ss.fffffffZ'))
+                        scenario='all';repeat=2;provider=$(if ($repeated.AcceptedSamples -and $repeated.Writes % 2) {'grounded-traversal'} else {'environment-probe'});event='SELECTED_PROVIDER_RUNTEST_ENTERED'}
+                    [IO.File]::WriteAllText((Join-Path $evidence 'test-start.json'),($data | ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
+                    $repeated.Writes++
+                }
+            }
+            $overall=Invoke-V2Supervisor -Worker { Start-Sleep -Seconds 30 } -Request (New-V2Request -EulaAccepted) -EvidenceRoot $testRoot -WorkingDirectory $repo -TimeoutMilliseconds 3500 -StartupMilliseconds 3000
+        } finally { Set-Item Function:Update-V2Processes -Value $originalUpdate }
         Assert-V2Settled $overall
         Assert ($overall.ExitCode -eq 124 -and $overall.TimeoutPhase -ceq 'OVERALL' -and $overall.StartupAcceptedElapsedMilliseconds -lt 3000 -and $overall.DeadlineMilliseconds -eq 3500) 'repeated receipt renewed/escaped overall deadline'
+        Assert ($repeated.Writes -ge 2 -and $repeated.AcceptedSamples -ge 1 -and $overall.StartReceipt.provider -ceq 'environment-probe') 'repeated receipt phase/first acceptance was not exercised'
+        @{Evidence=$overall.Evidence;PhaseControl=$repeated;Startup=$overall.StartupDeadlineMilliseconds;Overall=$overall.DeadlineMilliseconds;Result=$overall.TimeoutPhase} |
+            ConvertTo-Json -Depth 5 | Set-Content (Join-Path $testRoot 'repeated-receipt-phase-proof.json')
         $request=Get-Content -LiteralPath (Join-Path $success.Evidence 'request.json') -Raw | ConvertFrom-Json
         Assert ($request.Request.ChildEnvironment.MAPART_TEST_LAUNCH_ID -ceq $success.LaunchId -and $request.Request.ChildEnvironment.MAPART_TEST_LAUNCH_DIR -ceq $success.Evidence) 'final child challenge absent from request'
         Assert ($overall.LaunchId -cne $success.LaunchId) 'launch challenge reused'

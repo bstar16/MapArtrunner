@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('all','grounded-two-lane',IgnoreCase=$false)][string]$Scenario = 'all',
+    [ValidateSet('all','grounded-two-lane','grounded-traversal',IgnoreCase=$false)][string]$Scenario = 'all',
     [ValidateSet('1','2',IgnoreCase=$false)][string]$Repeat = '2',
     [ValidateScript({ ![string]::IsNullOrWhiteSpace($_) })][string]$JavaHome,
     [switch]$EulaAccepted,
@@ -8,7 +8,7 @@ param(
 )
 
 function New-V2Request {
-    param([ValidateSet('all','grounded-two-lane',IgnoreCase=$false)][string]$Scenario = 'all',
+    param([ValidateSet('all','grounded-two-lane','grounded-traversal',IgnoreCase=$false)][string]$Scenario = 'all',
         [ValidateSet('1','2',IgnoreCase=$false)][string]$Repeat = '2', [switch]$EulaAccepted,
         [string]$EulaEnvironment = $env:MAPART_TEST_EULA_ACCEPTED, [switch]$WrongExpectedBlock)
     if ($WrongExpectedBlock -and $Scenario -ne 'grounded-two-lane') { throw '-WrongExpectedBlock requires -Scenario grounded-two-lane.' }
@@ -130,9 +130,8 @@ function Get-V2TraversalTimeoutMilliseconds {
 function Get-V2TimeoutMilliseconds {
     param([string]$Scenario, [int]$Repeat)
     if ($Repeat -notin 1,2) { throw 'Expected Repeat1/2.' }
-    # Task16 activates traversal in all; the current four-provider all retains600000.
-    if ($Scenario -ceq 'all' -or $Scenario -ceq 'grounded-two-lane') { return 600000 }
-    if ($Scenario -cne 'grounded-traversal') { throw 'Unknown timeout scenario.' }
+    if ($Scenario -ceq 'grounded-two-lane') { return 600000 }
+    if ($Scenario -cnotin 'all','grounded-traversal') { throw 'Unknown timeout scenario.' }
     $repo=Split-Path $PSScriptRoot
     $ticks=@(foreach ($relative in @(
         'v2/test-fixtures/traversal-resume-21/definition.json',
@@ -193,7 +192,7 @@ function Read-V2StartReceipt {
             $repeatValue.GetInt32() -ne $Request.Repeat) { throw 'Receipt repeat differs from request.' }
         if ($strings.schema -cne 'mapartrunner-test-start-v1' -or $strings.event -cne 'SELECTED_PROVIDER_RUNTEST_ENTERED' -or
             $strings.launchId -cne $LaunchId -or $strings.scenario -cne $Request.Scenario) { throw 'Receipt schema/event/challenge/scenario differs from request.' }
-        $providers=@('environment-probe','single-lane','schematic-import','grounded-two-lane')
+        $providers=@('environment-probe','single-lane','schematic-import','grounded-two-lane','grounded-traversal')
         if ($strings.provider -cnotin $providers -or ($Request.Scenario -cne 'all' -and $strings.provider -cne $Request.Scenario)) { throw 'Receipt provider was not selected.' }
         $started=[DateTimeOffset]::MinValue
         if ($strings.startedUtc -cnotmatch '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$' -or
