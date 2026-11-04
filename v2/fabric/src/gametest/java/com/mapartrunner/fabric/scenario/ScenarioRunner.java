@@ -108,6 +108,7 @@ final class ScenarioRunner implements AutoCloseable {
     private final Roots roots;
     private final Path artifacts;
     private final boolean callerAutoJump;
+    private final int callerViewDistance;
     private final int expectedCountedRuns;
     private final ScenarioDefinition.Fixture fixture;
     private final ScenarioDefinition profileDefinition;
@@ -152,6 +153,11 @@ final class ScenarioRunner implements AutoCloseable {
     private List<GridPos> regionOrder=List.of();
     private Map<GridPos,BuildPlan.BlockSpec> finalTargets=Map.of();
     private int scalarOrdinal;
+    // One run owns at most two fault receipts; archive/seal precedes clearing on reset.
+    private final List<TraversalAssertions.Removal> removals=new ArrayList<>();
+    private TraversalAssertions.ForwardHistory forwardHistory;
+    private boolean removalConsumed;
+    private ServerFrame lastTraversalServer;
 
     ScenarioRunner(ClientGameTestContext context, ScenarioObserver.Watch watch, int expectedCountedRuns) {
         this(context,watch,expectedCountedRuns,ScenarioDefinition.Fixture.TWO_LANE);
@@ -165,6 +171,7 @@ final class ScenarioRunner implements AutoCloseable {
         this.context = Objects.requireNonNull(context); this.watch = Objects.requireNonNull(watch);
         roots = roots(); // Read-only loaded-module authority precedes evidence/world creation.
         try {
+        callerViewDistance=context.computeOnClient(c -> c.options.getViewDistance().getValue());
         callerAutoJump = context.computeOnClient(c -> {
             require(c.world == null && c.getServer() == null && c.player == null,
                     "Runner must create its own world; cannot adopt an open world");
@@ -446,6 +453,7 @@ final class ScenarioRunner implements AutoCloseable {
             if(!baseline()) {
                 boolean priorRun=capture!=null;
                 capture=null; sealed=null; compactCommitted=false; commitMarker=false; playerCheckpoints.clear(); scalarOrdinal=0;
+                removals.clear(); forwardHistory=null; removalConsumed=false; lastTraversalServer=null;
                 if(priorRun) initializeCompactBudget(resetOrdinal);
                 regionOrder=definition.worldCells().keySet().stream().sorted(Comparator.comparingInt(GridPos::x)
                         .thenComparingInt(GridPos::y).thenComparingInt(GridPos::z)).toList();
@@ -490,8 +498,9 @@ final class ScenarioRunner implements AutoCloseable {
                     && bound.dimension().equals("minecraft:overworld"), "Facade bound another start request");
             if(baseline()) watch.arm(c, plan);
             else {
-                try { capture=new TraversalCapture(outputs.root(),fresh,captureLimits,Set.of(),outputs); }
+                try { capture=new TraversalCapture(outputs.root(),fresh,captureLimits,admitted.removalIds(plan),outputs); }
                 catch(IOException error) { throw new UncheckedIOException(error); }
+                forwardHistory=new TraversalAssertions.ForwardHistory(fixture,plan);
                 watch.armTraversal(c,plan,capture);
             }
             if(baseline() && counted && supportCase==SupportCase.CONTROLLED) {
@@ -856,27 +865,108 @@ final class ScenarioRunner implements AutoCloseable {
                     ((ClientWorldPendingUpdateAccessor)c.world).mapart$getPendingUpdateManager().getSequence(),lifecycle.phase(),lifecycle.outcome().orElse(null),
                     e.diagnostic().map(BuildEngine.Diagnostic::reason).orElse(null),e.eligibleTicks(),e.verifyTicks(),e.pendingTargetIds().size(),e.unfinishedTargetIds().size(),status.controlOwner(),null);
         });
-        var remote=world.getServer().computeOnServer(s->{
-            requireServer(s); var p=serverPlayer; var v=p.getVelocity();
-            return new ServerFrame(0,capture.runId(),System.identityHashCode(server),System.identityHashCode(serverPlayer),
-                    System.identityHashCode(s),System.identityHashCode(p),s==server,p==serverPlayer,s.getTicks(),serverWorld.getTime(),p.age,
-                    p.getX(),p.getY(),p.getZ(),v.x,v.y,v.z,p.getYaw(),p.getAbilities().flying,p.isSprinting(),p.getInventory().getSelectedSlot(),
-                    p.getInventory().getStack(0).getCount(),p.getInventory().getStack(1).getCount()+p.getInventory().getStack(2).getCount(),
-                    p.getPlayerInput().equals(PlayerInput.DEFAULT)?0:1,local.ordinal,p.getBlockInteractionRange(),physics(p),null,null);
-        });
+        var remote=world.getServer().computeOnServer(s->sampleTraversalServer(s,local.ordinal));
         var appended=context.computeOnClient(c->{
             requireClient(c);
             var frame=new ServerFrame(capture.nextOrdinal(),remote.runId(),remote.originalServer(),remote.originalPlayer(),remote.server(),remote.player(),
                     remote.serverMatches(),remote.playerMatches(),remote.serverTick(),remote.worldTime(),remote.age(),remote.x(),remote.y(),remote.z(),
                     remote.vx(),remote.vy(),remote.vz(),remote.yaw(),remote.flying(),remote.sprinting(),remote.selectedSlot(),remote.reserved(),remote.usable(),
-                    remote.controls(),remote.followsClientOrdinal(),remote.interactionReach(),remote.physics(),null,null);
+                    remote.controls(),remote.followsClientOrdinal(),remote.interactionReach(),remote.physics(),remote.fault0(),remote.fault1());
             capture.append(frame); return frame;
         });
+        lastTraversalServer=appended;
         return new TraversalPoll(local.end,local.ordinal,local.client,local.keys,local.sequence,local.phase,local.outcome,local.reason,
                 local.eligible,local.verify,local.pending,local.unfinished,local.owner,appended);
     }
 
     private record RegionCheck(int count,long mismatches,String hash) { }
+
+    private ServerFrame sampleTraversalServer(MinecraftServer actual,long clientOrdinal) {
+        requireServer(actual); var p=serverPlayer; var v=p.getVelocity();
+        var facts=new ArrayList<TargetFact>();
+        if(!capture.faultTargets().isEmpty()) for(var target:plan.targets()) if(capture.faultTargets().contains(target.id())) {
+            var r=target.relativePos(); var at=new BlockPos(origin.x()+r.x(),origin.y()+r.y(),origin.z()+r.z());
+            boolean loaded=serverWorld.getChunkManager().getChunk(Math.floorDiv(at.getX(),16),Math.floorDiv(at.getZ(),16),ChunkStatus.FULL,false)!=null;
+            facts.add(new TargetFact(capture.runId(),target.id(),null,actual.getTicks(),loaded?Evidence.OBSERVED:Evidence.UNKNOWN,
+                    loaded?WorldEvidenceReader.blockSpec(serverWorld.getBlockState(at)):null));
+        }
+        require(facts.size()<=2,"Server fault sample exceeded declared bounded targets");
+        return new ServerFrame(0,capture.runId(),System.identityHashCode(server),System.identityHashCode(serverPlayer),
+                System.identityHashCode(actual),System.identityHashCode(p),actual==server,p==serverPlayer,actual.getTicks(),serverWorld.getTime(),p.age,
+                p.getX(),p.getY(),p.getZ(),v.x,v.y,v.z,p.getYaw(),p.getAbilities().flying,p.isSprinting(),p.getInventory().getSelectedSlot(),
+                p.getInventory().getStack(0).getCount(),p.getInventory().getStack(1).getCount()+p.getInventory().getStack(2).getCount(),
+                p.getPlayerInput().equals(PlayerInput.DEFAULT)?0:1,clientOrdinal,p.getBlockInteractionRange(),physics(p),
+                facts.isEmpty()?null:facts.getFirst(),facts.size()<2?null:facts.get(1));
+    }
+
+    private void requireRemovalFrame(MinecraftClient client,UUID runId,MotionFrame frame) {
+        requireClient(client);
+        var status=MapArtClient.status(); var p=client.player;
+        require(capture!=null && capture.runId().equals(runId) && capture.isLatestEnd(frame)
+                && capture.latestClientOrdinal()==frame.ordinal() && frame.phase().equals("END") && frame.runId().equals(runId)
+                && status.engine().lifecycle().phase()==Phase.RUNNING && status.engine().lifecycle().context().orElseThrow().runId().equals(runId)
+                && status.engine().eligibleTicks()==frame.eligible() && status.failure().isEmpty() && !client.isPaused()
+                && frame.lifecycle()==Phase.RUNNING && !frame.paused() && frame.pose()!=null
+                && frame.identities().worldMatches() && frame.identities().playerMatches() && frame.identities().handlerMatches() && frame.identities().connectionMatches()
+                && frame.identities().originalWorld()==System.identityHashCode(clientWorld) && frame.identities().originalPlayer()==System.identityHashCode(clientPlayer)
+                && frame.identities().originalHandler()==System.identityHashCode(handler) && frame.identities().originalConnection()==System.identityHashCode(connection)
+                && p.getX()==frame.pose().x() && p.getY()==frame.pose().y() && p.getZ()==frame.pose().z() && p.age==frame.pose().age()
+                && client.world.getTime()==frame.pose().worldTime() && p.getBlockInteractionRange()==frame.pose().interactionReach()
+                && p.getVelocity().x==frame.pose().vx() && p.getVelocity().y==frame.pose().vy() && p.getVelocity().z==frame.pose().vz()
+                && p.getEyePos().x==frame.pose().eyeX() && p.getEyePos().y==frame.pose().eyeY() && p.getEyePos().z==frame.pose().eyeZ()
+                && p.getYaw()==frame.pose().yaw() && p.headYaw==frame.pose().headYaw() && p.bodyYaw==frame.pose().bodyYaw()
+                && physics(p).equals(frame.pose().physics()),
+                "Removal refuses foreign/stale/reconstructed END/native binding");
+        int controls=0; var held=keys(client); for(int k=0;k<held.size();k++) if(held.get(k)) controls|=1<<k;
+        require(controls==frame.keys() && status.controlOwner()==frame.owner(),"Removal command ownership changed after original END");
+    }
+
+    /** END-history admits the fault; the complete original START/END stream must still pass after seal. */
+    private void applyTraversalRemoval(UUID runId,MotionFrame frame,Path stage) {
+        require(stage.equals(artifacts.resolve("success-"+countedStarts+"-"+runId)) && !removalConsumed && removals.isEmpty()
+                && !admitted.removalTargets().isEmpty(),"Wrong/consumed removal scope");
+        context.runOnClient(c->{ requireRemovalFrame(c,runId,frame); forwardHistory.requireRemoval(frame); });
+        removalConsumed=true; // A failed/partial native fault cannot be retried into another result.
+        for(var target:plan.targets()) if(admitted.removalTargets().contains(target.relativePos())) {
+            var relative=target.relativePos(); var at=new GridPos(origin.x()+relative.x(),origin.y()+relative.y(),origin.z()+relative.z());
+            context.runOnClient(c->{
+                requireRemovalFrame(c,runId,frame);
+                var fresh=WorldEvidenceReader.placementObservations(WorldEvidenceReader.capture(c,plan,
+                        MapArtClient.status().engine().lifecycle().context().orElseThrow(),clientWorld,handler,frame.tick()))
+                        .stream().filter(value->value.targetId()==target.id()).findFirst().orElseThrow();
+                require(fresh.runId().equals(runId) && fresh.tick()==frame.tick() && fresh.evidence()==Evidence.OBSERVED
+                        && fresh.observedState().filter(target.block()::equals).isPresent(),"Removal lacks fresh FULL/OBSERVED client target");
+                TargetFact original=frame.fault0()!=null && frame.fault0().targetId()==target.id()?frame.fault0():frame.fault1();
+                require(original!=null && original.targetId()==target.id() && original.evidence()==Evidence.OBSERVED && target.block().equals(original.state())
+                        && TraversalAssertions.boxDistanceSquared(frame.pose().eyeX(),frame.pose().eyeY(),frame.pose().eyeZ(),at)
+                        >frame.pose().interactionReach()*frame.pose().interactionReach(),"Removal lacks original correct/out-of-reach client target");
+            });
+            var receipt=world.getServer().computeOnServer(s->{
+                requireServer(s);
+                var position=new BlockPos(at.x(),at.y(),at.z());
+                require(serverWorld.getChunkManager().getChunk(Math.floorDiv(at.x(),16),Math.floorDiv(at.z(),16),ChunkStatus.FULL,false)!=null,
+                        "Removal target server chunk unavailable");
+                var before=WorldEvidenceReader.blockSpec(serverWorld.getBlockState(position)); var eye=serverPlayer.getEyePos();
+                double reach=serverPlayer.getBlockInteractionRange();
+                require(target.block().equals(before) && serverWorld.getBlockEntity(position)==null && Double.isFinite(reach) && reach>0
+                        && fixture.removalX(serverPlayer.getX()-origin.x()) && Math.abs(serverPlayer.getZ()-(origin.z()+frame.traversal().startZ()+.5))<=.25
+                        && TraversalAssertions.boxDistanceSquared(eye.x,eye.y,eye.z,at)>reach*reach,"Removal lacks fresh original correct/out-of-reach server passage");
+                var original=lastTraversalServer;
+                require(original!=null && original.followsClientOrdinal()==frame.ordinal() && original.runId().equals(runId)
+                        && original.server()==System.identityHashCode(s) && original.player()==System.identityHashCode(serverPlayer),
+                        "Removal lacks the original causal server poll");
+                long mutationTick=s.getTicks(),mutationTime=serverWorld.getTime(); int mutationAge=serverPlayer.age;
+                require(serverWorld.setBlockState(position,Blocks.AIR.getDefaultState()),"Native AIR removal rejected");
+                var after=WorldEvidenceReader.blockSpec(serverWorld.getBlockState(position));
+                require(after.equals(new BuildPlan.BlockSpec("minecraft:air",Map.of())),"Native AIR mutation did not produce AIR");
+                return new TraversalAssertions.Removal(runId,target.id(),relative,frame,original,mutationTick,mutationTime,mutationAge,eye.x,eye.y,eye.z,before,after);
+            });
+            removals.add(receipt);
+            scalar("removal-"+target.id()+".json",new Gson().toJson(receipt));
+            context.runOnClient(c->requireRemovalFrame(c,runId,frame));
+        }
+        TraversalAssertions.requireRemovalRecords(admitted,plan,runId,List.copyOf(removals));
+    }
 
     private Side withRegion(Side side,RegionCheck region) {
         side.state.add("region",new Gson().toJsonTree(region));
@@ -935,7 +1025,7 @@ final class ScenarioRunner implements AutoCloseable {
 
     private void verifyFinalCompact(Checkpoint finalState) {
         require(finalState.client.state.get("pendingOwnedCount").getAsInt()==0,"Final owned native predictions remain");
-        TraversalAssertions.requireRemovalReceipts(admitted,List.of());
+        TraversalAssertions.requireRemovalRecords(admitted,plan,capture.runId(),List.copyOf(removals));
         for(var side:List.of(finalState.client,finalState.server)) {
             var before=side==finalState.client?stable.client:stable.server;
             requireStock(side.state.getAsJsonArray("inventory"),before.state.getAsJsonArray("inventory"),admitted.finalUsable());
@@ -1507,6 +1597,12 @@ final class ScenarioRunner implements AutoCloseable {
                 requireRun(current.sample,id);
             } else {
                 poll=traversalPoll();
+                forwardHistory.accept(poll.end);
+                forwardHistory.acceptServer(poll.end,poll.server);
+                var motion=poll.end.traversal();
+                if(!admitted.removalTargets().isEmpty() && !removalConsumed && motion!=null && motion.pass().equals("FORWARD")
+                        && motion.physicalIndex()==fixture.removalLane() && motion.substage().equals("LANE") && motion.stage().equals("WALK")
+                        && fixture.removalX(poll.end.pose().x()-origin.x())) applyTraversalRemoval(id,poll.end,stage);
                 if(capture.hasCheckpoint(CheckpointKind.FIRST_VERIFY) && !playerCheckpoints.contains(CheckpointKind.FIRST_VERIFY))
                     fullPlayerCheckpoint(CheckpointKind.FIRST_VERIFY);
             }
@@ -1591,13 +1687,14 @@ final class ScenarioRunner implements AutoCloseable {
         verifyFinalState(released,stage);
         } else {
             verifyFinalCompact(fullPlayerCheckpoint(CheckpointKind.RELEASE_END));
-            scalar("result-"+id+".txt","run="+id+"; outcome=SUCCESS; reason=VERIFIED; definition="+definition.definitionHash()
+            scalar("engine-terminal-"+id+".txt","run="+id+"; originalEngineOutcome=SUCCESS; nativeProof=PENDING; reason=VERIFIED; definition="+definition.definitionHash()
                     +"; observedStart="+observedHash+"; originalTerminalEligible="+terminal.eligibleTicks()+"; releaseTicks=20");
             context.runOnClient(c->{ requireClient(c); MapArtClient.stop(); requireReleased(c); });
             sealCompact();
-            TraversalAssertions.verify(sealed,plan,fixture);
+            var proof=TraversalAssertions.verifyNative(sealed,plan,fixture,List.copyOf(removals));
+            writeInvocationFile(artifacts.resolve("native-proof-"+id+".txt"),proof);
+            writeInvocationFile(artifacts.resolve("result-"+id+".txt"),"run="+id+"; outcome=SUCCESS; original sealed START/END/native profile proof accepted; definition="+definition.definitionHash());
             archiveCompact(stage.resolve("sealed"),sealed);
-            copyCompact(outputs.root().resolve("result-"+id+".txt"),artifacts.resolve("result-"+id+".txt"));
         }
         previous = new ScenarioResult(id, terminal, definition.definitionHash(), observedHash, List.of(), artifacts);
         if(baseline()) writeNew(roots, artifacts.resolve("result-" + id + ".txt"), previous.toString());
@@ -2525,6 +2622,10 @@ final class ScenarioRunner implements AutoCloseable {
             requireClient(c);
             optionsOwned=true;
             c.options.getAutoJump().setValue(b(player,"autoJump"));
+            if(!baseline()) {
+                c.options.getViewDistance().setValue(fixture.viewDistance());
+                c.options.sendClientSettings(); // Ordinary server propagation must pass the same readiness200.
+            }
             // Reset owns private local hunger/menu/input/angles; subsequent readiness performs reads only.
             c.setScreen(null);
             restorePlayer(c.player, player, false);
@@ -2619,6 +2720,11 @@ final class ScenarioRunner implements AutoCloseable {
         state.add("keys",new Gson().toJsonTree(keys));
         state.addProperty("paused",c.isPaused()); state.addProperty("screenOpen",c.currentScreen!=null);
         state.addProperty("autoJump",c.options.getAutoJump().getValue());
+        if(!baseline()) {
+            int raw=c.options.getViewDistance().getValue(),clamped=c.options.getClampedViewDistance();
+            state.addProperty("viewDistanceRaw",raw); state.addProperty("viewDistanceClamped",clamped);
+            if(initial && (raw!=fixture.viewDistance() || clamped!=fixture.viewDistance())) errors.add("Client view distance not propagated");
+        }
         state.addProperty("mode",c.interactionManager==null ? "missing" : c.interactionManager.getCurrentGameMode().name());
         state.addProperty("input",c.player.input.playerInput.toString());
         state.addProperty("lastInput",c.player.getLastPlayerInput().toString());
@@ -2744,6 +2850,11 @@ final class ScenarioRunner implements AutoCloseable {
         actual.add("boundedEntities",new Gson().toJsonTree(entities.stream().map(e -> e.getType().toString()+":"+e.getUuid()).sorted().toList()));
         if (!entities.isEmpty()) errors.add("Unexpected bounded non-player entities");
         if (p instanceof ServerPlayerEntity sp) {
+            if(!baseline()) {
+                int request=sp.getViewDistance(),manager=server.getPlayerManager().getViewDistance();
+                actual.addProperty("viewDistanceRequested",request); actual.addProperty("viewDistanceManager",manager);
+                if(initial && (request!=fixture.viewDistance() || manager!=fixture.viewDistance())) errors.add("Server view distance not propagated");
+            }
             actual.addProperty("mode",sp.getGameMode().name()); actual.addProperty("input",sp.getPlayerInput().toString());
             if (sp.getGameMode()!=GameMode.SURVIVAL || !sp.getPlayerInput().equals(PlayerInput.DEFAULT)) errors.add("Server mode/input");
         }
@@ -2835,7 +2946,7 @@ final class ScenarioRunner implements AutoCloseable {
                 },
                 () -> context.runOnClient(c -> {
                     requireClient(c);
-                    if (optionsOwned) { c.options.getAutoJump().setValue(callerAutoJump); optionsOwned=false; }
+                    restoreCallerOptions(c);
                 }),
                 () -> context.runOnClient(c -> { requireClient(c); watch.closeWorld(); }),
                 () -> {
@@ -2844,6 +2955,13 @@ final class ScenarioRunner implements AutoCloseable {
                 }); // Keep identities through native close, even if an earlier cleanup failed.
         closed=true;
         normalClose=true;
+    }
+
+    private void restoreCallerOptions(MinecraftClient c) {
+        if(!optionsOwned) return;
+        c.options.getAutoJump().setValue(callerAutoJump);
+        if(!baseline()) { c.options.getViewDistance().setValue(callerViewDistance); c.options.sendClientSettings(); }
+        optionsOwned=false;
     }
 
     private void closeCompact() {
@@ -2859,7 +2977,7 @@ final class ScenarioRunner implements AutoCloseable {
         } catch(RuntimeException | Error error) { first=retain(first,error); }
         // Caller-owned options can be restored even when evidence must retain world/watch identities.
         try {
-            context.runOnClient(c->{ requireClient(c); if(optionsOwned) { c.options.getAutoJump().setValue(callerAutoJump); optionsOwned=false; } });
+            context.runOnClient(c->{ requireClient(c); restoreCallerOptions(c); });
         } catch(RuntimeException | Error error) { first=retain(first,error); }
         if(archived) {
             try {

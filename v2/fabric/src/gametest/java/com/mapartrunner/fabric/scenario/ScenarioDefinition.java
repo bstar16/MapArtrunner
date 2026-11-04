@@ -77,6 +77,16 @@ final class ScenarioDefinition {
         GridPos max() { return new GridPos(width+1,70,depth+1); }
         String directory() { return "/"+directory+"/"; }
         String sourceName() { return directory+".schem"; }
+        int viewDistance() { return this==RESUME_21 || this==SCALE_128?10:5; }
+        int initialLane() { return this==RESUME_21?20:0; }
+        int removalLane() {
+            return switch(this) { case REVERSE_ODD -> 2; case REVERSE_EVEN -> 3; case REVERSE_MULTI -> 4; default -> -1; };
+        }
+        boolean removalX(double x) { return Double.isFinite(x) && (this==REVERSE_EVEN?x<=3.5:x>=8); }
+        List<Integer> reverseBuilds() {
+            return switch(this) { case RESUME_21 -> List.of(0); case REVERSE_ODD,REVERSE_EVEN -> List.of(1);
+                case REVERSE_MULTI -> List.of(3,1); default -> List.of(); };
+        }
         Set<GridPos> removals() {
             return switch(this) {
                 case REVERSE_ODD, REVERSE_EVEN -> Set.of(new GridPos(6,0,5));
@@ -170,6 +180,12 @@ final class ScenarioDefinition {
     JsonObject playerData() { return JsonParser.parseString(canonicalPlayer).getAsJsonObject(); }
     GridPos origin() { return origin; }
     Set<GridPos> removalTargets() { return fixture.removals(); }
+    Set<Integer> removalIds(BuildPlan imported) {
+        var ids=new HashSet<Integer>();
+        for(var target:imported.targets()) if(removalTargets().contains(target.relativePos())) ids.add(target.id());
+        require(ids.size()==removalTargets().size(),"Declared removal lacks an actual imported target ID");
+        return Set.copyOf(ids);
+    }
     int initiallyAbsentStoneTargets() { return initiallyAbsentStoneTargets; }
     int initialUsable() { return initialUsable; }
     int finalUsable() { return initialUsable-(initiallyAbsentStoneTargets+removalTargets().size()); }

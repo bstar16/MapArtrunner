@@ -20,13 +20,18 @@ final class TraversalAssertions {
     private TraversalAssertions() { }
 
     static void verify(Sealed trace,com.mapartrunner.core.model.BuildPlan plan,ScenarioDefinition.Fixture fixture) {
+        verify(trace,plan,fixture,List.of());
+    }
+
+    private static void verify(Sealed trace,com.mapartrunner.core.model.BuildPlan plan,ScenarioDefinition.Fixture fixture,List<Removal> removals) {
         require(trace.complete() && trace.outputs().complete(),"Incomplete capture cannot establish construction success");
         var definition=ScenarioDefinition.load(fixture);
         expectedWorldTargets(definition,plan.targets());
-        requireRemovalReceipts(definition,List.of()); // Task13 must supply original causal receipts before these profiles can pass.
         var required=EnumSet.of(CheckpointKind.INITIAL,CheckpointKind.FIRST_VERIFY,CheckpointKind.TERMINAL,CheckpointKind.RELEASE_END);
         require(trace.checkpoints().keySet().equals(required),"Missing/foreign named full checkpoint/release END");
+        requireRemovalRecords(definition,plan,trace.checkpoints().get(CheckpointKind.INITIAL).runId(),removals);
         var lanes=new LanePlanner().plan(plan,2,5);
+        var faultIds=definition.removalIds(plan);
         var targets=new HashSet<Integer>(); plan.targets().forEach(t->targets.add(t.id()));
         var seen=EnumSet.noneOf(CheckpointKind.class);
         UUID run=null; MotionFrame start=null,lastEnd=null,terminal=null,firstVerify=null;
@@ -54,7 +59,7 @@ final class TraversalAssertions {
                             && !m.pose().flying() && !m.pose().sprinting(),"Nonfinite client pose/reach or flying/sprinting");
                     requireOrdinaryPhysics(m.pose().physics());
                     require(m.lifecycle()==Phase.TERMINAL || m.traversal()!=null,"Missing active traversal state");
-                    require(m.fault0()==null && m.fault1()==null,"Undeclared replacement fact without causal removal receipts");
+                    requireFaultFacts(m.fault0(),m.fault1(),run,faultIds,m.tick());
                     if(m.effect()!=null) {
                         var e=m.effect();
                         require(e.runId().equals(run) && targets.contains(e.targetId()),"Foreign original action tuple");
@@ -135,7 +140,7 @@ final class TraversalAssertions {
                     for(var candidate:new MotionFrame[]{latest,previous,older}) if(candidate!=null && candidate.ordinal()==s.followsClientOrdinal()) causal=candidate;
                     require(causal!=null && s.serverMatches() && s.playerMatches() && s.server()==s.originalServer() && s.player()==s.originalPlayer(),
                             "Server facts lack original causal client event/native identity");
-                    require(s.fault0()==null && s.fault1()==null,"Native replacement lacks declared causal receipts");
+                    requireFaultFacts(s.fault0(),s.fault1(),run,faultIds,s.serverTick());
                     require(Double.isFinite(s.x()) && Double.isFinite(s.y()) && Double.isFinite(s.z())
                             && Double.isFinite(s.interactionReach()) && s.interactionReach()>0 && !s.flying() && !s.sprinting(),"Nonfinite server pose/reach or flying/sprinting");
                     requireOrdinaryPhysics(s.physics());
@@ -171,6 +176,123 @@ final class TraversalAssertions {
 
     private static FullScan checkpoint(Sealed trace,CheckpointKind kind) {
         try { return trace.readCheckpoint(kind); } catch(IOException error) { throw new UncheckedIOException(error); }
+    }
+
+    private static void requireFaultFacts(TargetFact first,TargetFact second,UUID run,Set<Integer> declared,long tick) {
+        var facts=new ArrayList<TargetFact>(); if(first!=null) facts.add(first); if(second!=null) facts.add(second);
+        var seen=new HashSet<Integer>();
+        for(var fact:facts) require(fact.runId().equals(run) && declared.contains(fact.targetId()) && seen.add(fact.targetId())
+                && fact.actionId()==null && fact.tick()==tick,"Foreign/duplicate/fabricated declared fault observation");
+        require(seen.equals(declared),"Missing original declared fault observations");
+    }
+
+    static String verifyNative(Sealed trace,com.mapartrunner.core.model.BuildPlan plan,ScenarioDefinition.Fixture fixture,List<Removal> removals) {
+        verify(trace,plan,fixture,removals);
+        var definition=ScenarioDefinition.load(fixture);
+        var run=trace.checkpoints().get(CheckpointKind.INITIAL).runId();
+        var lanes=new LanePlanner().plan(plan,2,5); var history=new ForwardHistory(fixture,plan); var pace=new Pace();
+        var targetIds=new HashSet<Integer>(); plan.targets().forEach(t->targetIds.add(t.id()));
+        var actions=new Actions(run,targetIds); var accepted=new HashMap<Integer,BuildEngine.PlacementEffectResult>();
+        var repairs=new HashSet<Integer>(); var removalById=new HashMap<Integer,Removal>();
+        for(var target:plan.targets()) {
+            var p=target.relativePos(); var o=definition.origin();
+            if(!target.block().equals(definition.worldCells().get(new GridPos(o.x()+p.x(),o.y()+p.y(),o.z()+p.z())))) repairs.add(target.id());
+        }
+        for(var removal:removals) { repairs.add(removal.targetId()); removalById.put(removal.targetId(),removal); }
+        var replaced=new HashSet<Integer>(); var observed=new HashSet<Integer>(); var matchedReceipts=new HashSet<Integer>();
+        var forward=new LinkedHashSet<Integer>(); var reverse=new ArrayList<Integer>(); var serverEntries=new HashSet<Integer>();
+        var hops=new LinkedHashMap<String,Integer>();
+        MotionFrame latest=null; String build=null,transit=null; int transitCount=0;
+        double clientMinZ=Double.POSITIVE_INFINITY,clientMaxZ=Double.NEGATIVE_INFINITY,serverMinZ=Double.POSITIVE_INFINITY,serverMaxZ=Double.NEGATIVE_INFINITY;
+        long lastEligible=0,callbacks=0; int initial=-1;
+        try(var reader=trace.openEvents()) {
+            Optional<Event> next;
+            while((next=reader.next()).isPresent()) {
+                var event=next.orElseThrow();
+                if(event instanceof MotionFrame m) {
+                    latest=m; pace.accept(m); lastEligible=Math.max(lastEligible,m.eligible());
+                    clientMinZ=Math.min(clientMinZ,m.pose().z()); clientMaxZ=Math.max(clientMaxZ,m.pose().z());
+                    if(m.phase().equals("END")) { history.accept(m); callbacks++; }
+                    var t=m.traversal();
+                    if(t!=null) {
+                        if(Set.of("ENDPOINT","SHIFT","NEXT_ENTRY").contains(t.substage()))
+                            hops.merge(t.pass()+":"+t.physicalIndex(),t.transitionTicks(),Math::max);
+                        if(m.phase().equals("END") && t.substage().equals("LANE") && Set.of("FORWARD","REVERSE").contains(t.pass())) {
+                            String key=t.pass()+":"+t.physicalIndex();
+                            if(!key.equals(build)) {
+                                if(initial<0) { initial=t.physicalIndex(); require(initial==fixture.initialLane(),"Wrong actual initial selected lane"); }
+                                if(t.pass().equals("FORWARD")) {
+                                    require(t.physicalIndex()==fixture.initialLane()+forward.size(),"Forward sweep omitted/reordered a canonical lane");
+                                    forward.add(t.physicalIndex());
+                                } else {
+                                    requireForwardBeforeReverse(t,forward.size(),lanes.size()-fixture.initialLane());
+                                    requireReverseBuild(fixture,t.physicalIndex()); reverse.add(t.physicalIndex());
+                                }
+                                build=key;
+                            }
+                        }
+                        if(t.substage().equals("TRANSIT")) {
+                            String key=t.pass()+":"+t.physicalIndex()+":"+t.startX()+":"+t.endX();
+                            if(!key.equals(transit)) { transitCount++; transit=key; }
+                            require(t.enteredBuildIndex()==null && t.startZ()==t.endZ(),"X transit fabricated a BUILD or diagonal leg");
+                        } else transit=null;
+                    }
+                    for(var removal:removals) if(m.ordinal()==removal.frame().ordinal()) {
+                        require(m.equals(removal.frame()),"Removal receipt substituted a fabricated original END");
+                        history.requireRemoval(m); matchedReceipts.add(removal.targetId());
+                    }
+                    if(m.effect()!=null) {
+                        var effect=m.effect(); actions.accept(effect);
+                        if(effect.status()==BuildEngine.EffectStatus.ACCEPTED) {
+                            require(repairs.contains(effect.targetId()),"Native action consumed an already-correct/non-target block");
+                            var old=accepted.putIfAbsent(effect.targetId(),effect);
+                            require(old==null || old.equals(effect),"Duplicate native accepted action for one required repair");
+                            var removal=removalById.get(effect.targetId());
+                            require(removal==null || m.ordinal()>removal.frame().ordinal(),"Replacement action predates its causal AIR removal");
+                        }
+                    }
+                    for(var fact:new TargetFact[]{m.fault0(),m.fault1()}) if(fact!=null) {
+                        var removal=removalById.get(fact.targetId());
+                        if(removal!=null && m.ordinal()>removal.frame().ordinal() && fact.evidence()==Evidence.OBSERVED
+                                && definition.expectedTargets().get(removal.relative()).equals(fact.state())) observed.add(fact.targetId());
+                    }
+                } else {
+                    var remote=(ServerFrame)event;
+                    require(latest!=null && remote.followsClientOrdinal()==latest.ordinal(),"Native profile server span lacks its original client predecessor");
+                    history.acceptServer(latest,remote);
+                    serverMinZ=Math.min(serverMinZ,remote.z()); serverMaxZ=Math.max(serverMaxZ,remote.z());
+                    var t=latest.traversal();
+                    if(t!=null && t.pass().equals("REVERSE") && t.substage().equals("LANE")
+                            && near(remote.x(),t.startX()+.5) && near(remote.z(),t.startZ()+.5)) serverEntries.add(t.physicalIndex());
+                    for(var fact:new TargetFact[]{remote.fault0(),remote.fault1()}) if(fact!=null) {
+                        var removal=removalById.get(fact.targetId());
+                        if(removal!=null && remote.followsClientOrdinal()>removal.frame().ordinal() && remote.serverTick()>=removal.mutationTick()
+                                && fact.evidence()==Evidence.OBSERVED && definition.expectedTargets().get(removal.relative()).equals(fact.state())) replaced.add(fact.targetId());
+                    }
+                }
+            }
+        } catch(IOException error) { throw new UncheckedIOException(error); }
+        require(forward.size()==lanes.size()-fixture.initialLane() && reverse.equals(fixture.reverseBuilds())
+                && serverEntries.containsAll(reverse),"Selected reverse sequence/full server entry or forward trace incomplete");
+        int expectedTransit=switch(fixture) { case REVERSE_ODD -> 1; case REVERSE_MULTI -> 2; default -> 0; };
+        require(transitCount==expectedTransit,"Unnecessary/missing X transit or full-width clean-lane detour");
+        double zSpan=lanes.getLast().start().z()-lanes.getFirst().start().z();
+        require(clientMaxZ-clientMinZ>=Math.max(0,zSpan-.5) && serverMaxZ-serverMinZ>=Math.max(0,zSpan-.5),"Route labels lack actual full client/server Z movement");
+        requireRepairEvidence(repairs,accepted.keySet(),removalById.keySet(),matchedReceipts,replaced,observed);
+        require(lastEligible<=BuildEngine.runLimit(plan,new BuildEngine.Settings(2,5,false,1))
+                && callbacks<= (long)definition.data().getAsJsonObject("budgets").get("runTicks").getAsInt()+20,"Frozen production/fixture callback allowance exceeded");
+        require(fixture!=ScenarioDefinition.Fixture.SCALE_128 || lastEligible>1200 && forward.size()==26 && accepted.size()==28,
+                "SCALE lacks actual beyond1200/full26-lane/28-native-repair proof");
+        return "fixture="+fixture+"; coverage="+(removals.isEmpty()?"prefilled partial-start":"late-server-removal fault")
+                +"; run="+run+"; actualEndCallbacks="+callbacks+"; eligible="+lastEligible+"; initial="+initial+"; forward="+forward+"; reverse="+reverse
+                +"; nativeAcceptedActions="+accepted.values()+"; perHopMaximum="+hops+"; clientZSpan="+(clientMaxZ-clientMinZ)+"; serverZSpan="+(serverMaxZ-serverMinZ)
+                +"\n"+pace.finish(fixture);
+    }
+
+    private static void requireRepairEvidence(Set<Integer> repairs,Set<Integer> accepted,Set<Integer> removed,
+                                               Set<Integer> receipts,Set<Integer> replaced,Set<Integer> observed) {
+        require(accepted.equals(repairs) && receipts.equals(removed) && replaced.equals(removed) && observed.equals(removed),
+                "Missing removal receipt/original native accepted action/server replacement/current OBSERVED evidence");
     }
 
     private static void checkTraversalPair(MotionFrame before,MotionFrame after,List<LanePlanner.Lane> lanes,GridPos origin) {
@@ -230,6 +352,213 @@ final class TraversalAssertions {
         return Double.isFinite(delta) && Math.abs(delta)<=1.5;
     }
 
+    private static void requireReverseBuild(ScenarioDefinition.Fixture fixture,int index) {
+        require(fixture.reverseBuilds().contains(index),"Selected clean lane labeled BUILD: "+fixture+" / "+index);
+    }
+
+    private static void requireForwardBeforeReverse(Traversal reverse,int forwardCount,int remainingForward) {
+        require(reverse.pass().equals("REVERSE"),"Expected an actual reverse traversal");
+        require(forwardCount==remainingForward,"Reverse label without the complete remaining forward trace");
+    }
+
+    /** Original END route history; the sealed verifier also checks every original START/policy boundary. */
+    static final class ForwardHistory {
+        private final ScenarioDefinition.Fixture fixture;
+        private final Set<Integer> entered=new HashSet<>(),completed=new HashSet<>();
+        private final Set<Integer> serverEntered=new HashSet<>(),serverCompleted=new HashSet<>();
+        private MotionFrame previous;
+        private final List<LanePlanner.Lane> lanes;
+        ForwardHistory(ScenarioDefinition.Fixture fixture,com.mapartrunner.core.model.BuildPlan plan) {
+            this.fixture=fixture; lanes=new LanePlanner().plan(plan,2,5);
+        }
+        void accept(MotionFrame frame) {
+            if(!frame.phase().equals("END")) return;
+            if(previous!=null) require(previous.runId().equals(frame.runId()) && frame.tick()==previous.tick()+1,
+                    "Forward history lost a current-run END");
+            if(previous!=null) {
+                require(frame.eligible()==previous.eligible()+(previous.lifecycle()==Phase.RUNNING?1:0),"END history eligible counter changed");
+                checkTraversalPair(previous,frame,lanes,new GridPos(0,65,0));
+            }
+            var t=frame.traversal();
+            if(t!=null) {
+                Pace.publicCounter(t.noProgressTicks());
+                require(t.entryTicks()>=0 && t.entryTicks()<=52 && t.supportTicks()>=0 && t.supportTicks()<80
+                        && t.yawTicks()>=0 && t.yawTicks()<20 && t.transitionTicks()>=0 && t.transitionTicks()<=120,
+                        "END admission has invalid original public counters");
+            }
+            if(t!=null && t.pass().equals("FORWARD")) {
+                int index=t.physicalIndex(),center=Math.min(2+5*index,fixture.depth-3);
+                if(fixture.depth<=5) center=Math.min(2,fixture.depth-1);
+                if(t.substage().equals("LANE")) {
+                    require(t.laneId()==index && t.startZ()==center && t.endZ()==center && t.endX()==(index%2==0?fixture.width-1:0)
+                            && t.direction().equals(index%2==0?"EAST":"WEST"),"Forward label lacks actual canonical geometry");
+                    entered.add(index);
+                }
+                if(t.substage().equals("SHIFT") && near(frame.pose().x(),(index%2==0?fixture.width-.5:.5))
+                        && near(frame.pose().z(),center+.5)) completed.add(index);
+            }
+            previous=frame;
+        }
+        void acceptServer(MotionFrame causal,ServerFrame server) {
+            var t=causal.traversal();
+            if(t==null || !t.pass().equals("FORWARD")) return;
+            if(t.substage().equals("LANE") && near(server.x(),t.startX()+.5) && near(server.z(),t.startZ()+.5)) serverEntered.add(t.physicalIndex());
+            int center=fixture.depth<=5?Math.min(2,fixture.depth-1):Math.min(2+5*t.physicalIndex(),fixture.depth-3);
+            if(t.substage().equals("SHIFT") && near(server.x(),t.physicalIndex()%2==0?fixture.width-.5:.5)
+                    && near(server.z(),center+.5)) serverCompleted.add(t.physicalIndex());
+        }
+        void requireRemoval(MotionFrame frame) {
+            int last=fixture.removalLane(); var t=frame.traversal();
+            require(last>=0 && frame==previous && frame.lifecycle()==Phase.RUNNING && t!=null && t.pass().equals("FORWARD")
+                    && t.physicalIndex()==last && t.substage().equals("LANE") && t.stage().equals("WALK")
+                    && fixture.removalX(frame.pose().x()) && entered.contains(last),"Removal lacks actual final FORWARD WALK/X passage");
+            for(int index=0;index<last;index++) require(entered.contains(index) && completed.contains(index)
+                    && serverEntered.contains(index) && serverCompleted.contains(index),"Missing full client/server forward lane trace: "+index);
+        }
+    }
+
+    record Removal(UUID runId,int targetId,GridPos relative,MotionFrame frame,ServerFrame server,long mutationTick,long mutationTime,int mutationAge,
+                   double eyeX,double eyeY,double eyeZ,BlockSpec before,BlockSpec after) { }
+
+    static double boxDistanceSquared(double x,double y,double z,GridPos target) {
+        double dx=Math.max(Math.max(target.x()-x,0),x-(target.x()+1.0));
+        double dy=Math.max(Math.max(target.y()-y,0),y-(target.y()+1.0));
+        double dz=Math.max(Math.max(target.z()-z,0),z-(target.z()+1.0));
+        return dx*dx+dy*dy+dz*dz;
+    }
+
+    static void requireRemovalRecords(ScenarioDefinition definition,com.mapartrunner.core.model.BuildPlan plan,UUID run,List<Removal> removals) {
+        requireRemovalReceipts(definition,removals.stream().map(Removal::relative).toList());
+        for(var removal:removals) {
+            var target=plan.targets().stream().filter(t->t.id()==removal.targetId()).findFirst().orElseThrow();
+            var m=removal.frame(); var s=removal.server(); var o=definition.origin(); var p=removal.relative();
+            var at=new GridPos(o.x()+p.x(),o.y()+p.y(),o.z()+p.z());
+            require(removal.runId().equals(run) && m.runId().equals(run) && s.runId().equals(run) && target.relativePos().equals(p)
+                    && m.phase().equals("END") && s.followsClientOrdinal()==m.ordinal() && s.serverMatches() && s.playerMatches()
+                    && s.originalServer()==s.server() && s.originalPlayer()==s.player()
+                    && Double.isFinite(s.interactionReach()) && s.interactionReach()>0
+                    && Double.isFinite(m.pose().interactionReach()) && m.pose().interactionReach()>0
+                    && removal.mutationTick()>=s.serverTick() && removal.mutationTime()>=s.worldTime() && removal.mutationAge()>=s.age()
+                    && target.block().equals(removal.before()) && removal.after().equals(new BlockSpec("minecraft:air",Map.of()))
+                    && boxDistanceSquared(m.pose().eyeX(),m.pose().eyeY(),m.pose().eyeZ(),at)>m.pose().interactionReach()*m.pose().interactionReach()
+                    && boxDistanceSquared(removal.eyeX(),removal.eyeY(),removal.eyeZ(),at)>s.interactionReach()*s.interactionReach(),
+                    "Removal lacks original run/target/full-state/out-of-reach causal facts");
+        }
+    }
+
+    private static final class Actions {
+        private final UUID run;
+        private final Set<Integer> targets;
+        private final Map<Long,BuildEngine.PlacementEffectResult> seen=new HashMap<>();
+        Actions(UUID run,Set<Integer> targets) { this.run=run; this.targets=Set.copyOf(targets); }
+        void accept(BuildEngine.PlacementEffectResult effect) {
+            require(effect.runId().equals(run) && targets.contains(effect.targetId()),"Foreign original run/action/target");
+            var previous=seen.putIfAbsent(effect.actionId(),effect);
+            require(previous==null || previous.equals(effect),"Reused run/action with different original tuple");
+            require(seen.size()<=3L*targets.size(),"Original action stream exceeds the admitted three attempts/target");
+        }
+    }
+
+    /** Derived command/physics metrics, never the private policy result or credited coordinate. */
+    private static final class Pace {
+        private MotionFrame command,start,first,last;
+        private Traversal geometry;
+        private long callbacks,allCallbacks,longCallbacks,shortCallbacks,entryWaits,walkWaits;
+        private double gain,allGain,longGain,shortGain,accelerationGain;
+        private long accelerationCallbacks;
+        private int segments,longSegments,highwater;
+        private long highwaterOrdinal=-1;
+        private final List<String> rows=new ArrayList<>();
+        private final Map<String,Long> phaseCallbacks=new TreeMap<>();
+
+        static void publicCounter(int ticks) { require(ticks>=0 && ticks<=8,"Original public no-progress approaches40: "+ticks); }
+        static String rate(long callbacks,double gain,double remaining,boolean completed) {
+            require(callbacks>=0 && Double.isFinite(gain) && Double.isFinite(remaining),"Invalid native pace facts");
+            if(callbacks==0) { require(gain==0,"Uncommanded pace gain"); return "N/A"; }
+            require(gain>0,"Zero/backward geometric gain with commanded walking");
+            if(gain>=1) { require(callbacks<=8*gain,"Native segment exceeds eight callbacks/block"); return "long; rawRate="+(callbacks/gain); }
+            require(completed && remaining>0 && remaining<=1 && callbacks<=Math.ceil(8*gain),"Fractional walk lacks bounded genuine completion");
+            return "short; rawRate="+(callbacks/gain);
+        }
+        static void endpoint(MotionFrame command,MotionFrame start,MotionFrame end) {
+            require(start!=null && end!=null && command.phase().equals("END") && start.phase().equals("START") && end.phase().equals("END")
+                    && start.tick()==command.tick()+1 && end.tick()==start.tick() && command.runId().equals(start.runId()) && command.runId().equals(end.runId())
+                    && command.identities().equals(start.identities()) && command.identities().equals(end.identities())
+                    && !start.paused() && !end.paused() && start.lifecycle()==Phase.RUNNING && end.lifecycle()!=Phase.PAUSED
+                    && start.owner()==command.owner() && start.keys()==command.keys() && start.pose()!=null && end.pose()!=null
+                    && start.eligible()==command.eligible() && Objects.equals(start.traversal(),command.traversal()),
+                    "Commanded physics interval was censored by pause/replacement/missing boundary");
+            requireOrdinaryPhysics(start.pose().physics()); requireOrdinaryPhysics(end.pose().physics());
+            // END's new decision may normally release NATIVE at the endpoint; its pose still closes the old command.
+        }
+        private static boolean same(Traversal a,Traversal b) {
+            return a!=null && b!=null && a.pass().equals(b.pass()) && a.substage().equals(b.substage()) && a.physicalIndex()==b.physicalIndex()
+                    && a.laneId()==b.laneId() && a.direction().equals(b.direction()) && a.startX()==b.startX() && a.startZ()==b.startZ()
+                    && a.endX()==b.endX() && a.endZ()==b.endZ();
+        }
+        private static boolean commanded(MotionFrame before,MotionFrame after) {
+            var a=before.traversal(); var b=after.traversal();
+            return before.lifecycle()==Phase.RUNNING && after.lifecycle()==Phase.RUNNING && after.eligible()==before.eligible()+1
+                    && same(a,b) && a.stage().equals("WALK") && b.stage().equals("WALK") && Set.of("LANE","TRANSIT").contains(b.substage())
+                    && Set.of("EAST","WEST").contains(b.direction()) && after.owner()==BuildEngine.ControlOwner.NATIVE
+                    && (after.keys()&1)!=0 && (after.keys()&(2|16|32|64|128|256))==0 && (after.keys()&(4|8))!=(4|8)
+                    && b.supportTicks()==0 && b.yawTicks()==0;
+        }
+        void accept(MotionFrame frame) {
+            if(frame.traversal()!=null) {
+                int value=frame.traversal().noProgressTicks(); publicCounter(value);
+                if(highwaterOrdinal<0 || value>highwater) { highwater=value; highwaterOrdinal=frame.ordinal(); }
+            }
+            if(frame.phase().equals("START")) { start=frame; return; }
+            if(!frame.phase().equals("END")) return;
+            if(frame.lifecycle()==Phase.RUNNING && frame.traversal()!=null) {
+                var t=frame.traversal();
+                phaseCallbacks.merge(t.pass()+":"+t.substage()+":"+t.physicalIndex()+":"+t.stage(),1L,Long::sum);
+            }
+            if(command!=null) {
+                endpoint(command,start,frame);
+                double delta=(frame.pose().x()-command.pose().x())*(geometry.direction().equals("WEST")?-1:1);
+                callbacks++; gain+=delta; last=frame;
+                if(accelerationGain<1) { accelerationCallbacks++; accelerationGain+=delta; }
+                command=null;
+            }
+            if(geometry!=null && (!same(geometry,frame.traversal()) || !frame.traversal().stage().equals("WALK"))) finish(frame);
+            if(start!=null && commanded(start,frame)) {
+                requireOrdinaryPhysics(frame.pose().physics());
+                if(geometry==null) { geometry=frame.traversal(); first=frame; last=frame; }
+                command=frame;
+            } else if(frame.lifecycle()==Phase.RUNNING && frame.traversal()!=null) {
+                if(frame.traversal().stage().equals("WALK")) walkWaits++; else entryWaits++;
+            }
+        }
+        private void finish(MotionFrame completion) {
+            int sign=geometry.direction().equals("WEST")?-1:1;
+            double remaining=Math.max(0,sign*(geometry.endX()+.5-first.pose().x())-1);
+            boolean complete=completion!=null && sign*(geometry.endX()+.5-completion.pose().x())<=1;
+            var classification=rate(callbacks,gain,remaining,complete);
+            rows.add("segment="+(++segments)+"; pass="+geometry.pass()+"; substage="+geometry.substage()+"; physical="+geometry.physicalIndex()
+                    +"; direction="+geometry.direction()+"; C="+callbacks+"; G="+Double.toHexString(gain)+"; R="+Double.toHexString(remaining)
+                    +"; eightG="+(8*gain)+"; "+classification+"; accelerationC="+accelerationCallbacks+"; accelerationG="+accelerationGain
+                    +"; cruiseTailC="+(callbacks-accelerationCallbacks)+"; cruiseTailG="+(gain-accelerationGain)
+                    +"; firstOrdinal="+first.ordinal()+"; endpointOrdinal="+last.ordinal()+"; completionOrdinal="+completion.ordinal());
+            allCallbacks+=callbacks; allGain+=gain;
+            if(gain>=1) { longSegments++; longCallbacks+=callbacks; longGain+=gain; }
+            else { shortCallbacks+=callbacks; shortGain+=gain; }
+            geometry=null; first=null; last=null; callbacks=0; gain=0; accelerationCallbacks=0; accelerationGain=0;
+        }
+        String finish(ScenarioDefinition.Fixture fixture) {
+            require(command==null,"Missing physical endpoint for last commanded callback");
+            require(geometry==null,"Unfinished measured geometry cannot be called a completed span");
+            require(longSegments==0 || longCallbacks<=8*longGain,"Aggregate long native pace exceeds eight callbacks/block");
+            require(fixture!=ScenarioDefinition.Fixture.SCALE_128 || longSegments>=26,"SCALE lacks real long-segment calibration");
+            return String.join("\n",rows)+"\nallC="+allCallbacks+"; allG="+allGain+"; rawAllRate="+(allCallbacks==0?"N/A":allCallbacks/allGain)
+                    +"; longSegments="+longSegments+"; longC="+longCallbacks+"; longG="+longGain+"; calibratedRate="+(longSegments==0?"N/A":longCallbacks/longGain)
+                    +"; shortC="+shortCallbacks+"; shortG="+shortGain+"; nonWalkStageCallbacks="+entryWaits+"; nonCommandedXWalkStageCallbacks="+walkWaits
+                    +"; rawPhaseCallbacks="+phaseCallbacks
+                    +"; originalPublicNoProgressHighwater="+highwater+"; witnessOrdinal="+highwaterOrdinal+"; marginTo40="+(40-highwater);
+        }
+    }
+
     private static void requireOrdinaryPhysics(Physics p) {
         require(p!=null && p.onGround() && !p.noGravity() && !p.noDrag() && !p.jumping() && !p.vehicle() && !p.fluid() && !p.water()
                 && !p.submerged() && !p.lava() && !p.climbing() && !p.gliding() && !p.swimming() && !p.sneaking()
@@ -279,6 +608,9 @@ final class TraversalAssertions {
         refused("foreign result run",() -> ScenarioRunner.requireResultIdentity(result,result,Set.of(UUID.randomUUID()),artifacts,definition));
         refused("foreign result evidence root",() -> ScenarioRunner.requireResultIdentity(result,result,Set.of(run),artifacts.resolve("foreign"),definition));
         refused("foreign result fixture",() -> ScenarioRunner.requireResultIdentity(result,result,Set.of(run),artifacts,ScenarioDefinition.load()));
+        refused("later successful run substituted for failed run",()->ScenarioRunner.requireResultIdentity(
+                new ScenarioRunner.ScenarioResult(UUID.randomUUID(),result.terminal(),definition.definitionHash(),"later",List.of(),artifacts),
+                result,Set.of(run),artifacts,definition));
         for (var fixture:ScenarioDefinition.Fixture.values()) {
             var admitted=ScenarioDefinition.load(fixture);
             require(admitted.finalUsable()==fixture.finalUsable,"Wrong pinned inventory delta: "+fixture);
@@ -309,7 +641,74 @@ final class TraversalAssertions {
         current.get(0).getAsJsonObject().addProperty("count",6);
         refused("wrong reserved stock with correct usable count",() -> ScenarioRunner.requireStock(current,baseline,127));
         verifyCaptureGuards(directory);
+        verifyNativeProofGuards();
         System.out.println("TraversalAssertions closed-fixture/oracle self-checks passed; not native traversal evidence");
+    }
+
+    private static void verifyNativeProofGuards() {
+        require(Pace.rate(1,.1,.1,true).equals("short; rawRate=10.0"),"Fractional native finish lost its raw rate");
+        require(Pace.rate(0,0,0,true).equals("N/A"),"Zero movement was claimed as calibration");
+        refused("short callbacks cannot round distance up",()->Pace.rate(2,.05,.05,true));
+        refused("zero-gain commanded walk",()->Pace.rate(1,0,.1,true));
+        refused("slow segment cannot hide in aggregate",()->Pace.rate(9,1,1,true));
+        refused("unfinished fractional span",()->Pace.rate(1,.1,.1,false));
+        var run=UUID.randomUUID();
+        var command=proofFrame(run,1,"END",.5,1,BuildEngine.ControlOwner.NATIVE,Phase.RUNNING,false);
+        var start=proofFrame(run,2,"START",.5,1,BuildEngine.ControlOwner.NATIVE,Phase.RUNNING,false);
+        var tail=proofFrame(run,2,"END",.6,0,BuildEngine.ControlOwner.NONE,Phase.TERMINAL,false);
+        Pace.endpoint(command,start,tail);
+        refused("true pause censors physics",()->Pace.endpoint(command,
+                proofFrame(run,2,"START",.5,0,BuildEngine.ControlOwner.NONE,Phase.PAUSED,true),tail));
+        refused("replacement censors physics",()->Pace.endpoint(command,start,
+                proofFrame(UUID.randomUUID(),2,"END",.6,0,BuildEngine.ControlOwner.NONE,Phase.TERMINAL,false)));
+        refused("missing endpoint pose",()->Pace.endpoint(command,start,new MotionFrame(tail.ordinal(),tail.tick(),tail.phase(),run,
+                tail.identities(),null,0,false,tail.owner(),tail.lifecycle(),null,null,null,2,0,null,0,0,null,null,null,null)));
+        refused("public stationary highwater9",()->Pace.publicCounter(9));
+        requireRepairEvidence(Set.of(1),Set.of(1),Set.of(1),Set.of(1),Set.of(1),Set.of(1));
+        refused("missing causal removal record",()->requireRepairEvidence(Set.of(1),Set.of(1),Set.of(1),Set.of(),Set.of(1),Set.of(1)));
+        refused("missing original native replacement action",()->requireRepairEvidence(Set.of(1),Set.of(),Set.of(1),Set.of(1),Set.of(1),Set.of(1)));
+        refused("missing server native replacement",()->requireRepairEvidence(Set.of(1),Set.of(1),Set.of(1),Set.of(1),Set.of(),Set.of(1)));
+        var actions=new Actions(run,Set.of(0,1));
+        actions.accept(new BuildEngine.PlacementEffectResult(run,1,0,91,BuildEngine.EffectStatus.ACCEPTED));
+        refused("reused run/action",()->actions.accept(new BuildEngine.PlacementEffectResult(run,1,1,92,BuildEngine.EffectStatus.ACCEPTED)));
+        refused("foreign action run",()->actions.accept(new BuildEngine.PlacementEffectResult(UUID.randomUUID(),2,0,93,BuildEngine.EffectStatus.ACCEPTED)));
+        refused("selected clean lane labeled BUILD",()->requireReverseBuild(ScenarioDefinition.Fixture.REVERSE_MULTI,2));
+        var definition=ScenarioDefinition.load(ScenarioDefinition.Fixture.REVERSE_EVEN);
+        var targets=new ArrayList<Target>();
+        definition.expectedTargets().forEach((position,state)->targets.add(new Target(targets.size(),position,state)));
+        var plan=new com.mapartrunner.core.model.BuildPlan("entry-guards",definition.fixture().dimensions(),targets);
+        var history=new ForwardHistory(ScenarioDefinition.Fixture.REVERSE_EVEN,plan);
+        refused("removal without retained forward END",()->history.requireRemoval(command));
+        history.accept(command);
+        refused("missing original forward END",()->history.accept(proofFrame(run,3,"END",.6,1,BuildEngine.ControlOwner.NATIVE,Phase.RUNNING,false)));
+        refused("foreign forward END",()->history.accept(proofFrame(UUID.randomUUID(),2,"END",.6,1,BuildEngine.ControlOwner.NATIVE,Phase.RUNNING,false)));
+        var lanes=new LanePlanner().plan(plan,2,5);
+        var before=proofTraversal(command,new Traversal(1,null,"REVERSE","NEXT_ENTRY",1,0,0,7,11,0,7,"EAST","ENTER_YAW",1,2,1,0,0,20,0,false),0.5,7.5);
+        var after=proofTraversal(tail,new Traversal(1,1,"REVERSE","LANE",1,0,0,7,11,0,7,"EAST","WALK",0,0,0,0,0,0,0,false),0.5,7.5);
+        requireForwardBeforeReverse(after.traversal(),lanes.size(),lanes.size());
+        refused("reverse label without full forward passage",()->requireForwardBeforeReverse(after.traversal(),lanes.size()-1,lanes.size()));
+        checkTraversalPair(before,after,lanes,definition.origin());
+        refused("correct Z wrong X",()->checkTraversalPair(before,proofTraversal(after,after.traversal(),5.5,7.5),lanes,definition.origin()));
+        var one=new Traversal(1,null,"REVERSE","NEXT_ENTRY",1,0,0,7,11,0,7,"EAST","ENTER_YAW",0,1,0,0,0,20,0,false);
+        refused("only one aligned yaw sample",()->checkTraversalPair(proofTraversal(before,one,.5,7.5),after,lanes,definition.origin()));
+        var hop=new Traversal(1,null,"REVERSE","ENDPOINT",1,0,0,7,0,0,7,"EAST","ENTER_POSITION",0,0,0,0,0,0,0,false);
+        refused("hop reset before centered entry",()->checkTraversalPair(proofTraversal(before,before.traversal(),5.5,7.5),
+                proofTraversal(after,hop,5.5,7.5),lanes,definition.origin()));
+    }
+
+    private static MotionFrame proofFrame(UUID run,long tick,String phase,double x,int keys,BuildEngine.ControlOwner owner,Phase lifecycle,boolean paused) {
+        var physics=new Physics(true,false,false,false,false,false,false,false,false,false,false,false,false,false,false,0,.08);
+        return new MotionFrame(tick*2,tick,phase,run,new Identities(1,2,3,4,1,2,3,4,true,true,true,true),
+                new Pose(x,66,2.5,0,-.0784000015258789,0,x,67.62,2.5,(int)tick,tick,-90,-90,-90,false,false,1,7,128,4.5,physics),
+                keys,paused,owner,lifecycle,Activity.BUILD,null,null,phase.equals("START")?tick-1:tick,0,null,0,0,null,1,null,null);
+    }
+
+    private static MotionFrame proofTraversal(MotionFrame value,Traversal traversal,double x,double z) {
+        var p=value.pose();
+        return new MotionFrame(value.ordinal(),value.tick(),value.phase(),value.runId(),value.identities(),
+                new Pose(x,p.y(),z,p.vx(),p.vy(),p.vz(),x,p.eyeY(),z,p.age(),p.worldTime(),p.yaw(),p.headYaw(),p.bodyYaw(),
+                        false,false,1,7,128,4.5,p.physics()),value.keys(),value.paused(),value.owner(),Phase.RUNNING,value.activity(),null,null,
+                value.eligible(),value.verify(),traversal,0,0,null,1,null,null);
     }
 
     private static void verifyCaptureGuards(Path directory) {
@@ -352,7 +751,7 @@ final class TraversalAssertions {
             var pose=new Pose(lane.start().x()+.5,66,lane.start().z()+.5,0,-.0784000015258789,0,
                     lane.start().x()+.5,67.62,lane.start().z()+.5,0,0,-90,-90,-90,false,false,1,7,64,4.5,physics);
             var ids=new Identities(1,2,3,4,1,2,3,4,true,true,true,true);
-            MotionFrame prior=null;
+            MotionFrame prior=null,retainedEnd=null;
             int pauseTicks=mutation.equals("valid")?3000:0;
             for(int tick=0;tick<=pauseTicks+25;tick++) {
                 for(String phase:tick==0?List.of("INITIAL"):List.of("START","END")) {
@@ -373,7 +772,19 @@ final class TraversalAssertions {
                                     pose.yaw(),pose.headYaw(),pose.bodyYaw(),false,false,1,7,64,4.5,physics),0,false,BuildEngine.ControlOwner.NONE,
                             terminal?Phase.TERMINAL:paused?Phase.PAUSED:Phase.RUNNING,decision>=4?Activity.VERIFY:Activity.BUILD,
                             terminal?Outcome.SUCCESS:null,terminal?BuildEngine.Reason.VERIFIED:null,eligible,terminal?1:0,terminal?null:traversal,0,0,null,44,null,null);
+                    var previous=retainedEnd;
                     capture.append(frame); prior=frame;
+                    if(end && previous!=null)
+                        refused("stale retained END identity",()->require(capture.isLatestEnd(previous),"Not latest END"));
+                    if(end) retainedEnd=frame;
+                    if(tick==1 && end) {
+                        require(capture.isLatestEnd(frame),"Original retained END refused");
+                        var equal=new MotionFrame(frame.ordinal(),frame.tick(),frame.phase(),frame.runId(),frame.identities(),frame.pose(),frame.keys(),
+                                frame.paused(),frame.owner(),frame.lifecycle(),frame.activity(),frame.outcome(),frame.reason(),frame.eligible(),frame.verify(),
+                                frame.traversal(),frame.pending(),frame.unfinished(),frame.effect(),frame.predictionSequence(),frame.fault0(),frame.fault1());
+                        require(equal.equals(frame),"Reference guard did not construct an equal record");
+                        refused("equal reconstructed END identity",()->require(capture.isLatestEnd(equal),"Not original END"));
+                    }
                     CheckpointKind kind=tick==0?CheckpointKind.INITIAL:!end?null:tick==pauseTicks+4?CheckpointKind.FIRST_VERIFY:
                             tick==pauseTicks+5 && !mutation.equals("absent-full")?CheckpointKind.TERMINAL:
                                     tick==pauseTicks+(mutation.equals("early-release")?24:25) && !mutation.equals("absent-release")?CheckpointKind.RELEASE_END:null;

@@ -10,6 +10,8 @@ public final class GroundedSmokeGameTest implements FabricClientGameTest {
     private static final List<String> PROVIDERS=List.of("environment-probe","single-lane","schematic-import","grounded-two-lane");
     private static final Selection REQUESTED=selection(System.getProperty("mapart.test.scenario"),System.getProperty("mapart.test.repeat"));
 
+    static int requestedRepeat() { return REQUESTED.repeat(); }
+
     static boolean selected(String provider) {
         verifySelectionGuards();
         boolean selected=REQUESTED.includes(provider);
