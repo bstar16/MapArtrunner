@@ -1944,8 +1944,17 @@ final class ScenarioRunner implements AutoCloseable {
                 forwardHistory.acceptServer(poll.end,poll.server);
                 var motion=poll.end.traversal();
                 if(!admitted.removalTargets().isEmpty() && !removalConsumed && motion!=null && motion.pass().equals("FORWARD")
-                        && motion.physicalIndex()==fixture.removalLane() && motion.substage().equals("LANE") && motion.stage().equals("WALK")
-                        && fixture.removalX(poll.end.pose().x()-origin.x())) applyTraversalRemoval(id,poll.end,stage);
+                        && motion.physicalIndex()==fixture.removalLane() && motion.substage().equals("LANE") && motion.stage().equals("WALK")) {
+                    var pair=poll;
+                    boolean ready=context.computeOnClient(c->{
+                        requireRemovalFrame(c,id,pair.end);
+                        require(pair.server.originalServer()==System.identityHashCode(server) && pair.server.originalPlayer()==System.identityHashCode(serverPlayer),
+                                "Removal admission lost the bound original server/player");
+                        return TraversalAssertions.removalReady(fixture,plan,origin,capture.latestEnd().orElse(null),pair.end,pair.server);
+                    });
+                    // NOT_YET spends only the next existing outer iteration and never consumes this one-shot.
+                    if(ready) applyTraversalRemoval(id,pair.end,stage);
+                }
                 if(capture.hasCheckpoint(CheckpointKind.FIRST_VERIFY) && !playerCheckpoints.contains(CheckpointKind.FIRST_VERIFY))
                     fullPlayerCheckpoint(CheckpointKind.FIRST_VERIFY);
             }

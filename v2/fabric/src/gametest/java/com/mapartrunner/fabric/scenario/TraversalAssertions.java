@@ -417,6 +417,36 @@ final class TraversalAssertions {
         }
     }
 
+    /** Geometric NOT_YET is ordinary lag; invalid original identity or full-state evidence is never deferred. */
+    static boolean removalReady(ScenarioDefinition.Fixture fixture,com.mapartrunner.core.model.BuildPlan plan,GridPos origin,
+                                MotionFrame latest,MotionFrame frame,ServerFrame server) {
+        require(frame!=null && frame==latest && frame.phase().equals("END") && frame.lifecycle()==Phase.RUNNING && !frame.paused()
+                && frame.pose()!=null && server!=null && server.runId().equals(frame.runId()) && server.followsClientOrdinal()==frame.ordinal(),
+                "Removal admission lacks the current original END/causal server pair");
+        var i=frame.identities();
+        require(i.worldMatches() && i.playerMatches() && i.handlerMatches() && i.connectionMatches()
+                && i.world()==i.originalWorld() && i.player()==i.originalPlayer() && i.handler()==i.originalHandler() && i.connection()==i.originalConnection()
+                && server.serverMatches() && server.playerMatches() && server.server()==server.originalServer() && server.player()==server.originalPlayer(),
+                "Removal admission has foreign native identities");
+        var t=frame.traversal();
+        require(fixture.removalLane()>=0 && t!=null && t.pass().equals("FORWARD") && t.substage().equals("LANE") && t.stage().equals("WALK")
+                && t.physicalIndex()==fixture.removalLane(),"Removal admission lacks the declared forward lane");
+        require(Double.isFinite(frame.pose().x()) && Double.isFinite(frame.pose().z()) && Double.isFinite(server.x()) && Double.isFinite(server.z()),
+                "Removal admission has nonfinite geometry");
+        var expected=new HashMap<Integer,BlockSpec>();
+        var positions=fixture.removals();
+        for(var target:plan.targets()) if(positions.contains(target.relativePos())) expected.put(target.id(),target.block());
+        require(expected.size()==positions.size(),"Removal admission lost imported fault targets");
+        requireFaultFacts(frame.fault0(),frame.fault1(),frame.runId(),expected.keySet(),frame.tick());
+        requireFaultFacts(server.fault0(),server.fault1(),frame.runId(),expected.keySet(),server.serverTick());
+        for(var fact:new TargetFact[]{frame.fault0(),frame.fault1(),server.fault0(),server.fault1()}) if(fact!=null)
+            require(fact.evidence()==Evidence.OBSERVED && expected.get(fact.targetId()).equals(fact.state()),
+                    "Removal admission lacks original FULL/OBSERVED expected fault state");
+        double center=origin.z()+t.startZ()+.5;
+        return fixture.removalX(frame.pose().x()-origin.x()) && fixture.removalX(server.x()-origin.x())
+                && near(frame.pose().z(),center) && near(server.z(),center);
+    }
+
     record Removal(UUID runId,int targetId,GridPos relative,MotionFrame frame,ServerFrame server,long mutationTick,long mutationTime,int mutationAge,
                    double eyeX,double eyeY,double eyeZ,BlockSpec before,BlockSpec after) { }
 
@@ -646,6 +676,7 @@ final class TraversalAssertions {
     }
 
     private static void verifyNativeProofGuards() {
+        verifyRemovalAdmissionGuards();
         require(Pace.rate(1,.1,.1,true).equals("short; rawRate=10.0"),"Fractional native finish lost its raw rate");
         require(Pace.rate(0,0,0,true).equals("N/A"),"Zero movement was claimed as calibration");
         refused("short callbacks cannot round distance up",()->Pace.rate(2,.05,.05,true));
@@ -701,6 +732,76 @@ final class TraversalAssertions {
         return new MotionFrame(tick*2,tick,phase,run,new Identities(1,2,3,4,1,2,3,4,true,true,true,true),
                 new Pose(x,66,2.5,0,-.0784000015258789,0,x,67.62,2.5,(int)tick,tick,-90,-90,-90,false,false,1,7,128,4.5,physics),
                 keys,paused,owner,lifecycle,Activity.BUILD,null,null,phase.equals("START")?tick-1:tick,0,null,0,0,null,1,null,null);
+    }
+
+    /** Pure oracle cases, including the failed native pair's numbers; these are not native evidence. */
+    private static void verifyRemovalAdmissionGuards() {
+        var run=UUID.fromString("8512a184-7ed7-4248-9647-e841f9192517");
+        var origin=new GridPos(0,65,0); var stone=new BlockSpec("minecraft:stone",Map.of());
+        for(var fixture:List.of(ScenarioDefinition.Fixture.REVERSE_ODD,ScenarioDefinition.Fixture.REVERSE_MULTI,ScenarioDefinition.Fixture.REVERSE_EVEN)) {
+            var targets=new ArrayList<Target>();
+            fixture.removals().stream().sorted(Comparator.comparingInt(GridPos::z)).forEach(p->targets.add(new Target(65+120*targets.size(),p,stone)));
+            var plan=new com.mapartrunner.core.model.BuildPlan("removal-admission-guard",fixture.dimensions(),targets);
+            boolean west=fixture==ScenarioDefinition.Fixture.REVERSE_EVEN;
+            double z=west?17.5:fixture==ScenarioDefinition.Fixture.REVERSE_ODD?12.48962540857878:22.5;
+            double clientX=west?3.4:8.191650965010895,serverX=west?3.6:7.975791896643505;
+            var frame=removalGuardFrame(fixture,plan,run,645,215,clientX,z);
+            var lag=removalGuardServer(plan,frame,run,serverX,z,645,Evidence.OBSERVED);
+            require(!removalReady(fixture,plan,origin,frame,frame,lag),"Client-only passage consumed a premature "+fixture+" fault");
+            var ready=removalGuardServer(plan,frame,run,clientX,z,645,Evidence.OBSERVED);
+            require(removalReady(fixture,plan,origin,frame,frame,ready),"Both original points ready refused: "+fixture);
+            var clientLag=removalGuardFrame(fixture,plan,run,645,215,serverX,z);
+            require(!removalReady(fixture,plan,origin,clientLag,clientLag,ready),"Server-only passage admitted a fault");
+            require(!removalReady(fixture,plan,origin,frame,frame,removalGuardServer(plan,frame,run,clientX,z+.3,645,Evidence.OBSERVED)),
+                    "Wrong server center admitted a fault");
+            var offCenter=removalGuardFrame(fixture,plan,run,645,215,clientX,z+.3);
+            require(!removalReady(fixture,plan,origin,offCenter,offCenter,ready),"Wrong client center admitted a fault");
+            var later=removalGuardFrame(fixture,plan,run,648,216,west?3.2:8.407510033378285,z);
+            require(removalReady(fixture,plan,origin,later,later,removalGuardServer(plan,later,run,clientX,z,648,Evidence.OBSERVED)),
+                    "A new original pair cannot become ready after ordinary lag");
+            refused("stale removal admission pair",()->removalReady(fixture,plan,origin,later,frame,ready));
+            var equal=removalGuardFrame(fixture,plan,run,645,215,clientX,z);
+            require(equal.equals(frame),"Admission reference guard must hold equal values");
+            refused("reconstructed removal END",()->removalReady(fixture,plan,origin,frame,equal,ready));
+            refused("foreign removal server run",()->removalReady(fixture,plan,origin,frame,frame,
+                    removalGuardServer(plan,frame,UUID.randomUUID(),clientX,z,645,Evidence.OBSERVED)));
+            refused("mismatched removal causal ordinal",()->removalReady(fixture,plan,origin,frame,frame,
+                    removalGuardServer(plan,frame,run,clientX,z,642,Evidence.OBSERVED)));
+            var foreign=new ServerFrame(ready.ordinal(),run,ready.originalServer(),ready.originalPlayer(),9,ready.player(),false,true,
+                    ready.serverTick(),ready.worldTime(),ready.age(),ready.x(),ready.y(),ready.z(),ready.vx(),ready.vy(),ready.vz(),ready.yaw(),
+                    ready.flying(),ready.sprinting(),ready.selectedSlot(),ready.reserved(),ready.usable(),ready.controls(),ready.followsClientOrdinal(),
+                    ready.interactionReach(),ready.physics(),ready.fault0(),ready.fault1());
+            refused("foreign native removal server",()->removalReady(fixture,plan,origin,frame,frame,foreign));
+            for(var evidence:List.of(Evidence.UNKNOWN,Evidence.PREDICTED))
+                refused("invalid fault evidence cannot defer behind lag",()->removalReady(fixture,plan,origin,frame,frame,
+                        removalGuardServer(plan,frame,run,serverX,z,645,evidence)));
+        }
+    }
+
+    private static MotionFrame removalGuardFrame(ScenarioDefinition.Fixture fixture,com.mapartrunner.core.model.BuildPlan plan,
+                                                 UUID run,long ordinal,long tick,double x,double z) {
+        int lane=fixture.removalLane(),center=2+5*lane; boolean west=fixture==ScenarioDefinition.Fixture.REVERSE_EVEN;
+        var traversal=new Traversal(lane,lane,"FORWARD","LANE",lane,west?11:0,0,center,west?0:11,0,center,
+                west?"WEST":"EAST","WALK",0,0,0,0,0,0,0,false);
+        var value=proofTraversal(proofFrame(run,tick,"END",x,1,BuildEngine.ControlOwner.NATIVE,Phase.RUNNING,false),traversal,x,z);
+        var p=value.pose(); float yaw=west?90:-90;
+        var pose=new Pose(p.x(),p.y(),p.z(),p.vx(),p.vy(),p.vz(),p.eyeX(),p.eyeY(),p.eyeZ(),p.age(),p.worldTime(),yaw,yaw,yaw,
+                p.flying(),p.sprinting(),p.selectedSlot(),p.reserved(),p.usable(),p.interactionReach(),p.physics());
+        return new MotionFrame(ordinal,tick,value.phase(),run,value.identities(),pose,value.keys(),value.paused(),value.owner(),
+                value.lifecycle(),value.activity(),value.outcome(),value.reason(),value.eligible(),value.verify(),traversal,0,0,null,1,
+                removalGuardFact(plan,0,run,tick,Evidence.OBSERVED),removalGuardFact(plan,1,run,tick,Evidence.OBSERVED));
+    }
+
+    private static TargetFact removalGuardFact(com.mapartrunner.core.model.BuildPlan plan,int index,UUID run,long tick,Evidence evidence) {
+        return index>=plan.targets().size()?null:new TargetFact(run,plan.targets().get(index).id(),null,tick,evidence,plan.targets().get(index).block());
+    }
+
+    private static ServerFrame removalGuardServer(com.mapartrunner.core.model.BuildPlan plan,MotionFrame frame,UUID run,
+                                                  double x,double z,long follows,Evidence evidence) {
+        long tick=frame.tick()+17;
+        return new ServerFrame(frame.ordinal()+1,run,5,6,5,6,true,true,tick,tick,(int)tick,x,66,z,0,-.0784000015258789,0,
+                frame.pose().yaw(),false,false,1,7,127,1,follows,4.5,frame.pose().physics(),
+                removalGuardFact(plan,0,run,tick,evidence),removalGuardFact(plan,1,run,tick,evidence));
     }
 
     private static MotionFrame proofTraversal(MotionFrame value,Traversal traversal,double x,double z) {
