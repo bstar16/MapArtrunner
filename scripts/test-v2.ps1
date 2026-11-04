@@ -104,6 +104,13 @@ function New-V2Environment {
     }
 }
 
+function Resolve-V2GameEnvironment {
+    param($Jdk, $Request, [ValidateSet('ordinary','controlled',IgnoreCase=$false)][string]$InternalSupportCase='ordinary')
+    $environment=New-V2Environment -Jdk $Jdk -WrongExpectedBlock:($Request.WrongExpectedBlock)
+    if ($InternalSupportCase -ceq 'controlled') { $environment.MAPART_TWO_LANE_SUPPORT_CASE='controlled' }
+    $environment
+}
+
 function Get-V2TraversalTimeoutMilliseconds {
     param([object[]]$RunTicks, [int]$Repeat)
     if ($Repeat -notin 1,2 -or $RunTicks.Count -ne 7) { throw 'Expected seven traversal budgets and Repeat1/2.' }
@@ -377,8 +384,19 @@ function Invoke-V2Supervisor {
     param([scriptblock]$Worker, [hashtable]$Environment=@{}, [string]$EvidenceRoot,
         [string]$WorkingDirectory, [int]$TimeoutMilliseconds=600000,
         [string]$WorkerExecutable=(Join-Path $PSHOME pwsh.exe), [scriptblock]$Archive={}, $Request=$null,
-        [switch]$RequireGame, [ValidateRange(1,2147483647)][int]$StartupMilliseconds=600000)
+        [switch]$RequireGame, [ValidateRange(1,2147483647)][int]$StartupMilliseconds=600000,
+        [ValidateSet('ordinary','controlled',IgnoreCase=$false)][string]$InternalSupportCase='ordinary')
     $ErrorActionPreference='Stop'
+    if ($InternalSupportCase -ceq 'controlled') {
+        $canonical=New-V2Request -Scenario grounded-two-lane -Repeat 2 -EulaAccepted
+        if (!$RequireGame -or $Request -isnot [pscustomobject] -or $Request.Scenario -isnot [string] -or $Request.Scenario -cne $canonical.Scenario -or
+            $Request.Repeat -isnot [int] -or $Request.Repeat -ne 2 -or $Request.WrongExpectedBlock -isnot [bool] -or
+            $Request.WrongExpectedBlock -or $Request.EulaProvenance -cnotin 'operator-switch','process MAPART_TEST_EULA_ACCEPTED=1' -or
+            @($Request.Arguments).Count -ne $canonical.Arguments.Count) { throw 'Controlled support requires RequireGame and the canonical grounded-two-lane Repeat2 request without WrongExpectedBlock.' }
+        for ($i=0; $i -lt $canonical.Arguments.Count; $i++) {
+            if ($Request.Arguments[$i] -isnot [string] -or $Request.Arguments[$i] -cne $canonical.Arguments[$i]) { throw 'Controlled support requires the canonical ordered argument vector.' }
+        }
+    }
     $dummyStartup=$PSBoundParameters.ContainsKey('StartupMilliseconds')
     if ($RequireGame -and $dummyStartup) { throw 'Startup override is dummy-only; real startup is always600000ms.' }
     if ($TimeoutMilliseconds -le 0) { throw 'Whole invocation timeout must be positive.' }
@@ -405,12 +423,12 @@ function Invoke-V2Supervisor {
             $jdkArguments=@{}
             if ($Request.PSObject.Properties['JavaHome']) { $jdkArguments.JavaHome=$Request.JavaHome }
             $jdk=Find-V2Jdk @jdkArguments
-            $Environment=New-V2Environment -Jdk $jdk -WrongExpectedBlock:($Request.WrongExpectedBlock)
+            $Environment=Resolve-V2GameEnvironment $jdk $Request $InternalSupportCase
             $wrapper=Join-Path $WorkingDirectory gradlew.bat
             if (!(Test-Path -LiteralPath $wrapper -PathType Leaf)) { throw "Repository wrapper missing: $wrapper" }
-            $Request | Add-Member Jdk $jdk
-            $Request | Add-Member Wrapper $wrapper
-            $Request | Add-Member ScenarioInventoryBefore $before
+            $Request | Add-Member Jdk $jdk -Force
+            $Request | Add-Member Wrapper $wrapper -Force
+            $Request | Add-Member ScenarioInventoryBefore $before -Force
             $workerText='& ' + "'" + $wrapper.Replace("'","''") + "' " + (($Request.Arguments | ForEach-Object { "'" + $_.Replace("'","''") + "'" }) -join ' ') + "`n`$nativeExit=`$LASTEXITCODE`nexit `$nativeExit"
             $Worker=[scriptblock]::Create($workerText)
             $Archive={ param($evidence,$before) Save-V2Artifacts -Evidence $evidence -Game $game -ScenarioRoot $EvidenceRoot -Before $before -Owner $WorkingDirectory }
@@ -422,9 +440,11 @@ function Invoke-V2Supervisor {
         $Environment.MAPART_TEST_LAUNCH_ID=$null; $Environment.MAPART_TEST_LAUNCH_DIR=$null
         if ($requiresReceipt) {
             $Environment.MAPART_TEST_LAUNCH_ID=$launchId; $Environment.MAPART_TEST_LAUNCH_DIR=$evidence
-            if (!$Request) { $Request=[pscustomobject]@{Scenario='all';Repeat=2} }
         }
-        if ($Request) { $Request | Add-Member ChildEnvironment $Environment -Force }
+        if (!$Request) { $Request=[pscustomobject]@{Scenario='all';Repeat=2} }
+        $Request | Add-Member SupportCase $InternalSupportCase -Force
+        $Request | Add-Member SupportCaseSource $(if ($InternalSupportCase -ceq 'controlled') {'internal-reviewed-controlled-support'} else {'ordinary-default'}) -Force
+        $Request | Add-Member ChildEnvironment $Environment -Force
         [int]$deadlineMilliseconds=$TimeoutMilliseconds
         $marker=[Text.Encoding]::UTF8.GetBytes($evidence); $lock.Write($marker); $lock.Flush($true)
         $result=[pscustomobject]@{ Evidence=$evidence; LaunchId=$launchId; StartedUtc=[DateTime]::UtcNow.ToString('o'); DeadlineMilliseconds=$deadlineMilliseconds

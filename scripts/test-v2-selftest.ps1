@@ -375,6 +375,128 @@ $text=$receipt | ConvertTo-Json -Compress
         if ($Outcome.CleanupStatus -ne 'settled') { throw 'HOLD: startup regression ownership unresolved; no more launches.' }
         Assert ($Outcome.ArchiveStatus -eq 'retained') 'startup evidence archive failed'
     }
+    Run 'controlled support rejects noncanonical requests before JDK or worker construction' {
+        $originalJdk=${function:Find-V2Jdk}; $originalInfo=${function:New-V2ProcessInfo}
+        $calls=@{Jdk=0;Worker=0}; $proof=[Collections.Generic.List[object]]::new()
+        try {
+            Set-Item Function:Find-V2Jdk -Value { $calls.Jdk++; throw 'Unexpected JDK probe in rejected support request.' }
+            Set-Item Function:New-V2ProcessInfo -Value { $calls.Worker++; throw 'Unexpected worker construction in rejected support request.' }
+            $cases=@(
+                @{Name='without-game';Game=$false}, @{Name='null-request';Change={ $request=$null }},
+                @{Name='all';Change={ $request.Scenario='all' }}, @{Name='scenario-case';Change={ $request.Scenario='GROUNDED-TWO-LANE' }},
+                @{Name='scenario-array';Change={ $request.Scenario=@('grounded-two-lane') }},
+                @{Name='repeat1';Change={ $request.Repeat=1 }}, @{Name='repeat-string';Change={ $request.Repeat='2' }},
+                @{Name='wrong-block';Change={ $request.WrongExpectedBlock=$true }}, @{Name='wrong-string';Change={ $request.WrongExpectedBlock='false' }},
+                @{Name='wrong-missing';Change={ $request.PSObject.Properties.Remove('WrongExpectedBlock') }},
+                @{Name='eula-missing';Change={ $request.PSObject.Properties.Remove('EulaProvenance') }},
+                @{Name='arguments-missing';Change={ $request.Arguments=$request.Arguments[0..5] }},
+                @{Name='arguments-extra';Change={ $request.Arguments+='-Pmapart.test.repeat=2' }},
+                @{Name='arguments-duplicate';Change={ $request.Arguments+=$request.Arguments[-1] }},
+                @{Name='arguments-reordered';Change={ $request.Arguments[0]='v2'; $request.Arguments[1]='-p' }},
+                @{Name='arguments-case';Change={ $request.Arguments[-1]='-Pmapart.test.scenario=GROUNDED-TWO-LANE' }},
+                @{Name='support-case';Support='CONTROLLED'}, @{Name='support-unknown';Support='other'})
+            foreach ($case in $cases) {
+                $request=New-V2Request -Scenario grounded-two-lane -Repeat 2 -EulaAccepted
+                if ($case.Change) { . $case.Change }
+                $arguments=@{RequireGame=($case.Game -ne $false);Request=$request;InternalSupportCase='controlled'
+                    EvidenceRoot=(Join-Path $testRoot ('support-invalid-'+$case.Name));WorkingDirectory=$repo;Worker={ exit 0 }}
+                if ($case.Support) { $arguments.InternalSupportCase=$case.Support }
+                $rejected=$false
+                try { Invoke-V2Supervisor @arguments | Out-Null } catch { $rejected=$true }
+                $proof.Add(@{Name=$case.Name;Rejected=$rejected;JdkCalls=$calls.Jdk;WorkerCalls=$calls.Worker})
+                Assert ($rejected -and !$calls.Jdk -and !$calls.Worker) "support request reached subprocess boundary: $($case.Name)"
+            }
+            Reject { . (Join-Path $PSScriptRoot 'test-v2.ps1') -InternalSupportCase controlled -EulaAccepted } 'public controlled flag accepted'
+        } finally {
+            Set-Item Function:Find-V2Jdk -Value $originalJdk
+            Set-Item Function:New-V2ProcessInfo -Value $originalInfo
+            $proof | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $testRoot 'support-admission-proof.json')
+        }
+    }
+    Run 'shared support resolver transports controlled then clears ordinary in real dummy children' {
+        $names=@('MAPART_PROBE_WRONG_EXPECTED_BLOCK','MAPART_WITHHELD_OBSERVATION_EXPECT_SUCCESS','MAPART_STATE_FAULT_FORCE_TARGET_RELOAD',
+            'MAPART_TWO_LANE_SUPPORT_CASE','MAPART_TWO_LANE_WRONG_EXPECTED_BLOCK','MAPART_TEST_LAUNCH_ID','MAPART_TEST_LAUNCH_DIR','JAVA_TOOL_OPTIONS')
+        Invoke-V2EnvironmentFixture $names {
+            foreach ($name in $names[0..6]) { [Environment]::SetEnvironmentVariable($name,'controlled') }
+            $env:JAVA_TOOL_OPTIONS='-Doperator.diagnostic=support-transport'
+            $before=[Environment]::GetEnvironmentVariables().Clone(); $proof=[Collections.Generic.List[object]]::new()
+            $previousLaunch=$null
+            foreach ($support in 'controlled','ordinary') {
+                $request=New-V2Request -Scenario grounded-two-lane -Repeat 2 -EulaAccepted
+                $childEnv=Resolve-V2GameEnvironment $actualJdk $request $support
+                $ordinary=New-V2Environment -Jdk $actualJdk
+                Assert ($childEnv.Count -eq $ordinary.Count) 'resolver introduced another environment override'
+                foreach ($key in $ordinary.Keys) {
+                    if ($key -ne 'MAPART_TWO_LANE_SUPPORT_CASE') { Assert ($childEnv[$key] -ceq $ordinary[$key]) "resolver changed ordinary environment: $key" }
+                }
+                $change=@'
+$receipt.scenario='grounded-two-lane'; $receipt.provider='grounded-two-lane'
+Write-Output ('TRANSPORT='+(@{support=$env:MAPART_TWO_LANE_SUPPORT_CASE;launchId=$env:MAPART_TEST_LAUNCH_ID;launchDir=$env:MAPART_TEST_LAUNCH_DIR;probe=$env:MAPART_PROBE_WRONG_EXPECTED_BLOCK;observation=$env:MAPART_WITHHELD_OBSERVATION_EXPECT_SUCCESS;state=$env:MAPART_STATE_FAULT_FORCE_TARGET_RELOAD;wrong=$env:MAPART_TWO_LANE_WRONG_EXPECTED_BLOCK;options=$env:JAVA_TOOL_OPTIONS;home=$env:JAVA_HOME} | ConvertTo-Json -Compress))
+'@
+                $outcome=Invoke-V2Supervisor -Worker (New-V2ReceiptWorker $change 1000) -Environment $childEnv -Request $request -EvidenceRoot $testRoot -WorkingDirectory $repo -TimeoutMilliseconds 6000 -StartupMilliseconds 3000
+                Assert-V2Settled $outcome
+                Assert ($outcome.ExitCode -eq 0 -and $outcome.WorkerExitCode -eq 0 -and $outcome.ReceiptStatus -ceq 'Accepted') 'support dummy transport failed'
+                $line=Get-Content (Join-Path $outcome.Evidence 'launch.stdout.log') | Where-Object { $_.StartsWith('TRANSPORT=') }
+                Assert (@($line).Count -eq 1) 'actual dummy transport output missing'
+                $data=$line.Substring(10) | ConvertFrom-Json
+                Assert ($data.support -ceq $(if($support -ceq 'controlled'){'controlled'}else{$null})) 'actual child selector incorrect'
+                Assert (!$data.probe -and !$data.observation -and !$data.state -and !$data.wrong) 'other fault selector leaked'
+                Assert ($data.home -ceq $actualJdk.Home -and $data.options -match 'operator.diagnostic=support-transport') 'JDK/operator options lost'
+                Assert ($data.launchId -ceq $outcome.LaunchId -and $data.launchDir -ceq $outcome.Evidence -and $data.launchId -cne $previousLaunch) 'fresh child challenge incorrect'
+                $saved=Get-Content (Join-Path $outcome.Evidence 'request.json') -Raw | ConvertFrom-Json
+                Assert ($saved.Request.ChildEnvironment.MAPART_TWO_LANE_SUPPORT_CASE -ceq $data.support -and $saved.Request.ChildEnvironment.MAPART_TEST_LAUNCH_ID -ceq $data.launchId -and $saved.Request.ChildEnvironment.MAPART_TEST_LAUNCH_DIR -ceq $data.launchDir) 'recorded environment differs from actual child'
+                Assert ($saved.Request.SupportCase -ceq 'ordinary' -and $saved.Request.SupportCaseSource -ceq 'ordinary-default') 'dummy falsely claimed private controlled admission'
+                Assert ($outcome.StartIdentity.Pid -eq $outcome.WorkerPid -and !$outcome.NativeGameExitCodes.Count -and (Get-Item (Join-Path $testRoot 'supervisor.lock')).Length -eq 0) 'dummy ownership/lock evidence incorrect'
+                $previousLaunch=$data.launchId; $proof.Add(@{ResolverCase=$support;Evidence=$outcome.Evidence;ActualChild=$data;Request=$saved.Request})
+            }
+            $after=[Environment]::GetEnvironmentVariables()
+            Assert ($before.Count -eq $after.Count) 'support transport changed parent membership'
+            foreach ($key in $before.Keys) { Assert ($after.Contains($key) -and $before[$key] -ceq $after[$key]) "support transport changed parent: $key" }
+            @{Calls=@($proof);ParentCompared=$true;ParentCount=$before.Count} | ConvertTo-Json -Depth 12 | Set-Content (Join-Path $testRoot 'support-child-transport-proof.json')
+        }
+    }
+    Run 'RequireGame support replacement preserves override and appends fresh identity before constructor sentinel' {
+        $names=@('MAPART_TWO_LANE_SUPPORT_CASE','MAPART_PROBE_WRONG_EXPECTED_BLOCK','MAPART_TEST_LAUNCH_ID','MAPART_TEST_LAUNCH_DIR')
+        Invoke-V2EnvironmentFixture $names {
+            foreach ($name in $names) { [Environment]::SetEnvironmentVariable($name,'controlled') }
+            $before=[Environment]::GetEnvironmentVariables().Clone(); $proof=[Collections.Generic.List[object]]::new()
+            $request=New-V2Request -Scenario grounded-two-lane -Repeat 2 -EulaAccepted
+            $previousLaunch=$null
+            foreach ($support in 'controlled','default','ordinary') {
+                $root=Join-Path $testRoot ('support-constructor-'+$support)
+                $sentinel='Task15 pre-spawn support sentinel '+[guid]::NewGuid(); $capture=@{Calls=0}; $caught=$null
+                $originalInfo=${function:New-V2ProcessInfo}
+                try {
+                    Set-Item Function:New-V2ProcessInfo -Value {
+                        param($Executable,$WorkingDirectory,$Command,$Environment)
+                        $capture.Calls++; $capture.Environment=@{}+$Environment; $capture.Evidence=$evidence
+                        $capture.Request=Get-Content (Join-Path $evidence 'request.json') -Raw | ConvertFrom-Json
+                        throw $sentinel
+                    }
+                    $arguments=@{RequireGame=$true;Request=$request;EvidenceRoot=$root;WorkingDirectory=$repo
+                        Environment=@{MAPART_TWO_LANE_SUPPORT_CASE='controlled';MAPART_PROBE_WRONG_EXPECTED_BLOCK='1';MAPART_TEST_LAUNCH_ID='caller';MAPART_TEST_LAUNCH_DIR='caller';CALLER_SUPPORT_ONLY='discard'}}
+                    if ($support -cne 'default') { $arguments.InternalSupportCase=$support }
+                    try { Invoke-V2Supervisor @arguments | Out-Null } catch { $caught=$_.Exception.Message }
+                } finally { Set-Item Function:New-V2ProcessInfo -Value $originalInfo }
+                Assert ($caught -ceq $sentinel -and $capture.Calls -eq 1) 'support constructor sentinel was not reached exactly once'
+                $saved=$capture.Request; $expected=$(if($support -ceq 'controlled'){'controlled'}else{'ordinary'})
+                Assert ($saved.Request.SupportCase -ceq $expected -and $saved.Request.SupportCaseSource -ceq $(if($expected -ceq 'controlled'){'internal-reviewed-controlled-support'}else{'ordinary-default'})) 'support request provenance stale/incorrect'
+                Assert ($capture.Environment.MAPART_TWO_LANE_SUPPORT_CASE -ceq $(if($expected -ceq 'controlled'){'controlled'}else{$null})) 'RequireGame replacement erased override or ordinary inherited controlled'
+                Assert (!$capture.Environment.MAPART_PROBE_WRONG_EXPECTED_BLOCK -and !$capture.Environment.ContainsKey('CALLER_SUPPORT_ONLY')) 'caller environment bypassed replacement'
+                Assert ($saved.Request.Jdk.JavaVersion -match '(?m)^(?:openjdk|java) version "21\.' -and $capture.Environment.JAVA_HOME -ceq $saved.Request.Jdk.Home) 'real JDK discovery not retained'
+                Assert ($saved.LaunchId -cne 'caller' -and $saved.LaunchId -cne 'controlled' -and $saved.LaunchId -cne $previousLaunch -and $capture.Environment.MAPART_TEST_LAUNCH_ID -ceq $saved.LaunchId -and $capture.Environment.MAPART_TEST_LAUNCH_DIR -ceq $capture.Evidence) 'fresh supervisor launch pair incorrect'
+                foreach ($key in $capture.Environment.Keys) { Assert ($saved.Request.ChildEnvironment.$key -ceq $capture.Environment[$key]) "final request environment differs: $key" }
+                Assert (!$saved.WorkerPid -and $saved.CleanupStatus -ceq 'unresolved' -and $saved.ArchiveStatus -ceq 'pending') 'pre-spawn negative falsely claimed settlement'
+                Assert ((Get-Content (Join-Path $root 'supervisor.lock') -Raw) -ceq $capture.Evidence) 'isolated unresolved marker not retained'
+                foreach ($name in 'worker-assigned','outcome.json','launch.stdout.log','test-start.json') { Assert (!(Test-Path (Join-Path $capture.Evidence $name))) "constructor negative unexpectedly advanced: $name" }
+                $previousLaunch=$saved.LaunchId; $proof.Add(@{Case=$support;Caught=$caught;Capture=$capture})
+            }
+            $after=[Environment]::GetEnvironmentVariables()
+            Assert ($before.Count -eq $after.Count) 'RequireGame construction changed parent membership'
+            foreach ($key in $before.Keys) { Assert ($after.Contains($key) -and $before[$key] -ceq $after[$key]) "RequireGame construction changed parent: $key" }
+            @{Calls=@($proof);ParentCompared=$true;ParentCount=$before.Count;NoWorkerStarted=$true;ExpectedUnresolvedMarkers=3} | ConvertTo-Json -Depth 16 | Set-Content (Join-Path $testRoot 'support-constructor-proof.json')
+        }
+    }
     Run 'missing receipt, worker0 and JVM-looking logs never prove selected execution' {
         $request=New-V2Request -EulaAccepted
         $missing=Invoke-V2Supervisor -Worker { Start-Sleep -Seconds 30 } -Request $request -EvidenceRoot $testRoot -WorkingDirectory $repo -TimeoutMilliseconds 5000 -StartupMilliseconds 40
