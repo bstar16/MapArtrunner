@@ -744,8 +744,10 @@ final class TraversalAssertions {
     private static Sealed guardTrace(Path directory,com.mapartrunner.core.model.BuildPlan plan,String mutation) {
         var run=UUID.randomUUID();
         try {
-            var capture=new TraversalCapture(directory,run,Limits.forRun(3100,20,plan.targets().size(),1),
-                    mutation.equals("invalid-replacement")?Set.of(0):Set.of());
+            var limits=Limits.forRun(3100,20,plan.targets().size(),1);
+            var outputs=new OutputBudget(directory,limits);
+            var capture=new TraversalCapture(directory,run,limits,
+                    mutation.equals("invalid-replacement")?Set.of(0):Set.of(),outputs);
             var physics=new Physics(true,false,false,false,false,false,false,false,false,false,false,false,false,false,false,0,.08);
             var lane=new LanePlanner().plan(plan,2,5).getFirst();
             var pose=new Pose(lane.start().x()+.5,66,lane.start().z()+.5,0,-.0784000015258789,0,
@@ -795,7 +797,12 @@ final class TraversalAssertions {
                 capture.append(new ServerFrame(capture.nextOrdinal(),run,5,6,5,6,true,true,tick,tick,tick,pose.x(),pose.y(),pose.z(),0,0,0,-90,
                         false,false,1,7,64,0,prior.ordinal(),4.5,physics,fault,null));
             }
-            return capture.seal();
+            if(mutation.equals("valid")) try(var region=outputs.open(OutputKind.REGION,"reference-region.txt")) {
+                region.write("synthetic reference region".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            }
+            var sealed=capture.seal();
+            if(mutation.equals("valid")) ScenarioRunner.verifyPhaseReferenceGuards(directory,outputs,sealed,run);
+            return sealed;
         } catch(IOException error) { throw new UncheckedIOException(error); }
     }
 

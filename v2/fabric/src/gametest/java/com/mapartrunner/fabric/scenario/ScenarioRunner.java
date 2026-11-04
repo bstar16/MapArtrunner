@@ -147,8 +147,13 @@ final class ScenarioRunner implements AutoCloseable {
     private Limits captureLimits;
     private Sealed sealed;
     private boolean compactCommitted;
-    private boolean commitMarker;
     private Throwable compactArchiveFailure;
+    private Throwable compactOriginalFailure;
+    private int compactBudgetOrdinal;
+    private CompactOwner compactOwner;
+    private Map<String,CompactFile> compactFiles=Map.of();
+    private record CompactOwner(OutputBudget budget,Sealed trace,UUID run,UUID invocation,int ordinal) { }
+    private record CompactFile(String path,long bytes,String sha256) { }
     private final EnumSet<CheckpointKind> playerCheckpoints=EnumSet.noneOf(CheckpointKind.class);
     private List<GridPos> regionOrder=List.of();
     private Map<GridPos,BuildPlan.BlockSpec> finalTargets=Map.of();
@@ -208,6 +213,7 @@ final class ScenarioRunner implements AutoCloseable {
         var directory=artifacts.resolve("capture-"+ordinal); checkedDirectory(roots,directory);
         try { outputs=new OutputBudget(directory,captureLimits); }
         catch(IOException error) { throw new UncheckedIOException(error); }
+        compactBudgetOrdinal=ordinal;
     }
 
     private boolean baseline() { return fixture==ScenarioDefinition.Fixture.TWO_LANE; }
@@ -437,7 +443,7 @@ final class ScenarioRunner implements AutoCloseable {
             MapArtClient.stop();
             requireReleased(c);
             // Copy before clear/arm: both owners retain diagnostics across stop.
-            if(!baseline() && capture!=null && sealed==null) { prepareCompactSeal(); sealed=watch.sealTraversal(); }
+            if(!baseline() && capture!=null && sealed==null) sealed=watch.sealTraversal();
             return new Prior(MapArtClient.status(), baseline()?watch.copy():List.of(), PredictionFaults.snapshot(), PredictionFaults.stateSnapshot(),sealed);
         });
         var stage = artifacts.resolve("reset-" + (++resetOrdinal));
@@ -452,9 +458,10 @@ final class ScenarioRunner implements AutoCloseable {
             context.runOnClient(c -> { requireClient(c); PredictionFaults.clear(); watch.clear(); });
             if(!baseline()) {
                 boolean priorRun=capture!=null;
-                capture=null; sealed=null; compactCommitted=false; commitMarker=false; playerCheckpoints.clear(); scalarOrdinal=0;
+                // Prior references keep their old budget/ordinal until archive validation and owner clear finish.
+                capture=null; sealed=null; compactCommitted=false; playerCheckpoints.clear(); scalarOrdinal=0;
                 removals.clear(); forwardHistory=null; removalConsumed=false; lastTraversalServer=null;
-                if(priorRun) initializeCompactBudget(resetOrdinal);
+                if(priorRun) { compactOwner=null; compactFiles=Map.of(); initializeCompactBudget(resetOrdinal); }
                 regionOrder=definition.worldCells().keySet().stream().sorted(Comparator.comparingInt(GridPos::x)
                         .thenComparingInt(GridPos::y).thenComparingInt(GridPos::z)).toList();
             }
@@ -1239,7 +1246,12 @@ final class ScenarioRunner implements AutoCloseable {
 
     /** Throwable writes fail at the real byte cap; never construct a whole trace or swallow PrintWriter I/O failure. */
     private static void writeDiagnostic(OutputBudget budget,String name,Throwable failure) {
-        try(var bytes=budget.open(OutputKind.SCALAR,name); var utf8=new OutputStreamWriter(bytes,StandardCharsets.UTF_8)) {
+        writeDiagnostic(budget,name,failure,false);
+    }
+
+    private static void writeDiagnostic(OutputBudget budget,String name,Throwable failure,boolean postSeal) {
+        try(var bytes=postSeal?budget.openPostSealFailure(name):budget.open(OutputKind.SCALAR,name);
+            var utf8=new OutputStreamWriter(bytes,StandardCharsets.UTF_8)) {
             var streaming=new Writer() {
                 @Override public void write(char[] value,int offset,int length) {
                     try { utf8.write(value,offset,length); } catch(IOException error) { throw new UncheckedIOException(error); }
@@ -1340,11 +1352,12 @@ final class ScenarioRunner implements AutoCloseable {
                 "Oversized diagnostic lost first cause/bounded prefix");
         var restores=new int[1];
         rejected("incomplete diagnostic cannot commit/restore",()->archiveThenRestore(()->{
-            requireCompleteOutputs(budget);
-            try { Files.writeString(budget.root().resolve("COMMITTED"),"must never be reached"); }
-            catch(IOException error) { throw new UncheckedIOException(error); }
+            var owner=new CompactOwner(budget,null,null,UUID.randomUUID(),1);
+            phaseReference(roots(),budget.root(),owner,budget,null,1,"failed-diagnostic",
+                    budget.root().resolve("failed-diagnostic"),Map.of(),null,first);
         },()->restores[0]++));
-        require(restores[0]==0 && !Files.exists(budget.root().resolve("COMMITTED")),"Oversized diagnostic reached uncharged COMMITTED/restore");
+        require(restores[0]==0 && !Files.exists(budget.root().resolve("COMMITTED"))
+                        && !Files.exists(budget.root().resolve("failed-diagnostic/COMMITTED")),"Oversized diagnostic reached uncharged COMMITTED/restore");
         rejected("failed pre-facade budget cannot be adopted",()->{
             try { new TraversalCapture(budget.root(),UUID.randomUUID(),Limits.forRun(1,0,0,1),Set.of(),budget); }
             catch(IOException error) { throw new UncheckedIOException(error); }
@@ -1352,21 +1365,14 @@ final class ScenarioRunner implements AutoCloseable {
         require(budget.failure().orElseThrow()==first,"Refused adoption replaced diagnostic first cause");
     }
 
-    private void prepareCompactSeal() {
-        if(outputs!=null && !commitMarker && outputs.failure().isEmpty()) {
-            scalar("commit-marker.txt","archive complete; invocation="+invocation+"; run="+(capture==null?"pre-start":capture.runId()));
-            commitMarker=true;
-        }
-    }
-
     private void sealCompact() {
         if(sealed!=null) return;
-        prepareCompactSeal();
         if(capture!=null) sealed=context.computeOnClient(c -> { requireClient(c); return watch.sealTraversal(); });
         else if(outputs!=null) outputs.seal();
     }
 
     private void captureCompactFailure(Throwable primary) {
+        compactOriginalFailure=retain(compactOriginalFailure,primary);
         if(world!=null) capture(primary,()->context.runOnClient(c->{ requireClient(c); MapArtClient.stop(); requireReleased(c); }));
         if(outputs!=null && sealed==null && outputs.failure().isEmpty() && admitted!=null && plan!=null) {
             capture(primary,()->fullPlayerCheckpoint(CheckpointKind.FAILURE));
@@ -1481,40 +1487,377 @@ final class ScenarioRunner implements AutoCloseable {
         catch(RuntimeException | Error error) { compactArchiveFailure=retain(compactArchiveFailure,error); throw error; }
     }
 
+    /** Synthetic filesystem guards use the same closed-file/reference boundary as actual archive/reset/close. */
+    static void verifyPhaseReferenceGuards(Path provider,OutputBudget budget,Sealed trace,UUID run) {
+        var r=roots(); var invocation=UUID.randomUUID();
+        var owner=new CompactOwner(budget,trace,run,invocation,1);
+        var success=provider.resolve("reference-success");
+        var first=phaseReference(r,provider,owner,budget,trace,1,"success",success,Map.of(),null,null);
+        require(Files.isRegularFile(success.resolve("COMMITTED")),"Complete reference lacks final marker");
+        var priorBytes=trace.outputs().manifestBytes(); var priorHash=trace.outputs().manifestHash();
+        writePostSeal(budget,"reference-late-verdict.txt","actual later verdict; same original scalar reservation");
+        var postSuccess=new IllegalStateException("synthetic first failure after committed success; not native proof");
+        var afterSuccess=new IllegalArgumentException("synthetic later failure after retained verdict");
+        capture(postSuccess,()->{ throw afterSuccess; });
+        writeDiagnostic(budget,"reference-post-success-failure.txt",postSuccess,true);
+        var reset=provider.resolve("reference-reset-2");
+        var second=phaseReference(r,provider,owner,budget,trace,1,"reset-2",reset,first,null,postSuccess);
+        verifyFailureReference(provider,reset,budget,trace,run,postSuccess,null,budget.root().resolve("reference-post-success-failure.txt"),afterSuccess);
+        var afterReset=new AssertionError("synthetic later close failure after reset record");
+        capture(postSuccess,()->{ throw afterReset; });
+        writeDiagnostic(budget,"reference-before-close-failure.txt",postSuccess,true);
+        var close=provider.resolve("reference-close");
+        var third=phaseReference(r,provider,owner,budget,trace,1,"close",close,second,null,postSuccess);
+        verifyFailureReference(provider,close,budget,trace,run,postSuccess,null,budget.root().resolve("reference-before-close-failure.txt"),afterSuccess,afterReset);
+        require(trace.outputs().manifestBytes()==priorBytes && trace.outputs().manifestHash().equals(priorHash),
+                "Late phase rewrote the original sealed snapshot");
+        rejected("prior reset cannot spend next ordinal",()->phaseReference(r,provider,owner,budget,trace,2,
+                "wrong-budget",provider.resolve("reference-wrong-budget"),third,null,null));
+        var equal=new Sealed(trace.events(),trace.eventCount(),trace.eventBytes(),trace.eventHash(),trace.checkpoints(),
+                trace.metadata(),trace.outputs(),trace.complete(),trace.failure());
+        rejected("equal reconstructed seal",()->phaseReference(r,provider,owner,budget,equal,1,
+                "equal-seal",provider.resolve("reference-equal-seal"),third,null,null));
+        var foreign=new CompactOwner(budget,trace,UUID.randomUUID(),invocation,1);
+        rejected("foreign run",()->phaseReference(r,provider,foreign,budget,trace,1,
+                "foreign-run",provider.resolve("reference-foreign-run"),third,null,null));
+        var foreignPath=new Sealed(provider.resolveSibling("foreign-events.jsonl"),trace.eventCount(),trace.eventBytes(),trace.eventHash(),
+                trace.checkpoints(),trace.metadata(),trace.outputs(),true,null);
+        rejected("foreign sealed path",()->phaseReference(r,provider,new CompactOwner(budget,foreignPath,run,invocation,1),budget,foreignPath,1,
+                "foreign-path",provider.resolve("reference-foreign-path"),third,null,null));
+        var restores=new int[1]; var oldFailure=new IllegalStateException("original archive failure");
+        capture(postSuccess,()->{ throw oldFailure; });
+        writeDiagnostic(budget,"reference-after-archive-failure.txt",postSuccess,true);
+        rejected("old archive error prevents reset/close",()->archiveThenRestore(()->phaseReference(r,provider,owner,budget,trace,1,
+                "old-failure",provider.resolve("reference-old-failure"),third,oldFailure,postSuccess),()->restores[0]++));
+        verifyFailureReference(provider,provider.resolve("reference-old-failure"),budget,trace,run,postSuccess,oldFailure,
+                budget.root().resolve("reference-after-archive-failure.txt"),afterSuccess,afterReset,oldFailure);
+        require(restores[0]==0 && !Files.exists(provider.resolve("reference-old-failure/COMMITTED")),
+                "Previous archive failure reached restoration or a new marker");
+        var late=archiveLateSidecars(provider,budget,trace,run,third);
+        verifyLateFailureClosure(provider,budget,late,budget.root().resolve("reference-after-archive-failure.txt"));
+        require(restores[0]==0 && !Files.exists(provider.resolve("reference-old-failure/COMMITTED"))
+                        && compactFile(provider,trace.outputs().manifest()).sha256().equals(priorHash) && trace.outputs().manifestBytes()==priorBytes,
+                "Failure/late closure rewrote the original sealed receipt snapshot");
+        try {
+            var fixtures=provider.resolveSibling("reference-fixtures"); checkedDirectory(r,fixtures);
+            var next=new OutputBudget(fixtures.resolve("capture-2"),Limits.forRun(1,0,0,1));
+            var preFacade=new IllegalStateException("real pre-facade first failure");
+            var beforeSeal=new IllegalArgumentException("distinct pre-facade diagnostic failure");
+            capture(preFacade,()->{ throw beforeSeal; });
+            writeDiagnostic(next,"pre-facade.txt",preFacade); next.seal();
+            var nextOwner=new CompactOwner(next,null,null,invocation,2);
+            rejected("prior seal cannot adopt new budget",()->phaseReference(r,fixtures,owner,next,trace,1,
+                    "foreign-budget",fixtures.resolve("foreign-budget"),Map.of(),null,null));
+            var preFacadeFiles=phaseReference(r,fixtures,nextOwner,next,null,2,"pre-facade",fixtures.resolve("pre-facade"),Map.of(),null,preFacade);
+            verifyFailureReference(fixtures,fixtures.resolve("pre-facade"),next,null,null,preFacade,null,next.root().resolve("pre-facade.txt"),beforeSeal);
+            require(next.scalarBytes()>0 && budget.scalarBytes()>0 && owner.budget()!=nextOwner.budget(),
+                    "Repeat2 reused the prior run's reservation");
+            try(var unclosed=next.openPostSealFailure("unclosed-prefix.txt")) {
+                unclosed.write("actual open prefix".getBytes(StandardCharsets.UTF_8));
+                rejected("unclosed late output",()->archiveThenRestore(()->phaseReference(r,fixtures,nextOwner,next,null,2,"unclosed",
+                        fixtures.resolve("unclosed"),preFacadeFiles,null,preFacade),()->restores[0]++));
+            }
+            require(restores[0]==0 && !Files.exists(fixtures.resolve("unclosed/COMMITTED")),"Unclosed post-seal output obtained a marker/restoration");
+            var afterSeal=new AssertionError("distinct pre-facade late closure failure");
+            capture(preFacade,()->{ throw afterSeal; });
+            writeDiagnostic(next,"pre-facade-late.txt",preFacade,true);
+            var preFacadeLate=archiveLateSidecars(fixtures,next,null,null,preFacadeFiles);
+            verifyLateFailureClosure(fixtures,next,preFacadeLate,next.root().resolve("pre-facade-late.txt"));
+            require(Arrays.equals(preFacade.getSuppressed(),new Throwable[]{beforeSeal,afterSeal})
+                            && Files.readString(next.root().resolve("pre-facade-late.txt")).contains(afterSeal.toString()),
+                    "Pre-facade late output lost primary/suppressed provenance");
+            var backend=provider.resolveSibling("reference-backend"); checkedDirectory(r,backend);
+            var originals=new HashMap<String,Path>();
+            for(var file:currentCompactFiles(provider,budget,trace,run,third).values()) {
+                var path=provider.resolve(file.path());
+                if(path.getParent().equals(budget.root())) originals.put(file.sha256(),path);
+            }
+            // Copy only this labelled new synthetic provider, through the existing copier; no old proof is touched.
+            try(var paths=Files.walk(provider)) {
+                for(var source:paths.sorted().toList()) {
+                    var target=backend.resolve(provider.relativize(source));
+                    if(Files.isDirectory(source,LinkOption.NOFOLLOW_LINKS)) checkedDirectory(r,target);
+                    else copyCompact(r,backend,budget,Objects.requireNonNull(originals.get(compactFile(provider,source).sha256())),target);
+                }
+            }
+            verifyPhaseReference(backend,backend.resolve("reference-close/phase-reference.json"));
+            verifyPhaseReference(backend,backend.resolve("reference-reset-2/phase-reference.json"));
+            var bulk=new HashSet<Path>(); bulk.add(trace.events()); trace.checkpoints().values().forEach(c->bulk.add(c.path()));
+            budget.receipts().stream().filter(receipt->receipt.kind()==OutputKind.REGION).forEach(receipt->bulk.add(receipt.path()));
+            try(var files=Files.walk(provider)) {
+                var names=files.filter(p->Files.isRegularFile(p,LinkOption.NOFOLLOW_LINKS)).map(p->p.getFileName().toString()).toList();
+                for(var path:bulk) require(names.stream().filter(name->name.equals(path.getFileName().toString())).count()==1,
+                        "Phase references duplicated actual bulk event/scan/region bytes");
+            }
+            var missing=fixtures.resolve("missing-payload"); checkedDirectory(r,missing);
+            var missingStage=missing.resolve("reference-close"); checkedDirectory(r,missingStage);
+            for(var name:List.of("phase-reference.json","phase-reference.json.receipt.jsonl","COMMITTED","COMMITTED.receipt.jsonl")) {
+                var source=close.resolve(name);
+                copyCompact(r,missing,budget,Objects.requireNonNull(originals.get(compactFile(provider,source).sha256())),missingStage.resolve(name));
+            }
+            // Missing real payload bytes and changed bytes both fail while an old successful marker remains.
+            rejected("absent relocated payload",()->verifyPhaseReference(missing,missingStage.resolve("phase-reference.json")));
+            Files.writeString(backend.resolve("events.jsonl"),"changed synthetic payload",StandardOpenOption.APPEND);
+            rejected("old marker cannot hide changed payload",()->verifyPhaseReference(backend,backend.resolve("reference-close/phase-reference.json")));
+            var receipt=next.receipts().getFirst().receipt();
+            Files.writeString(receipt,"changed synthetic receipt",StandardOpenOption.APPEND);
+            rejected("first-reset receipt failure",()->archiveThenRestore(()->phaseReference(r,fixtures,nextOwner,next,null,2,"reset-first",
+                    fixtures.resolve("reset-first"),preFacadeLate,null,preFacade),()->restores[0]++));
+            rejected("second-reset old receipt failure",()->archiveThenRestore(()->phaseReference(r,fixtures,nextOwner,next,null,2,"reset-second",
+                    fixtures.resolve("reset-second"),preFacadeLate,null,preFacade),()->restores[0]++));
+            require(restores[0]==0 && !Files.exists(fixtures.resolve("reset-first/COMMITTED"))
+                            && !Files.exists(fixtures.resolve("reset-second/COMMITTED")),"Changed failure receipt reached reset restoration/marker");
+            var scanBudget=new OutputBudget(fixtures.resolve("scan-prefix"),Limits.forRun(1,0,1,1));
+            var scanRun=UUID.randomUUID(); var scanCapture=new TraversalCapture(scanBudget.root(),scanRun,Limits.forRun(1,0,1,1),Set.of(),scanBudget);
+            MotionFrame initial;
+            try(var reader=trace.openEvents()) { initial=(MotionFrame)reader.next().orElseThrow(); }
+            var frame=new MotionFrame(0,initial.tick(),initial.phase(),scanRun,initial.identities(),initial.pose(),initial.keys(),initial.paused(),
+                    initial.owner(),initial.lifecycle(),initial.activity(),initial.outcome(),initial.reason(),initial.eligible(),initial.verify(),
+                    initial.traversal(),initial.pending(),initial.unfinished(),initial.effect(),initial.predictionSequence(),null,null);
+            scanCapture.append(frame);
+            var large=new BuildPlan.BlockSpec("minecraft:stone",Map.of("synthetic-prefix","x".repeat(6000)));
+            rejected("actual partial scan writer",()->scanCapture.checkpoint(CheckpointKind.FAILURE,new FullScan(scanRun,frame.tick(),frame.phase(),0,
+                    List.of(new PlacementObservation(scanRun,0,OptionalLong.empty(),frame.tick(),Evidence.OBSERVED,Optional.of(large))))));
+            var scanPrefix=scanCapture.seal(); var scanCause=scanBudget.failure().orElseThrow();
+            rejected("incomplete scan cannot commit",()->phaseReference(r,fixtures,new CompactOwner(scanBudget,scanPrefix,scanRun,invocation,1),
+                    scanBudget,scanPrefix,1,"scan-prefix",fixtures.resolve("scan-prefix-phase"),Map.of(),null,scanCause));
+            require(!Files.exists(fixtures.resolve("scan-prefix-phase/COMMITTED")) && scanBudget.failure().orElseThrow()==scanCause
+                            && !scanPrefix.checkpoints().get(CheckpointKind.FAILURE).complete(),"Partial scan gained a commit or lost first cause");
+        } catch(IOException error) { throw new UncheckedIOException(error); }
+        System.out.println("ScenarioRunner actual shared phase/reference guards passed; synthetic, not native evidence");
+    }
+
+    private static void verifyFailureReference(Path provider,Path stage,OutputBudget budget,Sealed trace,UUID run,
+                                               Throwable primary,Throwable archiveFailure,Path diagnostic,Throwable... suppressed) {
+        try {
+            var descriptor=JsonParser.parseString(Files.readString(stage.resolve("phase-reference.json"))).getAsJsonObject();
+            require(descriptor.get("originalFailure").getAsString().equals(primary.getClass().getName())
+                            && descriptor.get("originalFailureMessage").getAsString().equals(primary.getMessage())
+                            && i(descriptor,"suppressedCount")==suppressed.length && Arrays.equals(primary.getSuppressed(),suppressed),
+                    "Compact phase lost original primary identity/message or suppressed snapshot");
+            require((archiveFailure==null ? descriptor.get("archiveFailure").isJsonNull()
+                            : descriptor.get("archiveFailure").getAsString().equals(archiveFailure.getClass().getName()))
+                            && b(descriptor,"complete")== (archiveFailure==null)
+                            && Files.isRegularFile(stage.resolve("COMMITTED"))==b(descriptor,"complete"),
+                    "Failed archive metadata authorized a marker or lost its actual archive failure");
+            require(run==null ? descriptor.get("run").isJsonNull() : descriptor.get("run").getAsString().equals(run.toString()),
+                    "Failure phase invented/lost actual run identity");
+            require(descriptor.get("sealedState").getAsString().equals(trace==null?"NO_STARTED_CAPTURE":"SEALED")
+                            && (trace==null ? descriptor.get("sealedReceipt").isJsonNull()
+                            : new Gson().fromJson(descriptor.get("sealedReceipt"),CompactFile.class).equals(compactFile(provider,trace.metadata()))),
+                    "Failure phase invented/lost original sealed provenance");
+            var text=Files.readString(diagnostic);
+            require(text.startsWith(primary.toString()),"Closed diagnostic replaced its original primary");
+            for(var error:suppressed) require(text.contains("Suppressed: "+error),"Closed diagnostic lost distinct suppressed failure");
+            var receipt=budget.receipts().stream().filter(value->value.path().equals(diagnostic)).findFirst().orElseThrow();
+            var files=List.of(new Gson().fromJson(descriptor.get("files"),CompactFile[].class));
+            require(files.contains(compactFile(provider,diagnostic)) && files.contains(compactFile(provider,receipt.receipt())),
+                    "Failure descriptor omitted actual diagnostic/closed receipt bytes");
+            verifyCompactFiles(provider,files);
+        } catch(IOException error) { throw new UncheckedIOException(error); }
+    }
+
+    private static void verifyLateFailureClosure(Path provider,OutputBudget budget,Map<String,CompactFile> closure,Path diagnostic) {
+        try {
+            var summary=JsonParser.parseString(Files.readString(budget.root().resolve("late-manifest.json"))).getAsJsonObject();
+            var predecessors=List.of(new Gson().fromJson(summary.get("closedPredecessors"),CompactFile[].class));
+            var receipt=budget.receipts().stream().filter(value->value.path().equals(diagnostic)).findFirst().orElseThrow();
+            require(predecessors.contains(compactFile(provider,diagnostic)) && predecessors.contains(compactFile(provider,receipt.receipt()))
+                            && closure.containsValue(compactFile(provider,budget.root().resolve("late-manifest.json")))
+                            && closure.containsValue(compactFile(provider,budget.root().resolve("late-manifest.json.receipt.jsonl"))),
+                    "Shared late closure omitted actual failure/summary/receipt provenance");
+            verifyCompactFiles(provider,closure.values());
+        } catch(IOException error) { throw new UncheckedIOException(error); }
+    }
+
     private void archiveCompactFiles(Path stage,Sealed trace) {
-        checkedDirectory(roots,stage);
-        if(outputs!=null) {
-            if(trace==null) { prepareCompactSeal(); outputs.seal(); }
-            var paths=new LinkedHashSet<Path>();
-            if(trace!=null) {
-                try {
-                    require(Files.size(trace.events())==trace.eventBytes() && fileHash(trace.events()).equals(trace.eventHash()),"Original sealed event bytes changed");
-                    for(var checkpoint:trace.checkpoints().values()) if(checkpoint.bytes()>=0 && checkpoint.hash()!=null)
-                        require(Files.size(checkpoint.path())==checkpoint.bytes() && fileHash(checkpoint.path()).equals(checkpoint.hash()),"Original checkpoint prefix changed");
-                    require(Files.size(trace.outputs().manifest())==trace.outputs().manifestBytes()
-                            && fileHash(trace.outputs().manifest()).equals(trace.outputs().manifestHash()),"Original output manifest changed");
-                } catch(IOException error) { throw new UncheckedIOException(error); }
-                paths.add(trace.events());
-                for(var checkpoint:trace.checkpoints().values()) paths.add(checkpoint.path()); // Incomplete entries are owned raw bytes, never parsed as scans.
-            }
-            for(var receipt:outputs.receipts()) {
-                try { require(Files.size(receipt.path())==receipt.bytes() && fileHash(receipt.path()).equals(receipt.hash()),"Owned closed output changed"); }
-                catch(IOException error) { throw new UncheckedIOException(error); }
-            }
-            paths.addAll(outputs.ownedFiles());
-            for(var source:paths) copyCompact(source,stage.resolve(source.getFileName()));
-        }
-        require(trace==null || trace.complete(),"Incomplete sealed trace archived; reset/rearm/owned close refused");
-        requireCompleteOutputs(outputs);
-        require(compactArchiveFailure==null,"Earlier archive failure forbids reset/rearm/normal close");
-        require(commitMarker,"Missing owned commit marker");
-        copyCompact(outputs.root().resolve("commit-marker.txt"),stage.resolve("COMMITTED"));
-        try(var file=java.nio.channels.FileChannel.open(stage.resolve("COMMITTED"),StandardOpenOption.WRITE)) { file.force(true); }
-        catch(IOException error) { throw new UncheckedIOException(error); }
+        if(compactOwner==null) compactOwner=new CompactOwner(outputs,sealed,capture==null?null:capture.runId(),invocation,compactBudgetOrdinal);
+        compactFiles=phaseReference(roots,artifacts,compactOwner,outputs,trace,compactBudgetOrdinal,
+                artifacts.relativize(stage).toString().replace('\\','/'),stage,compactFiles,compactArchiveFailure,compactOriginalFailure);
         compactCommitted=true;
     }
 
+    private static void writePostSeal(OutputBudget budget,String name,String text) {
+        try(var writer=new BufferedWriter(new OutputStreamWriter(budget.openPostSealFailure(name),StandardCharsets.UTF_8))) {
+            writer.write(text); writer.write('\n');
+        } catch(IOException error) { throw new UncheckedIOException(error); }
+    }
+
+    private static CompactFile compactFile(Path provider,Path path) {
+        require(provider.isAbsolute() && provider.normalize().equals(provider) && real(provider).equals(provider)
+                        && path.isAbsolute() && path.normalize().equals(path) && path.startsWith(provider)
+                        && real(path).equals(path) && Files.isRegularFile(path,LinkOption.NOFOLLOW_LINKS),
+                "Phase reference requires an actual canonical provider-relative regular file");
+        try {
+            try(var channel=java.nio.channels.FileChannel.open(path,StandardOpenOption.WRITE)) { channel.force(true); }
+            return new CompactFile(provider.relativize(path).toString().replace('\\','/'),Files.size(path),fileHash(path));
+        } catch(IOException error) { throw new UncheckedIOException(error); }
+    }
+
+    private static void verifyCompactFiles(Path provider,Collection<CompactFile> files) {
+        for(var expected:files) {
+            var relative=Path.of(expected.path());
+            require(!relative.isAbsolute() && !expected.path().isBlank() && relative.normalize().equals(relative)
+                            && !relative.startsWith(".."),"Escaped phase reference");
+            require(compactFile(provider,provider.resolve(relative)).equals(expected),"Closed phase/output bytes changed");
+        }
+    }
+
+    private static Map<String,CompactFile> currentCompactFiles(Path provider,OutputBudget budget,Sealed trace,UUID run,
+                                                              Map<String,CompactFile> prior) {
+        verifyCompactFiles(provider,prior.values());
+        var snapshot=budget.seal();
+        require(trace==null ? run==null : trace.outputs()==snapshot && run!=null,
+                "Sealed snapshot is not this original budget/run");
+        var result=new TreeMap<String,CompactFile>(); result.putAll(prior);
+        var paths=new LinkedHashSet<Path>(budget.ownedFiles());
+        try {
+            require(compactFile(provider,snapshot.manifest()).equals(new CompactFile(
+                    provider.relativize(snapshot.manifest()).toString().replace('\\','/'),snapshot.manifestBytes(),snapshot.manifestHash())),
+                    "Original sealed output manifest changed");
+            for(var receipt:budget.receipts()) {
+                require(receipt.path().getParent().equals(budget.root()) && receipt.receipt().getParent().equals(budget.root()),
+                        "Foreign output/receipt path");
+                var actual=compactFile(provider,receipt.path());
+                require(actual.bytes()==receipt.bytes() && actual.sha256().equals(receipt.hash()),"Owned closed output changed");
+                if(!receipt.receipt().equals(snapshot.manifest())) {
+                    var expected=new JsonArray(); expected.add("OUTPUT1"); expected.add(receipt.path().getFileName().toString());
+                    expected.add(receipt.kind().name()); expected.add(receipt.bytes()); expected.add(receipt.hash());
+                    compactFile(provider,receipt.receipt());
+                    require(JsonParser.parseString(Files.readString(receipt.receipt())).equals(expected),"Closed output receipt changed");
+                }
+            }
+            var receipted=new HashSet<Path>(); receipted.add(snapshot.manifest());
+            budget.receipts().forEach(receipt->{ receipted.add(receipt.path()); receipted.add(receipt.receipt()); });
+            require(receipted.equals(paths),"Current output contains an unclosed/unreceipted prefix");
+            if(trace!=null) {
+                require(trace.events().getParent().equals(budget.root()) && trace.metadata().getParent().equals(budget.root()),
+                        "Foreign sealed payload path");
+                var events=compactFile(provider,trace.events());
+                require(events.bytes()==trace.eventBytes() && events.sha256().equals(trace.eventHash()),"Original sealed event bytes changed");
+                // Reuse the original bounded stream reader; a descriptor never reconstructs a Sealed/native proof.
+                if(trace.complete()) try(var reader=trace.openEvents()) {
+                    for(var event=reader.next();event.isPresent();event=reader.next())
+                        require(event.get().runId().equals(run),"Foreign native event identity");
+                }
+                paths.add(trace.events()); paths.add(trace.metadata());
+                for(var checkpoint:trace.checkpoints().values()) {
+                    require(checkpoint.path().getParent().equals(budget.root()) && checkpoint.runId().equals(run),"Foreign checkpoint path/run");
+                    var actual=compactFile(provider,checkpoint.path());
+                    if(checkpoint.bytes()>=0 && checkpoint.hash()!=null)
+                        require(actual.bytes()==checkpoint.bytes() && actual.sha256().equals(checkpoint.hash()),"Original checkpoint prefix changed");
+                    paths.add(checkpoint.path());
+                }
+            }
+            for(var path:paths) {
+                require(path.getParent().equals(budget.root()),"Output is outside its original reservation");
+                var file=compactFile(provider,path); result.put(file.path(),file);
+            }
+        } catch(IOException error) { throw new UncheckedIOException(error); }
+        return Map.copyOf(result);
+    }
+
+    private static Map<String,CompactFile> phaseReference(Roots r,Path provider,CompactOwner owner,OutputBudget budget,Sealed trace,
+            int ordinal,String phase,Path stage,Map<String,CompactFile> prior,Throwable archiveFailure,Throwable originalFailure) {
+        checkRoots(r);
+        require(owner!=null && owner.budget()==budget && owner.trace()==trace && owner.ordinal()==ordinal,
+                "Phase reference lost original budget/seal/ordinal identity");
+        require(ordinal>=1 && provider.isAbsolute() && provider.normalize().equals(provider) && real(provider).equals(provider)
+                        && stage.isAbsolute() && stage.normalize().equals(stage) && provider.startsWith(r.evidence)
+                        && stage.startsWith(provider) && !stage.equals(budget.root())
+                        && budget.root().startsWith(provider),"Foreign phase/provider root");
+        checkedDirectory(r,stage);
+        var files=currentCompactFiles(provider,budget,trace,owner.run(),prior);
+        boolean complete=(trace==null || trace.complete()) && budget.failure().isEmpty() && budget.seal().complete() && archiveFailure==null;
+        String name="phase-"+provider.relativize(stage).toString().replace('\\','-').replace('/','-');
+        var descriptor=new JsonObject(); descriptor.addProperty("schema","mapartrunner-traversal-phase-reference-v1");
+        descriptor.addProperty("invocation",owner.invocation().toString());
+        descriptor.add("run",owner.run()==null?JsonNull.INSTANCE:new JsonPrimitive(owner.run().toString()));
+        descriptor.addProperty("budgetOrdinal",ordinal); descriptor.addProperty("phase",phase);
+        descriptor.addProperty("payloadRoot",provider.equals(budget.root())?".":provider.relativize(budget.root()).toString().replace('\\','/'));
+        descriptor.addProperty("sealedState",trace==null?"NO_STARTED_CAPTURE":trace.complete()?"SEALED":"INCOMPLETE_PREFIX");
+        descriptor.add("sealedReceipt",trace==null?JsonNull.INSTANCE:new Gson().toJsonTree(compactFile(provider,trace.metadata())));
+        descriptor.add("outputSnapshot",new Gson().toJsonTree(compactFile(provider,budget.seal().manifest())));
+        descriptor.addProperty("complete",complete);
+        descriptor.addProperty("originalFailure",originalFailure==null?null:originalFailure.getClass().getName());
+        descriptor.addProperty("originalFailureMessage",originalFailure==null?null:boundedMessage(originalFailure));
+        descriptor.addProperty("suppressedCount",originalFailure==null?0:originalFailure.getSuppressed().length);
+        descriptor.addProperty("archiveFailure",archiveFailure==null?null:archiveFailure.getClass().getName());
+        descriptor.addProperty("outputFailure",budget.failure().map(e->e.getClass().getName()).orElse(null));
+        descriptor.add("files",new Gson().toJsonTree(new TreeMap<>(files).values()));
+        descriptor.add("phaseRecords",new Gson().toJsonTree(new TreeMap<>(files).values().stream()
+                .filter(file->!prior.containsKey(file.path())).toList()));
+        // The finite predecessor set excludes the descriptor and its not-yet-created receipt.
+        writePostSeal(budget,name+".json",descriptor.toString());
+        copyCompact(r,provider,budget,budget.root().resolve(name+".json"),stage.resolve("phase-reference.json"));
+        copyCompact(r,provider,budget,budget.root().resolve(name+".json.receipt.jsonl"),stage.resolve("phase-reference.json.receipt.jsonl"));
+        files=currentCompactFiles(provider,budget,trace,owner.run(),files);
+        var predecessor=new TreeMap<>(files);
+        for(var path:List.of(stage.resolve("phase-reference.json"),stage.resolve("phase-reference.json.receipt.jsonl"))) {
+            var file=compactFile(provider,path); predecessor.put(file.path(),file);
+        }
+        require(complete,"Incomplete/previously failed archive; reset/rearm/owned close refused");
+        requireCompleteOutputs(budget);
+        var marker=new JsonObject(); marker.addProperty("invocation",owner.invocation().toString()); marker.addProperty("phase",phase);
+        marker.addProperty("meaning","complete closed phase predecessors; later world-close/invocation records are not claimed");
+        marker.add("files",new Gson().toJsonTree(predecessor.values()));
+        // Descriptor, its receipt, and every predecessor are closed and verified before final marker admission.
+        verifyCompactFiles(provider,predecessor.values());
+        writePostSeal(budget,name+".COMMITTED",marker.toString());
+        var closed=currentCompactFiles(provider,budget,trace,owner.run(),predecessor);
+        copyCompact(r,provider,budget,budget.root().resolve(name+".COMMITTED.receipt.jsonl"),stage.resolve("COMMITTED.receipt.jsonl"));
+        copyCompact(r,provider,budget,budget.root().resolve(name+".COMMITTED"),stage.resolve("COMMITTED"));
+        var result=new TreeMap<>(closed);
+        for(var path:List.of(stage.resolve("COMMITTED.receipt.jsonl"),stage.resolve("COMMITTED"))) {
+            var file=compactFile(provider,path); result.put(file.path(),file);
+        }
+        verifyCompactFiles(provider,result.values());
+        return Map.copyOf(result);
+    }
+
+    private static String boundedMessage(Throwable error) {
+        var message=String.valueOf(error.getMessage()); return message.substring(0,Math.min(2048,message.length()));
+    }
+
+    private static void verifyPhaseReference(Path provider,Path descriptorPath) {
+        require(descriptorPath.startsWith(provider),"Foreign descriptor path");
+        compactFile(provider,descriptorPath);
+        try {
+            var descriptor=JsonParser.parseString(Files.readString(descriptorPath)).getAsJsonObject();
+            require(descriptor.get("schema").getAsString().equals("mapartrunner-traversal-phase-reference-v1"),"Unknown phase schema");
+            var payload=Path.of(descriptor.get("payloadRoot").getAsString());
+            require(!payload.isAbsolute() && !payload.startsWith("..") && (payload.toString().equals(".") || payload.normalize().equals(payload))
+                            && real(provider.resolve(payload)).equals(provider.resolve(payload).normalize()),"Foreign payload root");
+            verifyCompactFiles(provider,List.of(new Gson().fromJson(descriptor.get("files"),CompactFile[].class)));
+            var markerPath=descriptorPath.getParent().resolve("COMMITTED");
+            var marker=JsonParser.parseString(Files.readString(markerPath)).getAsJsonObject();
+            require(b(descriptor,"complete") && marker.get("invocation").equals(descriptor.get("invocation"))
+                            && marker.get("phase").equals(descriptor.get("phase")),"Incomplete/foreign phase marker");
+            verifyCompactFiles(provider,List.of(new Gson().fromJson(marker.get("files"),CompactFile[].class)));
+            for(var path:List.of(descriptorPath,markerPath)) {
+                var actual=compactFile(provider,path);
+                var receiptPath=path.resolveSibling(path.getFileName()+".receipt.jsonl");
+                compactFile(provider,receiptPath);
+                var receipt=JsonParser.parseString(Files.readString(receiptPath)).getAsJsonArray();
+                require(receipt.size()==5 && receipt.get(0).getAsString().equals("OUTPUT1")
+                                && receipt.get(2).getAsString().equals("SCALAR") && receipt.get(3).getAsLong()==actual.bytes()
+                                && receipt.get(4).getAsString().equals(actual.sha256()),"Phase descriptor/marker receipt changed");
+                var original=provider.resolve(payload).normalize().resolve(receipt.get(1).getAsString());
+                var source=compactFile(provider,original);
+                require(source.bytes()==actual.bytes() && source.sha256().equals(actual.sha256()),"Phase copy lost original charged record");
+            }
+        } catch(IOException error) { throw new UncheckedIOException(error); }
+    }
+
     private void copyCompact(Path from,Path to) {
+        try {
+            copyCompact(roots,artifacts,outputs,from,to);
+            var files=new TreeMap<>(compactFiles); var file=compactFile(artifacts,to); files.put(file.path(),file);
+            compactFiles=Map.copyOf(files);
+        } catch(RuntimeException | Error error) { compactArchiveFailure=retain(compactArchiveFailure,error); throw error; }
+    }
+
+    private static void copyCompact(Roots roots,Path artifacts,OutputBudget outputs,Path from,Path to) {
         checkRoots(roots);
         require(outputs!=null && from.toAbsolutePath().normalize().equals(from) && from.getParent().equals(outputs.root())
                 && real(from).equals(from) && Files.isRegularFile(from,LinkOption.NOFOLLOW_LINKS)
@@ -1804,9 +2147,13 @@ final class ScenarioRunner implements AutoCloseable {
 
     /** Late verdict/failure sidecars spend the same reserve; the original sealed receipt snapshot never changes. */
     private void archiveLateSidecars() {
+        compactFiles=archiveLateSidecars(artifacts,outputs,sealed,capture==null?null:capture.runId(),compactFiles);
+    }
+
+    private static Map<String,CompactFile> archiveLateSidecars(Path artifacts,OutputBudget outputs,Sealed sealed,UUID run,
+                                                             Map<String,CompactFile> prior) {
         var original=sealed==null?outputs.seal():sealed.outputs();
-        var paths=new HashSet<Path>(); paths.add(original.manifest());
-        original.receipts().forEach(r->paths.add(r.path()));
+        var current=currentCompactFiles(artifacts,outputs,sealed,run,prior);
         var metadata=new JsonArray();
         for(var receipt:outputs.receipts()) if(!receipt.receipt().equals(original.manifest())) {
             var row=new JsonObject(); row.addProperty("file",receipt.path().getFileName().toString());
@@ -1814,10 +2161,11 @@ final class ScenarioRunner implements AutoCloseable {
             row.addProperty("receipt",receipt.receipt().getFileName().toString()); metadata.add(row);
         }
         try(var writer=new BufferedWriter(new OutputStreamWriter(outputs.openPostSealFailure("late-manifest.json"),StandardCharsets.UTF_8))) {
-            writer.write("{\"originalSealedManifest\":\""+original.manifest().getFileName()+"\",\"lateOutputs\":"+metadata+"}\n");
+            writer.write("{\"originalSealedManifest\":\""+original.manifest().getFileName()+"\",\"lateOutputs\":"+metadata
+                    +",\"closedPredecessors\":"+new Gson().toJson(new TreeMap<>(current).values())+"}\n");
         } catch(IOException error) { throw new UncheckedIOException(error); }
-        var destination=artifacts.resolve("late-sidecars"); checkedDirectory(roots,destination);
-        for(var path:outputs.ownedFiles()) if(!paths.contains(path)) copyCompact(path,destination.resolve(path.getFileName()));
+        // Close the final finite summary and its own charged receipt before checking the complete current closure.
+        return currentCompactFiles(artifacts,outputs,sealed,run,current);
     }
 
     private Live pauseShift(UUID id, Live before, Path stage, List<Live> checkpoints) {
@@ -2965,7 +3313,10 @@ final class ScenarioRunner implements AutoCloseable {
     }
 
     private void closeCompact() {
-        if(world==null) { sealCompact(); requireCompleteOutputs(outputs); closed=true; normalClose=true; return; }
+        if(world==null) {
+            sealCompact(); archiveCompact(artifacts.resolve("close-archive-"+resetOrdinal),sealed);
+            closed=true; normalClose=true; return;
+        }
         preflight(admitted==null?profileDefinition:admitted);
         Throwable first=null; boolean archived=false;
         try {
