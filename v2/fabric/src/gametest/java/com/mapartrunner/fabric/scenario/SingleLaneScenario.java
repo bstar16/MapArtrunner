@@ -55,6 +55,7 @@ import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.function.Consumer;
 import java.util.function.Predicate;
 
 import static com.mapartrunner.core.placement.PlacementObservation.Evidence.*;
@@ -64,7 +65,98 @@ final class SingleLaneScenario {
     enum Kind { BASELINE, STOP, FAILURE, DISCONNECT, REPLACEMENT, WITHHELD_RESPONSE, POST_FAULT_BASELINE,
         WITHHELD_OBSERVATION, POST_OBSERVATION_BASELINE, COMPUTED_STOP, COMPUTED_PAUSE_RESUME,
         WITHHELD_STATE, POST_STATE_BASELINE, REPEATED_STATE, POST_REPEATED_STATE_BASELINE }
-    private record Fixture(int missingTarget, Item usableItem, int stock, int selected) { }
+    record Fixture(int missingTarget, Item usableItem, int stock, int selected, double initialX) {
+        static Fixture of(Kind kind,BuildPlan plan) {
+            return switch(kind) {
+                case WITHHELD_RESPONSE, WITHHELD_STATE -> new Fixture(SingleLaneFixture.targetId(plan,new GridPos(0,0,0)),Items.STONE,64,0,.5);
+                case WITHHELD_OBSERVATION, COMPUTED_STOP, COMPUTED_PAUSE_RESUME -> new Fixture(SingleLaneFixture.targetId(plan,new GridPos(11,0,0)),Items.STONE,64,0,4.5);
+                case REPEATED_STATE -> new Fixture(SingleLaneFixture.targetId(plan,new GridPos(0,0,0)),Items.SNOW,2,1,.5);
+                default -> new Fixture(-1,Items.STONE,kind==Kind.FAILURE?12:64,0,.5);
+            };
+        }
+
+        static void verifyProfiles(BuildPlan plan) {
+            if(!plan.dimensions().equals(new GridSize(12,1,5)) || plan.targets().size()!=60
+                    || plan.targets().stream().anyMatch(t -> !t.block().equals(new BlockSpec("minecraft:stone",Map.of())))
+                    || SingleLaneFixture.targetId(plan,new GridPos(11,0,0))!=11)
+                throw new AssertionError("Fault profile requires the literal imported60/ID11 plan");
+            for(var kind:Kind.values()) {
+                var profile=of(kind,plan);
+                boolean nearEnd=kind==Kind.WITHHELD_OBSERVATION || kind==Kind.COMPUTED_STOP || kind==Kind.COMPUTED_PAUSE_RESUME;
+                boolean snow=kind==Kind.REPEATED_STATE;
+                int missing=nearEnd?11:kind==Kind.WITHHELD_RESPONSE || kind==Kind.WITHHELD_STATE || snow?0:-1;
+                if(profile.initialX()!=(nearEnd?4.5:.5) || profile.missingTarget()!=missing
+                        || profile.usableItem()!=(snow?Items.SNOW:Items.STONE) || profile.stock()!=(snow?2:kind==Kind.FAILURE?12:64)
+                        || profile.selected()!=(snow?1:0)) throw new AssertionError("Fault profile admission changed: "+kind+"; "+profile);
+                int standing=SingleLaneFixture.targetId(plan,new GridPos((int)Math.floor(profile.initialX()),0,2));
+                if(standing==profile.missingTarget() || nearEnd && (11.5-profile.initialX()!=7 || 11.5-profile.initialX()<=4.5))
+                    throw new AssertionError("Fault staging lacks supported standing/reach opportunity: "+kind);
+            }
+        }
+    }
+
+    static final class FailureDiagnostics {
+        static void append(Path file,String boundary,String values) throws IOException {
+            Files.writeString(file,boundary+System.lineSeparator()+values+System.lineSeparator(),StandardOpenOption.CREATE,StandardOpenOption.APPEND);
+        }
+
+        static void verify(Path directory) throws IOException {
+            Files.createDirectory(directory);
+            for(String name:List.of("fault-diagnostics.txt","state-diagnostics.txt")) {
+                var file=directory.resolve(name);
+                append(file,"PRIMARY_CAPTURE","original active snapshot; latest actual POLL");
+                append(file,"CLEANUP_CAPTURE","later inactive snapshot");
+                var expected="PRIMARY_CAPTURE"+System.lineSeparator()+"original active snapshot; latest actual POLL"+System.lineSeparator()
+                        +"CLEANUP_CAPTURE"+System.lineSeparator()+"later inactive snapshot"+System.lineSeparator();
+                if(!Files.readString(file).equals(expected)) throw new AssertionError("Diagnostic writer overwrote FIRST snapshot: "+name);
+            }
+        }
+
+        static void drain(List<Sample> batch,Consumer<Sample> persist,Consumer<Sample> validate) {
+            // A failing safety check must not abandon later boundaries from this captured batch.
+            for(var sample:batch) persist.accept(sample);
+            for(var sample:batch) validate.accept(sample);
+        }
+
+        static void verifyDrain(Path directory) throws IOException {
+            Files.createDirectory(directory);
+            var batch=List.of(new Sample(1,"GUARD_UNSAFE_START",0,false,null,List.of(),false,null,List.of()),
+                    new Sample(1,"GUARD_UNSAFE_END",0,false,null,List.of(),false,null,List.of()),
+                    new Sample(2,"GUARD_LAST_END",0,false,null,List.of(),false,null,List.of()));
+            var file=directory.resolve("queued-boundaries.txt");
+            var first=new AssertionError("first unsafe START");
+            int[] persisted={0},validated={0};
+            try {
+                drain(batch,sample -> {
+                    try { append(file,"QUEUED",sample.phase()); }
+                    catch(IOException error) { throw new UncheckedIOException(error); }
+                    persisted[0]++;
+                },sample -> {
+                    validated[0]++;
+                    throw sample==batch.getFirst()?first:new AssertionError("later unsafe boundary");
+                });
+                throw new AssertionError("Unsafe batch did not fail validation");
+            } catch(AssertionError error) {
+                if(error!=first) throw new AssertionError("First safety assertion lost primary identity",error);
+            }
+            var expected=String.join(System.lineSeparator(),"QUEUED","GUARD_UNSAFE_START","QUEUED","GUARD_UNSAFE_END",
+                    "QUEUED","GUARD_LAST_END","");
+            if(!Files.readString(file).equals(expected) || persisted[0]!=3 || validated[0]!=1)
+                throw new AssertionError("Final queued boundary was lost; persisted="+persisted[0]+"; validated="+validated[0]);
+            int[] ioValidated={0};
+            try {
+                drain(batch,sample -> {
+                    try { append(directory,"MUST_FAIL","directory is not a writable file"); }
+                    catch(IOException error) { throw new UncheckedIOException(error); }
+                },sample -> ioValidated[0]++);
+                throw new AssertionError("Real persistence I/O failure was hidden");
+            } catch(UncheckedIOException expectedFailure) {
+                if(expectedFailure.getCause()==null || ioValidated[0]!=0) throw new AssertionError("I/O error lost precedence",expectedFailure);
+                System.out.println("Expected real persistence failure: "+expectedFailure.getCause());
+            }
+            System.out.println("PASS actual queued-batch guard: persisted3; validated1; first assertion primary; real I/O failure visible");
+        }
+    }
     private static final int WAIT = ClientGameTestContext.DEFAULT_TIMEOUT;
     private static final GridPos ORIGIN = new GridPos(0,65,0);
     private static final BuildEngine.Settings SETTINGS = new BuildEngine.Settings(2,5,false,1);
@@ -85,18 +177,16 @@ final class SingleLaneScenario {
     private int writtenSamples;
     private double clientReach;
     private double serverReach;
-    private double maxClientX = .5;
-    private double maxServerX = .5;
+    private double initialClientX;
+    private double initialServerX;
+    private double maxClientX;
+    private double maxServerX;
+    private String latestReadWitness="No POLL sampled";
     private Step stateSettled;
 
     SingleLaneScenario(ClientGameTestContext context, Watch watch, Kind kind) {
         this.context = context; this.watch = watch; this.kind = kind;
-        fixture = switch(kind) {
-            case WITHHELD_RESPONSE, WITHHELD_STATE -> new Fixture(SingleLaneFixture.targetId(PLAN,new GridPos(0,0,0)),Items.STONE,64,0);
-            case WITHHELD_OBSERVATION, COMPUTED_STOP, COMPUTED_PAUSE_RESUME -> new Fixture(SingleLaneFixture.targetId(PLAN,new GridPos(11,0,0)),Items.STONE,64,0);
-            case REPEATED_STATE -> new Fixture(SingleLaneFixture.targetId(PLAN,new GridPos(0,0,0)),Items.SNOW,2,1);
-            default -> new Fixture(-1,Items.STONE,kind==Kind.FAILURE?12:64,0);
-        };
+        fixture = Fixture.of(kind,PLAN);
         var game = FabricLoader.getInstance().getGameDir().toAbsolutePath().normalize();
         require(game.getParent().getFileName().toString().equals("run")
                 && game.getParent().getParent().getFileName().toString().equals("build"), "Unmanaged game directory: " + game);
@@ -111,6 +201,16 @@ final class SingleLaneScenario {
         var manifest = manifest();
         write("fixture.txt", manifest);
         note("fixtureSha256=" + hash(manifest) + "; plan=" + PLAN.fingerprint());
+    }
+
+    static void verifyGuards() {
+        Fixture.verifyProfiles(PLAN);
+        var directory=Path.of(System.getProperty("java.io.tmpdir")).resolve("mapart-single-lane-guards-"+UUID.randomUUID());
+        try { FailureDiagnostics.verify(directory); }
+        catch(IOException error) { throw new UncheckedIOException(error); }
+        try { FailureDiagnostics.verifyDrain(directory.resolve("unsafe-batch")); }
+        catch(IOException error) { throw new UncheckedIOException(error); }
+        System.out.println("MapArtRunner single-lane profile and FIRST diagnostic guards passed; writer evidence="+directory);
     }
 
     void run(SingleLaneScenario disconnected) {
@@ -161,7 +261,8 @@ final class SingleLaneScenario {
             note("PASS after normal world close; run=" + runId);
         } catch (RuntimeException | Error error) {
             primary = error;
-            try { noteFailure(error); } catch (RuntimeException | Error logging) { error.addSuppressed(logging); }
+            try { if(runId!=null) drain(); } catch(RuntimeException | Error capture) { error.addSuppressed(capture); }
+            try { noteFailure(error,"PRIMARY_CAPTURE"); } catch (RuntimeException | Error logging) { error.addSuppressed(logging); }
             try { screenshot("failure"); } catch (RuntimeException | Error capture) { error.addSuppressed(capture); }
             throw error;
         } finally {
@@ -172,7 +273,7 @@ final class SingleLaneScenario {
                 }
             }
             if (primary != null) {
-                try { noteFailure(primary); } catch (RuntimeException | Error logging) { primary.addSuppressed(logging); }
+                try { noteFailure(primary,"CLEANUP_CAPTURE"); } catch (RuntimeException | Error logging) { primary.addSuppressed(logging); }
             }
             try { retainLog(); } catch (RuntimeException | Error logging) {
                 if(primary==null) throw logging;
@@ -234,7 +335,7 @@ final class SingleLaneScenario {
             p.getInventory().clear(); p.getInventory().setStack(0,new ItemStack(Items.STONE,7));
             p.getInventory().setStack(1,new ItemStack(fixture.usableItem(),fixture.stock())); p.getInventory().setSelectedSlot(fixture.selected());
             p.getInventory().markDirty(); p.currentScreenHandler.sendContentUpdates();
-            require(p.teleport(level,.5,66,2.5,java.util.Set.of(),0,60,false), "Setup teleport rejected");
+            require(p.teleport(level,fixture.initialX(),66,2.5,java.util.Set.of(),0,60,false), "Setup teleport rejected");
         });
         context.runOnClient(client -> {
             requireFixtureBinding(client, ownedServer, ownedPlayer);
@@ -246,7 +347,7 @@ final class SingleLaneScenario {
                 requireFixtureBinding(client, ownedServer, ownedPlayer);
                 return client.interactionManager != null && client.currentScreen == null
                         && !client.isPaused() && client.interactionManager.getCurrentGameMode() == GameMode.SURVIVAL
-                        && client.player.squaredDistanceTo(.5,66,2.5) < .0001 && Math.abs(client.player.getYaw()) < .01
+                        && client.player.squaredDistanceTo(fixture.initialX(),66,2.5) < .0001 && Math.abs(client.player.getYaw()) < .01
                         && client.player.getInventory().getSelectedSlot()==fixture.selected() && client.player.getInventory().getStack(0).isOf(Items.STONE)
                         && client.player.getInventory().getStack(0).getCount()==7 && client.player.getInventory().getStack(1).isOf(fixture.usableItem())
                         && client.player.getInventory().getStack(1).getCount()==fixture.stock() && client.player.isOnGround()
@@ -273,7 +374,7 @@ final class SingleLaneScenario {
             var p = server.getPlayerManager().getPlayerList().getFirst();
             require(p.interactionManager.getGameMode()==GameMode.SURVIVAL && !p.getAbilities().flying
                     && !p.getAbilities().allowFlying && p.getInventory().getSelectedSlot()==fixture.selected()
-                    && p.squaredDistanceTo(.5,66,2.5)<.0001 && Math.abs(p.getYaw())<.01, "Server survival/pose/inventory mismatch");
+                    && p.squaredDistanceTo(fixture.initialX(),66,2.5)<.0001 && Math.abs(p.getYaw())<.01, "Server survival/pose/inventory mismatch");
             require(p.getInventory().getStack(0).isOf(Items.STONE) && p.getInventory().getStack(0).getCount()==7
                     && p.getInventory().getStack(1).isOf(fixture.usableItem()) && p.getInventory().getStack(1).getCount()==fixture.stock(), "Server stock mismatch");
             for (int slot=2;slot<p.getInventory().size();slot++) require(p.getInventory().getStack(slot).isEmpty(), "Server extra inventory");
@@ -287,7 +388,21 @@ final class SingleLaneScenario {
             return p.getBlockInteractionRange();
         });
         context.waitTicks(3);
-        note("INITIAL VALIDATED: survival; seed=1; player=.5,66,2.5; yaw=0; selected="+fixture.selected()+"; matching stone sentinel=7; usable="
+        var clientStart=context.computeOnClient(client -> {
+            requireFixtureBinding(client,ownedServer,ownedPlayer);
+            require(client.player.squaredDistanceTo(fixture.initialX(),66,2.5)<.0001 && client.player.isOnGround(),"Client initial pose changed while settling");
+            return new Vec3d(client.player.getX(),client.player.getY(),client.player.getZ());
+        });
+        var serverStart=world.getServer().computeOnServer(server -> {
+            var p=server.getPlayerManager().getPlayerList().getFirst();
+            require(p.getEntityWorld()==server.getOverworld() && p.squaredDistanceTo(fixture.initialX(),66,2.5)<.0001
+                    && p.isOnGround(),"Server initial pose changed while settling");
+            return new Vec3d(p.getX(),p.getY(),p.getZ());
+        });
+        initialClientX=maxClientX=clientStart.x;
+        initialServerX=maxServerX=serverStart.x;
+        note("INITIAL VALIDATED: survival; seed=1; admittedPlayer="+initialPose()+"; actualClient="+clientStart+"; actualServer="+serverStart
+                +"; yaw=0; selected="+fixture.selected()+"; matching stone sentinel=7; usable="
                 + fixture.usableItem()+fixture.stock() + "; measured clientReach=" + clientReach + "; serverReach=" + serverReach);
     }
 
@@ -679,7 +794,7 @@ final class SingleLaneScenario {
                 "Wrong actual E/V/T or sustained VERIFY: "+e+"/"+v+"/"+t+" samples="+verifySamples);
         require(verify.status().engine().laneEntry().isPresent() && verify.status().engine().pendingTargetIds().equals(java.util.Set.of(fixture.missingTarget()))
                 && verify.status().engine().unfinishedTargetIds().equals(List.of(fixture.missingTarget())) && !verify.keys().getFirst(),"No actual movement COMPLETE/VERIFY entry");
-        require(maxClientX-.5>clientReach && maxServerX-.5>serverReach,"Omission motion did not exceed initial measured reach");
+        require(maxClientX-initialClientX>clientReach && maxServerX-initialServerX>serverReach,"Omission motion did not exceed initial measured reach");
         note("OMISSION ISSUANCE E="+e+"; action/sample="+action+"; BEFORE="+before.line()+"\nISSUED="+issuance.line()
                 +"\nMOVEMENT COMPLETE/VERIFY V="+v+"; "+verify.line()+"\nTERMINAL T="+t+"; "+terminal);
         idlePhysics("withheld observation pending80 failure",20);
@@ -691,7 +806,7 @@ final class SingleLaneScenario {
         require(rawPredicted.eligibleTick()==e && rawPredicted.removed().observedState().orElseThrow().equals(STONE)
                 && rawObserved.eligibleTick()<t,"No initial prediction then normal pending-key disappearance/raw OBSERVED stone");
         note("OMISSION VERIFIED: E="+e+"; V="+v+"; T="+t+"; consecutiveActive="+activeSamples+"; consecutiveVerify="+verifySamples
-                +"; displacement client="+(maxClientX-.5)+" server="+(maxServerX-.5)+"; reaches="+clientReach+","+serverReach
+                +"; displacement client="+(maxClientX-initialClientX)+" server="+(maxServerX-initialServerX)+"; reaches="+clientReach+","+serverReach
                 +"; firstRawPrediction="+rawPredicted+"; laterRawObserved="+rawObserved+"; conversionInvocations="+gate.omissions().size());
         for(var conversion:gate.omissions()) note("OMISSION CONVERSION (not adapter/sample/eligible tick) "+conversion);
         require(!"1".equals(expected) || terminal.lifecycle().outcome().orElseThrow()==Outcome.SUCCESS,
@@ -700,6 +815,10 @@ final class SingleLaneScenario {
 
     private void observationCondition(Step s) {
         var engine=s.client().status().engine();
+        if(engine.lifecycle().phase()==Phase.TERMINAL) require(engine.lifecycle().outcome().orElse(null)==Outcome.FAILED
+                && engine.diagnostic().filter(d -> d.reason()==BuildEngine.Reason.PENDING_EVIDENCE_TIMEOUT
+                    && d.targetIds().equals(List.of(fixture.missingTarget())) && d.detail().equals("Pending evidence reached eligible age 80")).isPresent(),
+                "Unexpected terminal before sustained controlled omission: "+engine);
         require(s.client().status().failure().isEmpty() && engine.lifecycle().outcome().orElse(null)!=Outcome.SUCCESS
                 && engine.unfinishedTargetIds().equals(List.of(fixture.missingTarget())),"Omission confirmed or unrelated unfinished work: "+s.client().line());
         if(engine.lifecycle().phase()==Phase.RUNNING) require(engine.pendingTargetIds().equals(java.util.Set.of(fixture.missingTarget())),"Missing real pending"+fixture.missingTarget());
@@ -760,8 +879,8 @@ final class SingleLaneScenario {
                     && d.placement().isPresent() && d.placement().orElseThrow().actionId()==accepted.getFirst().actionId()),"No correlated fresh real decision/accepted action: "+accepted);
             require(done.client().observations().size()==60 && done.client().observations().stream().allMatch(o -> o.evidence()==OBSERVED && o.observedState().orElseThrow().equals(STONE))
                     && done.server().blocks().stream().allMatch(Boolean::booleanValue) && done.server().usable()==63 && done.client().pose().usable()==63
-                    && maxClientX-.5>clientReach && maxServerX-.5>serverReach,"Fresh completion truth/inventory/motion mismatch");
-            note("FRESH COMPUTED PROGRESS: decisions="+later+"; accepted="+accepted+"; displacement="+(maxClientX-.5)+","+(maxServerX-.5));
+                    && maxClientX-initialClientX>clientReach && maxServerX-initialServerX>serverReach,"Fresh completion truth/inventory/motion mismatch");
+            note("FRESH COMPUTED PROGRESS: decisions="+later+"; accepted="+accepted+"; displacement="+(maxClientX-initialClientX)+","+(maxServerX-initialServerX));
             idlePhysics("computed pause/resume success",20);
         }
         gate=context.computeOnClient(c -> PredictionFaults.snapshot());
@@ -793,7 +912,7 @@ final class SingleLaneScenario {
         require(engine.lifecycle().outcome().orElseThrow()==Outcome.SUCCESS && done.client().status().failure().isEmpty()
                 && engine.diagnostic().orElseThrow().reason()==BuildEngine.Reason.VERIFIED
                 && engine.pendingTargetIds().isEmpty() && engine.unfinishedTargetIds().isEmpty(), "Not verified SUCCESS: " + done.client().status());
-        require(maxClientX-.5>clientReach && maxServerX-.5>serverReach, "Native positive-X motion did not exceed measured survival reach");
+        require(maxClientX-initialClientX>clientReach && maxServerX-initialServerX>serverReach, "Native positive-X motion did not exceed measured survival reach");
         var observations=done.client().observations();
         require(observations.size()==60 && observations.stream().map(PlacementObservation::targetId).distinct().count()==60
                 && observations.stream().allMatch(o -> o.evidence()==OBSERVED && o.observedState().orElseThrow().equals(STONE)), "Final client full scan mismatch");
@@ -801,7 +920,7 @@ final class SingleLaneScenario {
         await(s -> s.server().reserved()==7 && s.server().usable()==5 && s.client().pose().reserved()==7
                 && s.client().pose().usable()==5, WAIT,"final exact inventory");
         proveChains();
-        note("BASELINE VERIFIED: displacement client="+(maxClientX-.5)+" server="+(maxServerX-.5)
+        note("BASELINE VERIFIED: displacement client="+(maxClientX-initialClientX)+" server="+(maxServerX-initialServerX)
                 + "; reaches="+clientReach+","+serverReach+"; 60 exact server blocks; reserved0=7; usable1=5");
         idlePhysics("success",20);
     }
@@ -914,6 +1033,7 @@ final class SingleLaneScenario {
 
     private Step read() {
         var client=context.computeOnClient(c -> watch.sample(c,"POLL"));
+        latestReadWitness=pollWitness(client)+"; server=NOT_ACQUIRED; gate=NOT_ACQUIRED";
         var server=world.getServer().computeOnServer(s -> {
             var p=s.getPlayerManager().getPlayerList().getFirst();
             var blocks=PLAN.targets().stream().map(t -> s.getOverworld().getBlockState(new BlockPos(
@@ -925,11 +1045,18 @@ final class SingleLaneScenario {
             return new ServerSample(s.getTicks(),p.age,p.getEntityWorld().getTime(),p.getEntityWorld().getRegistryKey().getValue().toString(),
                     p.getX(),p.getY(),p.getZ(),p.getVelocity(),p.getInventory().getStack(0).getCount(),p.getInventory().getStack(1).getCount(),blocks);
         });
+        latestReadWitness=pollWitness(client)+"; server="+server+"; gate=NOT_ACQUIRED";
         if(runId!=null) {
             safety(client); position(server.x(),server.y(),server.z(),transferred,"server");
             maxServerX=Math.max(maxServerX,server.x());
         }
         var gate=context.computeOnClient(c -> PredictionFaults.snapshot());
+        latestReadWitness=pollWitness(client)+"; server="+server+"; gateActive="+gate.active()+"; gateFailure="+gate.failure()
+                +"; omissionLatched="+gate.omissionLatched()+"; omissions="+gate.omissions().size()+"; responses="+gate.responses().size()
+                +"; barrier="+gate.barrier().isPresent()+"; freshDecisions="+gate.fresh().size()
+                +"; support="+gate.support().map(s -> s.state()+"/captures="+s.captures()+"/cause="+s.firstCause());
+        drain();
+        note("SERVER "+server);
         require(gate.failure().isEmpty(),"Sticky fault fixture error: "+gate);
         if(faultCase() && runId!=null) require(gate.active(),"Fault deactivated before explicit cleanup");
         else require(!gate.active(),"Fault leaked to ordinary fixture");
@@ -945,8 +1072,21 @@ final class SingleLaneScenario {
                     .mapart$hasPendingPrediction(new BlockPos(11,65,0)),"Computed terminal native prediction remains"));
         }
         if(stateCase() && client.status().engine().lifecycle().phase()==Phase.TERMINAL) stateTerminalCondition(new Step(client,server));
-        drain(); note("SERVER "+server);
         return new Step(client,server);
+    }
+
+    private String pollWitness(Sample sample) {
+        var engine=sample.status().engine();
+        var observations=sample.observations();
+        return "LATEST_ALREADY_SAMPLED_"+sample.phase()+"; observerTick="+sample.tick()+"; world="+sample.worldIdentity()
+                +"; originalWorld="+sample.originalWorld()+"; pose="+sample.pose()+"; paused="+sample.paused()
+                +"; lifecycle="+engine.lifecycle()+"; eligible="+engine.eligibleTicks()+"; verify="+engine.verifyTicks()
+                +"; traversal="+engine.traversal()+"; diagnostic="+engine.diagnostic()+"; owner="+sample.status().controlOwner()
+                +"; unfinished="+engine.unfinishedTargetIds()+"; pending="+engine.pendingTargetIds()+"; effects="+engine.effectResults()
+                +"; keys="+sample.keys()+"; adapterFailure="+sample.status().failure()+"; observationCount="+observations.size()
+                +"; observationIDs="+(observations.size()<=60?observations.stream().map(PlacementObservation::targetId).toList():"OVER60")
+                +"; controlledID="+fixture.missingTarget()+"; controlledCount="+observations.stream().filter(o -> o.targetId()==fixture.missingTarget()).count()
+                +"; controlledFirst="+observations.stream().filter(o -> o.targetId()==fixture.missingTarget()).findFirst();
     }
 
     private Step step() { context.waitTick(); return read(); }
@@ -965,14 +1105,16 @@ final class SingleLaneScenario {
 
     private void drain() {
         var samples=context.computeOnClient(client -> watch.copy());
-        for(;writtenSamples<samples.size();writtenSamples++) {
-            var sample=samples.get(writtenSamples); note(sample.line());
+        FailureDiagnostics.drain(samples.subList(writtenSamples,samples.size()),sample -> {
+            note(sample.line());
+            writtenSamples++;
+        },sample -> {
             if(runId!=null) {
                 safety(sample);
                 var phase=sample.status().engine().lifecycle().phase();
                 if(phase==Phase.PAUSED || phase==Phase.TERMINAL) released(sample,"inactive observer phase");
             }
-        }
+        });
     }
 
     private void safety(Sample s) {
@@ -1027,12 +1169,13 @@ final class SingleLaneScenario {
     }
 
     private String manifest() {
-        var text=new StringBuilder("single-lane-v1;seed=1;flat;origin=0,65,0;dimensions=12,1,5;survival;player=.5,66,2.5;yaw=0;pitch=60;"
+        var text=new StringBuilder("single-lane-v1;seed=1;flat;origin=0,65,0;dimensions=12,1,5;survival;player="+initialPose()+";yaw=0;pitch=60;"
                 +SETTINGS.fingerprint()+";slot0=stone7,"+(fixture.selected()==0?"selected,":"")+"reserved;slot1="
                 +(fixture.usableItem()==Items.SNOW?"snow":"stone")+fixture.stock()+(fixture.selected()==1?",selected":"")+";all-other-slots=empty;autoJump=false\n");
         if(kind==Kind.WITHHELD_RESPONSE) text.append("SIMULATED RESPONSE FAULT;BEFORE-start all-but-ID"+fixture.missingTarget()+" prefill;no same-world recovery\n");
         if(kind==Kind.WITHHELD_OBSERVATION) text.append("SIMULATED PRODUCER OMISSION;BEFORE-start all-but-ID"+fixture.missingTarget()+" prefill;no full-building baseline credit\n");
         if(computedCase()) text.append("SIMULATED COMPUTED LIFECYCLE BARRIER;BEFORE-start all-but-ID"+fixture.missingTarget()+" prefill;no full-building baseline credit\n");
+        if(kind==Kind.WITHHELD_OBSERVATION || computedCase()) text.append("BEFORE-start supported player staging="+initialPose()+"; sole controlledID11; native outcome asserted separately\n");
         if(stateCase()) text.append(kind==Kind.REPEATED_STATE?"NATIVE-ONLY REPEATED STATE;BEFORE-start snow2/selected1/all-but-ID"+fixture.missingTarget()+";no production action credit\n"
                 :"SIMULATED STATE WITHHOLDING;BEFORE-start all-but-ID"+fixture.missingTarget()+" prefill;no same-world recovery\n");
         for(int x=-2;x<=13;x++) for(int z=-2;z<=6;z++) for(int y=64;y<=70;y++) text.append(x).append(',').append(y).append(',').append(z).append('=')
@@ -1044,6 +1187,8 @@ final class SingleLaneScenario {
         return text.toString();
     }
 
+    private String initialPose() { return (fixture.initialX()==.5?".5":Double.toString(fixture.initialX()))+",66,2.5"; }
+
     private boolean initiallyStone(int x,int z) {
         return x<0 || x>=12 || z<0 || z>=5 || (fixture.missingTarget()>=0 ? SingleLaneFixture.targetId(PLAN,new GridPos(x,0,z))!=fixture.missingTarget() : x==0 && z==2);
     }
@@ -1052,10 +1197,19 @@ final class SingleLaneScenario {
         try { return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(value.getBytes(StandardCharsets.UTF_8))); }
         catch(NoSuchAlgorithmException e) { throw new AssertionError(e); }
     }
-    private void noteFailure(Throwable error) {
+    private void noteFailure(Throwable error,String boundary) {
         var text=new StringWriter(); error.printStackTrace(new PrintWriter(text)); note("FAIL "+text);
-        if(kind==Kind.WITHHELD_OBSERVATION || computedCase()) write("fault-diagnostics.txt",context.computeOnClient(c -> PredictionFaults.snapshot()).toString());
-        if(stateCase()) write("state-diagnostics.txt",context.computeOnClient(c -> PredictionFaults.stateSnapshot()).toString());
+        note(boundary+"; "+latestReadWitness);
+        try {
+            if(kind==Kind.WITHHELD_OBSERVATION || computedCase()) {
+                FailureDiagnostics.append(artifacts.resolve("fault-diagnostics.txt"),boundary+" LATEST_READ",latestReadWitness);
+                FailureDiagnostics.append(artifacts.resolve("fault-diagnostics.txt"),boundary+" FAULT_SNAPSHOT",context.computeOnClient(c -> PredictionFaults.snapshot()).toString());
+            }
+            if(stateCase()) {
+                FailureDiagnostics.append(artifacts.resolve("state-diagnostics.txt"),boundary+" LATEST_READ",latestReadWitness);
+                FailureDiagnostics.append(artifacts.resolve("state-diagnostics.txt"),boundary+" STATE_SNAPSHOT",context.computeOnClient(c -> PredictionFaults.stateSnapshot()).toString());
+            }
+        } catch(IOException failure) { throw new UncheckedIOException(failure); }
     }
     private void note(String value) {
         try { Files.writeString(artifacts.resolve("scenario.log"),value+System.lineSeparator(),StandardOpenOption.CREATE,StandardOpenOption.APPEND); }
