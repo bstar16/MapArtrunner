@@ -69,7 +69,9 @@ final class SingleLaneScenario {
         static Fixture of(Kind kind,BuildPlan plan) {
             return switch(kind) {
                 case WITHHELD_RESPONSE, WITHHELD_STATE -> new Fixture(SingleLaneFixture.targetId(plan,new GridPos(0,0,0)),Items.STONE,64,0,.5);
-                case WITHHELD_OBSERVATION, COMPUTED_STOP, COMPUTED_PAUSE_RESUME -> new Fixture(SingleLaneFixture.targetId(plan,new GridPos(11,0,0)),Items.STONE,64,0,4.5);
+                // Observation staging targets VERIFY20 without changing pending80 or native movement.
+                case WITHHELD_OBSERVATION -> new Fixture(SingleLaneFixture.targetId(plan,new GridPos(11,0,0)),Items.STONE,64,0,4.625);
+                case COMPUTED_STOP, COMPUTED_PAUSE_RESUME -> new Fixture(SingleLaneFixture.targetId(plan,new GridPos(11,0,0)),Items.STONE,64,0,4.5);
                 case REPEATED_STATE -> new Fixture(SingleLaneFixture.targetId(plan,new GridPos(0,0,0)),Items.SNOW,2,1,.5);
                 default -> new Fixture(-1,Items.STONE,kind==Kind.FAILURE?12:64,0,.5);
             };
@@ -85,11 +87,11 @@ final class SingleLaneScenario {
                 boolean nearEnd=kind==Kind.WITHHELD_OBSERVATION || kind==Kind.COMPUTED_STOP || kind==Kind.COMPUTED_PAUSE_RESUME;
                 boolean snow=kind==Kind.REPEATED_STATE;
                 int missing=nearEnd?11:kind==Kind.WITHHELD_RESPONSE || kind==Kind.WITHHELD_STATE || snow?0:-1;
-                if(profile.initialX()!=(nearEnd?4.5:.5) || profile.missingTarget()!=missing
+                if(profile.initialX()!=(kind==Kind.WITHHELD_OBSERVATION?4.625:nearEnd?4.5:.5) || profile.missingTarget()!=missing
                         || profile.usableItem()!=(snow?Items.SNOW:Items.STONE) || profile.stock()!=(snow?2:kind==Kind.FAILURE?12:64)
                         || profile.selected()!=(snow?1:0)) throw new AssertionError("Fault profile admission changed: "+kind+"; "+profile);
                 int standing=SingleLaneFixture.targetId(plan,new GridPos((int)Math.floor(profile.initialX()),0,2));
-                if(standing==profile.missingTarget() || nearEnd && (11.5-profile.initialX()!=7 || 11.5-profile.initialX()<=4.5))
+                if(standing==profile.missingTarget() || nearEnd && (11.5-profile.initialX()!=(kind==Kind.WITHHELD_OBSERVATION?6.875:7) || 11.5-profile.initialX()<=4.5))
                     throw new AssertionError("Fault staging lacks supported standing/reach opportunity: "+kind);
             }
         }
