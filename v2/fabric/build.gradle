@@ -42,6 +42,7 @@ sourceSets.gametest.resources.srcDir rootProject.file('test-fixtures')
 
 tasks.named('compileTestJava', JavaCompile) {
     source('src/gametest/java/com/mapartrunner/fabric/scenario/threading/RegistrationAcknowledgement.java')
+    source('src/gametest/java/com/mapartrunner/fabric/scenario/threading/PacketHandlerAwait.java')
     source('src/gametest/java/com/mapartrunner/fabric/scenario/TraversalCapture.java')
 }
 
