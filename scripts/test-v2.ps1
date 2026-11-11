@@ -162,6 +162,10 @@ function Read-V2StartReceipt {
         $uuid=[guid]::Empty
         if (![guid]::TryParseExact($LaunchId,'D',[ref]$uuid) -or $uuid.ToString('D') -cne $LaunchId -or
             ![IO.Path]::IsPathFullyQualified($Evidence) -or (Split-Path $Evidence -Leaf) -cne "launch-$LaunchId") { throw 'Invalid owned launch identity/directory.' }
+        # Legacy requests are automatic. Only the trusted request selects the schema, never candidate JSON.
+        $mode=$(if ($Request.PSObject.Properties['Mode']) { $Request.Mode } else { 'automatic' })
+        if ($mode -isnot [string] -or $mode -cnotin 'automatic','inspect') { throw 'Invalid startup request mode.' }
+        $inspect=$mode -ceq 'inspect'
         [void](Assert-V2ManagedPath $Evidence (Split-Path $Evidence))
         $path=Join-Path $Evidence 'test-start.json'
         $item=Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
@@ -175,25 +179,34 @@ function Read-V2StartReceipt {
         $root=$document.RootElement
         if ($root.ValueKind -ne [Text.Json.JsonValueKind]::Object) { throw 'Receipt is not an object.' }
         $names=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-        $expected=@('schema','launchId','pid','startedUtc','scenario','repeat','provider','event')
+        $expected=$(if ($inspect) { @('schema','launchId','pid','startedUtc','scenario','mode','sessionId','event') }
+            else { @('schema','launchId','pid','startedUtc','scenario','repeat','provider','event') })
         foreach ($property in $root.EnumerateObject()) {
             if ($expected -cnotcontains $property.Name -or !$names.Add($property.Name)) { throw 'Receipt has unknown or duplicate fields.' }
         }
         if ($names.Count -ne 8) { throw 'Receipt fields are incomplete.' }
         $strings=@{}
-        foreach ($name in 'schema','launchId','startedUtc','scenario','provider','event') {
+        foreach ($name in @($expected | Where-Object { $_ -cnotin 'pid','repeat' })) {
             $value=$root.GetProperty($name)
             if ($value.ValueKind -ne [Text.Json.JsonValueKind]::String) { throw "Receipt $name is not a string." }
             $strings[$name]=$value.GetString()
         }
-        [int]$receiptPid=0; $pidValue=$root.GetProperty('pid'); $repeatValue=$root.GetProperty('repeat')
+        [int]$receiptPid=0; $pidValue=$root.GetProperty('pid')
         if ($pidValue.ValueKind -ne [Text.Json.JsonValueKind]::Number -or $pidValue.GetRawText() -cnotmatch '^[1-9][0-9]*$' -or !$pidValue.TryGetInt32([ref]$receiptPid)) { throw 'Receipt PID is not a positive integer.' }
-        if ($repeatValue.ValueKind -ne [Text.Json.JsonValueKind]::Number -or $repeatValue.GetRawText() -cnotin '1','2' -or
-            $repeatValue.GetInt32() -ne $Request.Repeat) { throw 'Receipt repeat differs from request.' }
-        if ($strings.schema -cne 'mapartrunner-test-start-v1' -or $strings.event -cne 'SELECTED_PROVIDER_RUNTEST_ENTERED' -or
-            $strings.launchId -cne $LaunchId -or $strings.scenario -cne $Request.Scenario) { throw 'Receipt schema/event/challenge/scenario differs from request.' }
-        $providers=@('environment-probe','single-lane','schematic-import','grounded-two-lane','grounded-traversal')
-        if ($strings.provider -cnotin $providers -or ($Request.Scenario -cne 'all' -and $strings.provider -cne $Request.Scenario)) { throw 'Receipt provider was not selected.' }
+        if ($strings.launchId -cne $LaunchId -or $strings.scenario -cne $Request.Scenario) { throw 'Receipt schema/event/challenge/scenario differs from request.' }
+        if ($inspect) {
+            if ($strings.schema -cne 'mapartrunner-inspect-ready-v1' -or $strings.event -cne 'INSPECT_WORLD_BOUND_COMMANDS_READY' -or
+                $strings.mode -cne 'inspect' -or $strings.scenario -cne 'grounded-two-lane') { throw 'Receipt inspect schema/event/mode/scenario differs from request.' }
+            $session=[guid]::Empty
+            if (![guid]::TryParseExact($strings.sessionId,'D',[ref]$session) -or $session.ToString('D') -cne $strings.sessionId) { throw 'Receipt session UUID is not canonical.' }
+        } else {
+            $repeatValue=$root.GetProperty('repeat')
+            if ($repeatValue.ValueKind -ne [Text.Json.JsonValueKind]::Number -or $repeatValue.GetRawText() -cnotin '1','2' -or
+                $repeatValue.GetInt32() -ne $Request.Repeat) { throw 'Receipt repeat differs from request.' }
+            if ($strings.schema -cne 'mapartrunner-test-start-v1' -or $strings.event -cne 'SELECTED_PROVIDER_RUNTEST_ENTERED') { throw 'Receipt schema/event/challenge/scenario differs from request.' }
+            $providers=@('environment-probe','single-lane','schematic-import','grounded-two-lane','grounded-traversal')
+            if ($strings.provider -cnotin $providers -or ($Request.Scenario -cne 'all' -and $strings.provider -cne $Request.Scenario)) { throw 'Receipt provider was not selected.' }
+        }
         $started=[DateTimeOffset]::MinValue
         if ($strings.startedUtc -cnotmatch '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$' -or
             ![DateTimeOffset]::TryParse($strings.startedUtc,[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::AssumeUniversal,[ref]$started)) { throw 'Invalid receipt process creation time.' }
@@ -209,8 +222,14 @@ function Read-V2StartReceipt {
             if (!$record.IsGame -or !$record.IdentityVerified -or !$JavaExecutable -or
                 ![IO.Path]::GetFullPath($record.Executable).Equals([IO.Path]::GetFullPath($JavaExecutable),[StringComparison]::OrdinalIgnoreCase)) { throw 'Receipt is not the configured JDK native game.' }
         } elseif ($record.Pid -ne $WorkerPid -or $record.Ownership -cne 'directly started gated worker') { throw 'Dummy receipt is not the directly held worker.' }
-        $receipt=[pscustomobject]@{schema=$strings.schema;launchId=$strings.launchId;pid=$receiptPid;startedUtc=$strings.startedUtc
-            scenario=$strings.scenario;repeat=$repeatValue.GetInt32();provider=$strings.provider;event=$strings.event}
+        # A canonical first READY session becomes trusted only after every shared path/process check above.
+        $receipt=$(if ($inspect) {
+            [pscustomobject]@{schema=$strings.schema;launchId=$strings.launchId;pid=$receiptPid;startedUtc=$strings.startedUtc
+                scenario=$strings.scenario;mode=$strings.mode;sessionId=$strings.sessionId;event=$strings.event}
+        } else {
+            [pscustomobject]@{schema=$strings.schema;launchId=$strings.launchId;pid=$receiptPid;startedUtc=$strings.startedUtc
+                scenario=$strings.scenario;repeat=$repeatValue.GetInt32();provider=$strings.provider;event=$strings.event}
+        })
         [pscustomobject]@{Status='Accepted';Reason=$null;Receipt=$receipt
             Identity=[pscustomobject]@{Pid=$record.Pid;StartedUtc=$record.StartedUtc;Executable=$record.Executable;IsGame=$record.IsGame;Ownership=$record.Ownership}}
     } catch { [pscustomobject]@{Status='Rejected';Reason=$_.Exception.Message} }

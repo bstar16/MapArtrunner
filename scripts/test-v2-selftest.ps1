@@ -469,6 +469,108 @@ $text=$receipt | ConvertTo-Json -Compress
         if ($Outcome.CleanupStatus -ne 'settled') { throw 'HOLD: startup regression ownership unresolved; no more launches.' }
         Assert ($Outcome.ArchiveStatus -eq 'retained') 'startup evidence archive failed'
     }
+    Run 'inspect READY establishes one session only after the same owned receipt checks' {
+        $request=[pscustomobject]@{Mode='inspect';Scenario='grounded-two-lane'}
+        $originalUpdate=${function:Update-V2Processes}; $proof=@{Checked=$false;Latched=$false;Samples=0;Session=$null;Elapsed=$null}
+        try {
+            Set-Item Function:Update-V2Processes -Value {
+                param($Job,$Records,$Handles,[switch]$Fast)
+                & $originalUpdate $Job $Records $Handles -Fast:$Fast
+                if ($Fast) { return }
+                $held=$Handles | Where-Object { $_.Record.Pid -eq $process.Id } | Select-Object -First 1
+                $file=Join-Path $evidence 'test-start.json'
+                if (!$proof.Checked) {
+                    $proof.Checked=$true
+                    $data=@{schema='mapartrunner-inspect-ready-v1';launchId=$launchId;pid=$held.Record.Pid;startedUtc=$held.Record.StartedUtc
+                        scenario='grounded-two-lane';mode='inspect';sessionId='a420fdb6-92ee-4691-a827-141d70ca5ab0';event='INSPECT_WORLD_BOUND_COMMANDS_READY'}
+                    $valid=$data | ConvertTo-Json -Compress
+                    $arguments=@{Evidence=$evidence;LaunchId=$launchId;Request=$Request;Handles=@($Handles);OwnedPids=@($Job.Pids());WorkerPid=$process.Id}
+                    Assert ((Read-V2StartReceipt @arguments).Status -ceq 'Missing') 'missing inspect receipt accepted'
+                    $cases=@(
+                        '{', '{}', '[]', (' '*4097),
+                        ($valid -replace '\{"','{"schema":"mapartrunner-inspect-ready-v1","'),
+                        ($valid -replace '\{"','{"repeat":2,"'),
+                        ($valid -replace '"mode":"inspect"','"mode":"automatic"'),
+                        ($valid -replace 'INSPECT_WORLD_BOUND_COMMANDS_READY','SELECTED_PROVIDER_RUNTEST_ENTERED'),
+                        ($valid -replace 'mapartrunner-inspect-ready-v1','mapartrunner-test-start-v1'),
+                        ($valid -replace 'grounded-two-lane','all'),
+                        ($valid -replace 'a420fdb6-92ee-4691-a827-141d70ca5ab0','A420FDB6-92EE-4691-A827-141D70CA5AB0'),
+                        ($valid -replace 'a420fdb6-92ee-4691-a827-141d70ca5ab0','not-a-session'),
+                        ($valid -replace ('"launchId":"'+$launchId+'"'),'"launchId":"00000000-0000-0000-0000-000000000000"'),
+                        ($valid -replace ('"pid":'+$held.Record.Pid),'"pid":1.5'),
+                        ($valid -replace '"sessionId":"[^"]+"','"sessionId":1')
+                    )
+                    foreach ($field in @($data.Keys)) {
+                        $partial=@{}+$data; $partial.Remove($field); $cases+=($partial | ConvertTo-Json -Compress)
+                    }
+                    foreach ($text in $cases) {
+                        [IO.File]::WriteAllText($file,$text,[Text.UTF8Encoding]::new($false))
+                        $checked=Read-V2StartReceipt @arguments
+                        Assert ($checked.Status -ceq 'Rejected' -and !$checked.Receipt -and !$checked.Identity) 'malformed inspect receipt established identity'
+                    }
+                    [IO.File]::WriteAllBytes($file,[byte[]]@(0xff,0xfe,0xff))
+                    Assert ((Read-V2StartReceipt @arguments).Status -ceq 'Rejected') 'invalid inspect UTF8 accepted'
+                    [IO.File]::WriteAllText($file,$valid,[Text.UTF8Encoding]::new($false))
+                    $arguments.OwnedPids=@()
+                    Assert ((Read-V2StartReceipt @arguments).Status -ceq 'Rejected') 'foreign inspect PID accepted'
+                    $arguments.OwnedPids=@($Job.Pids()); $arguments.Handles=@()
+                    $pending=Read-V2StartReceipt @arguments
+                    Assert ($pending.Status -ceq 'Pending' -and !$pending.Receipt -and !$pending.Identity -and !$result.StartReceipt) 'pending inspect inventory established a session'
+                    $record=$held.Record.PSObject.Copy(); $record.StartedUtc='2000-01-01T00:00:00Z'
+                    $arguments.Handles=@([pscustomobject]@{Process=$held.Process;Record=$record})
+                    Assert ((Read-V2StartReceipt @arguments).Status -ceq 'Rejected') 'reused inspect PID accepted'
+                    $record=$held.Record.PSObject.Copy(); $record.ExitCode=0
+                    $arguments.Handles=@([pscustomobject]@{Process=$held.Process;Record=$record})
+                    Assert ((Read-V2StartReceipt @arguments).Status -ceq 'Rejected') 'dead inspect record accepted'
+                    $record=$held.Record.PSObject.Copy(); $record.StartedUtc='2000-01-01T00:00:00Z'
+                    $arguments.Handles=@([pscustomobject]@{Process=$held.Process;Record=$record})
+                    $data.startedUtc=$record.StartedUtc
+                    [IO.File]::WriteAllText($file,($data | ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
+                    Assert ((Read-V2StartReceipt @arguments).Status -ceq 'Rejected') 'inspect creation record credited over actual held StartTime'
+                    [IO.File]::WriteAllText($file,$valid,[Text.UTF8Encoding]::new($false))
+                    $record=$held.Record.PSObject.Copy(); $record.IsGame=$true; $record.IdentityVerified=$true
+                    $arguments.Handles=@([pscustomobject]@{Process=$held.Process;Record=$record})
+                    Assert ((Read-V2StartReceipt @arguments -RequireGame -JavaExecutable (Join-Path $actualJdk.Home 'bin/java.exe')).Status -ceq 'Rejected') 'wrong configured JDK accepted for inspect'
+                    $arguments.Handles=@($Handles)
+                    Assert ((Read-V2StartReceipt @arguments -RequireGame -JavaExecutable (Join-Path $actualJdk.Home 'bin/java.exe')).Status -ceq 'Rejected') 'dummy credited as inspect game'
+                    $arguments.Request=New-V2Request -EulaAccepted
+                    Assert ((Read-V2StartReceipt @arguments).Status -ceq 'Rejected') 'untrusted receipt selected inspect mode'
+                    $arguments.Request=[pscustomobject]@{Mode='INSPECT';Scenario='grounded-two-lane'}
+                    Assert ((Read-V2StartReceipt @arguments).Status -ceq 'Rejected') 'unknown request mode accepted'
+                    $arguments.Request=$Request
+                    $arguments.Evidence='relative'
+                    Assert ((Read-V2StartReceipt @arguments).Status -ceq 'Rejected') 'relative inspect evidence accepted'
+                    $linkParent=Join-Path $testRoot ('receipt-link-'+[guid]::NewGuid())
+                    New-Item -ItemType Directory -Path $linkParent | Out-Null
+                    $link=Join-Path $linkParent "launch-$launchId"
+                    try {
+                        New-Item -ItemType Junction -Path $link -Target $evidence | Out-Null
+                        $arguments.Evidence=$link
+                        Assert ((Read-V2StartReceipt @arguments).Status -ceq 'Rejected') 'reparse inspect evidence accepted'
+                    } finally { if (Test-Path -LiteralPath $link) { Remove-Item -LiteralPath $link -Force }; Remove-Item -LiteralPath $linkParent -Force }
+                    $arguments.Evidence=$evidence
+                    Assert ((Read-V2StartReceipt @arguments).Status -ceq 'Accepted') 'valid inspect READY rejected'
+                }
+                elseif ($result.StartReceipt) {
+                    if (!$proof.Latched) { $proof.Session=$result.StartReceipt.sessionId; $proof.Elapsed=$result.StartupAcceptedElapsedMilliseconds }
+                    Assert ($result.StartReceipt.sessionId -ceq $proof.Session -and $result.StartupAcceptedElapsedMilliseconds -eq $proof.Elapsed) 'later inspect READY replaced session or renewed time'
+                    $proof.Latched=$true
+                    $proof.Samples++
+                    $later=$result.StartReceipt.PSObject.Copy(); $later.sessionId=[guid]::NewGuid().ToString('D')
+                    [IO.File]::WriteAllText($file,($later | ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
+                }
+            }
+            $outcome=Invoke-V2Supervisor -Worker { Start-Sleep -Milliseconds 700; exit 0 } -Request $request -EvidenceRoot $testRoot -WorkingDirectory $repo -TimeoutMilliseconds 6000 -StartupMilliseconds 3000
+        } finally { Set-Item Function:Update-V2Processes -Value $originalUpdate }
+        Assert-V2Settled $outcome
+        Assert ($proof.Checked -and $proof.Latched -and $proof.Samples -ge 2 -and $outcome.ExitCode -eq 0 -and $outcome.StartReceipt.sessionId -ceq 'a420fdb6-92ee-4691-a827-141d70ca5ab0') 'inspect readiness/latch path was not exercised'
+        $early=Invoke-V2Supervisor -Worker { exit 0 } -Request ([pscustomobject]@{Mode='inspect';Scenario='grounded-two-lane'}) -EvidenceRoot $testRoot -WorkingDirectory $repo -TimeoutMilliseconds 6000 -StartupMilliseconds 3000
+        Assert-V2Settled $early
+        Assert ($early.ExitCode -eq 125 -and !$early.StartReceipt -and !$early.StartIdentity) 'early inspect worker established readiness'
+        $missing=Invoke-V2Supervisor -Worker { Start-Sleep -Seconds 30 } -Request ([pscustomobject]@{Mode='inspect';Scenario='grounded-two-lane'}) -EvidenceRoot $testRoot -WorkingDirectory $repo -TimeoutMilliseconds 5000 -StartupMilliseconds 40
+        Assert-V2Settled $missing
+        Assert ($missing.ExitCode -eq 124 -and $missing.TimeoutPhase -ceq 'STARTUP' -and !$missing.StartReceipt -and !$missing.StartIdentity) 'missing inspect READY escaped startup or established session'
+    }
     Run 'controlled support rejects noncanonical requests before JDK or worker construction' {
         $originalJdk=${function:Find-V2Jdk}; $originalInfo=${function:New-V2ProcessInfo}
         $calls=@{Jdk=0;Worker=0}; $proof=[Collections.Generic.List[object]]::new()
