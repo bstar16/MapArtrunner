@@ -284,6 +284,37 @@ class ScenarioHostTest {
         }
     }
 
+    @Test void failedAdmissionAfterSettledFailureOwnsN1PrimaryWithoutContaminatingPriorOperation() throws Exception {
+        try(var h=new DispatchHarness()) {
+            var first=operation(1); var firstError=new IllegalStateException("completed A failure");
+            var firstCleanup=h.host.beginCleanup(h.host.beginWork(first),firstError);
+            h.host.settleCleanup(firstCleanup,new FinalOutcome(first,Verdict.FAILURE,CleanupStatus.SETTLED));
+            var priorPublications=List.copyOf(h.published);
+            // Closed fixture bytes and the original Throwable must survive the later transport shutdown unchanged.
+            var closed=Files.createDirectories(first.evidenceDirectory()).resolve("closed-A.txt");
+            Files.writeString(closed,"closed operation A evidence"); var priorBytes=Files.readAllBytes(closed);
+
+            var failed=operation(2); var admissionError=new IllegalStateException("B header/BEGIN admission failure");
+            h.host.cancelSession(admissionError); // B deliberately never receives WORK/issue().
+            var cleanup=h.host.beginShutdownCleanup(failed,admissionError);
+            assertSame(failed,cleanup.operation()); assertEquals(Kind.CLEANUP,cleanup.kind());
+            assertEquals(10_000_000_001L,cleanup.deadlineNanos());
+            assertThrows(IllegalStateException.class,() -> h.host.beginShutdownCleanup(operation(3),new Exception("cannot replace live B")));
+            var effects=new AtomicInteger();
+            var queued=h.worker.submit(() -> h.host.inScope(cleanup,() -> h.host.runOnClient(client -> {
+                effects.incrementAndGet(); assertDoesNotThrow(() -> Files.writeString(closed,"contaminated A"));
+            })));
+            var action=h.client.poll(2,TimeUnit.SECONDS); assertNotNull(action);
+            h.nativeCall(() -> h.host.onStopping(null));
+            assertSame(admissionError,failure(queued));
+            h.nativeCall(action);
+            assertEquals(0,effects.get()); assertEquals(priorPublications,h.published);
+            assertEquals(1,h.published.size()); assertSame(first,h.published.getFirst().operation());
+            assertArrayEquals(priorBytes,Files.readAllBytes(closed));
+            assertEquals(0,firstError.getSuppressed().length); assertEquals(0,admissionError.getSuppressed().length);
+        }
+    }
+
     @Test void inspectCreationRequiresStartupAndAnExplicitOwnerGuardBeforeAnyNativeAction() throws Exception {
         try (var h=new DispatchHarness()) {
             assertThrows(IllegalStateException.class,h.host::createWorld);

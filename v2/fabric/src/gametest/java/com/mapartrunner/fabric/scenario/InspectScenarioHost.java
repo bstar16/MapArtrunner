@@ -129,7 +129,9 @@ final class InspectScenarioHost implements Inspect {
             check(cancelled && !stopped && !unresolved && !shutdownIssued && current == null && !issued.contains(operation), "Shutdown cleanup requires failed admission without a scope");
             check(session == null || session.equals(operation.sessionId()), "Foreign shutdown session");
             check(operation.ordinal() > lastOrdinal, "Stale failed admission");
-            retain(primary); issued.add(operation); session = operation.sessionId(); lastOrdinal = operation.ordinal(); settlementAttempted=false;
+            // N1 bypasses issue(); this newly authenticated admission owns its cause, not the prior settled command.
+            originalFailure.set(primary);
+            issued.add(operation); session = operation.sessionId(); lastOrdinal = operation.ordinal(); settlementAttempted=false;
             lineage=Lineage.FAILED_ADMISSION;
             shutdownIssued=true;
             return current = new Scope(operation, Kind.CLEANUP, clock.getAsLong() + CLEANUP_NANOS);
