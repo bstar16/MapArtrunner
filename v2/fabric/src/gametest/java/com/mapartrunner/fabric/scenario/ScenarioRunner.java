@@ -173,6 +173,7 @@ final class ScenarioRunner implements AutoCloseable {
     private Operation inspectOperation;
     private Operation failedInspectAdmission;
     private Throwable inspectAdmissionFailure;
+    private Throwable inspectUnresolvedCleanupFailure;
     private int inspectOrdinal;
     private UUID inspectRun;
     private boolean inspectFailureCaptured;
@@ -185,6 +186,8 @@ final class ScenarioRunner implements AutoCloseable {
     private boolean inspectEvidenceIncomplete;
     private String inspectLastSummaryHash;
     private final java.util.function.Consumer<Operation> beforeInspectHeader;
+    private final Runnable inspectReleaseEffect;
+    private final Runnable inspectFreezeEffect;
 
     static ScenarioRunner inspect(ScenarioHost host, ScenarioObserver.Watch watch) {
         require(host instanceof Inspect, "Inspect requires an issuing inspect transport");
@@ -197,8 +200,20 @@ final class ScenarioRunner implements AutoCloseable {
     }
 
     ScenarioRunner(Inspect host, ScenarioObserver.Watch watch, Roots roots, java.util.function.Consumer<Operation> beforeHeader) {
+        this(host,watch,roots,beforeHeader,null,null);
+    }
+
+    /** Owner-policy tests double only these two effects; real-world authority is proved by the native guards/gates. */
+    ScenarioRunner(Inspect host, ScenarioObserver.Watch watch, Roots roots, Runnable release, Runnable freeze) {
+        this(host,watch,roots,operation -> { },Objects.requireNonNull(release),Objects.requireNonNull(freeze));
+    }
+
+    private ScenarioRunner(Inspect host, ScenarioObserver.Watch watch, Roots roots,
+                           java.util.function.Consumer<Operation> beforeHeader, Runnable release, Runnable freeze) {
         inspectMode=true;
         beforeInspectHeader=Objects.requireNonNull(beforeHeader);
+        inspectReleaseEffect=release==null?this::releaseInspectControls:release;
+        inspectFreezeEffect=freeze==null?this::freezeInspectWatch:freeze;
         this.host=Objects.requireNonNull(host); this.watch=Objects.requireNonNull(watch); this.roots=Objects.requireNonNull(roots);
         fixture=ScenarioDefinition.Fixture.TWO_LANE; profileDefinition=ScenarioDefinition.load(fixture);
         expectedCountedRuns=0;
@@ -211,6 +226,7 @@ final class ScenarioRunner implements AutoCloseable {
     Operation beginInspectOperation(Command command) {
         require(inspectMode && !closed, "Inspect session is unavailable");
         require(inspectAdmissionFailure==null, "Inspect evidence unavailable; restart required");
+        require(inspectUnresolvedCleanupFailure==null, "Owned inspect cleanup is unresolved; restart required");
         require(inspectOperation==null, "Inspect operation is still busy/unsettled");
         Objects.requireNonNull(command);
         require(command!=Command.STARTUP || !inspectStartupReserved && inspectOrdinal==0 && !worldCreated, "Startup is single-use");
@@ -238,7 +254,7 @@ final class ScenarioRunner implements AutoCloseable {
     }
 
     void failInspectAdmission(Operation operation, Throwable primary) {
-        require(inspectMode && operation==inspectOperation, "Foreign admission failure");
+        require(inspectMode && operation==inspectOperation && !inspectFinalizing, "Foreign or already finalized admission failure");
         Objects.requireNonNull(primary);
         if(inspectAdmissionFailure!=null) {
             require(operation==failedInspectAdmission,"Foreign failed reservation");
@@ -279,7 +295,8 @@ final class ScenarioRunner implements AutoCloseable {
 
     private void requireInspectWork(Command first, Command second) {
         if(!inspectMode) return;
-        require(inspectAdmissionFailure==null && inspectOperation!=null && !inspectFinalizing,"Inspect work is unavailable");
+        require(inspectAdmissionFailure==null && inspectUnresolvedCleanupFailure==null
+                && inspectOperation!=null && !inspectFinalizing,"Inspect work is unavailable");
         ((Inspect)host).requireScope(inspectOperation,Kind.WORK);
         require(inspectOperation.command()==first || inspectOperation.command()==second,"Wrong inspect work command");
     }
@@ -317,16 +334,21 @@ final class ScenarioRunner implements AutoCloseable {
         } catch(RuntimeException | Error error) { inspectEvidenceIncomplete=true; failure=retain(failure,error); }
         String cleanupStatus=!worldCreated?"NO_OWNED_WORLD":closed?"CLOSED":"RELEASED";
         if(worldCreated && !closed) {
-            try { releaseInspectControls(); }
+            try { inspectReleaseEffect.run(); }
             catch(RuntimeException | Error error) { cleanupStatus="FAILED"; failure=retain(failure,error); }
             try {
                 writeNew(roots,artifacts.resolve("after-release.txt"),host.computeOnClient(c -> {
                     requireClient(c); return MapArtClient.status().toString();
                 }));
             } catch(RuntimeException | Error error) { inspectEvidenceIncomplete=true; failure=retain(failure,error); }
-            try { host.runOnClient(c -> watch.freeze()); }
+            try { inspectFreezeEffect.run(); }
             catch(RuntimeException | Error error) { cleanupStatus="FAILED"; failure=retain(failure,error); }
-        } else watch.freeze();
+        } else {
+            try { watch.freeze(); }
+            catch(RuntimeException | Error error) { cleanupStatus="FAILED"; failure=retain(failure,error); }
+        }
+        // Transport settlement cannot resolve an unverified release/freeze owned by this Runner.
+        if(cleanupStatus.equals("FAILED")) inspectUnresolvedCleanupFailure=failure;
         ready=ready && failure==null && operation.command()==Command.RESET;
         Path summary=artifacts.resolve("completion.json");
         boolean complete=!inspectEvidenceIncomplete && (failure==null || inspectFailureCaptured);
@@ -341,7 +363,9 @@ final class ScenarioRunner implements AutoCloseable {
             manifest.addProperty("cleanupStatus",cleanupStatus);
             if(failure!=null && !inspectFailureCaptured)
                 manifest.addProperty("missingEvidence","failure capture was unavailable before cleanup failed; original pre-release snapshot is retained when available");
-            manifest.addProperty("cleanup","owned finalization ended; matching END/settlement required before publication");
+            manifest.addProperty("cleanup",inspectUnresolvedCleanupFailure==null
+                    ? "owned finalization ended; matching END/settlement required before publication"
+                    : "owned cleanup unresolved; transport settlement cannot permit successor work");
             manifest.add("closedFiles",inspectClosedFiles());
             writeNew(roots,summary,new GsonBuilder().setPrettyPrinting().create().toJson(manifest));
         } catch(RuntimeException | Error error) {
@@ -357,6 +381,10 @@ final class ScenarioRunner implements AutoCloseable {
             if(unsettled instanceof RuntimeException runtime) throw runtime;
             throw new IllegalStateException("Inspect cleanup remains unsettled",unsettled);
         }
+        if(inspectUnresolvedCleanupFailure instanceof Error fatal) throw fatal;
+        if(inspectUnresolvedCleanupFailure instanceof RuntimeException runtime) throw runtime;
+        if(inspectUnresolvedCleanupFailure!=null)
+            throw new IllegalStateException("Owned inspect cleanup remains unresolved",inspectUnresolvedCleanupFailure);
         var completion=new InspectCompletion(invocation,operation.operationId(),operation.ordinal(),operation.command(),
                 Optional.ofNullable(inspectRun),failure==null?"PASS":"FAIL",failure,artifacts,complete,cleanupStatus,true,summary);
         inspectLast=completion; inspectLastSummaryHash=summaryHash; inspectOperation=null;
@@ -390,6 +418,8 @@ final class ScenarioRunner implements AutoCloseable {
         });
     }
 
+    private void freezeInspectWatch() { host.runOnClient(c -> watch.freeze()); }
+
     private Path takeScreenshot(Path directory, String name) {
         if(inspectMode) {
             ((Inspect)host).requireScope(inspectOperation,inspectFinalizing?Kind.CLEANUP:Kind.WORK);
@@ -408,6 +438,8 @@ final class ScenarioRunner implements AutoCloseable {
     ScenarioRunner(ClientGameTestContext context,ScenarioObserver.Watch watch,int expectedCountedRuns,ScenarioDefinition.Fixture fixture) {
         inspectMode=false;
         beforeInspectHeader=operation -> { };
+        inspectReleaseEffect=this::releaseInspectControls;
+        inspectFreezeEffect=this::freezeInspectWatch;
         this.fixture=Objects.requireNonNull(fixture);
         profileDefinition=ScenarioDefinition.load(fixture);
         require(validExpectedCount(expectedCountedRuns),"Expected counted-run total must be 1..2");
@@ -3610,6 +3642,7 @@ final class ScenarioRunner implements AutoCloseable {
     }
 
     private void closeInspect() {
+        require(inspectUnresolvedCleanupFailure==null,"Owned inspect cleanup is unresolved; cannot renew its cleanup scope");
         var transport=(Inspect)host;
         if(inspectAdmissionFailure!=null) {
             var cleanup=transport.beginShutdownCleanup(failedInspectAdmission,inspectAdmissionFailure);

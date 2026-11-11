@@ -247,7 +247,7 @@ class ScenarioInspectLifecycleTest {
         assertEquals(0, host.effects);
     }
 
-    @Test void expiredWorkCanOnlyFinalizeWithFreshCleanupAndRetainsTimeoutUnderCaptureFailure() throws Exception {
+    @Test void expiredWorkWithRefusedOwnedCleanupRemainsUnresolvedAfterTransportSettlement() throws Exception {
         var host = new InspectTransport();
         var runner = runner(host);
         var operation = runner.beginInspectOperation(Command.RUN);
@@ -261,13 +261,139 @@ class ScenarioInspectLifecycleTest {
         assertThrows(AssertionError.class, () -> host.beginCleanup(work, timeout));
         // The doubled native transport refuses every capture/release attempt, exercising primary retention.
         runnerField("worldCreated").setBoolean(runner, true);
-        var result = host.inScope(cleanup, () -> runner.finishInspectOperation(operation, cleanup, timeout));
-        assertSame(timeout, result.failure());
+        assertSame(timeout, assertThrows(IllegalStateException.class,
+                () -> host.inScope(cleanup, () -> runner.finishInspectOperation(operation, cleanup, timeout))));
         assertTrue(timeout.getSuppressed().length > 0);
-        assertFalse(result.evidenceComplete());
-        assertEquals("FAILED", result.cleanupStatus());
-        assertTrue(result.cleanupSettled());
-        assertEquals("FAIL", result.verdict());
+        assertNull(host.current); // Transport settlement returned normally; Runner still owns unresolved cleanup.
+        assertTrue(runner.lastInspectCompletion().isEmpty());
+        int effects = host.effects;
+        int ordinal = runnerField("inspectOrdinal").getInt(runner);
+        for (var command : List.of(Command.RESET, Command.RUN, Command.RERUN))
+            assertThrows(AssertionError.class, () -> runner.beginInspectOperation(command));
+        assertEquals(ordinal, runnerField("inspectOrdinal").getInt(runner));
+        assertEquals(effects, host.effects);
+    }
+
+    @Test void releaseFailureKeepsPriorLastAndBlocksSuccessorAndRenewedShutdown() throws Exception {
+        unresolvedOwnedCleanup("release");
+    }
+
+    @Test void freezeFailureKeepsPriorLastAndBlocksSuccessorAndRenewedShutdown() throws Exception {
+        unresolvedOwnedCleanup("freeze");
+    }
+
+    private void unresolvedOwnedCleanup(String failingEffect) throws Exception {
+        // Doubled owner effects test actual Runner orchestration; they confer no native release/physics credit.
+        var host = new InspectTransport();
+        var watch = new ScenarioObserver.Watch();
+        var active = new Operation[1];
+        var expectedCleanup = new Scope[1];
+        var attempts = new int[2];
+        var releaseFailure = new IllegalStateException("owned release could not be verified");
+        var freezeFailure = new IllegalStateException("owned Watch freeze dispatch failed");
+        var runner = new ScenarioRunner(host, watch, roots(), () -> {
+            assertSame(expectedCleanup[0], host.requireScope(active[0], Kind.CLEANUP));
+            attempts[0]++;
+            if (failingEffect.equals("release")) throw releaseFailure;
+        }, () -> {
+            assertSame(expectedCleanup[0], host.requireScope(active[0], Kind.CLEANUP));
+            attempts[1]++;
+            if (failingEffect.equals("freeze")) throw freezeFailure;
+            watch.freeze();
+        });
+        var prior = settledPrior(runner, host);
+        var priorFiles = closedFileHashes(prior.evidenceDirectory());
+        var operation = runner.beginInspectOperation(Command.RUN);
+        active[0] = operation;
+        var work = host.beginWork(operation);
+        var original = new IllegalStateException("original scenario failure before cleanup");
+        var cleanup = host.beginCleanup(work, original);
+        expectedCleanup[0] = cleanup;
+        runnerField("worldCreated").setBoolean(runner, true);
+        field("frozen").setBoolean(watch, false);
+        assertSame(original, assertThrows(IllegalStateException.class,
+                () -> host.inScope(cleanup, () -> runner.finishInspectOperation(operation, cleanup, original))));
+        assertNull(host.current); // Successful transport settlement cannot prove either owned effect.
+        assertEquals(2, host.settlements);
+        assertArrayEquals(new int[]{1, 1}, attempts);
+        assertTrue(List.of(original.getSuppressed()).contains(failingEffect.equals("release") ? releaseFailure : freezeFailure));
+        assertSame(original, runnerField("inspectUnresolvedCleanupFailure").get(runner));
+        assertSame(operation, runnerField("inspectOperation").get(runner));
+        assertEquals(failingEffect.equals("release"), field("frozen").getBoolean(watch));
+        var failedFiles = closedFileHashes(operation.evidenceDirectory());
+        var manifest = com.google.gson.JsonParser.parseString(Files.readString(operation.evidenceDirectory().resolve("completion.json"))).getAsJsonObject();
+        assertEquals("FAILED", manifest.get("cleanupStatus").getAsString());
+        assertTrue(manifest.get("failure").getAsString().contains(original.getMessage()));
+        int ordinal = runnerField("inspectOrdinal").getInt(runner);
+        int effects = host.effects;
+        for (var command : List.of(Command.RESET, Command.RUN, Command.RERUN, Command.CLOSE))
+            assertThrows(AssertionError.class, () -> runner.beginInspectOperation(command));
+        assertThrows(AssertionError.class, () -> runner.run(ScenarioDefinition.load()));
+        assertThrows(AssertionError.class, () -> runner.failInspectAdmission(operation, new IllegalStateException("cannot reclassify cleanup as BEGIN failure")));
+        assertThrows(AssertionError.class, runner::close);
+        assertNull(host.shutdownOperation);
+        assertEquals(0, host.shutdownScopes);
+        assertEquals(effects, host.effects);
+        assertEquals(ordinal, runnerField("inspectOrdinal").getInt(runner));
+        assertSame(prior, runner.lastInspectCompletion().orElseThrow());
+        assertEquals(priorFiles, closedFileHashes(prior.evidenceDirectory()));
+        assertEquals(failedFiles, closedFileHashes(operation.evidenceDirectory()));
+    }
+
+    @Test void expiredWorkAndEvidenceOnlyFailureCanSettleAfterSuccessfulOwnedCleanup() throws Exception {
+        // These scoped effect doubles execute successfully; real native ownership remains a later gate.
+        var host = new InspectTransport();
+        var watch = new ScenarioObserver.Watch();
+        var active = new Operation[1];
+        var attempts = new int[2];
+        var runner = new ScenarioRunner(host, watch, roots(), () -> {
+            host.requireScope(active[0], Kind.CLEANUP); attempts[0]++;
+        }, () -> {
+            host.requireScope(active[0], Kind.CLEANUP); attempts[1]++; watch.freeze();
+        });
+        var prior = settledPrior(runner, host);
+        var priorFiles = closedFileHashes(prior.evidenceDirectory());
+        var operation = runner.beginInspectOperation(Command.RUN);
+        active[0] = operation;
+        var work = host.beginWork(operation);
+        host.expiredWork = true;
+        assertThrows(AssertionError.class, () -> host.inScope(work, () -> runner.run(ScenarioDefinition.load())));
+        var timeout = new IllegalStateException("original absolute WORK timeout");
+        var cleanup = host.beginCleanup(work, timeout);
+        assertNotSame(work, cleanup);
+        runnerField("worldCreated").setBoolean(runner, true);
+        var completion = host.inScope(cleanup, () -> runner.finishInspectOperation(operation, cleanup, timeout));
+        assertSame(timeout, completion.failure());
+        assertTrue(timeout.getSuppressed().length > 0); // Native evidence reads were refused by the test transport.
+        assertFalse(completion.evidenceComplete());
+        assertEquals("RELEASED", completion.cleanupStatus());
+        assertTrue(completion.cleanupSettled());
+        assertArrayEquals(new int[]{1, 1}, attempts);
+        assertTrue(field("frozen").getBoolean(watch));
+        assertNull(runnerField("inspectUnresolvedCleanupFailure").get(runner));
+        assertSame(completion, runner.lastInspectCompletion().orElseThrow());
+        int effects = host.effects;
+        assertEquals(operation.ordinal() + 1, runner.beginInspectOperation(Command.RESET).ordinal());
+        assertEquals(effects, host.effects);
+        assertEquals(priorFiles, closedFileHashes(prior.evidenceDirectory()));
+    }
+
+    private static ScenarioRunner.InspectCompletion settledPrior(ScenarioRunner runner, InspectTransport host) {
+        var operation = runner.beginInspectOperation(Command.RESET);
+        var work = host.beginWork(operation);
+        var failure = new IllegalStateException("previous settled scenario failure");
+        var cleanup = host.beginCleanup(work, failure);
+        return host.inScope(cleanup, () -> runner.finishInspectOperation(operation, cleanup, failure));
+    }
+
+    private static java.util.Map<String, String> closedFileHashes(Path directory) throws Exception {
+        var hashes = new java.util.TreeMap<String, String>();
+        try (var paths = Files.walk(directory)) {
+            for (var file : paths.filter(Files::isRegularFile).toList())
+                hashes.put(directory.relativize(file).toString(), Files.size(file) + ":" + java.util.HexFormat.of().formatHex(
+                        java.security.MessageDigest.getInstance("SHA-256").digest(Files.readAllBytes(file))));
+        }
+        return hashes;
     }
 
     private static Object checkpoint() throws Exception {
@@ -327,6 +453,7 @@ class ScenarioInspectLifecycleTest {
         int effects;
         Throwable settlementFailure;
         Operation shutdownOperation;
+        int settlements, shutdownScopes;
         public Scope beginStartup(Operation op) { return current = new Scope(op, Kind.STARTUP, Long.MAX_VALUE); }
         public void settleStartup(Scope scope) { assertSame(current, scope); current = null; }
         public Scope beginWork(Operation op) { assertFalse(cancelled); return current = new Scope(op, Kind.WORK, Long.MAX_VALUE); }
@@ -336,10 +463,12 @@ class ScenarioInspectLifecycleTest {
         public void settleCleanup(Scope scope) {
             assertSame(current, scope);
             if (settlementFailure != null) throw (RuntimeException) settlementFailure;
+            settlements++;
             current = null;
         }
         public void cancelSession(Throwable primary) { cancelled = true; current = null; }
         public Scope beginShutdownCleanup(Operation failed, Throwable primary) {
+            shutdownScopes++;
             shutdownOperation = failed;
             return current = new Scope(failed, Kind.CLEANUP, Long.MAX_VALUE);
         }
