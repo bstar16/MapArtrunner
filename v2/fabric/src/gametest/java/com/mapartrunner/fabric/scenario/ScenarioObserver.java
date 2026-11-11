@@ -71,6 +71,16 @@ final class ScenarioObserver {
         private Object originalConnection;
         private boolean traversalWriting;
         private boolean releaseEndRequested;
+        private boolean frozen;
+
+        record Retained(List<Sample> samples, Throwable failure) {
+            Retained { samples = List.copyOf(samples); }
+        }
+
+        // Inspect settlement retains the original binding and failure until archive-before-clear/arm.
+        void freeze() { frozen = true; }
+
+        Retained retained() { return new Retained(samples, failure); }
 
         void armTraversal(MinecraftClient client, BuildPlan plan, TraversalCapture capture) {
             requireClientThread(client);
@@ -120,6 +130,7 @@ final class ScenarioObserver {
             traversalWriting=false; releaseEndRequested=false;
             plan = null; run = null; world = null; handler = null;
             samples.clear(); failure = null; tick = 0;
+            frozen = false;
         }
 
         void closeWorld() {
@@ -128,6 +139,7 @@ final class ScenarioObserver {
         }
 
         void record(MinecraftClient client, String phase) {
+            if (frozen) return;
             if(traversalCapture!=null) { recordTraversal(client,phase); return; }
             if (plan == null || failure != null) return;
             try {

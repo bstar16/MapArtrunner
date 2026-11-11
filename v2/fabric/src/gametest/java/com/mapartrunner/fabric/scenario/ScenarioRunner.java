@@ -71,6 +71,8 @@ import javax.imageio.ImageIO;
 import javax.imageio.stream.MemoryCacheImageOutputStream;
 import java.util.concurrent.CompletableFuture;
 
+import static com.mapartrunner.fabric.scenario.ScenarioHost.*;
+
 /** Closed-profile fixture owner. No production reset API and no observation-time repairs. */
 final class ScenarioRunner implements AutoCloseable {
     private enum SupportCase {
@@ -88,7 +90,10 @@ final class ScenarioRunner implements AutoCloseable {
                           String observedStableStartHash, List<String> mismatches, Path artifacts) {
         ScenarioResult { mismatches = List.copyOf(mismatches); }
     }
-    private record Roots(Path module, Path game, Path build, Path evidence, Path saves) { }
+    record Roots(Path module, Path game, Path build, Path evidence, Path saves) { }
+    record InspectCompletion(UUID sessionId, UUID operationId, int ordinal, Command command, Optional<UUID> runId,
+                             String verdict, Throwable failure, Path evidenceDirectory, boolean evidenceComplete,
+                             String cleanupStatus, boolean cleanupSettled, Path summaryPath) { }
     private record Side(JsonObject state, int age, long time, int serverTick, List<String> problems) { }
     private record Checkpoint(Side client, Side server, FabricBuildAdapter.Status status) { }
     private record Prior(FabricBuildAdapter.Status status, List<ScenarioObserver.Sample> samples,
@@ -104,9 +109,9 @@ final class ScenarioRunner implements AutoCloseable {
     private final ScenarioObserver.Watch watch;
     private final UUID invocation = UUID.randomUUID();
     private final Roots roots;
-    private final Path artifacts;
-    private final boolean callerAutoJump;
-    private final int callerViewDistance;
+    private Path artifacts;
+    private boolean callerAutoJump;
+    private int callerViewDistance;
     private final int expectedCountedRuns;
     private final ScenarioDefinition.Fixture fixture;
     private final ScenarioDefinition profileDefinition;
@@ -162,12 +167,247 @@ final class ScenarioRunner implements AutoCloseable {
     private TraversalAssertions.ForwardHistory forwardHistory;
     private boolean removalConsumed;
     private ServerFrame lastTraversalServer;
+    // Inspect owns one operation until evidence is closed AND the exact cleanup settles. Never recycle a reservation.
+    private final boolean inspectMode;
+    private Path inspectDirectory;
+    private Operation inspectOperation;
+    private Operation failedInspectAdmission;
+    private Throwable inspectAdmissionFailure;
+    private int inspectOrdinal;
+    private UUID inspectRun;
+    private boolean inspectFailureCaptured;
+    private Throwable inspectOriginalFailure;
+    private boolean inspectFinalizing;
+    private InspectCompletion inspectLast;
+    private Checkpoint currentCountedStart;
+    private ScenarioResult priorCountedSuccess;
+    private boolean inspectStartupReserved;
+    private boolean inspectEvidenceIncomplete;
+    private String inspectLastSummaryHash;
+    private final java.util.function.Consumer<Operation> beforeInspectHeader;
+
+    static ScenarioRunner inspect(ScenarioHost host, ScenarioObserver.Watch watch) {
+        require(host instanceof Inspect, "Inspect requires an issuing inspect transport");
+        return new ScenarioRunner((Inspect) host, watch, roots(true));
+    }
+
+    /** Root injection is only for filesystem owner tests; native authority still uses the unchanged binding guards. */
+    ScenarioRunner(Inspect host, ScenarioObserver.Watch watch, Roots roots) {
+        this(host,watch,roots,operation -> { });
+    }
+
+    ScenarioRunner(Inspect host, ScenarioObserver.Watch watch, Roots roots, java.util.function.Consumer<Operation> beforeHeader) {
+        inspectMode=true;
+        beforeInspectHeader=Objects.requireNonNull(beforeHeader);
+        this.host=Objects.requireNonNull(host); this.watch=Objects.requireNonNull(watch); this.roots=Objects.requireNonNull(roots);
+        fixture=ScenarioDefinition.Fixture.TWO_LANE; profileDefinition=ScenarioDefinition.load(fixture);
+        expectedCountedRuns=0;
+        checkRoots(roots);
+        require(roots.game.equals(roots.build.resolve("run/inspect")),"Inspect requires its fixed game root");
+        artifacts=roots.evidence.resolve("two-lane-"+invocation);
+        inspectDirectory=artifacts.resolve("inspect-operations");
+    }
+
+    Operation beginInspectOperation(Command command) {
+        require(inspectMode && !closed, "Inspect session is unavailable");
+        require(inspectAdmissionFailure==null, "Inspect evidence unavailable; restart required");
+        require(inspectOperation==null, "Inspect operation is still busy/unsettled");
+        Objects.requireNonNull(command);
+        require(command!=Command.STARTUP || !inspectStartupReserved && inspectOrdinal==0 && !worldCreated, "Startup is single-use");
+        checkRoots(roots); // Read-only authority precedes reservation and allocation.
+        int ordinal=command==Command.STARTUP ? 0 : Math.incrementExact(inspectOrdinal);
+        if(command==Command.STARTUP) inspectStartupReserved=true;
+        if(command!=Command.STARTUP) inspectOrdinal=ordinal;
+        var id=UUID.randomUUID();
+        var operation=new Operation(invocation,ordinal,id,command,inspectDirectory.resolve("op-"+ordinal+"-"+id));
+        inspectOperation=operation;
+        artifacts=operation.evidenceDirectory(); inspectRun=null; inspectFailureCaptured=false; inspectOriginalFailure=null;
+        inspectFinalizing=false; inspectEvidenceIncomplete=false;
+        try {
+            checkedDirectory(roots,artifacts.getParent());
+            Files.createDirectory(artifacts); // Existing destinations never become a new operation.
+            beforeInspectHeader.accept(operation); // Tests inject a real header collision at this filesystem boundary.
+            writeNew(roots,artifacts.resolve("operation.json"),operationIdentity(operation).toString());
+        } catch(IOException | RuntimeException | Error error) {
+            var cause=error instanceof IOException io ? new UncheckedIOException(io) : error;
+            failInspectAdmission(operation,cause);
+            if(cause instanceof Error fatal) throw fatal;
+            throw (RuntimeException)cause;
+        }
+        return operation;
+    }
+
+    void failInspectAdmission(Operation operation, Throwable primary) {
+        require(inspectMode && operation==inspectOperation, "Foreign admission failure");
+        Objects.requireNonNull(primary);
+        if(inspectAdmissionFailure!=null) {
+            require(operation==failedInspectAdmission,"Foreign failed reservation");
+            return;
+        }
+        inspectAdmissionFailure=primary; failedInspectAdmission=operation;
+        // Latch first; a failing transport cancellation cannot restore mutation admission.
+        capture(primary,() -> ((Inspect)host).cancelSession(primary));
+    }
+
+    Optional<Throwable> inspectAdmissionFailure() { return Optional.ofNullable(inspectAdmissionFailure); }
+    Optional<Operation> failedInspectAdmission() { return Optional.ofNullable(failedInspectAdmission); }
+    Optional<InspectCompletion> lastInspectCompletion() { return Optional.ofNullable(inspectLast); }
+
+    private static JsonObject operationIdentity(Operation operation) {
+        var identity=new JsonObject();
+        identity.addProperty("sessionId",operation.sessionId().toString()); identity.addProperty("ordinal",operation.ordinal());
+        identity.addProperty("operationId",operation.operationId().toString()); identity.addProperty("command",operation.command().name());
+        identity.addProperty("evidenceDirectory",operation.evidenceDirectory().toString());
+        return identity;
+    }
+
+    void initializeInspectWorld() {
+        require(inspectMode && inspectOperation!=null && inspectOperation.command()==Command.STARTUP,
+                "Inspect initialization requires its startup operation");
+        ((Inspect)host).requireScope(inspectOperation,Kind.STARTUP);
+        require(!worldCreated,"Inspect cannot adopt an existing world");
+        callerViewDistance=host.computeOnClient(c -> { requireUncreatedClient(c); return c.options.getViewDistance().getValue(); });
+        callerAutoJump=host.computeOnClient(c -> { requireUncreatedClient(c); return c.options.getAutoJump().getValue(); });
+        createOwnedWorld(); // Creation/binding only: no reset, import, restore or start.
+        writeNew(roots,artifacts.resolve("startup-complete.txt"),"Owned world bound; reset/run remain mandatory; session="+invocation);
+        var manifest=new JsonObject(); manifest.add("operation",operationIdentity(inspectOperation));
+        manifest.addProperty("verdict","OWNED_WORLD_BOUND"); manifest.add("closedFiles",inspectClosedFiles());
+        writeNew(roots,artifacts.resolve("completion.json"),manifest.toString());
+        ((Inspect)host).settleStartup(((Inspect)host).requireScope(inspectOperation,Kind.STARTUP));
+        inspectOperation=null;
+    }
+
+    private void requireInspectWork(Command first, Command second) {
+        if(!inspectMode) return;
+        require(inspectAdmissionFailure==null && inspectOperation!=null && !inspectFinalizing,"Inspect work is unavailable");
+        ((Inspect)host).requireScope(inspectOperation,Kind.WORK);
+        require(inspectOperation.command()==first || inspectOperation.command()==second,"Wrong inspect work command");
+    }
+
+    InspectCompletion finishInspectOperation(Operation operation, Scope cleanup, Throwable primary) {
+        require(inspectMode && inspectAdmissionFailure==null && operation==inspectOperation && !inspectFinalizing,
+                "Foreign, failed-admission or already finalized operation");
+        require(((Inspect)host).requireScope(operation,Kind.CLEANUP)==cleanup,"Wrong cleanup handle");
+        inspectFinalizing=true; // No retry can write the fixed evidence names again.
+        Throwable failure=inspectOriginalFailure;
+        if(primary!=null) failure=retain(failure,primary);
+        if(failure==null) {
+            try {
+                switch(operation.command()) {
+                    case RESET -> require(ready && admitted!=null,"RESET lacks independent validated readiness");
+                    case RUN, RERUN -> require(inspectRun!=null && previous!=null && previous.runId().equals(inspectRun)
+                            && previous.artifacts().equals(artifacts) && assertedSuccesses.stream().anyMatch(r -> r==previous),
+                            "RUN lacks this operation's independently asserted success");
+                    case CLOSE -> require(closed && normalClose,"CLOSE lacks normal owned-world closure");
+                    case STARTUP -> throw new AssertionError("Startup uses initialization/settleStartup, not operation finalization");
+                }
+            } catch(RuntimeException | Error error) { failure=error; }
+        }
+        try {
+            if(failure!=null) captureFailure(failure);
+            if(worldCreated && !closed) {
+                // Original status/Watch/fault diagnostics precede every release mutation.
+                writeNew(roots,artifacts.resolve("before-release.txt"),host.computeOnClient(c -> {
+                    requireClient(c);
+                    return MapArtClient.status()+"\n"+watch.retained()+"\n"+PredictionFaults.snapshot()+"\n"+PredictionFaults.stateSnapshot();
+                }));
+                host.runOnClient(this::requireClient);
+                copyNew(roots,roots.game.resolve("logs/latest.log"),artifacts.resolve("minecraft-latest.log"));
+            }
+        } catch(RuntimeException | Error error) { inspectEvidenceIncomplete=true; failure=retain(failure,error); }
+        String cleanupStatus=!worldCreated?"NO_OWNED_WORLD":closed?"CLOSED":"RELEASED";
+        if(worldCreated && !closed) {
+            try { releaseInspectControls(); }
+            catch(RuntimeException | Error error) { cleanupStatus="FAILED"; failure=retain(failure,error); }
+            try {
+                writeNew(roots,artifacts.resolve("after-release.txt"),host.computeOnClient(c -> {
+                    requireClient(c); return MapArtClient.status().toString();
+                }));
+            } catch(RuntimeException | Error error) { inspectEvidenceIncomplete=true; failure=retain(failure,error); }
+            try { host.runOnClient(c -> watch.freeze()); }
+            catch(RuntimeException | Error error) { cleanupStatus="FAILED"; failure=retain(failure,error); }
+        } else watch.freeze();
+        ready=ready && failure==null && operation.command()==Command.RESET;
+        Path summary=artifacts.resolve("completion.json");
+        boolean complete=!inspectEvidenceIncomplete && (failure==null || inspectFailureCaptured);
+        try {
+            if(failure!=null) writeNew(roots,artifacts.resolve("operation-close-failure.txt"),trace(failure));
+            var manifest=new JsonObject();
+            manifest.add("operation",operationIdentity(operation));
+            manifest.addProperty("runId",inspectRun==null?null:inspectRun.toString());
+            manifest.addProperty("verdict",failure==null?"PASS":"FAIL");
+            manifest.addProperty("failure",failure==null?null:trace(failure));
+            manifest.addProperty("evidenceComplete",complete);
+            manifest.addProperty("cleanupStatus",cleanupStatus);
+            if(failure!=null && !inspectFailureCaptured)
+                manifest.addProperty("missingEvidence","failure capture was unavailable before cleanup failed; original pre-release snapshot is retained when available");
+            manifest.addProperty("cleanup","owned finalization ended; matching END/settlement required before publication");
+            manifest.add("closedFiles",inspectClosedFiles());
+            writeNew(roots,summary,new GsonBuilder().setPrettyPrinting().create().toJson(manifest));
+        } catch(RuntimeException | Error error) {
+            complete=false; failure=retain(failure,error);
+        }
+        String summaryHash=null;
+        try { if(Files.isRegularFile(summary)) summaryHash=fileHash(summary); }
+        catch(IOException | RuntimeException | Error error) { complete=false; failure=retain(failure,error); }
+        try { ((Inspect)host).settleCleanup(cleanup); }
+        catch(RuntimeException | Error error) {
+            var unsettled=retain(failure,error);
+            if(unsettled instanceof Error fatal) throw fatal;
+            if(unsettled instanceof RuntimeException runtime) throw runtime;
+            throw new IllegalStateException("Inspect cleanup remains unsettled",unsettled);
+        }
+        var completion=new InspectCompletion(invocation,operation.operationId(),operation.ordinal(),operation.command(),
+                Optional.ofNullable(inspectRun),failure==null?"PASS":"FAIL",failure,artifacts,complete,cleanupStatus,true,summary);
+        inspectLast=completion; inspectLastSummaryHash=summaryHash; inspectOperation=null;
+        return completion;
+    }
+
+    private JsonArray inspectClosedFiles() {
+        var files=new JsonArray();
+        try(var paths=Files.walk(artifacts)) {
+            for(var file:paths.sorted().toList()) {
+                require(real(file).equals(file),"Redirected operation evidence");
+                if(Files.isDirectory(file,LinkOption.NOFOLLOW_LINKS)) continue;
+                require(Files.isRegularFile(file,LinkOption.NOFOLLOW_LINKS) && real(file).equals(file),"Redirected operation evidence");
+                files.add(new Gson().toJsonTree(new CompactFile(artifacts.relativize(file).toString().replace('\\','/'),Files.size(file),fileHash(file))));
+            }
+        } catch(IOException error) { throw new UncheckedIOException(error); }
+        return files;
+    }
+
+    private void releaseInspectControls() {
+        requireServerCheckpoint();
+        host.runOnClient(c -> {
+            requireClient(c);
+            require(MapArtClient.status().engine().lifecycle().context().map(context -> runs.contains(context.runId())).orElse(true),
+                    "Cleanup refuses another run's controls");
+            MapArtClient.stop(); requireReleased(c);
+            if(supportArm!=null) {
+                requireClient(c);
+                PredictionFaults.cancelSupportAvailabilityForClose(c,server,save,supportArm.context().runId(),supportArm);
+            }
+        });
+    }
+
+    private Path takeScreenshot(Path directory, String name) {
+        if(inspectMode) {
+            ((Inspect)host).requireScope(inspectOperation,inspectFinalizing?Kind.CLEANUP:Kind.WORK);
+            require(directory.startsWith(inspectOperation.evidenceDirectory()),"Image escaped current operation");
+            require(!Files.exists(directory.resolve(name+".png"),LinkOption.NOFOLLOW_LINKS),"Image target already exists");
+            writeNew(roots,directory.resolve(name+".image-reservation"),"operation="+inspectOperation.operationId());
+        }
+        // The ordinary host owns CREATE_NEW output and late exact-scope invalidation; automatic remains native.
+        return host.takeScreenshot(directory,name);
+    }
 
     ScenarioRunner(ClientGameTestContext context, ScenarioObserver.Watch watch, int expectedCountedRuns) {
         this(context,watch,expectedCountedRuns,ScenarioDefinition.Fixture.TWO_LANE);
     }
 
     ScenarioRunner(ClientGameTestContext context,ScenarioObserver.Watch watch,int expectedCountedRuns,ScenarioDefinition.Fixture fixture) {
+        inspectMode=false;
+        beforeInspectHeader=operation -> { };
         this.fixture=Objects.requireNonNull(fixture);
         profileDefinition=ScenarioDefinition.load(fixture);
         require(validExpectedCount(expectedCountedRuns),"Expected counted-run total must be 1..2");
@@ -408,11 +648,13 @@ final class ScenarioRunner implements AutoCloseable {
     }
 
     void reset(ScenarioDefinition definition) {
+        requireInspectWork(Command.RESET,Command.RERUN);
+        require(!inspectMode || worldCreated,"Inspect startup must create and bind the owned world before reset");
         preflight(definition); // Stale authority cannot invalidate readiness, stop, or archive.
         require(baseline() || compactArchiveFailure==null,"Reset refuses an earlier failed compact archive");
         require(baseline() || outputs.failure().isEmpty() && (resetOrdinal==0 || capture!=null),
                 "Reset refuses failed output or renewal of an unadopted compact budget");
-        if(baseline() && !supportReceipt) {
+        if(baseline() && (inspectMode || !supportReceipt)) {
             writeNew(roots,artifacts.resolve("support-coverage.txt"),"invocation="+invocation+"; definition="+definition.definitionHash()
                     +"; case="+supportCase.label()+"; selector="+(supportSelector==null?"absent":supportSelector)
                     +"; expectedCounted="+expectedCountedRuns+"; meaning="+supportMeaning());
@@ -443,7 +685,8 @@ final class ScenarioRunner implements AutoCloseable {
             requireReleased(c);
             // Copy before clear/arm: both owners retain diagnostics across stop.
             if(!baseline() && capture!=null && sealed==null) sealed=watch.sealTraversal();
-            return new Prior(MapArtClient.status(), baseline()?watch.copy():List.of(), PredictionFaults.snapshot(), PredictionFaults.stateSnapshot(),sealed);
+            return new Prior(MapArtClient.status(), baseline()?(inspectMode?watch.retained().samples():watch.copy()):List.of(),
+                    PredictionFaults.snapshot(), PredictionFaults.stateSnapshot(),sealed);
         });
         var stage = artifacts.resolve("reset-" + (++resetOrdinal));
         archiveThenRestore(() -> {
@@ -483,11 +726,12 @@ final class ScenarioRunner implements AutoCloseable {
     }
 
     private UUID start(ScenarioDefinition definition, boolean counted) {
+        requireInspectWork(Command.RUN,Command.RERUN);
         preflight(definition);
         require(baseline() || compactArchiveFailure==null,"Start refuses an earlier failed compact archive");
         require(ready && admitted != null && definition.definitionHash().equals(admitted.definitionHash()),
                 "Run requires this invocation's successful reset");
-        require(counted ? countedStarts<i(definition.data().getAsJsonObject("budgets"),"repeatMaximum") : runs.isEmpty(),
+        require(startAllowed(inspectMode,counted,countedStarts,i(definition.data().getAsJsonObject("budgets"),"repeatMaximum"),runs.isEmpty()),
                 "Repeat bound exceeded or dirty prelude was not first");
         if (counted) countedStarts++;
         ready = false; // Consume before facade reentry; failure cannot reuse readiness.
@@ -498,6 +742,11 @@ final class ScenarioRunner implements AutoCloseable {
             require(now.problems.isEmpty() && now.state.equals(stable.client.state), "Start state changed without physics");
             UUID fresh = MapArtClient.start(plan, origin, settings);
             require(runs.add(fresh), "Facade reused a run UUID");
+            if(inspectMode) {
+                inspectRun=fresh;
+                var identity=operationIdentity(inspectOperation); identity.addProperty("runId",fresh.toString());
+                writeNew(roots,artifacts.resolve("run-identity.json"),identity.toString());
+            }
             var bound = MapArtClient.status().engine().lifecycle().context().orElseThrow();
             require(bound.runId().equals(fresh) && bound.planFingerprint().equals(plan.fingerprint())
                     && bound.origin().equals(origin) && bound.settingsFingerprint().equals(settings.fingerprint())
@@ -518,6 +767,10 @@ final class ScenarioRunner implements AutoCloseable {
         if (counted && countedStarts==1 && releasedFailedRun!=null)
             verifyReleaseRefusal("old-failed-after-fresh-start",server,save,releasedFailedRun);
         return started;
+    }
+
+    static boolean startAllowed(boolean inspect, boolean counted, int starts, int maximum, boolean runsEmpty) {
+        return counted ? inspect || starts<maximum : runsEmpty;
     }
 
     private String supportMeaning() {
@@ -1167,25 +1420,37 @@ final class ScenarioRunner implements AutoCloseable {
     }
 
     void captureFailure(Throwable error) {
+        int earlierSuppressed=error.getSuppressed().length;
+        if(inspectMode) {
+            require(inspectOperation!=null && inspectAdmissionFailure==null,"No admitted operation for failure evidence");
+            ((Inspect)host).requireScope(inspectOperation,inspectFinalizing?Kind.CLEANUP:Kind.WORK);
+            inspectOriginalFailure=retain(inspectOriginalFailure,error);
+            if(inspectFailureCaptured) return;
+            inspectFailureCaptured=true; // Fixed names belong to exactly one capture attempt, including partial failure.
+        }
         if(!baseline()) { captureCompactFailure(error); return; }
         capture(error,() -> writeNew(roots,artifacts.resolve("failure.txt"),trace(error)));
         capture(error,() -> writeNew(roots,artifacts.resolve("failure-state.json"),failureMetadata(invocation,resetOrdinal,
                 worldCreated,admitted,plan,origin,settings,ready,runs,previous,observedHash,
                 stable==null ? null : stable.status.engine().lifecycle().context().map(c -> c.runId()).orElse(null)).toString()));
-        if (worldCreated) {
+        if (worldCreated && (!inspectMode || !closed)) {
             capture(error,() -> writeNew(roots,artifacts.resolve("failure-support-gate.txt"),
-                    host.computeOnClient(c -> PredictionFaults.resetSnapshot().support()).toString()));
+                    host.computeOnClient(c -> { if(inspectMode) requireClient(c); return PredictionFaults.resetSnapshot().support(); }).toString()));
             capture(error,() -> {
                 host.runOnClient(this::requireClient);
-                host.takeScreenshot(artifacts,"failure");
+                takeScreenshot(artifacts,"failure");
             });
             if (failureLiveAvailable(true,admitted,plan,origin,settings))
                 capture(error,() -> writeNew(roots,artifacts.resolve("failure-live.txt"),live().toString()));
             capture(error,() -> writeLinesNew(artifacts.resolve("failure-observer.txt"),
-                    host.computeOnClient(c -> watch.copy()).stream().map(ScenarioObserver.Sample::line)::iterator));
+                    host.computeOnClient(c -> {
+                        if(inspectMode) { requireClient(c); return watch.retained().samples(); }
+                        return watch.copy();
+                    }).stream().map(ScenarioObserver.Sample::line)::iterator));
         }
         // Capture errors are present here; later try-with-resources close errors remain in the outer log.
         capture(error,() -> writeNew(roots,artifacts.resolve("failure-after-capture.txt"),trace(error)));
+        if(inspectMode && error.getSuppressed().length!=earlierSuppressed) inspectEvidenceIncomplete=true;
     }
 
     private static boolean failureLiveAvailable(boolean ownedWorld, ScenarioDefinition admitted, BuildPlan plan,
@@ -1878,6 +2143,7 @@ final class ScenarioRunner implements AutoCloseable {
 
     ScenarioResult run(ScenarioDefinition definition) {
         UUID id = start(definition,true);
+        boolean firstSuccess=inspectMode?assertedSuccesses.isEmpty():countedStarts==1;
         var stage=artifacts.resolve("success-"+countedStarts+"-"+id);
         checkedDirectory(roots,stage);
         if(baseline()) {
@@ -1900,11 +2166,11 @@ final class ScenarioRunner implements AutoCloseable {
         if(baseline()) writeNew(roots,stage.resolve("start.txt"),startText); else scalar("start.txt",startText);
         if (priorCountedStart!=null) {
             var comparison="previousObservedHash="
-                +assertedSuccesses.getLast().observedStableStartHash()+"; currentObservedHash="+observedHash
+                +(inspectMode?priorCountedSuccess:assertedSuccesses.getLast()).observedStableStartHash()+"; currentObservedHash="+observedHash
                 +"; rawDelta="+deltas(priorCountedStart,stable)+"; both starts independently passed readiness; byte equality is not required";
             if(baseline()) writeNew(roots,stage.resolve("start-comparison.txt"),comparison); else scalar("start-comparison.txt",comparison);
         }
-        priorCountedStart=stable;
+        if(inspectMode) currentCountedStart=stable; else priorCountedStart=stable;
         List<Live> checkpoints=baseline()?new ArrayList<>():null;
         Live current=baseline()?live():null, shiftStart=null, resumed=null;
         if(baseline()) checkpoints.add(current);
@@ -1960,7 +2226,7 @@ final class ScenarioRunner implements AutoCloseable {
             if ((baseline()?current.sample.status().engine().lifecycle().phase():poll.phase)==Phase.TERMINAL) break;
             if (baseline() && substage(current.sample,ForwardTraversal.Substage.SHIFT)) {
                 if (shiftStart==null) shiftStart=current;
-                if (countedStarts==1 && !paused && nativeForward(current.sample)
+                if (firstSuccess && !paused && nativeForward(current.sample)
                         && moved(shiftStart,current,"z",.25,1) && (supportCase==SupportCase.ORDINARY
                             || host.computeOnClient(c -> findSupportWitness(id,plan,origin,supportArm,
                                     PredictionFaults.resetSnapshot().support(),watch.copy()).isPresent()))) {
@@ -1980,7 +2246,7 @@ final class ScenarioRunner implements AutoCloseable {
                         && terminal.unfinishedTargetIds().isEmpty() && terminal.pendingTargetIds().isEmpty(),
                 "SUCCESS lacks exact VERIFIED/ALL_CONFIRMED export"+(baseline()?": "+terminal:"; compact prefix retained"));
         if(baseline()) {
-            require(countedStarts!=1 || paused,"First success never reached the required actual SHIFT pause");
+            require(!firstSuccess || paused,"First success never reached the required actual SHIFT pause");
             verifyTraversal(id,checkpoints,samples,clientReach,serverReach,resumed,stage);
             if(supportCase==SupportCase.ORDINARY) verifyOrdinarySupport(id,samples,stage);
             else {
@@ -2053,6 +2319,7 @@ final class ScenarioRunner implements AutoCloseable {
     }
 
     void assertResult(ScenarioResult result) {
+        if(inspectMode) requireInspectWork(Command.RUN,Command.RERUN);
         requireResultIdentity(result,previous,runs,artifacts,admitted);
         require(result != null && result==previous && runs.contains(result.runId()) && result.artifacts().equals(artifacts)
                 && admitted != null && result.definitionHash().equals(admitted.definitionHash()), "Foreign result");
@@ -2060,6 +2327,7 @@ final class ScenarioRunner implements AutoCloseable {
                 "Scenario failed: " + (baseline()?result:result.runId()));
         require(assertedSuccesses.stream().noneMatch(r -> r.runId().equals(result.runId())),"Duplicate counted assertion");
         assertedSuccesses.add(result);
+        if(inspectMode) { priorCountedStart=currentCountedStart; priorCountedSuccess=result; }
     }
 
     static void requireResultIdentity(ScenarioResult result,ScenarioResult previous,Set<UUID> runs,Path artifacts,ScenarioDefinition admitted) {
@@ -2945,14 +3213,34 @@ final class ScenarioRunner implements AutoCloseable {
         writeLinesNew(stage.resolve("prior-observer.txt"),prior.samples.stream().map(ScenarioObserver.Sample::line)::iterator);
         writeNew(roots, stage.resolve("prior-fault.txt"), prior.fault + "\n" + prior.stateFault);
         writeNew(roots, stage.resolve("prior-mismatches.txt"), previous==null ? "no previous result" : previous.mismatches.toString());
-        Path screenshot = host.takeScreenshot(stage,"before-reset");
+        if(inspectMode && inspectLast!=null) {
+            verifyInspectPriorEvidence();
+            writeNew(roots,stage.resolve("prior-operation.txt"),inspectLast.toString());
+            writeNew(roots,stage.resolve("prior-observer-failure.txt"),String.valueOf(watch.retained().failure()));
+        }
+        Path screenshot = takeScreenshot(stage,"before-reset");
         require(real(screenshot).startsWith(real(stage)) && Files.isRegularFile(screenshot), "Archive screenshot absent/escaped");
         copyNew(roots, roots.game.resolve("logs/latest.log"), stage.resolve("minecraft-latest.log"));
         // COMMITTED is last; any archive exception leaves observer/fault/world untouched after stop.
         writeNew(roots, stage.resolve("COMMITTED"), "archive complete; invocation=" + invocation);
     }
 
-    private static void archiveThenRestore(Runnable archive, Runnable restore) { archive.run(); restore.run(); }
+    static void archiveThenRestore(Runnable archive, Runnable restore) { archive.run(); restore.run(); }
+
+    private void verifyInspectPriorEvidence() {
+        try {
+            require(inspectLastSummaryHash!=null && fileHash(inspectLast.summaryPath()).equals(inspectLastSummaryHash),
+                    "Prior operation completion changed or is unavailable");
+            var manifest=JsonParser.parseString(Files.readString(inspectLast.summaryPath())).getAsJsonObject();
+            for(var value:manifest.getAsJsonArray("closedFiles")) {
+                var entry=value.getAsJsonObject();
+                var file=inspectLast.evidenceDirectory().resolve(entry.get("path").getAsString()).normalize();
+                require(file.startsWith(inspectLast.evidenceDirectory()) && real(file).equals(file)
+                        && Files.size(file)==entry.get("bytes").getAsLong()
+                        && fileHash(file).equals(entry.get("sha256").getAsString()),"Prior closed operation evidence changed");
+            }
+        } catch(IOException error) { throw new UncheckedIOException(error); }
+    }
 
     private void restore(ScenarioDefinition d) {
         preflight(d);
@@ -3272,6 +3560,7 @@ final class ScenarioRunner implements AutoCloseable {
 
     @Override public void close() {
         if (closed) return;
+        if(inspectMode) { closeInspect(); return; }
         if(!baseline()) { closeCompact(); return; }
         closeOwned(worldCreated,
                 () -> preflight(admitted==null?profileDefinition:admitted),
@@ -3318,6 +3607,55 @@ final class ScenarioRunner implements AutoCloseable {
         c.options.getAutoJump().setValue(callerAutoJump);
         if(!baseline()) { c.options.getViewDistance().setValue(callerViewDistance); c.options.sendClientSettings(); }
         optionsOwned=false;
+    }
+
+    private void closeInspect() {
+        var transport=(Inspect)host;
+        if(inspectAdmissionFailure!=null) {
+            var cleanup=transport.beginShutdownCleanup(failedInspectAdmission,inspectAdmissionFailure);
+            transport.inScope(cleanup,() -> closeInspectOwned(failedInspectAdmission,cleanup));
+        } else {
+            require(inspectOperation!=null && (inspectOperation.command()==Command.CLOSE || inspectOperation.command()==Command.STARTUP),
+                    "Inspect close requires its owned CLOSE/startup cleanup operation");
+            var cleanup=transport.requireScope(inspectOperation,Kind.CLEANUP);
+            closeInspectOwned(inspectOperation,cleanup);
+        }
+    }
+
+    private void closeInspectOwned(Operation operation, Scope cleanup) {
+        require(((Inspect)host).requireScope(operation,Kind.CLEANUP)==cleanup,"Wrong shutdown cleanup scope");
+        // Damaged admission cannot gate freshly authorized release or cause writes into prior closed evidence.
+        Throwable failure=null;
+        if(worldCreated) {
+            if(inspectAdmissionFailure==null) {
+                try {
+                    writeNew(roots,artifacts.resolve("before-close.txt"),host.computeOnClient(c -> {
+                        requireClient(c);
+                        return MapArtClient.status()+"\n"+watch.retained()+"\n"+PredictionFaults.snapshot()+"\n"+PredictionFaults.stateSnapshot();
+                    }));
+                } catch(RuntimeException | Error error) { failure=retain(failure,error); }
+            }
+            try { releaseInspectControls(); } catch(RuntimeException | Error error) { failure=retain(failure,error); }
+            try { host.runOnClient(c -> { requireClient(c); restoreCallerOptions(c); }); }
+            catch(RuntimeException | Error error) { failure=retain(failure,error); }
+            try { host.runOnClient(c -> watch.freeze()); } catch(RuntimeException | Error error) { failure=retain(failure,error); }
+            try {
+                requireServerCheckpoint(); host.runOnClient(this::requireClient); host.closeWorld(); closed=true; normalClose=true;
+                if(inspectAdmissionFailure==null)
+                    writeNew(roots,artifacts.resolve("world-closed.txt"),"WORLD CLOSED normally; session="+invocation+"; operation="+operation.operationId());
+            } catch(RuntimeException | Error error) { failure=retain(failure,error); }
+        } else { watch.freeze(); closed=true; normalClose=true; }
+        if(inspectAdmissionFailure!=null) {
+            // This exceptional shutdown has no BEGIN/CLEANUP/END repair or successor operation.
+            if(failure!=null) {
+                retain(inspectAdmissionFailure,failure);
+                System.err.println("Inspect damaged-session shutdown retained an owned cleanup failure");
+                failure.printStackTrace(System.err);
+            }
+        } else {
+            if(failure instanceof Error fatal) throw fatal;
+            if(failure!=null) throw (RuntimeException)failure;
+        }
     }
 
     private void closeCompact() {
@@ -3503,7 +3841,9 @@ final class ScenarioRunner implements AutoCloseable {
         System.out.println("ScenarioRunner failure-selection/metadata/capture self-checks passed");
     }
 
-    private static Roots roots() {
+    private static Roots roots() { return roots(false); }
+
+    private static Roots roots(boolean inspect) {
         try {
             var source=Path.of(ScenarioRunner.class.getProtectionDomain().getCodeSource().getLocation().toURI()).toAbsolutePath().normalize();
             require(Files.isDirectory(source) && source.endsWith(Path.of("build","classes","java","gametest")), "Unsupported loaded fixture origin: " + source);
@@ -3512,9 +3852,10 @@ final class ScenarioRunner implements AutoCloseable {
             require(module.endsWith(Path.of("v2","fabric")) && Files.isRegularFile(module.resolve("build.gradle")), "Unsupported module root");
             var definition=Path.of(ScenarioDefinition.class.getProtectionDomain().getCodeSource().getLocation().toURI()).toRealPath();
             require(source.equals(definition), "Definition loaded from foreign module");
-            var build=module.resolve("build").toRealPath(); var game=build.resolve("run/clientGameTest").toRealPath();
+            var build=module.resolve("build").toRealPath(); var game=build.resolve(inspect?"run/inspect":"run/clientGameTest").toRealPath();
             var actual=FabricLoader.getInstance().getGameDir().toAbsolutePath().normalize();
-            require(actual.equals(game) && actual.toRealPath().equals(game) && game.equals(build.resolve("run/clientGameTest")), "Unmanaged/redirected game root");
+            require(actual.equals(game) && actual.toRealPath().equals(game)
+                    && game.equals(build.resolve(inspect?"run/inspect":"run/clientGameTest")), "Unmanaged/redirected game root");
             return new Roots(module,game,build,build.resolve("scenario-results"),game.resolve("saves"));
         } catch (java.net.URISyntaxException | IOException e) { throw new IllegalStateException("Cannot establish loaded-module authority",e); }
     }
@@ -3543,7 +3884,8 @@ final class ScenarioRunner implements AutoCloseable {
 
     private static void checkRoots(Roots r) {
         require(real(r.module).equals(r.module) && real(r.build).equals(r.build) && real(r.game).equals(r.game)
-                && r.build.equals(r.module.resolve("build")) && r.game.equals(r.build.resolve("run/clientGameTest")),"Redirected invocation roots");
+                && r.build.equals(r.module.resolve("build"))
+                && (r.game.equals(r.build.resolve("run/clientGameTest")) || r.game.equals(r.build.resolve("run/inspect"))),"Redirected invocation roots");
         if (Files.exists(r.evidence)) require(real(r.evidence).equals(r.evidence),"Redirected evidence root");
         require(r.saves.equals(r.game.resolve("saves")),"Saves parent escaped authorized game root");
         if (Files.exists(r.saves,LinkOption.NOFOLLOW_LINKS))
