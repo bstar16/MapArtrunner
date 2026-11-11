@@ -31,10 +31,18 @@ loom {
     runs.configureEach {
         runDir "build/run/${name}"
     }
+    runs.named('clientGameTest') {
+        property 'mapart.test.scenario', providers.gradleProperty('mapart.test.scenario').getOrElse('all')
+        property 'mapart.test.repeat', providers.gradleProperty('mapart.test.repeat').getOrElse('2')
+    }
 }
 
 sourceSets.test.resources.srcDir rootProject.file('test-fixtures')
 sourceSets.gametest.resources.srcDir rootProject.file('test-fixtures')
+
+tasks.named('compileTestJava', JavaCompile) {
+    source('src/gametest/java/com/mapartrunner/fabric/scenario/threading/RegistrationAcknowledgement.java')
+}
 
 tasks.named('test', Test) {
     workingDir = layout.buildDirectory.dir('run/unitTest').get().asFile

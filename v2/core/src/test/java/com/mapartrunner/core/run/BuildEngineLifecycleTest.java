@@ -15,12 +15,57 @@ import static com.mapartrunner.core.run.RunLifecycle.*;
 import static org.junit.jupiter.api.Assertions.*;
 
 class BuildEngineLifecycleTest {
-    @Test void emptyPlanSucceedsAndMultiLaneFailsBeforeAcquisition() {
+    @Test void pauseKeepsTraversalAndLedger() {
+        var h = shiftHarness(target(90, 11, 3));
+        h.support = support(h.plan, AIR, Evidence.OBSERVED); h.available.put(90, PlacementAvailability.READY);
+        h.step(); var before = h.engine.snapshot(); h.engine.pause();
+        for (int i = 0; i < 200; i++) {
+            var paused = h.step();
+            assertEquals(before.traversal(), paused.snapshot().traversal());
+            assertEquals(before.eligibleTicks(), paused.snapshot().eligibleTicks());
+            assertEquals(before.pendingTargetIds(), paused.snapshot().pendingTargetIds());
+            assertEquals(before.unfinishedTargetIds(), paused.snapshot().unfinishedTargetIds());
+            assertTrue(paused.movement().isEmpty()); assertTrue(paused.placement().isEmpty());
+        }
+        h.engine.resume(h.context);
+        var input = h.input(); var resumed = h.engine.tick(input); var after = resumed.snapshot();
+        assertEquals(before.traversal().orElseThrow().transitionTicks() + 1, after.traversal().orElseThrow().transitionTicks());
+        assertEquals(before.eligibleTicks() + 1, after.eligibleTicks());
+        assertEquals(2, after.laneEntry().orElseThrow().supportHoldTicks());
+        assertEquals(before.pendingTargetIds(), after.pendingTargetIds());
+        assertEquals(after, h.engine.tick(input).snapshot());
+        assertEquals(after, h.engine.tick(new TickInput(UUID.randomUUID(), h.nextTick + 100, Optional.empty(),
+                input.player(), input.support(), input.observations(), input.availability(), input.effectResults())).snapshot());
+    }
+
+    @Test void lateOldActionCannotChangeFreshRun() {
+        var h = shiftHarness(target(90, 11, 3)); h.available.put(90, PlacementAvailability.READY);
+        var old = h.step().placement().orElseThrow(); var staleInput = h.input(); h.engine.stop();
+        var fresh = new Context(UUID.randomUUID(), "connection", "world", "minecraft:overworld",
+                h.plan.fingerprint(), h.context.origin(), h.settings.fingerprint());
+        h.engine.start(h.plan, fresh, h.settings); var before = h.engine.snapshot();
+        assertEquals(before, h.engine.tick(staleInput).snapshot());
+        var freshDecision = h.engine.tick(new TickInput(fresh.runId(), 0, Optional.of(fresh),
+                Optional.of(new PlayerObservation(.5, 1, 2.5, -90)), h.support,
+                List.of(new PlacementObservation(old.runId(), old.targetId(), OptionalLong.of(old.actionId()), 0,
+                        Evidence.OBSERVED, Optional.of(STONE))), Map.of(), List.of(result(old, EffectStatus.ACCEPTED))));
+        assertRunning(freshDecision); assertEquals(1, freshDecision.snapshot().eligibleTicks());
+        assertEquals(List.of(90), freshDecision.snapshot().unfinishedTargetIds());
+        assertTrue(freshDecision.snapshot().pendingTargetIds().isEmpty());
+        assertTrue(freshDecision.snapshot().effectResults().isEmpty());
+        assertEquals(0, freshDecision.snapshot().traversal().orElseThrow().laneIndex());
+        assertEquals(ForwardTraversal.Substage.LANE, freshDecision.snapshot().traversal().orElseThrow().substage());
+    }
+
+    @Test void emptyPlanSucceedsAndMultiLaneStartsWithoutEffects() {
         var empty = new Harness(plan(2, 5));
         assertEquals(Outcome.SUCCESS, empty.engine.snapshot().lifecycle().outcome().orElseThrow());
         assertReason(empty.step(), Reason.NOTHING_TO_BUILD);
         var multi = new Harness(plan(12, 6, target(7, 0, 0)));
-        assertReason(multi.step(), Reason.UNSUPPORTED_PLAN);
+        assertEquals(Phase.RUNNING, multi.engine.snapshot().lifecycle().phase());
+        assertEquals(Activity.APPROACH, multi.engine.snapshot().lifecycle().activity().orElseThrow());
+        assertEquals(0, multi.engine.snapshot().eligibleTicks());
+        assertRunning(multi.step());
     }
 
     @Test void outsideNativeEntryEnvelopeFailsBeforeMovementOrPlacement() {

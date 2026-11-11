@@ -9,7 +9,7 @@ import com.mapartrunner.core.run.RunLifecycle.*;
 import com.mapartrunner.fabric.MapArtClient;
 import com.mapartrunner.fabric.mixin.ClientWorldPendingUpdateAccessor;
 import com.mapartrunner.fabric.prediction.PendingPredictionView;
-import com.mapartrunner.fabric.scenario.GroundedSingleLaneGameTest.*;
+import com.mapartrunner.fabric.scenario.ScenarioObserver.*;
 import net.fabricmc.fabric.api.client.gametest.v1.context.ClientGameTestContext;
 import net.fabricmc.fabric.api.client.gametest.v1.context.TestSingleplayerContext;
 import net.fabricmc.fabric.api.client.gametest.v1.screenshot.TestScreenshotOptions;
