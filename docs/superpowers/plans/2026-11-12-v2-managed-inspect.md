@@ -22,7 +22,7 @@
 Use `S = v2/fabric/src/gametest/java/com/mapartrunner/fabric/scenario/`, `T = v2/fabric/src/test/java/com/mapartrunner/fabric/scenario/`, `PS = scripts/test-v2.ps1` throughout. These abbreviations expand to exact paths.
 
 1. New `S/ScenarioHost.java` contains the narrow transport plus the automatic adapter. Proposed methods are `void runOnClient(Consumer<MinecraftClient>)`, `<V> V computeOnClient(Function<MinecraftClient,V>)`, `void runOnServer(Consumer<MinecraftServer>)`, `<V> V computeOnServer(Function<MinecraftServer,V>)`, `void waitTick()`, `void createWorld()`, `Path saveDirectory()`, `Path takeScreenshot(Path directory,String name)`, `void closeWorld()`. The adapter retains its native context/handle; successful create assigns that handle before Runner marks worldCreated, preserving the original first server validation dispatch and partial-creation cleanup eligibility. Runner keeps and validates the actual world/save/player/handler/connection identities. Automatic methods delegate original tick/thread/screenshot/close behavior. Existing Runner constructors `(ClientGameTestContext,Watch,int)` and `(ClientGameTestContext,Watch,int,Fixture)` remain compatibility entry points for both existing providers.
-2. The same host contract defines immutable inspect `Operation(sessionId, ordinal, operationId, command, evidenceDirectory)` and opaque `Scope(operation, kind, deadline)` handles, with `STARTUP`, `WORK` and `CLEANUP` kinds. Host owns current scope validity and expiry; Commands cannot reset its deadline or reuse a scope. Define `beginStartup(Operation ordinal0) -> Scope`, `settleStartup(Scope)`, `beginWork(Operation) -> Scope`, `beginCleanup(Scope expiredOrCompleted,Throwable primary) -> Scope`, `settleCleanup(Scope)`, `cancelSession(Throwable)`, `beginShutdownCleanup(Operation failedAdmission,Throwable) -> Scope`, and `void inScope(Scope,Runnable)`/`<V> V inScope(Scope,Supplier<V>)` for inspect only. inScope binds only the calling worker's dispatch context for the duration of that call; each transport method copies that exact Scope into the queued closure before returning to its wait. A queued action checks that captured Scope again at execution, never a newer current scope. Commands invokes existing reset/run/assert inside inScope(work,...), and Runner finalization inside inScope(cleanup,...). Runner refuses reset/start unless the bound inspect scope is WORK; only its finalizer/close path uses CLEANUP. These inspect declarations live in nested ScenarioHost.Inspect; automatic implements only the base transport. Command includes internal STARTUP/CLOSE without extra public grammar. Scope uses immutable monotonic deadlineNanos. Inspect.requireScope(Operation expected,Kind expectedKind) returns the exact existing worker-bound issuing-host Scope only after operation identity/kind/validity/expiry checks, never creating/rebinding/renewing; Runner uses WORK before reset/start and validates its supplied CLEANUP scope by identity before finalization. Automatic adapter calls never enter this inspect lifecycle.
+2. The same host contract defines immutable inspect `Operation(sessionId, ordinal, operationId, command, evidenceDirectory)` and opaque `Scope(operation, kind, deadline)` handles, with `STARTUP`, `WORK` and `CLEANUP` kinds. Host owns current scope validity and expiry; Commands cannot reset its deadline or reuse a scope. Define `beginStartup(Operation ordinal0) -> Scope`, `settleStartup(Scope)`, `beginWork(Operation) -> Scope`, `beginCleanup(Scope expiredOrCompleted,Throwable primary) -> Scope`, `settleCleanup(Scope,FinalOutcome)`, `cancelSession(Throwable)`, `beginShutdownCleanup(Operation failedAdmission,Throwable) -> Scope`, and `void inScope(Scope,Runnable)`/`<V> V inScope(Scope,Supplier<V>)` for inspect only. inScope binds only the calling worker's dispatch context for the duration of that call; each transport method copies that exact Scope into the queued closure before returning to its wait. A queued action checks that captured Scope again at execution, never a newer current scope. Commands invokes existing reset/run/assert inside inScope(work,...), and Runner finalization inside inScope(cleanup,...). Runner refuses reset/start unless the bound inspect scope is WORK; only its finalizer/close path uses CLEANUP. These inspect declarations live in nested ScenarioHost.Inspect; automatic implements only the base transport. Command includes internal STARTUP/CLOSE without extra public grammar. Scope uses immutable monotonic deadlineNanos. Inspect.requireScope(Operation expected,Kind expectedKind) returns the exact existing worker-bound issuing-host Scope only after operation identity/kind/validity/expiry checks, never creating/rebinding/renewing; Runner uses WORK before reset/start and validates its supplied CLEANUP scope by identity before finalization. Automatic adapter calls never enter this inspect lifecycle.
 3. Runner provides `static ScenarioRunner inspect(ScenarioHost,Watch)`, `void initializeInspectWorld()` (create/bind only), `Operation beginInspectOperation(Command)`, `void failInspectAdmission(Operation,Throwable)`, and `InspectCompletion finishInspectOperation(Operation,Scope cleanup,Throwable primary)`. Existing reset/run/assertResult/captureFailure/close remain the work route. `InspectCompletion` is immutable and contains session/operation/ordinal, command, optional run UUID, verdict/original failure, evidence directory/completeness, cleanup status and summary path. Runner alone allocates/writes/seals operation evidence and determines scenario assertions. Scope is transport permission, never world/reset authority.
 4. `ScenarioCommands` uses those entry points on one worker, returning immediately from Fabric callbacks. `RESET` calls reset; `RUN` calls run/assertResult; `RERUN` calls reset then run/assertResult under one operation/deadline; `last` reads the immutable last completion without effects. Only literal grounded-two-lane is admitted now. No fifth public command or no-argument aliases. Busy mutation requests are refused through cleanup settlement; `last` can name the busy operation and previous completed result separately. Foreign/stale/overlapping rejected requests never replace `last`, capture a new world or release its controls.
 5. `ScenarioClientInitializer` gates the inspect property, registers the command session and lifecycle callbacks once, then asynchronously starts host/Runner initialization after the client is usable. It calls the shared receipt publisher only after Runner's real owned-world binding and installed command session have both been established. No call to `selected(...)` or gametest provider occurs in ordinary startup.
@@ -121,13 +121,59 @@ Create `S/ScenarioLaunchReceipt.java`, `T/ScenarioLaunchReceiptTest.java`; modif
 - [ ] RED/GREEN: original automatic eight-field output/first-publication behavior and all old negative schemas stay exact. Add inspect eight-field producer/validator cases for valid readiness, missing/partial/duplicate fields, wrong mode/event/scenario/session/launch, reparse/invalid paths, foreign/dead/reused PID, wrong configured JDK, pending held inventory and early worker exit. Use actual atomic writer/parser and existing bounded dummy supervision; never call selected to fake ordinary readiness.
 - [ ] Producer integration comes in slice5, so unregistered inspect can have only typed receipt tests here. Preserve startup600000ms and all/traversal overall helper arithmetic. Do not register or launch inspect in this slice. Confirm GroundedSmokeGameTest is now an explicitly owned changed path.
 
-### Task 4 — ordinary native host consumes explicit scopes (2 paths)
+### Task 4 — ordinary native host consumes explicit scopes (5 paths)
 
-Create `S/InspectScenarioHost.java`; extend `T/ScenarioHostTest.java`.
+Create `S/InspectScenarioHost.java`; modify `S/ScenarioHost.java`, `S/ScenarioRunner.java`, `T/ScenarioHostTest.java` and `T/ScenarioInspectLifecycleTest.java`.
 
 - [ ] RED/GREEN: wrong-thread blocking, actual-next-tick requirement, cancelled/deadline-expired queued action zero effects, independent cleanup scope, one cleanup transition, stale completion/image refusal, stopped-client wakeup and original-error retention. Same operation's cleanup is allowed after WORK expiry; no new command can borrow it.
 - [ ] Assemble the public startup/button/actual-binding transport and neutral chat wait above. All waits share their own WORK or CLEANUP absolute budget; no gametest context/phaser, synthetic physics, second world/reset state or new production dependency.
 - [ ] Compile against pinned public descriptors and run focused dispatch tests. Actual normal-host world/button/load/physics remains a required slice8 game check, not a unit-test claim.
+
+#### Adopted Task4 owner-interface amendment
+
+Root adopted the independently prepared amendment after reading the actual missing interfaces; Task2 source is accepted. Task3 readiness source remains separately reviewed. This design grants no native acceptance.
+Paths: S/InspectScenarioHost.java, S/ScenarioHost.java, S/ScenarioRunner.java, T/ScenarioHostTest.java, T/ScenarioInspectLifecycleTest.java (S/T as brief). Preserve automatic base API, adapter and native call order.
+
+1. Creation: inspect-only overload
+
+ScenarioHost.Inspect adds:
+  void createWorld(BiConsumer<MinecraftClient, Path> beforeCreate);
+Runner inspect passes this::requireProspectiveInspectSave; automatic still calls host.createWorld(). Ordinary no-argument createWorld refuses. Host supplies actual WorldCreator/native saves candidate. In the same exact STARTUP client action immediately before the unique public button press: recheck screen/creator/candidate, invoke Runner guard, press. No wait between guard and press.
+
+Runner private void requireProspectiveInspectSave(MinecraftClient client, Path candidate) owns fixed real saves parent, bounded direct-child session name, no existing target including NOFOLLOW/reparse entry, no open world/server/player ; Host authenticates captured STARTUP, Runner world authority. Native binding validates actual server/save; prediction grants no adoption.
+
+2. Stopping: one bound owner callback, existing permission only
+
+ScenarioHost.Inspect adds:
+  void bindStoppingOwner(BiConsumer<MinecraftClient, Scope> owner);
+  void requireStoppingScope(Scope cleanup);
+Bind once before startup to Runner private void stopInspectOnClient(MinecraftClient client, Scope cleanup).
+
+Host CLIENT_STOPPING closes admission/WORK and wakes waiters with its retained first cause. It can claim one direct callback only for exact already-issued, live CLEANUP, within the original deadline. Use a nonblocking claim under Host's phase lock; contention means refusal. Mark an in-flight stopping claim before releasing the lock. requireStoppingScope authenticates client thread, exact active callback/claim/scope identity, CLEANUP kind, and original validity/deadline. It neither binds worker ThreadLocal context nor grants general dispatch. Runner calls it immediately before effects. No dispatch/future/server wait on the client thread.
+
+Settlement cannot publish/invalidate while this claim is in flight; worker waits only within remaining cleanup budget, then fails unresolved. Callback finally stores completion of the claim and wakes the worker. Expiry permits no next action; executing synchronous work cannot be undone.
+
+Runner owns a client-thread-only immutable native stop binding, installed at real world binding and refreshed immediately at actual start/fault arm: server/save/world/player/handler/connection/run/arm identities. Revalidate current native identities/run before effects; no server-world reads or requireServerCheckpoint. Replacement mismatch has zero game effects. Capture original status/Watch/fault observations before effects; release/assert keys/NONE, cancel matching arm, freeze Watch. No reset/start/restore/import/world-close/file IO.
+
+Normal inspect cleanup and stopping use one client-owned per-exact-scope effect-attempt state. Each release/freeze effect is attempted at most once, including failure; later callers consume its immutable result/original observations, never retry. Worker consumes earlier stop results; later stopping cannot retry failed effects or mutate sealed evidence. Worker alone aggregates primary/suppressed failures, closes evidence and controls admission/last. Automatic cleanup remains unchanged.
+
+No live cleanup (including stopping during WORK before transition), expired/settled/unresolved cleanup, or unavailable claim: refuse native callback effects and use existing client/job shutdown. No fresh scope, WORK handoff, CLOSE ordinal or extra allowance.
+
+3. Final END: minimal explicit outcome
+
+Replace inspect-only signature with:
+  void settleCleanup(Scope cleanup, FinalOutcome outcome);
+Nested types:
+  enum Verdict { SUCCESS, FAILURE, TIMEOUT }
+  enum CleanupStatus { SETTLED, UNRESOLVED }
+  record FinalOutcome(Operation operation, Verdict verdict, CleanupStatus cleanup) {}
+Add typed ScopeTimeoutException for actual Host deadline expiry; never parse messages.
+
+Runner selects outcome after release/freeze/evidence and passes it as the final operation step. Cleanup-only failure is FAILURE; original timeout remains TIMEOUT. Unverified release/freeze is UNRESOLVED; evidence-only failure may be SETTLED. Original failure/suppressed details and all evidence metadata stay in Runner.
+
+Host authenticates exact operation/scope, publishes matching END before successful invalidation/return, and never infers final verdict from beginCleanup's earlier primary. Publication failure preserves busy/last; UNRESOLVED never promotes completion/admission. Task6 wires actual publisher.
+
+Tests: create refusals; stop identity/thread/claim/expiry/settlement races; once-only effects; final FAILURE/TIMEOUT/SETTLED and publisher throw. Preserve Task2/N1 tests. Native/cross-owner gates OPEN.
 
 ### Task 5 — serialized Commands/ordinary initializer with real readiness (3 paths)
 
@@ -168,4 +214,4 @@ Update `v2/docs/testing.md` and, only for the measured inspect status, `v2/docs/
 
 ## Review handoff
 
-This adopted plan preserves the independently reviewed I1/I2/I3/M1/startup/chat and N1/N2 resolutions. Admission/header/BEGIN failures permanently block successor mutation; deadline arithmetic stays exact. Eight path caps remain 4/3/5/2/3/5/5/2. Source16f adds PacketHandlerAwait to Task1 single-owner compilation and focused checks; its required network mixin semantics remain unchanged. Compilation, cross-owner checks, real ordinary-host acceptance, fresh automatic regression and release exclusion remain mandatory; Task8 cannot be completed from this plan or from historical baseline success.
+This adopted plan preserves the independently reviewed I1/I2/I3/M1/startup/chat and N1/N2 resolutions. Admission/header/BEGIN failures permanently block successor mutation; deadline arithmetic stays exact. Eight path caps remain 4/3/5/5/3/5/5/2. Source16f adds PacketHandlerAwait to Task1 single-owner compilation and focused checks; its required network mixin semantics remain unchanged. Compilation, cross-owner checks, real ordinary-host acceptance, fresh automatic regression and release exclusion remain mandatory; Task8 cannot be completed from this plan or from historical baseline success.
