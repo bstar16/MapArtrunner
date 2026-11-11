@@ -196,6 +196,8 @@ Execute the independently reviewed [complete-traversal plan](2026-10-30-v2-compl
 
 ## Task 9: Provide the persistent inspect workflow
 
+Execute the reviewed [managed inspect plan](2026-11-12-v2-managed-inspect.md). It starts from reviewed source16f while Task8 native acceptance remains open. Fresh ordinary-host and automatic regression evidence is required; plan adoption and shared-transport unit checks do not establish a usable preview.
+
 **Dependencies:** 7; may precede 8 if it reduces debugging cost. **Likely files:** test fixture client initializer, `ScenarioCommands.java`, existing scenario runner/environment, script, and testing guide; five or fewer per slice.
 
 - [ ] Add test-only `/maparttest reset`, `run`, `rerun`, and `last` commands to a managed development session launched with `scripts/test-v2.ps1 -Scenario grounded-two-lane -Inspect`.
