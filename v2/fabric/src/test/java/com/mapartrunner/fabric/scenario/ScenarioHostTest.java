@@ -17,13 +17,417 @@ import org.junit.jupiter.params.provider.ValueSource;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Proxy;
 import java.nio.file.Path;
+import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.UUID;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
+import org.junit.jupiter.api.io.TempDir;
+
+import static com.mapartrunner.fabric.scenario.ScenarioHost.*;
 
 import static org.junit.jupiter.api.Assertions.*;
 
 class ScenarioHostTest {
+    @TempDir Path temporary;
+
+    @Test void inspectQueuedExpiredAndCancelledActionsHaveZeroEffects() throws Exception {
+        try (var h = new DispatchHarness()) {
+            var op = operation(1);
+            var work = h.host.beginWork(op);
+            var effects = new AtomicInteger();
+            var result = h.worker.submit(() -> h.host.inScope(work, () -> h.host.runOnClient(c -> effects.incrementAndGet())));
+            var queued = h.client.poll(2, TimeUnit.SECONDS); assertNotNull(queued);
+            h.now.set(work.deadlineNanos());
+            h.nativeCall(queued);
+            assertInstanceOf(ScopeTimeoutException.class, failure(result));
+            assertEquals(0, effects.get());
+            var cleanup = h.host.beginCleanup(work, null);
+            assertNotSame(work, cleanup);
+            assertEquals(work.deadlineNanos() + TimeUnit.SECONDS.toNanos(10), cleanup.deadlineNanos());
+            assertThrows(IllegalStateException.class, () -> h.host.beginCleanup(work, null));
+            h.host.inScope(cleanup, () -> assertSame(cleanup, h.host.requireScope(op, Kind.CLEANUP)));
+            h.host.settleCleanup(cleanup, new FinalOutcome(op, Verdict.TIMEOUT, CleanupStatus.SETTLED));
+            var next = h.host.beginWork(operation(2));
+            var pending = h.worker.submit(() -> h.host.inScope(next, () -> h.host.runOnClient(c -> effects.incrementAndGet())));
+            var late = h.client.poll(2, TimeUnit.SECONDS); assertNotNull(late);
+            var original = new IllegalStateException("cancelled original");
+            h.host.cancelSession(original);
+            h.nativeCall(late);
+            assertSame(original, failure(pending));
+            assertEquals(0, effects.get());
+            assertThrows(IllegalStateException.class, () -> h.host.beginWork(operation(3)));
+        }
+    }
+
+    @Test void inspectRequiresExactBoundHandleAndRejectsBlockingOnNativeThreads() throws Exception {
+        try (var h = new DispatchHarness()) {
+            var op = operation(1);
+            var work = h.host.beginWork(op);
+            assertThrows(IllegalStateException.class, () -> h.host.runOnClient(c -> fail()));
+            var equal = new Scope(op, Kind.WORK, work.deadlineNanos());
+            assertThrows(IllegalStateException.class, () -> h.host.inScope(equal, () -> fail()));
+            h.nativeCall(() -> {
+                assertThrows(IllegalStateException.class, () -> h.host.inScope(work, () -> fail("native scope binding")));
+                assertThrows(IllegalStateException.class, () -> h.host.runOnClient(c -> fail()));
+                assertThrows(IllegalStateException.class, () -> h.host.runOnServer(s -> fail()));
+                assertThrows(IllegalStateException.class, h.host::waitTick);
+            });
+            h.serverThread.set(true);
+            try {
+                assertThrows(IllegalStateException.class, () -> h.host.inScope(work, () -> fail("server scope binding")));
+                assertThrows(IllegalStateException.class, h.host::waitTick);
+            }
+            finally { h.serverThread.remove(); }
+            assertTrue(h.client.isEmpty());
+        }
+    }
+
+    @Test void inspectTickRequiresAnActualLaterNotificationAndStoppedClientWakesWaiter() throws Exception {
+        try (var h = new DispatchHarness()) {
+            var work = h.host.beginWork(operation(1));
+            h.host.onTick(); // An earlier tick cannot satisfy the next wait.
+            var waiting = h.worker.submit(() -> h.host.inScope(work, h.host::waitTick));
+            await(() -> h.host.waitingCount() == 1);
+            assertFalse(waiting.isDone());
+            h.host.onTick();
+            waiting.get(2, TimeUnit.SECONDS);
+            var next = h.worker.submit(() -> h.host.inScope(work, h.host::waitTick));
+            await(() -> h.host.waitingCount() == 1);
+            h.nativeCall(() -> h.host.onStopping(null));
+            assertInstanceOf(IllegalStateException.class, failure(next));
+        }
+    }
+
+    @Test void inspectStoppingClaimsOnlyExistingCleanupAndSettlementWaitsForClaim() throws Exception {
+        try (var h = new DispatchHarness()) {
+            var op = operation(1);
+            var work = h.host.beginWork(op);
+            var original = new IllegalStateException("work failed");
+            var cleanup = h.host.beginCleanup(work, original);
+            var entered = new CountDownLatch(1);
+            var release = new CountDownLatch(1);
+            var calls = new AtomicInteger();
+            h.host.bindStoppingOwner((client, scope) -> {
+                assertSame(cleanup, scope);
+                h.host.requireStoppingScope(scope);
+                assertThrows(IllegalStateException.class, () -> h.host.requireStoppingScope(new Scope(op,Kind.CLEANUP,scope.deadlineNanos())));
+                calls.incrementAndGet(); entered.countDown();
+                assertDoesNotThrow(() -> assertTrue(release.await(2, TimeUnit.SECONDS)));
+            });
+            assertThrows(IllegalStateException.class, () -> h.host.requireStoppingScope(cleanup));
+            var stopper = new Thread(() -> h.nativeCall(() -> h.host.onStopping(null)));
+            stopper.start(); assertTrue(entered.await(2, TimeUnit.SECONDS));
+            var settled = h.worker.submit(() -> h.host.settleCleanup(cleanup,
+                    new FinalOutcome(op, Verdict.FAILURE, CleanupStatus.SETTLED)));
+            await(() -> h.host.waitingCount() == 1);
+            assertFalse(settled.isDone()); assertTrue(h.published.isEmpty());
+            release.countDown(); stopper.join(2000); assertFalse(stopper.isAlive());
+            settled.get(2, TimeUnit.SECONDS);
+            assertEquals(List.of(new FinalOutcome(op, Verdict.FAILURE, CleanupStatus.SETTLED)), h.published);
+            h.nativeCall(() -> h.host.onStopping(null));
+            assertEquals(1, calls.get());
+            assertThrows(IllegalStateException.class, () -> h.host.beginWork(operation(2)));
+        }
+    }
+
+    @Test void inspectStoppingDuringWorkOrAfterCleanupExpiryCannotMintPermission() throws Exception {
+        for (boolean expiredCleanup : List.of(false, true)) try (var h = new DispatchHarness()) {
+            var calls = new AtomicInteger();
+            h.host.bindStoppingOwner((client, scope) -> calls.incrementAndGet());
+            var work = h.host.beginWork(operation(1));
+            if (expiredCleanup) {
+                var cleanup = h.host.beginCleanup(work, null); h.now.set(cleanup.deadlineNanos());
+            }
+            h.nativeCall(() -> h.host.onStopping(null));
+            assertEquals(0, calls.get());
+            assertThrows(IllegalStateException.class, () -> h.host.beginShutdownCleanup(operation(2), new Exception()));
+        }
+    }
+
+    @Test void cleanupDeadlineCannotBeExtendedWhileStoppingClaimIsInFlight() throws Exception {
+        try (var h=new DispatchHarness()) {
+            var op=operation(1); var cleanup=h.host.beginCleanup(h.host.beginWork(op),null);
+            var entered=new CountDownLatch(1); var release=new CountDownLatch(1); var refused=new AtomicInteger();
+            h.host.bindStoppingOwner((client,scope) -> {
+                h.host.requireStoppingScope(scope); entered.countDown();
+                assertDoesNotThrow(() -> assertTrue(release.await(2,TimeUnit.SECONDS)));
+                assertThrows(ScopeTimeoutException.class,() -> h.host.requireStoppingScope(scope)); refused.incrementAndGet();
+            });
+            var stopper=new Thread(() -> h.nativeCall(() -> h.host.onStopping(null)));
+            stopper.start(); assertTrue(entered.await(2,TimeUnit.SECONDS));
+            var settlement=h.worker.submit(() -> h.host.settleCleanup(cleanup,new FinalOutcome(op,Verdict.FAILURE,CleanupStatus.UNRESOLVED)));
+            await(() -> h.host.waitingCount()==1); h.now.set(cleanup.deadlineNanos()); h.host.onTick();
+            assertInstanceOf(ScopeTimeoutException.class,failure(settlement)); assertTrue(h.published.isEmpty());
+            release.countDown(); stopper.join(2000); assertFalse(stopper.isAlive()); assertEquals(1,refused.get());
+            assertThrows(IllegalStateException.class,() -> h.host.beginShutdownCleanup(operation(2),new Exception()));
+        }
+    }
+
+    @Test void inspectOutcomeIdentityAndPublicationFailureRetainBusyScope() throws Exception {
+        try (var h = new DispatchHarness()) {
+            var op = operation(1);
+            var cleanup = h.host.beginCleanup(h.host.beginWork(op), null);
+            var equal = new Operation(op.sessionId(), op.ordinal(), op.operationId(), op.command(), op.evidenceDirectory());
+            assertThrows(IllegalStateException.class, () -> h.host.settleCleanup(cleanup,
+                    new FinalOutcome(equal, Verdict.SUCCESS, CleanupStatus.SETTLED)));
+            var error = new IllegalStateException("publisher failed");
+            h.publicationFailure.set(error);
+            assertSame(error, assertThrows(IllegalStateException.class, () -> h.host.settleCleanup(cleanup,
+                    new FinalOutcome(op, Verdict.FAILURE, CleanupStatus.UNRESOLVED))));
+            assertThrows(IllegalStateException.class, () -> h.host.beginWork(operation(2)));
+            h.host.inScope(cleanup, () -> assertSame(cleanup, h.host.requireScope(op, Kind.CLEANUP)));
+            h.publicationFailure.set(null);
+            assertThrows(IllegalStateException.class, () -> h.host.settleCleanup(cleanup,
+                    new FinalOutcome(op,Verdict.SUCCESS,CleanupStatus.SETTLED)));
+            assertTrue(h.published.isEmpty());
+        }
+    }
+
+    @Test void unresolvedSettlementCannotBecomeFailedAdmissionShutdownOrSuccessor() throws Exception {
+        try (var h=new DispatchHarness()) {
+            var op=operation(1); var cleanup=h.host.beginCleanup(h.host.beginWork(op),null);
+            h.host.settleCleanup(cleanup,new FinalOutcome(op,Verdict.FAILURE,CleanupStatus.UNRESOLVED));
+            assertThrows(IllegalStateException.class,() -> h.host.beginWork(operation(2)));
+            assertThrows(IllegalStateException.class,() -> h.host.beginShutdownCleanup(operation(2),new Exception()));
+            assertThrows(IllegalStateException.class,() -> h.host.inScope(cleanup,() -> fail("settled cleanup reused")));
+        }
+    }
+
+    @Test void startupAndFailedAdmissionScopesNeverFabricateOrdinaryEnd() throws Exception {
+        try(var h=new DispatchHarness()) {
+            var startup=new Operation(inspectSession,0,UUID.randomUUID(),Command.STARTUP,temporary.resolve("startup"));
+            var scope=h.host.beginStartup(startup); h.host.cancelSession(new IllegalStateException("startup failure"));
+            var cleanup=h.host.beginCleanup(scope,null);
+            h.host.settleCleanup(cleanup,new FinalOutcome(startup,Verdict.FAILURE,CleanupStatus.SETTLED));
+            assertTrue(h.published.isEmpty());
+        }
+        try(var h=new DispatchHarness()) {
+            var failed=operation(1); h.host.cancelSession(new IllegalStateException("header failed"));
+            var cleanup=h.host.beginShutdownCleanup(failed,null);
+            h.host.settleCleanup(cleanup,new FinalOutcome(failed,Verdict.FAILURE,CleanupStatus.SETTLED));
+            assertTrue(h.published.isEmpty());
+            assertThrows(IllegalStateException.class,() -> h.host.beginShutdownCleanup(operation(2),new Exception("No second N1 budget")));
+        }
+    }
+
+    @Test void closeWorkAndCleanupShareOnlyOneTenSecondCeiling() throws Exception {
+        try(var h=new DispatchHarness()) {
+            var close=new Operation(inspectSession,1,UUID.randomUUID(),Command.CLOSE,temporary.resolve("close"));
+            var work=h.host.beginWork(close);
+            assertEquals(10_000_000_001L,work.deadlineNanos());
+            h.now.set(3_000_000_001L); var cleanup=h.host.beginCleanup(work,null);
+            assertEquals(10_000_000_001L,cleanup.deadlineNanos());
+            h.now.set(10_000_000_001L);
+            assertThrows(ScopeTimeoutException.class,() -> h.host.inScope(cleanup,() -> fail("renewed close budget")));
+        }
+    }
+
+    @Test void executingNativeActionMayFinishButLateSuccessfulCompletionIsRefused() throws Exception {
+        try(var h=new DispatchHarness()) {
+            var work=h.host.beginWork(operation(1)); var effects=new AtomicInteger();
+            var result=h.worker.submit(() -> h.host.inScope(work,() -> h.host.computeOnClient(client -> {
+                effects.incrementAndGet(); h.now.set(work.deadlineNanos()); return "late completion";
+            })));
+            var action=h.client.poll(2,TimeUnit.SECONDS); assertNotNull(action); h.nativeCall(action);
+            assertInstanceOf(ScopeTimeoutException.class,failure(result)); assertEquals(1,effects.get());
+        }
+    }
+
+    @Test void visibleEndReturningAfterCleanupDeadlineCannotSettleOrRetry() throws Exception {
+        try(var h=new DispatchHarness()) {
+            var op=operation(1); var cleanup=h.host.beginCleanup(h.host.beginWork(op),null);
+            h.publicationEffect.set(() -> h.now.set(cleanup.deadlineNanos()));
+            assertThrows(ScopeTimeoutException.class,() -> h.host.settleCleanup(cleanup,new FinalOutcome(op,Verdict.SUCCESS,CleanupStatus.SETTLED)));
+            assertEquals(1,h.published.size()); // Post-link truth remains visible, while local settlement failed.
+            assertThrows(IllegalStateException.class,() -> h.host.beginWork(operation(2)));
+            assertThrows(ScopeTimeoutException.class,() -> h.host.settleCleanup(cleanup,new FinalOutcome(op,Verdict.SUCCESS,CleanupStatus.SETTLED)));
+            assertEquals(1,h.published.size());
+        }
+    }
+
+    @Test void imageAlreadyDeliveredToAnExpiredWaitIsClosedWithoutBeingWritten() throws Exception {
+        try(var h=new DispatchHarness()) {
+            var work=h.host.beginWork(operation(1)); var closed=new AtomicInteger();
+            var image=CompletableFuture.<AutoCloseable>completedFuture(closed::incrementAndGet);
+            h.now.set(work.deadlineNanos());
+            assertThrows(ScopeTimeoutException.class,() -> h.host.awaitImage(work,image));
+            assertEquals(1,closed.get());
+        }
+    }
+
+    @Test void imageDeliveredBeforeLateCaptureDispatchReturnsIsStillClosed() throws Exception {
+        try(var h=new DispatchHarness()) {
+            var work=h.host.beginWork(operation(1)); var closed=new AtomicInteger(); var image=new CompletableFuture<AutoCloseable>();
+            var pending=h.worker.submit(() -> h.host.inScope(work,() -> h.host.captureImage(work,client -> { },(client,receiver) -> {
+                receiver.accept(closed::incrementAndGet); h.now.set(work.deadlineNanos());
+            },image)));
+            var action=h.client.poll(2,TimeUnit.SECONDS); assertNotNull(action); h.nativeCall(action);
+            assertInstanceOf(ScopeTimeoutException.class,failure(pending)); assertEquals(1,closed.get());
+        }
+    }
+
+    @Test void priorSettledFailureCannotReplaceCurrentOperationsOriginalCause() throws Exception {
+        try (var h=new DispatchHarness()) {
+            var first=operation(1); var firstError=new IllegalStateException("old settled error");
+            var firstCleanup=h.host.beginCleanup(h.host.beginWork(first),firstError);
+            h.host.settleCleanup(firstCleanup,new FinalOutcome(first,Verdict.FAILURE,CleanupStatus.SETTLED));
+            var next=operation(2); var work=h.host.beginWork(next);
+            var original=new IllegalStateException("current work error"); var cleanup=h.host.beginCleanup(work,original);
+            var queued=h.worker.submit(() -> h.host.inScope(cleanup,() -> h.host.runOnServer(server -> fail("late server action"))));
+            var action=h.server.poll(2,TimeUnit.SECONDS); assertNotNull(action);
+            h.nativeCall(() -> h.host.onStopping(null));
+            assertSame(original,failure(queued));
+            action.run();
+        }
+    }
+
+    @Test void inspectCreationRequiresStartupAndAnExplicitOwnerGuardBeforeAnyNativeAction() throws Exception {
+        try (var h=new DispatchHarness()) {
+            assertThrows(IllegalStateException.class,h.host::createWorld);
+            var work=h.host.beginWork(operation(1));
+            h.host.inScope(work,() -> assertThrows(IllegalStateException.class,() -> h.host.createWorld((client,path) -> fail())));
+            assertTrue(h.client.isEmpty());
+        }
+    }
+
+    @Test void inspectCaptureRechecksOwnerInsideNativeActionAndClosesLateImage() throws Exception {
+        try (var h=new DispatchHarness()) {
+            var work=h.host.beginWork(operation(1)); var failure=new IllegalStateException("replacement world");
+            var captures=new AtomicInteger(); var closed=new AtomicInteger();
+            var image=new CompletableFuture<AutoCloseable>();
+            var rejected=h.worker.submit(() -> h.host.inScope(work,() -> h.host.captureImage(work,
+                    client -> { throw failure; },(client,receiver) -> captures.incrementAndGet(),image)));
+            var action=h.client.poll(2,TimeUnit.SECONDS); assertNotNull(action); h.nativeCall(action);
+            assertSame(failure,failure(rejected)); assertEquals(0,captures.get());
+            assertTrue(image.isCancelled());
+            var successful=new CompletableFuture<AutoCloseable>();
+            var receiver=new AtomicReference<java.util.function.Consumer<AutoCloseable>>();
+            var queued=h.worker.submit(() -> h.host.inScope(work,() -> h.host.captureImage(work,
+                    client -> { },(client,callback) -> { captures.incrementAndGet(); receiver.set(callback); },successful)));
+            var capture=h.client.poll(2,TimeUnit.SECONDS); assertNotNull(capture); h.nativeCall(capture);
+            queued.get(2,TimeUnit.SECONDS); assertEquals(1,captures.get());
+            h.now.set(work.deadlineNanos()); receiver.get().accept(closed::incrementAndGet);
+            assertEquals(1,closed.get()); assertTrue(successful.isCompletedExceptionally());
+            assertThrows(IllegalStateException.class,() -> h.host.takeScreenshot(temporary,"unguarded"));
+        }
+    }
+
+    @Test void inspectCloseRequiresCleanupAndRechecksOwnerInActualDisconnectAction() throws Exception {
+        try (var h=new DispatchHarness()) {
+            var op=operation(1); var work=h.host.beginWork(op);
+            assertThrows(IllegalStateException.class,h.host::closeWorld);
+            h.host.inScope(work,() -> assertThrows(IllegalStateException.class,() -> h.host.closeWorld(client -> fail())));
+            assertTrue(h.client.isEmpty());
+            var cleanup=h.host.beginCleanup(work,null); var replacement=new IllegalStateException("replaced connection");
+            var closing=h.worker.submit(() -> h.host.inScope(cleanup,() -> h.host.closeWorld(client -> { throw replacement; })));
+            var action=h.client.poll(2,TimeUnit.SECONDS); assertNotNull(action); h.nativeCall(action);
+            assertSame(replacement,failure(closing)); assertTrue(h.client.isEmpty());
+        }
+    }
+
+    @Test void inspectStaleImagesAreClosedAndFinalImageNeverReplaced() throws Exception {
+        try (var h = new DispatchHarness()) {
+            var op = operation(1); var work = h.host.beginWork(op);
+            var closed = new AtomicInteger();
+            var received = new CompletableFuture<AutoCloseable>();
+            h.now.set(work.deadlineNanos());
+            h.host.receiveImage(work, closed::incrementAndGet, received);
+            assertEquals(1, closed.get()); assertTrue(received.isCompletedExceptionally());
+            var cleanup = h.host.beginCleanup(work, null);
+            Files.createDirectories(op.evidenceDirectory());
+            var dir = op.evidenceDirectory().toRealPath();
+            var target = dir.resolve("failure.png"); Files.writeString(target, "original");
+            assertThrows(RuntimeException.class, () -> h.host.writeImage(cleanup, closed::incrementAndGet, dir, "failure",
+                    path -> assertDoesNotThrow(() -> Files.writeString(path, "replacement"))));
+            assertEquals("original", Files.readString(target)); assertEquals(2, closed.get());
+            try (var paths = Files.list(dir)) { assertEquals(List.of(target), paths.toList()); }
+        }
+    }
+
+    @Test void previousOperationsImageCannotCompleteIntoNewScope() throws Exception {
+        try (var h=new DispatchHarness()) {
+            var op=operation(1); var work=h.host.beginWork(op); var cleanup=h.host.beginCleanup(work,null);
+            h.host.settleCleanup(cleanup,new FinalOutcome(op,Verdict.SUCCESS,CleanupStatus.SETTLED));
+            var current=h.host.beginWork(operation(2)); var closed=new AtomicInteger(); var image=new CompletableFuture<AutoCloseable>();
+            h.host.receiveImage(work,closed::incrementAndGet,image);
+            assertEquals(1,closed.get()); assertTrue(image.isCompletedExceptionally());
+            h.host.inScope(current,() -> assertSame(current,h.host.requireScope(current.operation(),Kind.WORK)));
+        }
+    }
+
+    @Test void inspectImageOutputIsBoundToItsScopeAndExpiryDuringEncodingLeavesNoFinal() throws Exception {
+        try (var h = new DispatchHarness()) {
+            var op = operation(1); var work = h.host.beginWork(op);
+            var dir = Files.createDirectories(op.evidenceDirectory()).toRealPath();
+            var other = Files.createDirectory(temporary.resolve("other")).toRealPath();
+            var closed = new AtomicInteger();
+            assertThrows(IllegalStateException.class, () -> h.host.writeImage(work, closed::incrementAndGet, other, "foreign",
+                    path -> assertDoesNotThrow(() -> Files.writeString(path, "wrong scope"))));
+            try (var files = Files.list(other)) { assertEquals(0, files.count()); }
+            assertEquals(dir.resolve("first.png"), h.host.writeImage(work, closed::incrementAndGet, dir, "first",
+                    path -> assertDoesNotThrow(() -> Files.writeString(path, "first image"))));
+            assertEquals("first image", Files.readString(dir.resolve("first.png")));
+            assertThrows(ScopeTimeoutException.class, () -> h.host.writeImage(work, closed::incrementAndGet, dir, "late", path -> {
+                assertDoesNotThrow(() -> Files.writeString(path, "expired image")); h.now.set(work.deadlineNanos());
+            }));
+            assertEquals(3, closed.get());
+            try (var files = Files.list(dir)) { assertEquals(List.of(dir.resolve("first.png")), files.toList()); }
+        }
+    }
+
+    @Test void stoppedCleanupWaitRetainsOriginalWorkFailureAndCannotRenewExpiredClaim() throws Exception {
+        try (var h = new DispatchHarness()) {
+            var op=operation(1); var work=h.host.beginWork(op);
+            var original=new IllegalStateException("first work error"); var cleanup=h.host.beginCleanup(work,original);
+            var queued=h.worker.submit(() -> h.host.inScope(cleanup,() -> h.host.runOnClient(c -> fail("late cleanup action"))));
+            var action=h.client.poll(2,TimeUnit.SECONDS); assertNotNull(action);
+            h.nativeCall(() -> h.host.onStopping(null));
+            assertSame(original,failure(queued)); h.nativeCall(action);
+            h.now.set(cleanup.deadlineNanos());
+            assertThrows(ScopeTimeoutException.class,() -> h.host.settleCleanup(cleanup,new FinalOutcome(op,Verdict.FAILURE,CleanupStatus.UNRESOLVED)));
+            assertThrows(IllegalStateException.class,() -> h.host.beginCleanup(work,original));
+            assertThrows(IllegalStateException.class,() -> h.host.beginShutdownCleanup(operation(2),original));
+            assertTrue(h.published.isEmpty());
+        }
+    }
+
+    private final UUID inspectSession = UUID.randomUUID();
+    private Operation operation(int ordinal) {
+        return new Operation(inspectSession, ordinal, UUID.randomUUID(), Command.RUN, temporary.resolve("op-" + ordinal));
+    }
+
+    private static Throwable failure(Future<?> future) throws Exception {
+        return assertThrows(ExecutionException.class, () -> future.get(2, TimeUnit.SECONDS)).getCause();
+    }
+
+    private static void await(java.util.function.BooleanSupplier condition) {
+        long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+        while (!condition.getAsBoolean() && System.nanoTime() < until) Thread.onSpinWait();
+        assertTrue(condition.getAsBoolean(), "worker did not reach the deterministic barrier");
+    }
+
+    private static final class DispatchHarness implements AutoCloseable {
+        final AtomicLong now = new AtomicLong(1);
+        final ThreadLocal<Boolean> clientThread = ThreadLocal.withInitial(() -> false);
+        final ThreadLocal<Boolean> serverThread = ThreadLocal.withInitial(() -> false);
+        final BlockingQueue<Runnable> client = new LinkedBlockingQueue<>();
+        final BlockingQueue<Runnable> server = new LinkedBlockingQueue<>();
+        final ExecutorService worker = Executors.newSingleThreadExecutor();
+        final List<FinalOutcome> published = new CopyOnWriteArrayList<>();
+        final AtomicReference<RuntimeException> publicationFailure = new AtomicReference<>();
+        final AtomicReference<Runnable> publicationEffect = new AtomicReference<>(() -> { });
+        final InspectScenarioHost host = new InspectScenarioHost(now::get, clientThread::get, serverThread::get,
+                action -> { client.add(action); }, action -> { server.add(action); }, outcome -> {
+                    if (publicationFailure.get() != null) throw publicationFailure.get();
+                    published.add(outcome);
+                    publicationEffect.get().run();
+                });
+        void nativeCall(Runnable action) { clientThread.set(true); try { action.run(); } finally { clientThread.remove(); } }
+        @Override public void close() { worker.shutdownNow(); }
+    }
     @Test void automaticClientAndServerCallbacksKeepResultsAndCallOrder() {
         var nativeHost = new NativeContext();
         var host = ScenarioHost.automatic(nativeHost.client);

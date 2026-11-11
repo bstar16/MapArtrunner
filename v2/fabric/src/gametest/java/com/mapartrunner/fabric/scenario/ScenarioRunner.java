@@ -188,10 +188,65 @@ final class ScenarioRunner implements AutoCloseable {
     private final java.util.function.Consumer<Operation> beforeInspectHeader;
     private final Runnable inspectReleaseEffect;
     private final Runnable inspectFreezeEffect;
+    private final InspectEffects inspectEffects = new InspectEffects();
+    private boolean inspectDoubledEffects;
+    // Installed/refreshed only on the client thread at binding/start/arm; stopping never reads server-world state.
+    private StopBinding inspectStopBinding;
+    private Scope inspectStartupScope;
+    private Throwable inspectStartupFailure;
+    private boolean inspectStartupAttempted;
+    private record StopBinding(MinecraftServer server, Path save, ClientWorld world, ClientPlayerEntity player,
+                               ClientPlayNetworkHandler handler, ClientConnection connection, UUID run,
+                               PredictionFaults.SupportArmIdentity arm) { }
+
+    record InspectEffectResult(String before, String after, Throwable observationFailure, Throwable releaseFailure,
+                               Throwable freezeFailure, Throwable aftermathFailure) { }
+
+    /** Client-owned effects are attempted once per identity; the worker seals their immutable result before files. */
+    static final class InspectEffects {
+        private Scope scope;
+        private InspectEffectResult result;
+        private boolean sealed;
+        synchronized InspectEffectResult attempt(Scope cleanup, java.util.function.Supplier<String> observe,
+                                                  Runnable release, Runnable freeze, java.util.function.Supplier<String> after) {
+            bind(cleanup);
+            if (result != null || sealed) return result;
+            String before = null, aftermath = null;
+            Throwable observation = null, releaseError = null, freezeError = null, aftermathError = null;
+            try { before = observe.get(); } catch (RuntimeException | Error error) { observation = error; }
+            try { release.run(); } catch (RuntimeException | Error error) { releaseError = error; }
+            try { aftermath = after.get(); } catch (RuntimeException | Error error) { aftermathError=error; }
+            try { freeze.run(); } catch (RuntimeException | Error error) { freezeError = error; }
+            return result = new InspectEffectResult(before,aftermath,observation,releaseError,freezeError,aftermathError);
+        }
+        synchronized InspectEffectResult seal(Scope cleanup, Throwable unavailable) {
+            bind(cleanup);
+            if (result == null) {
+                require(unavailable != null,"Cannot seal unattempted cleanup as healthy");
+                result = new InspectEffectResult(null,null,unavailable,unavailable,unavailable,null);
+            }
+            sealed = true; return result;
+        }
+        private void bind(Scope cleanup) {
+            require(cleanup.kind()==Kind.CLEANUP,"Effects require CLEANUP");
+            if (scope != cleanup) {
+                require(scope==null || sealed && scope.operation()!=cleanup.operation(),"Foreign cleanup handle");
+                scope=cleanup; result=null; sealed=false;
+            }
+        }
+    }
 
     static ScenarioRunner inspect(ScenarioHost host, ScenarioObserver.Watch watch) {
         require(host instanceof Inspect, "Inspect requires an issuing inspect transport");
-        return new ScenarioRunner((Inspect) host, watch, roots(true));
+        var runner=new ScenarioRunner((Inspect) host, watch, roots(true));
+        runner.reserveInspectStartup();
+        return runner;
+    }
+
+    private void reserveInspectStartup() {
+        var operation=beginInspectOperation(Command.STARTUP);
+        try { inspectStartupScope=((Inspect)host).beginStartup(operation); }
+        catch(RuntimeException | Error error) { inspectStartupFailure=error; capture(error,() -> ((Inspect)host).cancelSession(error)); throw error; }
     }
 
     /** Root injection is only for filesystem owner tests; native authority still uses the unchanged binding guards. */
@@ -214,6 +269,7 @@ final class ScenarioRunner implements AutoCloseable {
         beforeInspectHeader=Objects.requireNonNull(beforeHeader);
         inspectReleaseEffect=release==null?this::releaseInspectControls:release;
         inspectFreezeEffect=freeze==null?this::freezeInspectWatch:freeze;
+        inspectDoubledEffects=release!=null;
         this.host=Objects.requireNonNull(host); this.watch=Objects.requireNonNull(watch); this.roots=Objects.requireNonNull(roots);
         fixture=ScenarioDefinition.Fixture.TWO_LANE; profileDefinition=ScenarioDefinition.load(fixture);
         expectedCountedRuns=0;
@@ -221,11 +277,13 @@ final class ScenarioRunner implements AutoCloseable {
         require(roots.game.equals(roots.build.resolve("run/inspect")),"Inspect requires its fixed game root");
         artifacts=roots.evidence.resolve("two-lane-"+invocation);
         inspectDirectory=artifacts.resolve("inspect-operations");
+        host.bindStoppingOwner(this::stopInspectOnClient);
     }
 
     Operation beginInspectOperation(Command command) {
         require(inspectMode && !closed, "Inspect session is unavailable");
         require(inspectAdmissionFailure==null, "Inspect evidence unavailable; restart required");
+        require(inspectStartupFailure==null,"Inspect startup failed; restart required");
         require(inspectUnresolvedCleanupFailure==null, "Owned inspect cleanup is unresolved; restart required");
         require(inspectOperation==null, "Inspect operation is still busy/unsettled");
         Objects.requireNonNull(command);
@@ -246,7 +304,10 @@ final class ScenarioRunner implements AutoCloseable {
             writeNew(roots,artifacts.resolve("operation.json"),operationIdentity(operation).toString());
         } catch(IOException | RuntimeException | Error error) {
             var cause=error instanceof IOException io ? new UncheckedIOException(io) : error;
-            failInspectAdmission(operation,cause);
+            if(command==Command.STARTUP) {
+                inspectStartupFailure=cause;
+                capture(cause,() -> ((Inspect)host).cancelSession(cause));
+            } else failInspectAdmission(operation,cause);
             if(cause instanceof Error fatal) throw fatal;
             throw (RuntimeException)cause;
         }
@@ -254,7 +315,8 @@ final class ScenarioRunner implements AutoCloseable {
     }
 
     void failInspectAdmission(Operation operation, Throwable primary) {
-        require(inspectMode && operation==inspectOperation && !inspectFinalizing, "Foreign or already finalized admission failure");
+        require(inspectMode && inspectStartupFailure==null && operation==inspectOperation && operation.command()!=Command.STARTUP
+                && !inspectFinalizing, "Foreign, startup or already finalized admission failure");
         Objects.requireNonNull(primary);
         if(inspectAdmissionFailure!=null) {
             require(operation==failedInspectAdmission,"Foreign failed reservation");
@@ -268,6 +330,19 @@ final class ScenarioRunner implements AutoCloseable {
     Optional<Throwable> inspectAdmissionFailure() { return Optional.ofNullable(inspectAdmissionFailure); }
     Optional<Operation> failedInspectAdmission() { return Optional.ofNullable(failedInspectAdmission); }
     Optional<InspectCompletion> lastInspectCompletion() { return Optional.ofNullable(inspectLast); }
+    UUID inspectSessionId() { require(inspectMode,"Not an inspect session"); return invocation; }
+
+    /** Native command pre-admission guard only: no ordinal, readiness/pose check, scope, transport or effect. */
+    void requireInspectCommandWorld(MinecraftClient client) {
+        require(inspectMode && !closed && worldCreated && inspectAdmissionFailure==null && inspectStartupFailure==null && inspectUnresolvedCleanupFailure==null,
+                "Inspect command session/world unavailable");
+        require(client!=null && client.isOnThread() && server!=null && clientWorld!=null && clientPlayer!=null
+                && handler!=null && connection!=null && save!=null,"Incomplete native inspect binding");
+        checkRoots(roots);
+        require(real(save).equals(save) && real(server.getSavePath(WorldSavePath.ROOT)).equals(save)
+                && real(roots.saves).equals(roots.saves) && save.getParent().equals(roots.saves),"Command save authority redirected");
+        requireClientBinding(client);
+    }
 
     private static JsonObject operationIdentity(Operation operation) {
         var identity=new JsonObject();
@@ -277,7 +352,25 @@ final class ScenarioRunner implements AutoCloseable {
         return identity;
     }
 
-    void initializeInspectWorld() {
+    void initializeInspectWorld(Runnable publishReady) {
+        Objects.requireNonNull(publishReady);
+        initializeInspectStartup(() -> initializeInspectWorldScoped(publishReady));
+    }
+
+    private void initializeInspectStartup(Runnable initialize) {
+        require(inspectStartupScope!=null,"Inspect factory has not reserved startup");
+        require(!inspectStartupAttempted && inspectStartupFailure==null,"Startup is single-use and terminal on failure");
+        inspectStartupAttempted=true;
+        try { ((Inspect)host).inScope(inspectStartupScope,initialize); }
+        catch(RuntimeException | Error original) {
+            inspectStartupFailure=original; ready=false;
+            capture(original,() -> ((Inspect)host).cancelSession(original));
+            cleanupFailedStartup(original);
+            throw original;
+        }
+    }
+
+    private void initializeInspectWorldScoped(Runnable publishReady) {
         require(inspectMode && inspectOperation!=null && inspectOperation.command()==Command.STARTUP,
                 "Inspect initialization requires its startup operation");
         ((Inspect)host).requireScope(inspectOperation,Kind.STARTUP);
@@ -289,25 +382,62 @@ final class ScenarioRunner implements AutoCloseable {
         var manifest=new JsonObject(); manifest.add("operation",operationIdentity(inspectOperation));
         manifest.addProperty("verdict","OWNED_WORLD_BOUND"); manifest.add("closedFiles",inspectClosedFiles());
         writeNew(roots,artifacts.resolve("completion.json"),manifest.toString());
+        publishInspectStartup(publishReady);
+    }
+
+    private void publishInspectStartup(Runnable publishReady) {
+        ((Inspect)host).requireScope(inspectOperation,Kind.STARTUP);
+        publishReady.run();
         ((Inspect)host).settleStartup(((Inspect)host).requireScope(inspectOperation,Kind.STARTUP));
         inspectOperation=null;
     }
 
+    private void cleanupFailedStartup(Throwable original) {
+        var transport=(Inspect)host;
+        capture(original,() -> writeNew(roots,artifacts.resolve("startup-failure.txt"),trace(original)));
+        final Scope cleanup;
+        try { cleanup=transport.beginCleanup(inspectStartupScope,original); }
+        catch(RuntimeException | Error unavailable) {
+            retain(original,unavailable);
+            capture(original,() -> writeNew(roots,artifacts.resolve("startup-cleanup-unavailable.txt"),trace(original)));
+            return; // Already settled/expired permission is never revived; initializer requests ordinary process stop.
+        }
+        try {
+            transport.inScope(cleanup,() -> {
+                try { closeInspectOwned(cleanup.operation(),cleanup); }
+                catch(RuntimeException | Error error) { retain(original,error); }
+                boolean resolved=closed && normalClose && inspectUnresolvedCleanupFailure==null;
+                if(!resolved) inspectUnresolvedCleanupFailure=original;
+                capture(original,() -> writeNew(roots,artifacts.resolve("startup-cleanup.txt"),
+                        "operation="+cleanup.operation().operationId()+"; ownedCleanup="+(resolved?"SETTLED":"UNRESOLVED")
+                                +"; transport settlement still required\n"+trace(original)));
+                transport.settleCleanup(cleanup,new FinalOutcome(cleanup.operation(),timeoutFailure(inspectStartupFailure)?Verdict.TIMEOUT:Verdict.FAILURE,
+                        resolved?CleanupStatus.SETTLED:CleanupStatus.UNRESOLVED));
+            });
+        } catch(RuntimeException | Error error) {
+            retain(original,error); inspectUnresolvedCleanupFailure=original;
+            capture(original,() -> writeNew(roots,artifacts.resolve("startup-settlement-failure.txt"),trace(original)));
+        }
+    }
+
     private void requireInspectWork(Command first, Command second) {
         if(!inspectMode) return;
-        require(inspectAdmissionFailure==null && inspectUnresolvedCleanupFailure==null
+        require(inspectAdmissionFailure==null && inspectStartupFailure==null && inspectUnresolvedCleanupFailure==null
                 && inspectOperation!=null && !inspectFinalizing,"Inspect work is unavailable");
         ((Inspect)host).requireScope(inspectOperation,Kind.WORK);
         require(inspectOperation.command()==first || inspectOperation.command()==second,"Wrong inspect work command");
     }
 
     InspectCompletion finishInspectOperation(Operation operation, Scope cleanup, Throwable primary) {
-        require(inspectMode && inspectAdmissionFailure==null && operation==inspectOperation && !inspectFinalizing,
+        require(inspectMode && inspectAdmissionFailure==null && inspectStartupFailure==null && operation==inspectOperation
+                        && operation.command()!=Command.STARTUP && !inspectFinalizing,
                 "Foreign, failed-admission or already finalized operation");
         require(((Inspect)host).requireScope(operation,Kind.CLEANUP)==cleanup,"Wrong cleanup handle");
         inspectFinalizing=true; // No retry can write the fixed evidence names again.
         Throwable failure=inspectOriginalFailure;
         if(primary!=null) failure=retain(failure,primary);
+        boolean workTimedOut=timeoutFailure(failure);
+        if(inspectUnresolvedCleanupFailure!=null) failure=retain(failure,inspectUnresolvedCleanupFailure);
         if(failure==null) {
             try {
                 switch(operation.command()) {
@@ -320,31 +450,33 @@ final class ScenarioRunner implements AutoCloseable {
                 }
             } catch(RuntimeException | Error error) { failure=error; }
         }
-        try {
-            if(failure!=null) captureFailure(failure);
-            if(worldCreated && !closed) {
-                // Original status/Watch/fault diagnostics precede every release mutation.
-                writeNew(roots,artifacts.resolve("before-release.txt"),host.computeOnClient(c -> {
-                    requireClient(c);
-                    return MapArtClient.status()+"\n"+watch.retained()+"\n"+PredictionFaults.snapshot()+"\n"+PredictionFaults.stateSnapshot();
-                }));
+        try { if(failure!=null) captureFailure(failure); }
+        catch(RuntimeException | Error error) { inspectEvidenceIncomplete=true; failure=retain(failure,error); }
+        String cleanupStatus=inspectUnresolvedCleanupFailure!=null?"FAILED":!worldCreated?"NO_OWNED_WORLD":closed?"CLOSED":"RELEASED";
+        if(worldCreated && !closed) {
+            InspectEffectResult effects;
+            try { effects=finishInspectEffects(cleanup); }
+            catch(RuntimeException | Error error) {
+                // An uncompleted/expired stopping claim must not race manifest sealing or acquire another budget.
+                inspectUnresolvedCleanupFailure=retain(failure,error);
+                if(inspectUnresolvedCleanupFailure instanceof Error fatal) throw fatal;
+                throw (RuntimeException)inspectUnresolvedCleanupFailure;
+            }
+            if(effects.releaseFailure()!=null) { cleanupStatus="FAILED"; failure=retain(failure,effects.releaseFailure()); }
+            if(effects.freezeFailure()!=null) { cleanupStatus="FAILED"; failure=retain(failure,effects.freezeFailure()); }
+            if(effects.observationFailure()!=null) { inspectEvidenceIncomplete=true; failure=retain(failure,effects.observationFailure()); }
+            if(effects.aftermathFailure()!=null) { inspectEvidenceIncomplete=true; failure=retain(failure,effects.aftermathFailure()); }
+            try {
+                if(effects.before()!=null) writeNew(roots,artifacts.resolve("before-release.txt"),effects.before());
+                if(effects.after()!=null) writeNew(roots,artifacts.resolve("after-release.txt"),effects.after());
                 host.runOnClient(this::requireClient);
                 copyNew(roots,roots.game.resolve("logs/latest.log"),artifacts.resolve("minecraft-latest.log"));
-            }
-        } catch(RuntimeException | Error error) { inspectEvidenceIncomplete=true; failure=retain(failure,error); }
-        String cleanupStatus=!worldCreated?"NO_OWNED_WORLD":closed?"CLOSED":"RELEASED";
-        if(worldCreated && !closed) {
-            try { inspectReleaseEffect.run(); }
-            catch(RuntimeException | Error error) { cleanupStatus="FAILED"; failure=retain(failure,error); }
-            try {
-                writeNew(roots,artifacts.resolve("after-release.txt"),host.computeOnClient(c -> {
-                    requireClient(c); return MapArtClient.status().toString();
-                }));
             } catch(RuntimeException | Error error) { inspectEvidenceIncomplete=true; failure=retain(failure,error); }
-            try { inspectFreezeEffect.run(); }
-            catch(RuntimeException | Error error) { cleanupStatus="FAILED"; failure=retain(failure,error); }
         } else {
-            try { watch.freeze(); }
+            try {
+                inspectEffects.attempt(cleanup,() -> null,() -> { },watch::freeze,() -> null);
+                inspectEffects.seal(cleanup,null);
+            }
             catch(RuntimeException | Error error) { cleanupStatus="FAILED"; failure=retain(failure,error); }
         }
         // Transport settlement cannot resolve an unverified release/freeze owned by this Runner.
@@ -374,7 +506,9 @@ final class ScenarioRunner implements AutoCloseable {
         String summaryHash=null;
         try { if(Files.isRegularFile(summary)) summaryHash=fileHash(summary); }
         catch(IOException | RuntimeException | Error error) { complete=false; failure=retain(failure,error); }
-        try { ((Inspect)host).settleCleanup(cleanup); }
+        var verdict=workTimedOut?Verdict.TIMEOUT:failure==null?Verdict.SUCCESS:Verdict.FAILURE;
+        var outcome=new FinalOutcome(operation,verdict,inspectUnresolvedCleanupFailure==null?CleanupStatus.SETTLED:CleanupStatus.UNRESOLVED);
+        try { ((Inspect)host).settleCleanup(cleanup,outcome); }
         catch(RuntimeException | Error error) {
             var unsettled=retain(failure,error);
             if(unsettled instanceof Error fatal) throw fatal;
@@ -389,6 +523,82 @@ final class ScenarioRunner implements AutoCloseable {
                 Optional.ofNullable(inspectRun),failure==null?"PASS":"FAIL",failure,artifacts,complete,cleanupStatus,true,summary);
         inspectLast=completion; inspectLastSummaryHash=summaryHash; inspectOperation=null;
         return completion;
+    }
+
+    private static boolean timeoutFailure(Throwable failure) {
+        if(failure instanceof ScopeTimeoutException) return true;
+        return failure!=null && failure.getCause() instanceof ScopeTimeoutException;
+    }
+
+    private String inspectObservations(MinecraftClient client) {
+        return MapArtClient.status()+"\n"+watch.retained()+"\n"+PredictionFaults.snapshot()+"\n"+PredictionFaults.stateSnapshot();
+    }
+
+    private InspectEffectResult finishInspectEffects(Scope cleanup) {
+        if(inspectDoubledEffects) {
+            inspectEffects.attempt(cleanup,() -> "doubled owner effects; no native authority credit",inspectReleaseEffect,inspectFreezeEffect,() -> null);
+            return inspectEffects.seal(cleanup,null);
+        }
+        Throwable unavailable=null;
+        try {
+            requireServerCheckpoint();
+            return host.computeOnClient(c -> {
+                inspectEffects.attempt(cleanup,() -> { requireClient(c); return inspectObservations(c); },
+                        () -> releaseInspectOnClient(c,false,cleanup),() -> watch.freeze(),() -> {
+                            requireClient(c); return MapArtClient.status().toString();
+                        });
+                return inspectEffects.seal(cleanup,null);
+            });
+        } catch(RuntimeException | Error error) { unavailable=error; }
+        // requireScope waits for an in-flight stopping claim; no manifest can outrun its observations/effects.
+        try { ((Inspect)host).requireScope(cleanup.operation(),Kind.CLEANUP); }
+        catch(RuntimeException | Error error) {
+            var unresolved=retain(unavailable,error);
+            if(unresolved instanceof Error fatal) throw fatal;
+            throw (RuntimeException)unresolved;
+        }
+        return inspectEffects.seal(cleanup,unavailable);
+    }
+
+    private void bindInspectStop(MinecraftClient client) {
+        if(!inspectMode) return;
+        inspectStopBinding=new StopBinding(server,save,client.world,client.player,handler,connection,
+                MapArtClient.status().engine().lifecycle().context().map(c -> c.runId()).orElse(null),supportArm);
+    }
+
+    private void requireInspectStopClient(MinecraftClient c,Scope cleanup) {
+        ((Inspect)host).requireStoppingScope(cleanup);
+        var b=inspectStopBinding;
+        require(b!=null && c.isOnThread() && !closed && c.getServer()==b.server && c.world==b.world && c.player==b.player
+                && c.getNetworkHandler()==b.handler && b.handler.getConnection()==b.connection && b.connection.isOpen()
+                && b.handler.getWorld()==b.world && b.player.getEntityWorld()==b.world
+                && b.world.getRegistryKey().equals(World.OVERWORLD)
+                && b.server.getSavePath(WorldSavePath.ROOT).toAbsolutePath().normalize().equals(b.save)
+                && c.getLevelStorage().getSavesDirectory().toAbsolutePath().normalize().equals(roots.saves),"Stale stopping binding");
+        require(Objects.equals(b.run,MapArtClient.status().engine().lifecycle().context().map(context -> context.runId()).orElse(null))
+                && b.arm==supportArm,"Stopping refuses another run/arm");
+        require(PredictionFaults.resetSnapshot().support().map(gate -> gate.identity()).orElse(null)==b.arm,
+                "Stopping refuses a replaced native fault arm");
+    }
+
+    private void releaseInspectOnClient(MinecraftClient c,boolean stopping,Scope cleanup) {
+        if(stopping) requireInspectStopClient(c,cleanup); else requireClient(c);
+        require(MapArtClient.status().engine().lifecycle().context().map(context -> runs.contains(context.runId())).orElse(true),
+                "Cleanup refuses another run's controls");
+        MapArtClient.stop(); requireReleased(c);
+        var arm=stopping?inspectStopBinding.arm:supportArm;
+        if(arm!=null) {
+            if(stopping) requireInspectStopClient(c,cleanup); else requireClient(c);
+            PredictionFaults.cancelSupportAvailabilityForClose(c,server,save,arm.context().runId(),arm);
+        }
+    }
+
+    private void stopInspectOnClient(MinecraftClient c,Scope cleanup) {
+        ((Inspect)host).requireStoppingScope(cleanup);
+        inspectEffects.attempt(cleanup,() -> { requireInspectStopClient(c,cleanup); return inspectObservations(c); },
+                () -> releaseInspectOnClient(c,true,cleanup),() -> {
+                    ((Inspect)host).requireStoppingScope(cleanup); watch.freeze();
+                },() -> { requireInspectStopClient(c,cleanup); return MapArtClient.status().toString(); });
     }
 
     private JsonArray inspectClosedFiles() {
@@ -428,7 +638,7 @@ final class ScenarioRunner implements AutoCloseable {
             writeNew(roots,directory.resolve(name+".image-reservation"),"operation="+inspectOperation.operationId());
         }
         // The ordinary host owns CREATE_NEW output and late exact-scope invalidation; automatic remains native.
-        return host.takeScreenshot(directory,name);
+        return inspectMode?((Inspect)host).takeScreenshot(directory,name,this::requireClient):host.takeScreenshot(directory,name);
     }
 
     ScenarioRunner(ClientGameTestContext context, ScenarioObserver.Watch watch, int expectedCountedRuns) {
@@ -729,7 +939,10 @@ final class ScenarioRunner implements AutoCloseable {
             }
         }, () -> {
             int consumed=release ? releaseForReset(stage,prior) : 0;
-            host.runOnClient(c -> { requireClient(c); PredictionFaults.clear(); watch.clear(); });
+            host.runOnClient(c -> {
+                requireClient(c); PredictionFaults.clear(); watch.clear();
+                if(inspectMode) { supportArm=null; bindInspectStop(c); }
+            });
             if(!baseline()) {
                 boolean priorRun=capture!=null;
                 // Prior references keep their old budget/ordinal until archive validation and owner clear finish.
@@ -774,6 +987,7 @@ final class ScenarioRunner implements AutoCloseable {
             require(now.problems.isEmpty() && now.state.equals(stable.client.state), "Start state changed without physics");
             UUID fresh = MapArtClient.start(plan, origin, settings);
             require(runs.add(fresh), "Facade reused a run UUID");
+            bindInspectStop(c);
             if(inspectMode) {
                 inspectRun=fresh;
                 var identity=operationIdentity(inspectOperation); identity.addProperty("runId",fresh.toString());
@@ -792,8 +1006,10 @@ final class ScenarioRunner implements AutoCloseable {
             }
             if(baseline() && counted && supportCase==SupportCase.CONTROLLED) {
                 supportArm=PredictionFaults.armSupportAvailability(c,server,save,fresh,plan,settings,watch).identity();
+                bindInspectStop(c);
                 verifySupportArmRefusals(c,fresh);
             }
+            bindInspectStop(c);
             return fresh;
         });
         if (counted && countedStarts==1 && releasedFailedRun!=null)
@@ -3169,7 +3385,10 @@ final class ScenarioRunner implements AutoCloseable {
         try {
             if (!Files.exists(roots.saves,LinkOption.NOFOLLOW_LINKS)) Files.createDirectory(roots.saves);
         } catch (IOException e) { throw new UncheckedIOException(e); }
-        guardedWorldCreation(roots,roots.saves,real(roots.saves),() -> { host.createWorld(); worldCreated=true; });
+        guardedWorldCreation(roots,roots.saves,real(roots.saves),() -> {
+            if(inspectMode) ((Inspect)host).createWorld(this::requireProspectiveInspectSave); else host.createWorld();
+            worldCreated=true;
+        });
         server = host.computeOnServer(s -> {
             require(s.getOverworld().getSeed()==1 && s.getOverworld().getChunkManager().getChunkGenerator() instanceof FlatChunkGenerator,
                     "Owned world must be seed1/flat");
@@ -3186,6 +3405,7 @@ final class ScenarioRunner implements AutoCloseable {
                     && c.player!=null && c.getNetworkHandler()!=null, "Missing creation binding");
             clientWorld=c.world; clientPlayer=c.player; handler=c.getNetworkHandler(); connection=handler.getConnection();
             requireClient(c);
+            bindInspectStop(c);
         });
         writeHeader(artifacts.resolve("authority.txt"), "invocation=" + invocation + "; roots=" + roots + "; save=" + save
                 + "; server=" + System.identityHashCode(server) + "; serverPlayer=" + System.identityHashCode(serverPlayer)
@@ -3212,8 +3432,26 @@ final class ScenarioRunner implements AutoCloseable {
         require(c.getLevelStorage().getSavesDirectory().toAbsolutePath().equals(roots.saves),"Foreign native saves directory");
     }
 
+    private void requireProspectiveInspectSave(MinecraftClient client,Path candidate) {
+        require(inspectOperation!=null && inspectOperation.command()==Command.STARTUP,"No owned startup operation");
+        requireUncreatedClient(client);
+        requireProspectiveInspectSave(roots,invocation,candidate);
+    }
+
+    static void requireProspectiveInspectSave(Roots roots,UUID session,Path candidate) {
+        checkRoots(roots);
+        require(real(roots.saves).equals(roots.saves) && candidate.isAbsolute() && candidate.normalize().equals(candidate)
+                && roots.saves.equals(candidate.getParent()) && candidate.getFileName().toString().equals("mapart-inspect-"+session)
+                && candidate.getFileName().toString().length()<=64,"Prospective save escaped exact session scope");
+        require(!Files.exists(candidate,LinkOption.NOFOLLOW_LINKS),"Prospective save already exists/reparse target");
+    }
+
     private void requireClient(MinecraftClient c) {
         require(c.isOnThread(), "Not client thread"); checkSave();
+        requireClientBinding(c);
+    }
+
+    private void requireClientBinding(MinecraftClient c) {
         require(c.getServer()==server && c.world==clientWorld && c.player==clientPlayer && c.getNetworkHandler()==handler
                 && handler.getConnection()==connection && connection.isOpen() && handler.getWorld()==clientWorld
                 && clientPlayer.getEntityWorld()==clientWorld && clientWorld.getRegistryKey().equals(World.OVERWORLD)
@@ -3591,6 +3829,7 @@ final class ScenarioRunner implements AutoCloseable {
     }
 
     @Override public void close() {
+        if(inspectMode) require(inspectStartupFailure==null && inspectUnresolvedCleanupFailure==null,"Inspect terminal cleanup cannot renew permission");
         if (closed) return;
         if(inspectMode) { closeInspect(); return; }
         if(!baseline()) { closeCompact(); return; }
@@ -3668,16 +3907,27 @@ final class ScenarioRunner implements AutoCloseable {
                     }));
                 } catch(RuntimeException | Error error) { failure=retain(failure,error); }
             }
-            try { releaseInspectControls(); } catch(RuntimeException | Error error) { failure=retain(failure,error); }
+            var effects=finishInspectEffects(cleanup);
+            if(effects.releaseFailure()!=null) failure=retain(failure,effects.releaseFailure());
+            if(effects.freezeFailure()!=null) failure=retain(failure,effects.freezeFailure());
+            if(effects.observationFailure()!=null) failure=retain(failure,effects.observationFailure());
+            if(effects.aftermathFailure()!=null) failure=retain(failure,effects.aftermathFailure());
+            if(effects.releaseFailure()!=null || effects.freezeFailure()!=null) inspectUnresolvedCleanupFailure=failure;
             try { host.runOnClient(c -> { requireClient(c); restoreCallerOptions(c); }); }
             catch(RuntimeException | Error error) { failure=retain(failure,error); }
-            try { host.runOnClient(c -> watch.freeze()); } catch(RuntimeException | Error error) { failure=retain(failure,error); }
             try {
-                requireServerCheckpoint(); host.runOnClient(this::requireClient); host.closeWorld(); closed=true; normalClose=true;
+                requireServerCheckpoint(); host.runOnClient(this::requireClient);
+                ((Inspect)host).closeWorld(this::requireClient); closed=true; normalClose=true;
                 if(inspectAdmissionFailure==null)
                     writeNew(roots,artifacts.resolve("world-closed.txt"),"WORLD CLOSED normally; session="+invocation+"; operation="+operation.operationId());
             } catch(RuntimeException | Error error) { failure=retain(failure,error); }
-        } else { watch.freeze(); closed=true; normalClose=true; }
+        } else {
+            inspectEffects.attempt(cleanup,() -> null,() -> { },watch::freeze,() -> null);
+            var effects=inspectEffects.seal(cleanup,null);
+            if(effects.releaseFailure()!=null) failure=retain(failure,effects.releaseFailure());
+            if(effects.freezeFailure()!=null) failure=retain(failure,effects.freezeFailure());
+            if(failure==null) { closed=true; normalClose=true; } else inspectUnresolvedCleanupFailure=failure;
+        }
         if(inspectAdmissionFailure!=null) {
             // This exceptional shutdown has no BEGIN/CLEANUP/END repair or successor operation.
             if(failure!=null) {

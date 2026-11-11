@@ -28,6 +28,160 @@ class ScenarioInspectLifecycleTest {
     }
     @TempDir Path directory;
 
+    @Test void commandAuthorityRefusalHasNoOrdinalEvidenceOrTransportEffects() throws Exception {
+        var host=new InspectTransport(); var runner=runner(host);
+        var session=runner.inspectSessionId();
+        assertThrows(AssertionError.class,() -> runner.requireInspectCommandWorld(null));
+        assertEquals(0,host.effects); assertEquals(0,runnerField("inspectOrdinal").getInt(runner));
+        assertNull(runnerField("inspectOperation").get(runner)); assertFalse(Files.exists(rootsDirectory(runner).evidence()));
+        var operation=runner.beginInspectOperation(Command.RUN);
+        assertEquals(session,operation.sessionId()); assertEquals(1,operation.ordinal());
+    }
+
+    private static ScenarioRunner.Roots rootsDirectory(ScenarioRunner runner) throws Exception {
+        return (ScenarioRunner.Roots)runnerField("roots").get(runner);
+    }
+
+    @Test void realStoppingHostResultsAreConsumedOnceBeforeWorkerSealsEvidence() throws Exception {
+        var nativeThread=ThreadLocal.withInitial(() -> false); var outcomes=new java.util.ArrayList<FinalOutcome>();
+        var host=new InspectScenarioHost(() -> 1L,nativeThread::get,() -> false,
+                action -> fail("Stopped host must not enqueue"),action -> fail("Stopped server must not enqueue"),outcomes::add);
+        var attempts=new int[2]; var watch=new ScenarioObserver.Watch();
+        var runner=new ScenarioRunner(host,watch,roots(),() -> attempts[0]++,() -> attempts[1]++);
+        var op=runner.beginInspectOperation(Command.RUN); var work=host.beginWork(op);
+        var original=new IllegalStateException("original work failure"); var cleanup=host.beginCleanup(work,original);
+        runnerField("worldCreated").setBoolean(runner,true);
+        nativeThread.set(true);
+        try { host.onStopping(null); } finally { nativeThread.remove(); }
+        // No installed native binding: actual Runner refuses all release/capture effects, freezes its old Watch.
+        assertTrue(field("frozen").getBoolean(watch));
+        assertSame(original,assertThrows(IllegalStateException.class,() -> host.inScope(cleanup,
+                () -> runner.finishInspectOperation(op,cleanup,original))));
+        assertArrayEquals(new int[]{0,0},attempts); assertEquals(CleanupStatus.UNRESOLVED,outcomes.getFirst().cleanup());
+        assertEquals(Verdict.FAILURE,outcomes.getFirst().verdict());
+        var closed=closedFileHashes(op.evidenceDirectory());
+        nativeThread.set(true); try { host.onStopping(null); } finally { nativeThread.remove(); }
+        assertEquals(closed,closedFileHashes(op.evidenceDirectory())); assertTrue(runner.lastInspectCompletion().isEmpty());
+    }
+
+    @Test void startupReservesOrdinalZeroAndInitializationBindsItsScopeInternally() throws Exception {
+        var host=new InspectTransport(); var runner=runner(host);
+        invokeRunner(runner,"reserveInspectStartup");
+        assertEquals(Kind.STARTUP,host.current.kind()); assertEquals(0,host.current.operation().ordinal());
+        assertEquals(Command.STARTUP,host.current.operation().command());
+        assertTrue(Files.isRegularFile(host.current.operation().evidenceDirectory().resolve("operation.json")));
+        assertThrows(AssertionError.class,() -> runner.initializeInspectWorld(() -> fail("Publication before binding"))); // Native double refuses first client query.
+        assertEquals(1,host.effects); assertNull(host.bound);
+        assertThrows(AssertionError.class,() -> invokeRunner(runner,"reserveInspectStartup"));
+    }
+
+    @Test void startupPublicationFailurePreservesClosedFilesAndNeverCreatesOrdinaryLastOrShutdownLineage() throws Exception {
+        for(boolean linked : List.of(false,true)) {
+            var host=new InspectTransport(); var runner=runner(host); invokeRunner(runner,"reserveInspectStartup");
+            var startup=host.current; var op=startup.operation();
+            Files.writeString(op.evidenceDirectory().resolve("completion.json"),"closed owned binding evidence");
+            var oldFiles=closedFileHashes(op.evidenceDirectory()); var receipt=directory.resolve("ready-"+linked);
+            var original=new IllegalStateException("publication failed "+linked);
+            Runnable publish=() -> {
+                assertSame(startup,host.requireScope(op,Kind.STARTUP));
+                if(linked) assertDoesNotThrow(() -> Files.writeString(receipt,"visible immutable READY"));
+                throw original;
+            };
+            // Synthetic completed-binding envelope exercises production publication/failure ordering only.
+            Runnable initialization=() -> invokeRunner(runner,"publishInspectStartup",publish);
+            assertSame(original,assertThrows(IllegalStateException.class,() -> invokeRunner(runner,"initializeInspectStartup",initialization)));
+            assertEquals(linked,Files.exists(receipt)); if(linked) assertEquals("visible immutable READY",Files.readString(receipt));
+            for(var entry:oldFiles.entrySet()) assertEquals(entry.getValue(),closedFileHashes(op.evidenceDirectory()).get(entry.getKey()));
+            assertEquals(Verdict.FAILURE,host.outcome.verdict()); assertEquals(CleanupStatus.SETTLED,host.outcome.cleanup());
+            assertSame(op,host.outcome.operation()); assertTrue(runner.lastInspectCompletion().isEmpty());
+            assertEquals(0,host.shutdownScopes);
+            for(var command:List.of(Command.RESET,Command.RUN,Command.CLOSE)) assertThrows(AssertionError.class,() -> runner.beginInspectOperation(command));
+            assertThrows(AssertionError.class,runner::close);
+            assertThrows(AssertionError.class,() -> runner.failInspectAdmission(op,new Exception("No N1 reclassification")));
+            assertThrows(AssertionError.class,() -> invokeRunner(runner,"initializeInspectStartup",initialization));
+            assertEquals(1,host.settlements);
+        }
+    }
+
+    @Test void startupSettlementPrecedesReturnAndLaterErrorCannotReviveItsPermission() throws Exception {
+        var host=new InspectTransport(); var runner=runner(host); invokeRunner(runner,"reserveInspectStartup");
+        var startup=host.current; var original=new IllegalStateException("after startup settlement");
+        Runnable initialization=() -> {
+            invokeRunner(runner,"publishInspectStartup",() -> assertSame(startup,host.current));
+            assertNull(host.current); throw original;
+        };
+        assertSame(original,assertThrows(IllegalStateException.class,() -> invokeRunner(runner,"initializeInspectStartup",initialization)));
+        assertEquals(0,host.settlements); assertNull(host.outcome); assertEquals(0,host.effects); assertEquals(0,host.shutdownScopes);
+        assertTrue(runner.lastInspectCompletion().isEmpty()); assertThrows(AssertionError.class,runner::close);
+        assertThrows(AssertionError.class,() -> runner.beginInspectOperation(Command.RUN));
+    }
+
+    @Test void prospectiveSaveRejectsForeignNamesParentsAndExistingEntries() throws Exception {
+        var roots = roots(); Files.createDirectory(roots.saves());
+        var session = UUID.randomUUID();
+        var prospective = roots.saves().resolve("mapart-inspect-" + session);
+        ScenarioRunner.requireProspectiveInspectSave(roots, session, prospective);
+        assertThrows(AssertionError.class, () -> ScenarioRunner.requireProspectiveInspectSave(roots, session, roots.saves().resolve("other")));
+        assertThrows(AssertionError.class, () -> ScenarioRunner.requireProspectiveInspectSave(roots, session, roots.game().resolve(prospective.getFileName())));
+        Files.writeString(prospective, "existing save entry");
+        assertThrows(AssertionError.class, () -> ScenarioRunner.requireProspectiveInspectSave(roots, session, prospective));
+        assertEquals("existing save entry", Files.readString(prospective));
+    }
+
+    @Test void cleanupEffectsKeepOriginalObservationsAndAttemptFailuresOnlyOnceBeforeSeal() {
+        var op = new Operation(UUID.randomUUID(), 1, UUID.randomUUID(), Command.RUN, directory);
+        var scope = new Scope(op, Kind.CLEANUP, Long.MAX_VALUE);
+        var effects = new ScenarioRunner.InspectEffects();
+        var order = new java.util.ArrayList<String>();
+        var release = new IllegalStateException("original release failure");
+        var result = effects.attempt(scope, () -> { order.add("observe"); return "original status/watch/fault"; },
+                () -> { order.add("release"); throw release; }, () -> order.add("freeze"), () -> "aftermath");
+        assertSame(release, result.releaseFailure());
+        assertEquals("original status/watch/fault", result.before());
+        assertSame(result, effects.seal(scope, null));
+        assertSame(result, effects.attempt(scope, () -> fail("sealed observation"), () -> fail("retried release"),
+                () -> fail("retried freeze"), () -> fail("sealed aftermath")));
+        assertEquals(List.of("observe", "release", "freeze"), order);
+        assertThrows(AssertionError.class, () -> effects.seal(new Scope(op, Kind.CLEANUP, Long.MAX_VALUE), null));
+    }
+
+    @Test void finalOutcomeReportsTypedTimeoutAndCleanupOnlyFailure() throws Exception {
+        var host = new InspectTransport(); var runner = runner(host);
+        var operation = runner.beginInspectOperation(Command.RUN);
+        var work = host.beginWork(operation); var timeout = new ScopeTimeoutException();
+        var cleanup = host.beginCleanup(work, timeout);
+        var result = host.inScope(cleanup, () -> runner.finishInspectOperation(operation, cleanup, timeout));
+        assertSame(timeout, result.failure()); assertSame(operation, host.outcome.operation());
+        assertEquals(Verdict.TIMEOUT, host.outcome.verdict()); assertEquals(CleanupStatus.SETTLED, host.outcome.cleanup());
+    }
+
+    @Test void cleanupOnlyTimeoutIsFailureAndUnresolvedRatherThanSuccessfulWorkTimeout() throws Exception {
+        // Synthetic asserted success, real owner finalization; no world/control acceptance is claimed.
+        var host=new InspectTransport(); var watch=new ScenarioObserver.Watch(); var cleanupFailure=new ScopeTimeoutException();
+        var runner=new ScenarioRunner(host,watch,roots(),() -> { throw cleanupFailure; },watch::freeze);
+        var op=runner.beginInspectOperation(Command.RUN); var work=host.beginWork(op);
+        var success=successfulOwnerState(runner,op,checkpoint(),"synthetic-success");
+        host.inScope(work,() -> runner.assertResult(success));
+        runnerField("worldCreated").setBoolean(runner,true);
+        var cleanup=host.beginCleanup(work,null);
+        assertSame(cleanupFailure,assertThrows(ScopeTimeoutException.class,() -> host.inScope(cleanup,
+                () -> runner.finishInspectOperation(op,cleanup,null))));
+        assertEquals(Verdict.FAILURE,host.outcome.verdict()); assertEquals(CleanupStatus.UNRESOLVED,host.outcome.cleanup());
+        assertTrue(runner.lastInspectCompletion().isEmpty());
+    }
+
+    @Test void completedNativeCloseCannotEraseEarlierUnresolvedOwnedEffects() throws Exception {
+        var host=new InspectTransport(); var runner=runner(host); var op=runner.beginInspectOperation(Command.CLOSE);
+        var cleanup=host.beginCleanup(host.beginWork(op),null); var failedRelease=new IllegalStateException("unverified close release");
+        // Synthetic native-close outcome only; test owner latch retention, never world shutdown acceptance.
+        runnerField("worldCreated").setBoolean(runner,true); runnerField("closed").setBoolean(runner,true);
+        runnerField("normalClose").setBoolean(runner,true); runnerField("inspectUnresolvedCleanupFailure").set(runner,failedRelease);
+        assertSame(failedRelease,assertThrows(IllegalStateException.class,() -> host.inScope(cleanup,
+                () -> runner.finishInspectOperation(op,cleanup,null))));
+        assertEquals(CleanupStatus.UNRESOLVED,host.outcome.cleanup()); assertEquals(Verdict.FAILURE,host.outcome.verdict());
+        assertTrue(runner.lastInspectCompletion().isEmpty()); assertThrows(AssertionError.class,() -> runner.beginInspectOperation(Command.RESET));
+    }
+
     @Test void admittedFailuresHaveDistinctClosedEvidenceWithoutRunUuid() throws Exception {
         var host = new InspectTransport();
         var runner = runner(host);
@@ -314,6 +468,8 @@ class ScenarioInspectLifecycleTest {
         assertSame(original, assertThrows(IllegalStateException.class,
                 () -> host.inScope(cleanup, () -> runner.finishInspectOperation(operation, cleanup, original))));
         assertNull(host.current); // Successful transport settlement cannot prove either owned effect.
+        assertEquals(CleanupStatus.UNRESOLVED,host.outcome.cleanup());
+        assertEquals(Verdict.FAILURE,host.outcome.verdict());
         assertEquals(2, host.settlements);
         assertArrayEquals(new int[]{1, 1}, attempts);
         assertTrue(List.of(original.getSuppressed()).contains(failingEffect.equals("release") ? releaseFailure : freezeFailure));
@@ -433,6 +589,14 @@ class ScenarioInspectLifecycleTest {
             throw (RuntimeException) error.getCause();
         } catch (ReflectiveOperationException error) { throw new AssertionError(error); }
     }
+    private static void invokeRunner(ScenarioRunner runner,String name,Runnable action) {
+        try {
+            var method=ScenarioRunner.class.getDeclaredMethod(name,Runnable.class); method.setAccessible(true); method.invoke(runner,action);
+        } catch(java.lang.reflect.InvocationTargetException error) {
+            if(error.getCause() instanceof Error fatal) throw fatal;
+            throw (RuntimeException)error.getCause();
+        } catch(ReflectiveOperationException error) { throw new AssertionError(error); }
+    }
 
     private ScenarioRunner runner(InspectTransport host) throws Exception {
         return new ScenarioRunner(host, new ScenarioObserver.Watch(), roots());
@@ -454,19 +618,27 @@ class ScenarioInspectLifecycleTest {
         Throwable settlementFailure;
         Operation shutdownOperation;
         int settlements, shutdownScopes;
+        FinalOutcome outcome;
+        public void bindStoppingOwner(BiConsumer<MinecraftClient, Scope> owner) { }
+        public void requireStoppingScope(Scope cleanup) { fail("No native stopping claim"); }
+        public void createWorld(BiConsumer<MinecraftClient, Path> guard) { effects++; fail("No native world available"); }
+        public Path takeScreenshot(Path directory,String name,Consumer<MinecraftClient> guard) { effects++; return fail("No native world available"); }
+        public void closeWorld(Consumer<MinecraftClient> guard) { effects++; fail("No native world available"); }
+        public void awaitNeutralChat() { effects++; fail("No native world available"); }
         public Scope beginStartup(Operation op) { return current = new Scope(op, Kind.STARTUP, Long.MAX_VALUE); }
         public void settleStartup(Scope scope) { assertSame(current, scope); current = null; }
         public Scope beginWork(Operation op) { assertFalse(cancelled); return current = new Scope(op, Kind.WORK, Long.MAX_VALUE); }
         public Scope beginCleanup(Scope work, Throwable primary) {
             assertSame(current, work); return current = new Scope(work.operation(), Kind.CLEANUP, Long.MAX_VALUE);
         }
-        public void settleCleanup(Scope scope) {
+        public void settleCleanup(Scope scope, FinalOutcome outcome) {
             assertSame(current, scope);
+            assertSame(scope.operation(), outcome.operation()); this.outcome = outcome;
             if (settlementFailure != null) throw (RuntimeException) settlementFailure;
             settlements++;
             current = null;
         }
-        public void cancelSession(Throwable primary) { cancelled = true; current = null; }
+        public void cancelSession(Throwable primary) { cancelled = true; }
         public Scope beginShutdownCleanup(Operation failed, Throwable primary) {
             shutdownScopes++;
             shutdownOperation = failed;
@@ -481,8 +653,8 @@ class ScenarioInspectLifecycleTest {
         public <V> V inScope(Scope scope, Supplier<V> action) {
             var old = bound; bound = scope; try { return action.get(); } finally { bound = old; }
         }
-        public void runOnClient(Consumer<MinecraftClient> action) { effects++; fail("No native world available"); }
-        public <V> V computeOnClient(Function<MinecraftClient, V> action) { effects++; return fail("No native world available"); }
+        public void runOnClient(Consumer<MinecraftClient> action) { requireScope(current.operation(),current.kind()); effects++; fail("No native world available"); }
+        public <V> V computeOnClient(Function<MinecraftClient, V> action) { requireScope(current.operation(),current.kind()); effects++; return fail("No native world available"); }
         public void runOnServer(Consumer<MinecraftServer> action) { effects++; fail("No native world available"); }
         public <V> V computeOnServer(Function<MinecraftServer, V> action) { effects++; return fail("No native world available"); }
         public void waitTick() { effects++; fail("No native world available"); }

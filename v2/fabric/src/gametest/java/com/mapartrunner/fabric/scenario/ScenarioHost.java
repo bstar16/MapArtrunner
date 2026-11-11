@@ -12,6 +12,7 @@ import java.util.UUID;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Supplier;
+import java.util.function.BiConsumer;
 
 /** Fixture transport only. The runner retains world, player, connection and save authority. */
 interface ScenarioHost {
@@ -27,6 +28,16 @@ interface ScenarioHost {
 
     enum Command { RESET, RUN, RERUN, STARTUP, CLOSE }
     enum Kind { STARTUP, WORK, CLEANUP }
+    enum Verdict { SUCCESS, FAILURE, TIMEOUT }
+    enum CleanupStatus { SETTLED, UNRESOLVED }
+    record FinalOutcome(Operation operation, Verdict verdict, CleanupStatus cleanup) {
+        public FinalOutcome {
+            Objects.requireNonNull(operation); Objects.requireNonNull(verdict); Objects.requireNonNull(cleanup);
+        }
+    }
+    final class ScopeTimeoutException extends IllegalStateException {
+        ScopeTimeoutException() { super("Inspect scope absolute deadline expired"); }
+    }
 
     record Operation(UUID sessionId, int ordinal, UUID operationId, Command command, Path evidenceDirectory) {
         public Operation {
@@ -66,7 +77,13 @@ interface ScenarioHost {
         void settleStartup(Scope scope);
         Scope beginWork(Operation operation);
         Scope beginCleanup(Scope expiredOrCompleted, Throwable primary);
-        void settleCleanup(Scope scope);
+        void settleCleanup(Scope scope, FinalOutcome outcome);
+        void createWorld(BiConsumer<MinecraftClient, Path> beforeCreate);
+        Path takeScreenshot(Path directory, String name, Consumer<MinecraftClient> beforeCapture);
+        void closeWorld(Consumer<MinecraftClient> beforeClose);
+        void awaitNeutralChat();
+        void bindStoppingOwner(BiConsumer<MinecraftClient, Scope> owner);
+        void requireStoppingScope(Scope cleanup);
         void cancelSession(Throwable primary);
         Scope beginShutdownCleanup(Operation failedAdmission, Throwable primary);
         /**
