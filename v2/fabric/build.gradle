@@ -40,13 +40,17 @@ loom {
 sourceSets.test.resources.srcDir rootProject.file('test-fixtures')
 sourceSets.gametest.resources.srcDir rootProject.file('test-fixtures')
 
+sourceSets.test {
+    compileClasspath += sourceSets.gametest.output + sourceSets.gametest.compileClasspath
+    runtimeClasspath += sourceSets.gametest.output + sourceSets.gametest.runtimeClasspath
+}
+
 tasks.named('compileTestJava', JavaCompile) {
-    source('src/gametest/java/com/mapartrunner/fabric/scenario/threading/RegistrationAcknowledgement.java')
-    source('src/gametest/java/com/mapartrunner/fabric/scenario/threading/PacketHandlerAwait.java')
-    source('src/gametest/java/com/mapartrunner/fabric/scenario/TraversalCapture.java')
+    dependsOn tasks.named('gametestClasses')
 }
 
 tasks.named('test', Test) {
+    dependsOn tasks.named('gametestClasses')
     workingDir = layout.buildDirectory.dir('run/unitTest').get().asFile
     doFirst {
         workingDir.mkdirs()
