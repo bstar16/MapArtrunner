@@ -17,6 +17,111 @@ import static com.mapartrunner.core.run.RunLifecycle.*;
 import static org.junit.jupiter.api.Assertions.*;
 
 class BuildEngineTest {
+    @Test void supportedStationaryWalkFailsAt40() {
+        var h = new Harness(plan(12, 5, target(7, 1, 2), target(99, 10, 4)));
+        h.support = support(h.plan, STONE, Evidence.OBSERVED); h.ready();
+        for (int i = 0; i < 39; i++) {
+            var walking = h.step(); assertRunning(walking);
+            assertEquals(Status.WALKING, walking.movement().orElseThrow().status());
+            assertEquals(0, walking.snapshot().laneEntry().orElseThrow().supportHoldTicks());
+            assertEquals(0, walking.snapshot().laneEntry().orElseThrow().yawHoldTicks());
+        }
+        h.available.put(7, PlacementAvailability.READY);
+        var failed = h.step();
+        assertEquals(Phase.TERMINAL, failed.snapshot().lifecycle().phase());
+        assertReason(failed, Reason.WALK_NO_PROGRESS);
+        assertEquals(ControlOwner.NONE, failed.owner());
+        assertTrue(failed.movement().isEmpty()); assertTrue(failed.placement().isEmpty());
+        assertEquals(List.of(7, 99), failed.snapshot().unfinishedTargetIds());
+    }
+
+    @Test void sidewaysOrOscillatingPoseDoesNotReset() {
+        for (int mode = 0; mode < 3; mode++) {
+            var h = new Harness(plan(12, 5, target(7, 1, 2), target(99, 0, 4)));
+            h.support = support(h.plan, STONE, Evidence.OBSERVED); h.ready();
+            if (mode == 2) {
+                h.at(new PlayerObservation(.75, 1, 2.5, -90)); assertRunning(h.step());
+                assertEquals(0, h.engine.snapshot().traversal().orElseThrow().walkNoProgressTicks());
+            }
+            for (int i = 0; i < 39; i++) {
+                h.at(new PlayerObservation(mode == 0 ? .5 : .5 + (i % 2) * (mode == 2 ? .25 : .125),
+                        1, mode == 0 ? 2.375 + (i % 2) * .25 : 2.5, -90));
+                var d = h.step(); assertRunning(d);
+                assertEquals(Status.WALKING, d.movement().orElseThrow().status());
+                assertEquals(i + 1, d.snapshot().traversal().orElseThrow().walkNoProgressTicks());
+            }
+            h.available.put(7, PlacementAvailability.READY);
+            var failed = h.step();
+            assertEquals(Phase.TERMINAL, failed.snapshot().lifecycle().phase());
+            assertReason(failed, Reason.WALK_NO_PROGRESS);
+            assertTrue(failed.movement().isEmpty()); assertTrue(failed.placement().isEmpty());
+            assertEquals(List.of(7, 99), failed.snapshot().unfinishedTargetIds());
+        }
+    }
+
+    @Test void quarterBlockForwardProgressResetsOnlyThisWatchdog() {
+        var h = new Harness(plan(12, 5, target(7, 1, 2), target(99, 0, 4)));
+        h.support = support(h.plan, STONE, Evidence.OBSERVED); h.ready();
+        h.available.put(7, PlacementAvailability.READY);
+        for (int i = 0; i < 38; i++) assertRunning(h.step());
+        assertEquals(38, h.engine.snapshot().traversal().orElseThrow().walkNoProgressTicks());
+        h.at(new PlayerObservation(.625, 1, 2.5, -90)); assertRunning(h.step());
+        assertEquals(39, h.engine.snapshot().traversal().orElseThrow().walkNoProgressTicks());
+        h.at(new PlayerObservation(.75, 1, 2.5, -90)); assertRunning(h.step());
+        assertEquals(0, h.engine.snapshot().traversal().orElseThrow().walkNoProgressTicks());
+        for (int i = 0; i < 39; i++) assertRunning(h.step());
+        assertEquals(39, h.engine.snapshot().traversal().orElseThrow().walkNoProgressTicks());
+        h.at(new PlayerObservation(1, 1, 2.5, -90)); assertRunning(h.step());
+        assertEquals(0, h.engine.snapshot().traversal().orElseThrow().walkNoProgressTicks());
+        assertEquals(83, h.engine.snapshot().eligibleTicks());
+        assertEquals(Set.of(7), h.engine.snapshot().pendingTargetIds());
+        assertEquals(0, h.engine.snapshot().laneEntry().orElseThrow().supportHoldTicks());
+        assertEquals(0, h.engine.snapshot().laneEntry().orElseThrow().yawHoldTicks());
+        var failed = h.step(); assertReason(failed, Reason.PENDING_EVIDENCE_TIMEOUT);
+        assertEquals(84, failed.snapshot().eligibleTicks());
+        assertEquals(List.of(7, 99), failed.snapshot().unfinishedTargetIds());
+    }
+
+    @Test void placementConfirmationsDoNotBuyMovementTime() {
+        var h = new Harness(plan(12, 5, target(7, 1, 2), target(8, 0, 0), target(99, 0, 4)));
+        h.support = support(h.plan, STONE, Evidence.OBSERVED);
+        h.available.put(7, PlacementAvailability.READY); h.available.put(8, PlacementAvailability.READY);
+        h.ready(); assertEquals(Set.of(7, 8), h.engine.snapshot().pendingTargetIds());
+        for (int i = 0; i < 39; i++) {
+            h.observations = i == 10 || i == 30
+                    ? List.of(observation(h, i == 10 ? 7 : 8, h.nextTick, STONE, Evidence.OBSERVED)) : List.of();
+            assertRunning(h.step());
+        }
+        assertEquals(List.of(99), h.engine.snapshot().unfinishedTargetIds());
+        h.available.put(99, PlacementAvailability.READY);
+        var failed = h.step();
+        assertEquals(Phase.TERMINAL, failed.snapshot().lifecycle().phase());
+        assertReason(failed, Reason.WALK_NO_PROGRESS);
+        assertTrue(failed.movement().isEmpty()); assertTrue(failed.placement().isEmpty());
+        assertEquals(List.of(99), failed.snapshot().unfinishedTargetIds());
+    }
+
+    @Test void pauseDoesNotResetMovementDebt() {
+        var h = new Harness(plan(12, 5, target(7, 1, 2), target(99, 0, 4)));
+        h.support = support(h.plan, STONE, Evidence.OBSERVED); h.ready();
+        for (int i = 0; i < 39; i++) assertRunning(h.step());
+        var before = h.engine.snapshot(); h.engine.pause();
+        assertEquals(39, before.traversal().orElseThrow().walkNoProgressTicks());
+        for (int i = 0; i < 200; i++) {
+            var paused = h.step();
+            assertEquals(before.traversal(), paused.snapshot().traversal());
+            assertEquals(before.eligibleTicks(), paused.snapshot().eligibleTicks());
+            assertTrue(paused.movement().isEmpty()); assertTrue(paused.placement().isEmpty());
+        }
+        h.engine.resume(h.context); h.available.put(7, PlacementAvailability.READY);
+        var failed = h.step();
+        assertEquals(Phase.TERMINAL, failed.snapshot().lifecycle().phase());
+        assertReason(failed, Reason.WALK_NO_PROGRESS);
+        assertEquals(before.eligibleTicks() + 1, failed.snapshot().eligibleTicks());
+        assertTrue(failed.movement().isEmpty()); assertTrue(failed.placement().isEmpty());
+        assertEquals(List.of(7, 99), failed.snapshot().unfinishedTargetIds());
+    }
+
     static final BlockSpec STONE = new BlockSpec("minecraft:stone", Map.of());
     static final BlockSpec AIR = new BlockSpec("minecraft:air", Map.of());
 
@@ -55,7 +160,10 @@ class BuildEngineTest {
     void pendingTimeoutPreservesCanonicalCauseInBuildAndVerify(int width) {
         var h = new Harness(plan(width, 5, target(7, 0, 0)));
         h.available.put(7, PlacementAvailability.READY); h.step();
-        for (int i = 0; i < 79; i++) assertRunning(h.step());
+        for (int i = 0; i < 79; i++) {
+            if (width == 12 && i >= 20) h.at(new PlayerObservation(.5 + .25 * (i / 20), 1, 2.5, -90));
+            assertRunning(h.step());
+        }
         assertEquals(width == 2 ? Activity.VERIFY : Activity.BUILD,
                 h.engine.snapshot().lifecycle().activity().orElseThrow());
         var input = h.engine.snapshot().traversal().orElseThrow();
@@ -534,6 +642,7 @@ class BuildEngineTest {
         var intent = h.step().placement().orElseThrow();
         h.results = List.of(result(intent, status));
         for (int i = 0; i < 79; i++) {
+            if (i >= 20) h.at(new PlayerObservation(.5 + .25 * (i / 20), 1, 2.5, -90));
             assertTrue(h.step().placement().isEmpty());
             assertEquals(Set.of(7), h.engine.snapshot().pendingTargetIds());
         }
@@ -552,7 +661,10 @@ class BuildEngineTest {
             h.observations = List.of(observation(h, 7, h.nextTick, AIR, Evidence.OBSERVED));
         }
         h.observations = List.of();
-        for (int i = 0; i < 79; i++) assertRunning(h.step());
+        for (int i = 0; i < 79; i++) {
+            if (i >= 20) h.at(new PlayerObservation(.5 + .25 * (i / 20), 1, 2.5, -90));
+            assertRunning(h.step());
+        }
         assertReason(h.step(), Reason.PENDING_EVIDENCE_TIMEOUT);
     }
 
@@ -610,7 +722,10 @@ class BuildEngineTest {
     @Test void genuineEvidenceAtPendingBoundaryResolvesBeforeTimeout() {
         var h = new Harness(plan(12, 5, target(7, 0, 0)));
         h.available.put(7, PlacementAvailability.READY); h.step();
-        for (int i = 0; i < 79; i++) h.step();
+        for (int i = 0; i < 79; i++) {
+            if (i >= 20) h.at(new PlayerObservation(.5 + .25 * (i / 20), 1, 2.5, -90));
+            h.step();
+        }
         h.observations = h.scan(STONE);
         var d = h.step();
         assertRunning(d); assertTrue(d.snapshot().pendingTargetIds().isEmpty());
@@ -621,6 +736,7 @@ class BuildEngineTest {
         var h = new Harness(plan(12, 5, target(7, 0, 0)));
         h.available.put(7, PlacementAvailability.READY); h.step();
         for (int i = 0; i < 79; i++) {
+            if (i >= 20) h.at(new PlayerObservation(.5 + .25 * (i / 20), 1, 2.5, -90));
             h.observations = List.of(observation(h, 7, h.nextTick, STONE, evidence));
             assertTrue(h.step().placement().isEmpty());
         }
@@ -745,7 +861,9 @@ class BuildEngineTest {
             var d = h.step(); assertRunning(d);
             assertTrue(d.placement().isEmpty()); assertTrue(d.movement().isEmpty());
         }
-        assertReason(h.step(), Reason.RUN_TIMEOUT);
+        var failed = h.step();
+        assertReason(failed, Reason.RUN_TIMEOUT);
+        assertEquals("Run reached 1200 active callbacks", failed.snapshot().diagnostic().orElseThrow().detail());
         assertEquals(1200, h.engine.snapshot().eligibleTicks());
     }
 
@@ -775,7 +893,7 @@ class BuildEngineTest {
     static Harness verifyHarness() {
         var h = new Harness(plan(2, 5, target(7, 0, 0), target(100, 1, 4)));
         h.observations = h.scan(STONE); h.step(); h.observations = List.of();
-        h.step(); h.step(); h.step(); return h;
+        return h;
     }
     static BuildPlan plan(int width, int depth, Target... targets) {
         return new BuildPlan("plan", new GridSize(width, 1, depth), List.of(targets));

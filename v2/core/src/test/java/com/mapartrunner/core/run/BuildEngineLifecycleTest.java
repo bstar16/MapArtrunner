@@ -173,7 +173,10 @@ class BuildEngineLifecycleTest {
     @Test void pauseAtPendingBoundaryDoesNotSpendWallTicksAndResumeNeedsFreshSample() {
         var h = new Harness(plan(12, 5, target(7, 0, 0)));
         h.available.put(7, PlacementAvailability.READY); h.step();
-        for (int i = 0; i < 79; i++) h.step();
+        for (int i = 0; i < 79; i++) {
+            if (i >= 20) h.at(new PlayerObservation(.5 + .25 * (i / 20), 1, 2.5, -90));
+            h.step();
+        }
         h.engine.pause(); for (int i = 0; i < 100; i++) h.step();
         assertEquals(80, h.engine.snapshot().eligibleTicks());
         h.engine.resume(h.context); h.observations = h.scan(STONE);
