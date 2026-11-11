@@ -35,7 +35,13 @@ class BuildEngineResumeTest {
         h.observations = List.of(); h.step(); h.step();
         h.at(new PlayerObservation(2.5, 1, 102.5, -90));
         var exhausted = h.step(); assertRunning(exhausted);
-        assertEquals(Activity.VERIFY, exhausted.snapshot().lifecycle().activity().orElseThrow());
+        assertEquals(Activity.BUILD, exhausted.snapshot().lifecycle().activity().orElseThrow());
+        var reverse = exhausted.snapshot().traversal().orElseThrow();
+        assertEquals(ForwardTraversal.Pass.REVERSE, reverse.pass());
+        assertEquals(20, reverse.laneIndex());
+        assertEquals(canonical.get(20).end(), reverse.entry().lane().start());
+        assertEquals(canonical.get(20).start(), reverse.entry().lane().end());
+        assertEquals(canonical.get(20).expectedFloor(), reverse.entry().lane().expectedFloor());
         assertTrue(exhausted.snapshot().unfinishedTargetIds().contains(900));
         assertEquals(List.of(160, 900), exhausted.snapshot().unfinishedTargetIds());
         assertTrue(exhausted.snapshot().lifecycle().outcome().isEmpty());

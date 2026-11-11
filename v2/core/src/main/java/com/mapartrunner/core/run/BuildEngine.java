@@ -156,6 +156,7 @@ public final class BuildEngine {
             if (advanced.traversalComplete()) {
                 lifecycle.updateActivity(input.runId(), Activity.VERIFY); verifyEnteredTick = input.tick();
             } else {
+                // X transit and all adjacent-hop stages retain SHIFT placement/control semantics.
                 if (result != null) lifecycle.updateActivity(input.runId(),
                         traversal.snapshot().substage() == ForwardTraversal.Substage.LANE ? Activity.BUILD : Activity.SHIFT);
                 if (result != null && result.status() != Status.COMPLETE) movement = Optional.of(result);

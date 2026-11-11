@@ -185,8 +185,8 @@ class BuildEngineLifecycleTest {
 
     @Test void pauseAtVerifyAndRunBoundaryFreezesBothAndAllowsFreshSuccess() {
         var h = new Harness(plan(2, 5, target(7, 0, 0))); h.player = Optional.empty();
-        for (int i = 0; i < 1116; i++) h.step();
-        h.at(new PlayerObservation(.5, 1, 2.5, -90)); h.ready(); h.step();
+        for (int i = 0; i < 1112; i++) h.step();
+        h.at(new PlayerObservation(.5, 1, 2.5, -90)); h.ready(); h.step(); finishWidthTwoReverse(h);
         for (int i = 0; i < 79; i++) h.step();
         h.engine.pause(); for (int i = 0; i < 100; i++) h.step();
         assertEquals(1199, h.engine.snapshot().eligibleTicks());

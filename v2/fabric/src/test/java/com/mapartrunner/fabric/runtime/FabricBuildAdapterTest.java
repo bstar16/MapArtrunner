@@ -131,6 +131,12 @@ class FabricBuildAdapterTest {
         var h = new Harness(2); h.start();
         h.adapter.tick(); h.adapter.tick(); h.adapter.tick();
         assertEquals(NATIVE, h.adapter.status().controlOwner());
+        h.adapter.tick();
+        assertEquals(com.mapartrunner.core.run.ForwardTraversal.Pass.REVERSE,
+                h.adapter.status().engine().traversal().orElseThrow().pass());
+        assertEquals(new GridPos(1, 0, 2), h.adapter.status().engine().laneEntry().orElseThrow().lane().start());
+        h.sample(1.5, 2.5, 90); h.sample(1.5, 2.5, 90); h.sample(1.5, 2.5, 90);
+        assertEquals(Stage.WALK, h.adapter.status().engine().laneEntry().orElseThrow().stage());
         h.events.clear(); h.ready = READY; h.adapter.tick();
         assertEquals(Activity.VERIFY, h.adapter.status().engine().lifecycle().activity().orElseThrow());
         assertEquals(NONE, h.adapter.status().controlOwner());
@@ -472,7 +478,7 @@ class FabricBuildAdapterTest {
         h.state = new ClientState(h.state.world(), h.state.handler(), h.state.connection(), h.state.player(),
                 h.state.dimension(), true, false, false);
         h.adapter.tick(); assertEquals(Phase.PAUSED, h.adapter.status().engine().lifecycle().phase());
-        h.adapter.resume(); h.adapter.tick();
+        h.adapter.resume(); h.sample(1.5, 2.5, 90);
         assertEquals(paused.eligibleTicks() + 1, h.adapter.status().engine().eligibleTicks());
     }
 
@@ -503,7 +509,16 @@ class FabricBuildAdapterTest {
 
     @Test void unavailableMaterialAndUnknownEvidenceDoNotFreezeVerifyTimeout() {
         var h = new Harness(2); h.start(); h.observed = null;
-        for (int i = 0; i < 84; i++) h.adapter.tick();
+        for (int i = 0; i < 4; i++) h.adapter.tick();
+        assertEquals(com.mapartrunner.core.run.ForwardTraversal.Pass.REVERSE,
+                h.adapter.status().engine().traversal().orElseThrow().pass());
+        assertEquals(new GridPos(1, 0, 2), h.adapter.status().engine().laneEntry().orElseThrow().lane().start());
+        h.sample(1.5, 2.5, 90); h.sample(1.5, 2.5, 90); h.sample(1.5, 2.5, 90);
+        assertEquals(Stage.WALK, h.adapter.status().engine().laneEntry().orElseThrow().stage());
+        h.adapter.tick();
+        assertEquals(Activity.VERIFY, h.adapter.status().engine().lifecycle().activity().orElseThrow());
+        assertEquals(0, h.adapter.status().engine().verifyTicks());
+        for (int i = 0; i < 80; i++) h.adapter.tick();
         assertEquals(Reason.VERIFY_TIMEOUT, h.adapter.status().engine().diagnostic().orElseThrow().reason());
         assertEquals(80, h.adapter.status().engine().verifyTicks());
         assertEquals(Outcome.FAILED, h.adapter.status().engine().lifecycle().outcome().orElseThrow());
