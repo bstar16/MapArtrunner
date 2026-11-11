@@ -9,8 +9,11 @@ import net.fabricmc.fabric.api.client.gametest.v1.screenshot.TestScreenshotOptio
 public final class GroundedSingleLaneGameTest implements FabricClientGameTest {
     @Override public void runTest(ClientGameTestContext context) {
         if (!GroundedSmokeGameTest.selected("single-lane")) return;
-        try { SingleLaneFixture.verifyCoordinateLookup(); }
-        catch(AssertionError error) {
+        try {
+            SingleLaneFixture.verifyCoordinateLookup();
+            SingleLaneScenario.verifyGuards();
+        }
+        catch(RuntimeException | Error error) {
             try { context.takeScreenshot(TestScreenshotOptions.of("coordinate-lookup-failure").disableCounterPrefix()); }
             catch(RuntimeException | Error capture) { error.addSuppressed(capture); }
             throw error;
