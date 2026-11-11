@@ -69,6 +69,13 @@ interface ScenarioHost {
         void settleCleanup(Scope scope);
         void cancelSession(Throwable primary);
         Scope beginShutdownCleanup(Operation failedAdmission, Throwable primary);
+        /**
+         * Returns the exact live scope currently bound to this calling worker and issued by this host,
+         * only if its operation is expected by identity, its kind is expectedKind, and it remains valid/unexpired.
+         * Refuses unbound, foreign, stale, expired or wrong-kind calls without creating, rebinding or renewing a scope.
+         * Finalization also compares the returned handle by identity with its supplied cleanup scope.
+         */
+        Scope requireScope(Operation expected, Kind expectedKind);
         void inScope(Scope scope, Runnable action);
         <V> V inScope(Scope scope, Supplier<V> action);
     }
