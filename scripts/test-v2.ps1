@@ -830,7 +830,9 @@ function Invoke-V2Supervisor {
                 Executable=$WorkerExecutable; CommandLine=($process.StartInfo.ArgumentList -join ' '); Ownership='directly started gated worker'
                 ExitCode=$null; ExitedUtc=$null; ObservedExitUtc=$null; IdentityVerified=$false; IsGame=$false }
             $records.Add($rootRecord); $handles.Add([pscustomobject]@{ Process=$process; Record=$rootRecord })
-            $stdoutFile=[IO.File]::Create((Join-Path $evidence 'launch.stdout.log')); $stderrFile=[IO.File]::Create((Join-Path $evidence 'launch.stderr.log'))
+            # Readers must see even small live markers; retain exclusive write/delete ownership.
+            $stdoutFile=[IO.FileStream]::new((Join-Path $evidence 'launch.stdout.log'),[IO.FileMode]::Create,[IO.FileAccess]::Write,[IO.FileShare]::Read,1,[IO.FileOptions]::Asynchronous)
+            $stderrFile=[IO.FileStream]::new((Join-Path $evidence 'launch.stderr.log'),[IO.FileMode]::Create,[IO.FileAccess]::Write,[IO.FileShare]::Read,1,[IO.FileOptions]::Asynchronous)
             $stdout=$process.StandardOutput.BaseStream.CopyToAsync($stdoutFile); $stderr=$process.StandardError.BaseStream.CopyToAsync($stderrFile)
             $job.Assign($process.Handle)
             Update-V2Processes $job $records $handles

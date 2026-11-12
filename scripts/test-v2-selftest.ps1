@@ -666,6 +666,94 @@ try {
             $environmentProof | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $testRoot 'parent-environment-proof.json')
         }
     }
+    Run 'live owned stdout and stderr expose small markers to readers while denying other writers' {
+        $caseRoot=Join-Path $testRoot ('live-streams-'+[guid]::NewGuid())
+        New-Item -ItemType Directory -Path $caseRoot | Out-Null
+        $release=Join-Path $caseRoot 'observer-release'
+        $ready=Join-Path $caseRoot 'worker-ready.json'
+        $pipeline=[Management.Automation.PowerShell]::Create()
+        $invocation=$null; $held=$null
+        $proof=[ordered]@{Streams=@();WorkerLive=$false;Outcome=$null}
+        try {
+            $worker={
+                [Console]::Out.WriteLine('INSPECT_ACCEPTANCE_IDLE {"event":"BEGIN","stream":"stdout"}')
+                [Console]::Error.WriteLine('INSPECT_ACCEPTANCE_IDLE {"event":"BEGIN","stream":"stderr"}')
+                $identity=@{Pid=$PID;StartedUtc=(Get-Process -Id $PID).StartTime.ToUniversalTime().ToString('o')} | ConvertTo-Json
+                [IO.File]::WriteAllText((Join-Path $env:TASK8N_ROOT 'worker-ready.tmp'),$identity)
+                [IO.File]::Move((Join-Path $env:TASK8N_ROOT 'worker-ready.tmp'),(Join-Path $env:TASK8N_ROOT 'worker-ready.json'))
+                $wait=[Diagnostics.Stopwatch]::StartNew()
+                while (!(Test-Path -LiteralPath (Join-Path $env:TASK8N_ROOT 'observer-release'))) {
+                    if ($wait.ElapsedMilliseconds -gt 15000) { exit 99 }
+                    Start-Sleep -Milliseconds 10
+                }
+                [Console]::Out.WriteLine('stdout EOF tail')
+                [Console]::Error.WriteLine('stderr EOF tail')
+                exit 7
+            }
+            [void]$pipeline.AddScript({
+                param($Source,$Owner,$Root,$WorkerText)
+                $ErrorActionPreference='Stop'
+                . $Source
+                Invoke-V2Supervisor -Worker ([scriptblock]::Create($WorkerText)) -Environment @{TASK8N_ROOT=$Root} -EvidenceRoot $Root -WorkingDirectory $Owner -TimeoutMilliseconds 25000 -Archive {
+                    param($Evidence,$Before,$Context)
+                    if ($Context.CleanupStatus -cne 'settled') { throw 'Archive ran before stream cleanup settled.' }
+                    Set-Content -LiteralPath (Join-Path $Evidence 'archive-streams-checked') 'streams settled before archive'
+                }
+            }.ToString()).AddArgument((Join-Path $repo 'scripts/test-v2.ps1')).AddArgument($repo).AddArgument($caseRoot).AddArgument($worker.ToString())
+            $invocation=$pipeline.BeginInvoke()
+            $wait=[Diagnostics.Stopwatch]::StartNew()
+            while (!(Test-Path -LiteralPath $ready) -and !$invocation.IsCompleted -and $wait.ElapsedMilliseconds -lt 10000) { Start-Sleep -Milliseconds 20 }
+            Assert (Test-Path -LiteralPath $ready) 'live stream worker never emitted its small markers'
+            $identity=Get-Content -LiteralPath $ready -Raw | ConvertFrom-Json
+            $held=[Diagnostics.Process]::GetProcessById($identity.Pid)
+            Assert ($held.StartTime.ToUniversalTime() -eq ([DateTimeOffset]$identity.StartedUtc).UtcDateTime -and !$held.HasExited) 'live stream worker identity changed/exited'
+            $launch=@(Get-ChildItem -LiteralPath $caseRoot -Directory -Filter 'launch-*')
+            Assert ($launch.Count -eq 1) 'live stream fixture lacks one actual launch'
+            foreach ($stream in 'stdout','stderr') {
+                $path=Join-Path $launch[0].FullName "launch.$stream.log"
+                $expected='INSPECT_ACCEPTANCE_IDLE {"event":"BEGIN","stream":"'+$stream+'"}'+"`r`n"
+                $text=$null; $readError=$null
+                $readClock=[Diagnostics.Stopwatch]::StartNew()
+                do {
+                    $reader=$null; $handle=$null
+                    try {
+                        $handle=[IO.File]::Open($path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite)
+                        $reader=[IO.StreamReader]::new($handle)
+                        $text=$reader.ReadToEnd(); $readError=$null
+                    } catch { $readError=$_.Exception.Message }
+                    finally { if ($reader) { $reader.Dispose() } elseif ($handle) { $handle.Dispose() } }
+                    if ($text -ceq $expected) { break }
+                    Start-Sleep -Milliseconds 20
+                } while ($readClock.ElapsedMilliseconds -lt 3000 -and !$held.HasExited)
+                $writerDenied=$false; $otherWriter=$null
+                try { $otherWriter=[IO.File]::Open($path,[IO.FileMode]::Open,[IO.FileAccess]::Write,[IO.FileShare]::ReadWrite) }
+                catch [IO.IOException] { $writerDenied=$true }
+                finally { if ($otherWriter) { $otherWriter.Dispose() } }
+                $proof.Streams+=@{Stream=$stream;ExactSmallMarker=($text -ceq $expected);Bytes=[Text.Encoding]::UTF8.GetByteCount($expected);ReadError=$readError;OtherWriterDenied=$writerDenied;WorkerLive=!$held.HasExited}
+            }
+            $proof.WorkerLive=!$held.HasExited -and !$invocation.IsCompleted -and !(Test-Path -LiteralPath $release)
+            Set-Content -LiteralPath $release 'observed'
+            Assert ($invocation.AsyncWaitHandle.WaitOne(15000)) 'HOLD: live stream supervisor did not settle'
+            $outcome=@($pipeline.EndInvoke($invocation))
+            Assert ($outcome.Count -eq 1 -and !$pipeline.HadErrors) "live stream supervisor failed: $($pipeline.Streams.Error -join '; ')"
+            $outcome=$outcome[0]; $proof.Outcome=$outcome
+            $proof | ConvertTo-Json -Depth 14 | Set-Content (Join-Path $caseRoot 'live-stream-proof.json')
+            Assert ($proof.WorkerLive -and @($proof.Streams | Where-Object { !$_.ExactSmallMarker -or $_.Bytes -ge 4096 -or !$_.OtherWriterDenied -or !$_.WorkerLive }).Count -eq 0) "live small marker reader/writer contract failed: $($proof.Streams | ConvertTo-Json -Compress)"
+            Assert ($outcome.ExitCode -eq 7 -and $outcome.WorkerExitCode -eq 7 -and $outcome.PrimaryFailure.ExitCode -eq 7 -and !$outcome.TimedOut -and !$outcome.TerminationRequested) 'live stream fixture lost raw worker failure/first cause'
+            Assert ($outcome.CleanupStatus -ceq 'settled' -and $outcome.ArchiveStatus -ceq 'retained' -and (Test-Path -LiteralPath (Join-Path $outcome.Evidence 'archive-streams-checked')) -and (Get-Item -LiteralPath (Join-Path $caseRoot 'supervisor.lock')).Length -eq 0) 'live stream EOF/archive/ownership did not settle'
+            Assert (@($outcome.Processes | Where-Object { $_.Pid -eq $held.Id -and $_.ExitCode -eq 7 }).Count -eq 1) 'live stream held worker raw exit missing'
+            foreach ($stream in 'stdout','stderr') {
+                $expected='INSPECT_ACCEPTANCE_IDLE {"event":"BEGIN","stream":"'+$stream+'"}'+"`r`n$stream EOF tail`r`n"
+                Assert ([IO.File]::ReadAllText((Join-Path $outcome.Evidence "launch.$stream.log")) -ceq $expected) "final $stream marker/tail bytes changed"
+            }
+        } finally {
+            if (!(Test-Path -LiteralPath $release)) { Set-Content -LiteralPath $release 'cleanup-release' }
+            if ($invocation -and !$invocation.IsCompleted) { $pipeline.Stop() }
+            if ($held) { $held.Dispose() }
+            if ($invocation) { $invocation.AsyncWaitHandle.Dispose() }
+            $pipeline.Dispose()
+        }
+    }
     Run 'owned worker exits0/7; startup125; archive failure never0 or masks7' {
         foreach ($code in @(0,7)) {
             $result = Invoke-V2Supervisor -Worker ([scriptblock]::Create("Write-Output 'dummy stdout'; [Console]::Error.WriteLine('dummy stderr'); exit $code")) -EvidenceRoot $testRoot -WorkingDirectory $repo -TimeoutMilliseconds 10000
