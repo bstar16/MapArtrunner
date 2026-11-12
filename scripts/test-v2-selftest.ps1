@@ -67,10 +67,16 @@ try {
                     Reject { New-V2Request -Inspect -Scenario grounded-two-lane -EulaAccepted } "inspect inherited $name enable accepted"
                     Assert ([Environment]::GetEnvironmentVariable($name) -ceq $option) 'mode check changed parent option'
                 }
-                foreach ($value in @('false','','TRUE','TrUe','"true"',"'true'")) {
-                    $option="-Dmapart.test.inspect=$value"
+                foreach ($case in @(
+                    @{Value='false';JvmEnabled=$false;WrapperEnabled=$false},
+                    @{Value='';JvmEnabled=$false;WrapperEnabled=$false},
+                    @{Value='TRUE';JvmEnabled=$true;WrapperEnabled=$true},
+                    @{Value='TrUe';JvmEnabled=$true;WrapperEnabled=$true},
+                    @{Value='"true"';JvmEnabled=$true;WrapperEnabled=$true},
+                    @{Value="'true'";JvmEnabled=$true;WrapperEnabled=$false})) {
+                    $option="-Dmapart.test.inspect=$($case.Value)"
                     [Environment]::SetEnvironmentVariable($name,$option)
-                    $enabled=($value -replace '["'']','') -ieq 'true' -and !($name -in 'JAVA_OPTS','GRADLE_OPTS' -and $value -ceq "'true'")
+                    $enabled=$(if($name -in 'JAVA_OPTS','GRADLE_OPTS'){$case.WrapperEnabled}else{$case.JvmEnabled})
                     if ($enabled) {
                         Reject { New-V2Request -EulaAccepted } 'automatic inherited inspect=true accepted'
                         New-V2Request -Inspect -Scenario grounded-two-lane -EulaAccepted | Out-Null
@@ -101,6 +107,36 @@ try {
             $environment=Resolve-V2GameEnvironment ([pscustomobject]@{Home='C:/unused-jdk'}) (New-V2Request -Inspect -Scenario grounded-two-lane -EulaAccepted)
             Assert ($environment.JAVA_TOOL_OPTIONS -ceq $env:JAVA_TOOL_OPTIONS -and $environment.JAVA_TOOL_OPTIONS -notmatch 'gametest|headless|mapart.test.scenario|mapart.test.repeat') 'inspect appended automatic JVM settings'
             Reject { Resolve-V2GameEnvironment ([pscustomobject]@{Home='C:/unused-jdk'}) (New-V2Request -Inspect -Scenario grounded-two-lane -EulaAccepted) controlled } 'inspect controlled support resolved'
+        }
+    }
+    Run 'Task7 wrapper adjacent mode quotes fail closed while direct JVM semantics remain unchanged' {
+        # Independent pinned JDK/cmd probe: task-7-review-quotes.json. Wrappers retain literal quotes
+        # in ins"pect, tr"ue and game"test; JVM-direct variables concatenate those same fragments.
+        $cases=@(
+            @{Option='-Dmapart.test.inspect="true"';AutomaticRejected=$true;InspectRejected=$false;AmbiguousWrapper=$false},
+            @{Option='-Dmapart.test."ins""pect"=true';AutomaticRejected=$true;InspectRejected=$false;AmbiguousWrapper=$true},
+            @{Option='-Dmapart.test.in"sp"ect=true';AutomaticRejected=$true;InspectRejected=$false;AmbiguousWrapper=$false},
+            @{Option='-Dmapart.test.inspect="tr""ue"';AutomaticRejected=$true;InspectRejected=$false;AmbiguousWrapper=$true},
+            @{Option='"-Dmapart.test.inspect=''true''"';AutomaticRejected=$false;InspectRejected=$true;AmbiguousWrapper=$false},
+            @{Option='-Dfabric.client."game""test"=false';AutomaticRejected=$false;InspectRejected=$true;AmbiguousWrapper=$true},
+            @{Option='-Dmapart.test.inspect=""';AutomaticRejected=$false;InspectRejected=$true;AmbiguousWrapper=$false},
+            @{Option='-DMapart.test.inspect="tr""ue"';AutomaticRejected=$false;InspectRejected=$false;AmbiguousWrapper=$false},
+            @{Option='-Doperator.diagnostic="tr""ue"';AutomaticRejected=$false;InspectRejected=$false;AmbiguousWrapper=$false})
+        $names=@('JAVA_OPTS','GRADLE_OPTS','JAVA_TOOL_OPTIONS','JDK_JAVA_OPTIONS','_JAVA_OPTIONS')
+        Invoke-V2EnvironmentFixture $names {
+            foreach ($name in $names) { Remove-Item "Env:$name" -ErrorAction SilentlyContinue }
+            foreach ($name in $names) { foreach ($case in $cases) {
+                [Environment]::SetEnvironmentVariable($name,$case.Option)
+                foreach ($inspect in $false,$true) {
+                    $expected=$(if($name -in 'JAVA_OPTS','GRADLE_OPTS' -and $case.AmbiguousWrapper){$true}
+                        elseif($inspect){$case.InspectRejected}else{$case.AutomaticRejected})
+                    $rejected=$false
+                    try { New-V2Request -Inspect:$inspect -Scenario grounded-two-lane -EulaAccepted | Out-Null } catch { $rejected=$true }
+                    Assert ($rejected -eq $expected) "quote policy differs for $name / inspect=$inspect / $($case.Option)"
+                }
+                Assert ([Environment]::GetEnvironmentVariable($name) -ceq $case.Option) 'quote validation changed parent options'
+                Remove-Item "Env:$name" -ErrorAction SilentlyContinue
+            } }
         }
     }
     Run 'Task7 fixture registers the gated ordinary initializer beside five providers and nine mixins' {

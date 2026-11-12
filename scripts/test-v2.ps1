@@ -28,6 +28,10 @@ function Assert-V2InheritedMode {
                 if($match.Groups[1].Success){$match.Groups[1].Value}else{$match.Groups[2].Value}})
             $property=[regex]::Match($option,'^-D(fabric\.client\.gametest|mapart\.test\.inspect)(?:=(.*))?$')
             if (!$property.Success) { continue }
+            # cmd/JDK preserves a literal quote between adjacent quoted fragments; do not guess mode.
+            if ($wrapper -and $token.Value -match '"[^"]*""[^"]*"') {
+                throw "Ambiguous adjacent quotes in inherited mode option in $name."
+            }
             if ($Inspect -and $property.Groups[1].Value -ceq 'fabric.client.gametest') {
                 throw "-Inspect conflicts with inherited fabric.client.gametest in $name (even false enables it)."
             }
