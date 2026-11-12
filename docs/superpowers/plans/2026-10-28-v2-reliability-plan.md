@@ -209,6 +209,8 @@ Execute the reviewed [managed inspect plan](2026-11-12-v2-managed-inspect.md). I
 
 **Dependencies:** 8. Split into pure demand policy, real navigation/container adapter, then end-to-end return/resume; each slice gets its own tests and review.
 
+**Source-only scheduling exception:** the [four-file pure refill producer](2026-11-13-v2-refill-policy.md) may be implemented and independently reviewed while Task8 native acceptance remains pending. It adds no runtime caller, configured start, trip, dependency or gameplay behavior. This does not accept Tasks8/9/10 or adopt the rest of the refill candidate. S2 and every runtime/integration/native/recovery/parity/release dependency still require the accepted prerequisites and a fresh scoped brief; no quality gate is waived.
+
 **Likely files:** `core/refill/RefillPlan.java`, `core/refill/RefillFlow.java`, Fabric inventory/coarse-travel adapter, corresponding unit/game tests. Reuse established v1 slot reservation and transfer rules after translating types; do not copy its separate simulation algorithm.
 
 **Contract:** `RefillPlan` contains `targetInventoryTotals`; inventory observations exclude reserved slots and describe actual capacity/stack limits. Return initiation always checks its result, and return progress has finite deadlines and a failure outcome. Traversal state is retained by its owner, not reconstructed by refill.
