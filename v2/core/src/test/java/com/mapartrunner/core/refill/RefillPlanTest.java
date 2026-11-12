@@ -157,6 +157,76 @@ class RefillPlanTest {
     }
 
     @Test
+    void revisionRetainsUnchangedI3OriginalCapacityLimitedDemand() {
+        var inventory = facts(List.of(held(0, 32, false, A)), List.of(
+                slot(10, Area.MAIN, false, false, 32, A), slot(9, Area.MAIN, true, false, 64, A, B)));
+        var original = allocate(List.of(demand(73, A, 64), demand(21, B, 64)), inventory);
+        var revised = original.revise(inventory, Map.of());
+        assertEquals(List.of(new Unmet(B, 64, Reason.CAPACITY_LIMITED)), revised.unmet());
+        assertEquals(original.targetInventoryTotals(), revised.targetInventoryTotals());
+        assertEquals(original.demand(), revised.demand());
+        assertEquals(original.reservations(), revised.reservations());
+    }
+
+    @Test
+    void revisionRetainsNonzeroClippedOriginalDemandAndCountsNewFeasibilityLoss() {
+        var inventory = facts(List.of(), List.of(slot(9, Area.MAIN, true, false, 64, A)));
+        var original = allocate(List.of(demand(73, A, 100)), inventory);
+        assertEquals(List.of(new Unmet(A, 36, Reason.CAPACITY_LIMITED)), original.revise(inventory, Map.of()).unmet());
+    }
+
+    @Test
+    void revisionCountsNewFeasibilityLossAgainstFullOriginalDemand() {
+        var original = allocate(List.of(demand(73, A, 100)), facts(List.of(), List.of(slot(9, Area.MAIN, true, false, 64, A))));
+        var reduced = original.revise(facts(List.of(), List.of(slot(10, Area.MAIN, true, false, 16, A))), Map.of(9, 10));
+        assertEquals(List.of(new Unmet(A, 84, Reason.CAPACITY_LIMITED)), reduced.unmet());
+        assertEquals(Map.of(A, 64L), reduced.targetInventoryTotals());
+        assertEquals(16, reduced.reservations().getFirst().amount());
+        assertEquals(9, reduced.reservations().getFirst().assignmentSlot());
+    }
+
+    @Test
+    void revisionUsesFreshHeldForOriginalDemandWithoutIncreasingFrozenIncomingObjective() {
+        var original = allocate(List.of(demand(73, A, 100)), facts(List.of(), List.of(slot(9, Area.MAIN, true, false, 64, A))));
+        var slots = List.of(slot(10, Area.MAIN, true, false, 64, A));
+        var forty = original.revise(facts(List.of(held(0, 40, false, A)), slots), Map.of());
+        assertEquals(List.of(new Unmet(A, 36, Reason.CAPACITY_LIMITED)), forty.unmet());
+        assertEquals(24, forty.reservations().getFirst().amount());
+        var eighty = original.revise(facts(List.of(held(0, 80, false, A)), slots), Map.of());
+        assertEquals(List.of(new Unmet(A, 20, Reason.CAPACITY_LIMITED)), eighty.unmet());
+        assertTrue(eighty.reservations().isEmpty());
+        var hundred = original.revise(facts(List.of(held(0, 100, false, A)), slots), Map.of());
+        assertTrue(hundred.unmet().isEmpty());
+        assertTrue(hundred.reservations().isEmpty());
+        for (var revised : List.of(forty, eighty, hundred)) assertEquals(Map.of(A, 64L), revised.targetInventoryTotals());
+    }
+
+    @Test
+    void revisionFreshHeldCanCoverMaterialWithZeroFrozenTarget() {
+        var slots = List.of(slot(9, Area.MAIN, true, false, 64, A, B));
+        var original = allocate(List.of(demand(73, A, 64), demand(21, B, 64)), facts(List.of(held(0, 32, false, A)), slots));
+        var partiallyCovered = original.revise(facts(List.of(held(0, 32, false, A), held(1, 20, false, B)), slots), Map.of());
+        assertEquals(List.of(new Unmet(B, 44, Reason.CAPACITY_LIMITED)), partiallyCovered.unmet());
+        var covered = original.revise(facts(List.of(held(0, 32, false, A), held(1, 64, false, B)), slots), Map.of());
+        assertTrue(covered.unmet().isEmpty());
+        assertEquals(Map.of(A, 64L, B, 0L), covered.targetInventoryTotals());
+        assertEquals(32, covered.reservations().getFirst().amount());
+        assertEquals(A, covered.reservations().getFirst().material());
+    }
+
+    @Test
+    void revisionCreditsSharedFreshPhysicalHeldOnceAcrossOriginalDemand() {
+        var original = allocate(List.of(demand(73, A, 80), demand(21, B, 80)),
+                facts(List.of(), List.of(slot(9, Area.MAIN, true, false, 64, A, B))));
+        var revised = original.revise(facts(List.of(held(0, 100, false, A, B)),
+                List.of(slot(10, Area.MAIN, true, false, 64, A, B))), Map.of());
+        assertEquals(List.of(new Unmet(B, 60, Reason.CAPACITY_LIMITED)), revised.unmet());
+        assertEquals(Map.of(A, 64L, B, 0L), revised.targetInventoryTotals());
+        assertTrue(revised.reservations().isEmpty());
+        assertEquals(original.demand(), revised.demand());
+    }
+
+    @Test
     void rejectsDuplicatePhysicalFactsInvalidCountsAndOverflow() {
         assertThrows(IllegalArgumentException.class, () -> demand(-1, A, 1));
         assertThrows(IllegalArgumentException.class, () -> demand(0, A, -1));

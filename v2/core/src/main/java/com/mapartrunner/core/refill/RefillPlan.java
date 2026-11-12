@@ -34,7 +34,7 @@ public final class RefillPlan {
     public List<Unmet> unmet() { return unmet; }
 
     public static RefillPlan allocate(List<MaterialDemand> orderedDemand, InventorySnapshot facts) {
-        return allocate(orderedDemand, facts, Map.of(), Set.of());
+        return allocate(orderedDemand, facts, Map.of(), Set.of(), Map.of());
     }
 
     /** Revise this original request, never a prior revision, using cumulative acknowledged consumption. */
@@ -52,12 +52,7 @@ public final class RefillPlan {
             if (consumed == reservation.amount()) spent.add(reservation.slot());
         }
         if (!knownSlots.containsAll(consumedBySlot.keySet())) throw new IllegalArgumentException("Unknown consumed reservation");
-        var frozenDemand = new ArrayList<MaterialDemand>();
-        for (var entry : targetInventoryTotals.entrySet()) {
-            int firstTargetId = demand.stream().filter(target -> target.material().equals(entry.getKey())).findFirst().orElseThrow().targetId();
-            frozenDemand.add(new MaterialDemand(firstTargetId, entry.getKey(), entry.getValue()));
-        }
-        var revised = allocate(frozenDemand, facts, limits, spent);
+        var revised = allocate(demand, facts, limits, spent, targetInventoryTotals);
         var assigned = new ArrayList<DestinationReservation>();
         var remainingAllowances = new LinkedHashMap<Integer, Integer>();
         for (var reservation : reservations) remainingAllowances.put(reservation.assignmentSlot(),
@@ -81,7 +76,8 @@ public final class RefillPlan {
     }
 
     private static RefillPlan allocate(List<MaterialDemand> orderedDemand, InventorySnapshot facts,
-                                       Map<Material, Long> incomingLimits, Set<Integer> spentSlots) {
+                                       Map<Material, Long> incomingLimits, Set<Integer> spentSlots,
+                                       Map<Material, Long> frozenTargets) {
         Objects.requireNonNull(facts, "facts");
         var demands = List.copyOf(orderedDemand);
         var required = new LinkedHashMap<Material, Long>();
@@ -113,7 +109,10 @@ public final class RefillPlan {
         var unmet = new ArrayList<Unmet>();
         for (var entry : required.entrySet()) {
             long missing = entry.getValue() - totals.get(entry.getKey());
-            long remaining = Math.min(missing, incomingLimits.getOrDefault(entry.getKey(), Long.MAX_VALUE));
+            // Fresh held stock covers original demand even beyond a clipped trip objective, but incoming
+            // reservations may fill only that frozen objective and the original unconsumed allowance.
+            long objectiveMissing = Math.max(0, frozenTargets.getOrDefault(entry.getKey(), entry.getValue()) - totals.get(entry.getKey()));
+            long remaining = Math.min(Math.min(missing, objectiveMissing), incomingLimits.getOrDefault(entry.getKey(), Long.MAX_VALUE));
             for (var slot : orderedSlots) {
                 if (remaining == 0) break;
                 if (slot.reserved() || claimedSlots.contains(slot.index()) || spentSlots.contains(slot.index())) continue;
