@@ -345,6 +345,14 @@ Emit exactly four finite identity-bound JSON markers in existing launch logs: BE
 
 Focused behavioral RED/GREEN, one covering Fabric suite/fixture compilation and independent L source review precede the separately admitted combined K/L game. Native acceptance requires both measured idle intervals, unchanged retained/closed evidence, exact K failure/reset/success/LAST and original close/raw exits. Unit clocks are policy evidence only. M reset/archive faults and every other existing completion gate remain separate; optional polish adds no v2 scope.
 
+### Task 8n — make existing owned transcripts observable while writing (2 paths)
+
+The first combined K/L attempt stopped before accepted READY: the new read-only observer correctly opens with FileShare.ReadWrite, while the existing supervisor creates launch.stdout.log/stderr.log with File.Create's exclusive sharing. That consumed attempt is retained FAILED with one Root cancellation, actual tool1/public125/native125 and no gameplay credit. Change only scripts/test-v2.ps1 and scripts/test-v2-selftest.ps1.
+
+Use the existing supervisor-owned transcript streams with one writer and explicit read sharing. Ensure a small complete output line becomes observable during the worker's lifetime, without requiring worker exit or a later buffer-filling write. Reuse standard FileStream flags/buffering rather than a new logging owner, artifact, channel, controller or timer. Preserve other-writer exclusion, known paths, asynchronous stdout/stderr drain, final tails/EOF, original raw exits/first cause, cleanup/resource/ownership and archive semantics. No native/world/placement/fixture behavior changes.
+
+Meaningful existing-source RED uses an actual owned writer/supervisor and a small marker observed before producer closure; GREEN requires timely unchanged bytes, concurrent writer refusal and preserved final transcript. Exercise the production path, not a copied constructor. Run focused evidence and one covering Windows self-check suite, then independent source review before a new separately admitted K/L scope. No Java/core/v1 reassurance rerun for this isolated v2 script change; inspect actual shared impact if discovered. All prior failed proof stays immutable and the original scope/budget limits remain.
+
 ### Task 8 — actual game acceptance, release exclusion and final documentation (<=2 source/doc paths)
 
 Update `v2/docs/testing.md` and, only for the measured inspect status, `v2/docs/behavior-parity.md`. New evidence is separately scoped by root; old proofs remain immutable.
