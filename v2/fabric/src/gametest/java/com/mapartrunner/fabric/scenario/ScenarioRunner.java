@@ -2704,12 +2704,14 @@ final class ScenarioRunner implements AutoCloseable {
         var profileText="fixture="+fixture+"; physicsRunTicks="+budget
                 +"; productionEligibleAllowance="+BuildEngine.runLimit(plan,settings)+"; targets="+plan.targets().size();
         if(baseline()) writeNew(roots,stage.resolve("fixture-profile.txt"),profileText); else scalar("fixture-profile.txt",profileText);
+        boolean atomicShiftPause=inspectMode && baseline() && supportCase==SupportCase.ORDINARY;
         for (int tick=0; physics==null?tick<budget:physics.consumed()<budget; tick++) {
             int outerOrdinal=physics==null?tick:physics.consumed();
             var anchorClocks=physics==null?null:PhysicsClocks.of(current);
             PhysicsClocks candidateClocks=null;
             PhysicsInvariants candidateInvariants=null;
             int candidatePredicates=-1;
+            ConstructionCapture construction=null;
             try {
             if(physics==null) host.waitTick();
             else physics.waitTick(false,host::waitTick);
@@ -2730,7 +2732,15 @@ final class ScenarioRunner implements AutoCloseable {
                 });
             });
             if(baseline()) {
-                var next=live();
+                Live next;
+                if(atomicShiftPause) {
+                    // Worker owns the allowance; admission and action use this one already-charged request.
+                    construction=constructionCapture(host,this::clientLive,
+                            c -> { requireClient(c); MapArtClient.pause(); requireReleased(c); },id,shiftStart,
+                            firstSuccess && !paused,physics.constructionLimit-physics.consumed(),
+                            () -> host.computeOnServer(s -> { requireServer(s); return readPlayer(serverPlayer,false,s.getTicks()); }));
+                    next=withServer(construction.before);
+                } else next=live();
                 if(physics!=null) {
                     candidateClocks=PhysicsClocks.of(next);
                     candidatePredicates=physicsPredicates(current,next);
@@ -2770,7 +2780,11 @@ final class ScenarioRunner implements AutoCloseable {
             if ((baseline()?current.sample.status().engine().lifecycle().phase():poll.phase)==Phase.TERMINAL) break;
             if (baseline() && substage(current.sample,ForwardTraversal.Substage.SHIFT)) {
                 if (shiftStart==null) shiftStart=current;
-                if (firstSuccess && !paused && nativeForward(current.sample)
+                if(atomicShiftPause && construction.transition.isPresent()) {
+                    resumed=pauseShift(id,current,construction.transition.orElseThrow(),construction.admissionProbe,stage,checkpoints,physics);
+                    paused=true;
+                }
+                if (!atomicShiftPause && firstSuccess && !paused && nativeForward(current.sample)
                         && moved(shiftStart,current,"z",.25,1) && (supportCase==SupportCase.ORDINARY
                             || host.computeOnClient(c -> findSupportWitness(id,plan,origin,supportArm,
                                     PredictionFaults.resetSnapshot().support(),watch.copy()).isPresent()))) {
@@ -3012,9 +3026,14 @@ final class ScenarioRunner implements AutoCloseable {
     private Live pauseShift(UUID id, Live before, Path stage, List<Live> checkpoints,PhysicsAllowance physics) {
         require(substage(before.sample,ForwardTraversal.Substage.SHIFT) && nativeForward(before.sample),"Pause checkpoint is not moving SHIFT");
         var pause=pauseOnClient(host,this::clientLive,c -> { requireClient(c); MapArtClient.pause(); requireReleased(c); },id);
-        Live immediateBefore=withServer(pause.before);
+        return pauseShift(id,withServer(pause.before),pause,null,stage,checkpoints,physics);
+    }
+
+    private Live pauseShift(UUID id,Live immediateBefore,ClientTransition pause,Side admissionProbe,
+                            Path stage,List<Live> checkpoints,PhysicsAllowance physics) {
         Live paused=withServer(pause.after);
-        writeNew(roots,stage.resolve("pause-before.txt"),"before="+immediateBefore+"\nimmediate="+paused);
+        writeNew(roots,stage.resolve("pause-before.txt"),"before="+immediateBefore+"\nimmediate="+paused
+                +(admissionProbe==null?"":"\nadmissionProbeBeforeClient="+admissionProbe+"; physicsHoldTraversalCredit=0"));
         Live prior=paused;
         for (int tick=0;tick<20;tick++) {
             Live next;
@@ -3044,6 +3063,28 @@ final class ScenarioRunner implements AutoCloseable {
     }
 
     record ClientTransition(Live before, Live after) { }
+    record ConstructionCapture(Live before,Optional<ClientTransition> transition,Side admissionProbe) { }
+
+    static ConstructionCapture constructionCapture(ScenarioHost host,Function<MinecraftClient,Live> capture,
+                                                   Consumer<MinecraftClient> pause,UUID id,Live shiftStart,
+                                                   boolean pausePending,int remaining,Supplier<Side> readAdmissionServer) {
+        // This earlier independent probe is admission evidence only, never the causal checkpoint/hold baseline.
+        var probe=pausePending && shiftStart!=null?readAdmissionServer.get():null;
+        return host.computeOnClient(c -> {
+            var before=capture.apply(c);
+            requireRun(before.sample,id);
+            if(pausePending && shiftStart!=null) {
+                requireRun(shiftStart.sample,id);
+                var admission=new Live(before.sample,before.client,probe,before.fault,before.pending,before.nativeSequence,before.nativeIdentities);
+                if(substage(before.sample,ForwardTraversal.Substage.SHIFT) && nativeForward(before.sample)
+                        && moved(shiftStart,admission,"z",.25,1)) {
+                    require(remaining>=20,"SHIFT pause would exceed the shared run physics budget");
+                    return new ConstructionCapture(before,Optional.of(pauseNow(c,capture,pause,id,before)),probe);
+                }
+            }
+            return new ConstructionCapture(before,Optional.empty(),probe);
+        });
+    }
 
     static boolean ordinaryPhysics(boolean inspect,boolean baseline) { return inspect && baseline; }
 
@@ -3158,11 +3199,16 @@ final class ScenarioRunner implements AutoCloseable {
             var before=capture.apply(c);
             requireRun(before.sample,id);
             require(substage(before.sample,ForwardTraversal.Substage.SHIFT) && nativeForward(before.sample),"Pause checkpoint is not moving SHIFT");
-            pause.accept(c);
-            var after=capture.apply(c);
-            requirePaused(before,after,id);
-            return new ClientTransition(before,after);
+            return pauseNow(c,capture,pause,id,before);
         });
+    }
+
+    private static ClientTransition pauseNow(MinecraftClient c,Function<MinecraftClient,Live> capture,
+                                             Consumer<MinecraftClient> pause,UUID id,Live before) {
+        pause.accept(c);
+        var after=capture.apply(c);
+        requirePaused(before,after,id);
+        return new ClientTransition(before,after);
     }
 
     static ClientTransition resumeOnClient(ScenarioHost host, Function<MinecraftClient,Live> capture,
