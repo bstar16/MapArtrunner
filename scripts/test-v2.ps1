@@ -692,24 +692,39 @@ function Invoke-V2Supervisor {
                         $result.InspectEscalation=$inspectFailure.Exception.Message; $result.InspectIncomplete=$true
                         if (!$result.PrimaryFailure) { $result.ExitCode=125 }; break
                     }
-                    # Read every available phase first: a completed old operation is not timed out by a late poll.
-                    if ($inspectState.Active -and $clock.Elapsed.TotalMilliseconds -ge $inspectState.CapElapsed) {
-                        $result.TimedOut=$true; $result.TimeoutPhase='INSPECT_'+$inspectState.NextPhase.ToUpperInvariant()
-                        $result.InspectEscalation='Inspect operation did not settle by its original cleanup cap.'; $result.InspectIncomplete=$true
-                        if (!$result.PrimaryFailure) { $result.ExitCode=124 }; break
-                    }
-                    if ($inspectState.Held.Process.HasExited -or $null -ne $result.WorkerExitCode -or $result.PrimaryFailure) {
-                        # The exit test itself may be the first observation; preserve its raw failure before Stop.
+                    $inspectExitObserved=$inspectState.Held.Process.HasExited -or $null -ne $result.WorkerExitCode -or $result.PrimaryFailure
+                    $inspectCapObserved=$inspectState.Active -and $clock.Elapsed.TotalMilliseconds -ge $inspectState.CapElapsed
+                    if ($inspectExitObserved -or $inspectCapObserved) {
+                        # Missing was only a snapshot. Reconcile after the positive exit/cap observation,
+                        # including idle's next BEGIN, before declaring completion, incompleteness or timeout.
+                        try { Update-V2InspectOperations $inspectState $result $WorkingDirectory $clock -RequireGame:$RequireGame -InternalInspectTest $InternalInspectTest }
+                        catch { $inspectFailure=$_ }
                         Update-V2ProcessExits @($handles) -IncludeExiting
                         Set-V2ObservedFailure $result $records
                         if ($null -ne $rootRecord.ExitCode) { $result.WorkerExitCode=$rootRecord.ExitCode }
-                        $inspectEnded=$true
-                        if ($inspectState.Active) {
-                            $result.InspectIncomplete=$true; $result.InspectEscalation='Process exited with unfinished inspect operation.'
+                        if ($inspectFailure) {
+                            $result.InspectEscalation=$inspectFailure.Exception.Message; $result.InspectIncomplete=$true
                             if (!$result.PrimaryFailure) { $result.ExitCode=125 }
+                            break
                         }
-                        break
+                        if ($inspectState.Active -and $clock.Elapsed.TotalMilliseconds -ge $inspectState.CapElapsed) {
+                            $result.TimedOut=$true; $result.TimeoutPhase='INSPECT_'+$inspectState.NextPhase.ToUpperInvariant()
+                            $result.InspectEscalation='Inspect operation did not settle by its original cleanup cap.'; $result.InspectIncomplete=$true
+                            if (!$result.PrimaryFailure) { $result.ExitCode=124 }; break
+                        }
+                        if ($inspectExitObserved) {
+                            $inspectEnded=$true
+                            if ($inspectState.Active) {
+                                $result.InspectIncomplete=$true; $result.InspectEscalation='Process exited with unfinished inspect operation.'
+                                if (!$result.PrimaryFailure) { $result.ExitCode=125 }
+                            }
+                            break
+                        }
                     }
+                    # An exit arriving after the captured observation belongs to the next ordinary poll,
+                    # whose decision will reconcile again; never fall through to automatic exit handling.
+                    Start-Sleep -Milliseconds 50
+                    continue
                 }
                 if (($requiresReceipt -and $null -eq $result.StartupAcceptedElapsedMilliseconds -and $clock.ElapsedMilliseconds -ge $StartupMilliseconds) -or (!$inspectMode -and $clock.ElapsedMilliseconds -ge $deadlineMilliseconds)) {
                     $result.TimedOut=$true

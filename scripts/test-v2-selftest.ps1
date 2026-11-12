@@ -1032,6 +1032,85 @@ Write-Output ('TRANSPORT='+(@{support=$env:MAPART_TWO_LANE_SUPPORT_CASE;launchId
         }
         $phaseProofs|ConvertTo-Json -Depth 14|Set-Content (Join-Path $testRoot 'inspect-phase-proofs.json')
     }
+    Run 'inspect reconciles records published after Missing at exit and cap decisions' {
+        $decisionProofs=[Collections.Generic.List[object]]::new(); $decisionFailures=[Collections.Generic.List[string]]::new()
+        foreach($case in 'active-exit','idle-exit','timely-cap','late-cap') {
+            $originalUpdate=${function:Update-V2Processes}; $originalPhaseReader=${function:Read-V2InspectOperationReceipt}
+            $proof=@{Case=$case;Seeded=$false;Triggered=$false;Session=[guid]::NewGuid().ToString('D');Id=[guid]::NewGuid().ToString('D')}
+            try {
+                Set-Item Function:Update-V2Processes -Value {
+                    param($Job,$Records,$Handles,[switch]$Fast)
+                    & $originalUpdate $Job $Records $Handles -Fast:$Fast
+                    if ($Fast -or $result.StartReceipt) { return }
+                    $held=$Handles|Where-Object {$_.Record.Pid -eq $process.Id}|Select-Object -First 1
+                    $ready=@{schema='mapartrunner-inspect-ready-v1';launchId=$launchId;pid=$held.Record.Pid;startedUtc=$held.Record.StartedUtc
+                        scenario='grounded-two-lane';mode='inspect';sessionId=$proof.Session;event='INSPECT_WORLD_BOUND_COMMANDS_READY'}
+                    [IO.File]::WriteAllText((Join-Path $evidence 'test-start.json'),($ready|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
+                }
+                Set-Item Function:Read-V2InspectOperationReceipt -Value {
+                    param($Evidence,$WorkingDirectory,$StartReceipt,$StartIdentity,$Held,$Ordinal,$Phase,$Previous,$PreviousSettledUtc,
+                        [switch]$RequireGame,$InternalInspectTest,$Clock)
+                    function Publish-DecisionPhase([string]$Suffix,$Occurrence,$Deadline) {
+                        $directory=Join-Path $repo "v2/fabric/build/scenario-results/two-lane-$($proof.Session)/inspect-operations/op-1-$($proof.Id)"
+                        New-Item -ItemType Directory -Path $directory -Force|Out-Null
+                        $data=@{schema='mapartrunner-inspect-operation-v1';launchId=$StartReceipt.launchId;pid=$StartReceipt.pid;startedUtc=$StartReceipt.startedUtc
+                            mode='inspect';sessionId=$proof.Session;ordinal=1;operationId=$proof.Id;command='RUN'
+                            phase=@{begin='WORK';cleanup='CLEANUP';end='SETTLED'}[$Suffix];phaseStartedUtc=$Occurrence.ToString('o')
+                            phaseDeadlineUtc=$(if($null -ne $Deadline){$Deadline.ToString('o')}else{$null});evidenceDir=$directory
+                            verdict=$(if($Suffix -ceq 'begin'){$null}else{'SUCCESS'});cleanupStatus=$(if($Suffix -ceq 'end'){'SETTLED'}else{$null})}
+                        $path=Join-Path $Evidence "inspect-op-1.$Suffix.json"
+                        Assert (!(Test-Path -LiteralPath $path)) 'decision fixture attempted receipt replacement'
+                        [IO.File]::WriteAllText($path,($data|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
+                    }
+                    if (!$proof.Seeded -and $Ordinal -eq 1 -and $Phase -ceq 'begin' -and $proof.Case -cne 'idle-exit') {
+                        $proof.Start=[DateTimeOffset]::UtcNow; $proof.Seeded=$true
+                        Publish-DecisionPhase begin $proof.Start $proof.Start.AddMilliseconds(1000)
+                        if ($proof.Case -cin 'timely-cap','late-cap') { Publish-DecisionPhase cleanup $proof.Start $proof.Start.AddMilliseconds(2000) }
+                    }
+                    $checked=& $originalPhaseReader @PSBoundParameters
+                    $expectedMissing=$(if($proof.Case -ceq 'idle-exit'){'begin'}elseif($proof.Case -ceq 'active-exit'){'cleanup'}else{'end'})
+                    if (!$proof.Triggered -and $Ordinal -eq 1 -and $Phase -ceq $expectedMissing -and $checked.Status -ceq 'Missing') {
+                        # Force publication after the real reader returned Missing; do not let the inventory hook publish it.
+                        $proof.Triggered=$true; $proof.MissingPhase=$Phase; $proof.MissingElapsed=$Clock.Elapsed.TotalMilliseconds
+                        $proof.ActiveAtMissing=$State.Active; $proof.OriginalCap=$State.CapElapsed
+                        if ($proof.Case -ceq 'idle-exit') {
+                            $proof.Start=[DateTimeOffset]::UtcNow
+                            Publish-DecisionPhase begin $proof.Start $proof.Start.AddMilliseconds(1000)
+                        }
+                        if ($proof.Case -cin 'active-exit','idle-exit') {
+                            $time=[DateTimeOffset]::UtcNow
+                            Publish-DecisionPhase cleanup $time $time.AddMilliseconds(2000)
+                            Publish-DecisionPhase end ([DateTimeOffset]::UtcNow) $null
+                            Set-Content -LiteralPath (Join-Path $Evidence 'decision-done') 'done'
+                            Assert ($Held.Process.WaitForExit(3000)) 'decision fixture original worker did not exit'
+                            $proof.ActualExitUtc=$Held.Process.ExitTime.ToUniversalTime().ToString('o')
+                        } else {
+                            Assert ($Clock.Elapsed.TotalMilliseconds -lt $State.CapElapsed) 'cap fixture reached Missing after its cap'
+                            if ($proof.Case -ceq 'timely-cap') { Publish-DecisionPhase end ([DateTimeOffset]::UtcNow) $null }
+                            $remaining=[Math]::Max(0,[Math]::Ceiling($State.CapElapsed-$Clock.Elapsed.TotalMilliseconds)+20)
+                            Start-Sleep -Milliseconds $remaining
+                            if ($proof.Case -ceq 'late-cap') { Publish-DecisionPhase end ([DateTimeOffset]::UtcNow) $null }
+                            $proof.DecisionElapsed=$Clock.Elapsed.TotalMilliseconds
+                        }
+                    }
+                    if ($proof.Case -ceq 'timely-cap' -and $proof.Triggered -and $Ordinal -eq 1 -and $Phase -ceq 'end' -and $checked.Status -ceq 'Accepted') {
+                        Set-Content -LiteralPath (Join-Path $Evidence 'decision-done') 'done'
+                    }
+                    $checked
+                }
+                $worker={ $bounded=[Diagnostics.Stopwatch]::StartNew(); while(!(Test-Path (Join-Path $env:MAPART_TEST_LAUNCH_DIR 'decision-done'))) { if($bounded.ElapsedMilliseconds -gt 8000){exit 99}; Start-Sleep -Milliseconds 10 }; exit 0 }
+                $outcome=Invoke-V2Supervisor -Worker $worker -Request ([pscustomobject]@{Mode='inspect';Scenario='grounded-two-lane'}) -EvidenceRoot $testRoot -WorkingDirectory $repo -TimeoutMilliseconds 100 -StartupMilliseconds 3000 -InternalInspectTest @{WorkMilliseconds=1000;CleanupMilliseconds=2000}
+            } finally { Set-Item Function:Update-V2Processes -Value $originalUpdate; Set-Item Function:Read-V2InspectOperationReceipt -Value $originalPhaseReader }
+            Assert-V2Settled $outcome
+            $settled=$proof.Triggered -and $outcome.InspectOperations.Count -eq 1 -and !$outcome.InspectIncomplete -and !$outcome.TimedOut -and $outcome.ExitCode -eq 0 -and $outcome.WorkerExitCode -eq 0
+            $passed=$(if($case -ceq 'late-cap'){$proof.Triggered -and $outcome.ExitCode -eq 125 -and $outcome.InspectIncomplete -and $outcome.InspectOperations.Count -eq 0 -and $outcome.InspectEscalation -like '*Invalid END*'}else{$settled})
+            $passed=$passed -and (Get-Item -LiteralPath (Join-Path $testRoot 'supervisor.lock')).Length -eq 0 -and @($outcome.Processes|Where-Object {$null -eq $_.ExitCode}).Count -eq 0
+            $decisionProofs.Add(@{Case=$case;Passed=$passed;Fixture=$proof;Outcome=$outcome})
+            if (!$passed) { $decisionFailures.Add("${case}: public=$($outcome.ExitCode), raw=$($outcome.WorkerExitCode), ENDs=$($outcome.InspectOperations.Count), incomplete=$($outcome.InspectIncomplete), timeout=$($outcome.TimedOut), error=$($outcome.SupervisorError), escalation=$($outcome.InspectEscalation)") }
+        }
+        $decisionProofs|ConvertTo-Json -Depth 14|Set-Content (Join-Path $testRoot 'inspect-decision-proofs.json')
+        Assert (!$decisionFailures.Count) ($decisionFailures -join '; ')
+    }
     Run 'observed native failure precedence has deterministic simultaneous ordering' {
         $failures=@(
             [pscustomobject]@{Pid=400;IsGame=$true;ExitCode=9;ExitedUtc='2026-01-01T00:00:02Z';ObservedExitUtc='2026-01-01T00:00:03Z';StartedUtc='2026-01-01T00:00:00Z'},
