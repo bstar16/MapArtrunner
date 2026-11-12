@@ -75,6 +75,181 @@ final class InspectScenarioHost implements Inspect {
     private volatile MinecraftServer server;
     private volatile Path save;
 
+    // One finite probe: arm -> entered hold -> worker consumes/replays -> measured -> cleanup proof -> retire.
+    // Native callers only claim detached requests. WORK cancellation never authorizes an action or another scope.
+    private static final class ForeignBoundary {
+        final Operation operation;
+        final long workDeadline;
+        Scope work;
+        Runnable continuation;
+        String stage="ARMED";
+        boolean entered, replayRejected, measured, retired;
+        long request;
+        long cleanupDeadline;
+        Scope cleanup;
+        ScenarioCommands.ForeignProofAck ack;
+        ScenarioCommands.ForeignFinalFacts facts;
+        ForeignBoundary(Operation operation,Scope work) { this.operation=operation; this.work=work; workDeadline=work.deadlineNanos(); }
+    }
+    private ForeignBoundary foreign;
+    private final Map<String,int[]> foreignGuards=new TreeMap<>();
+    private final AtomicBoolean foreignAbandoned=new AtomicBoolean();
+    private volatile ScenarioCommands.ForeignObservation foreignObservation;
+
+    static boolean foreignAcceptanceEnabled() {
+        return Boolean.getBoolean("mapart.test.inspect") && Boolean.getBoolean("mapart.test.inspect.acceptance")
+                && System.getProperty("fabric.client.gametest")==null
+                && "foreign-world".equals(System.getProperty("mapart.test.inspect.acceptance.case"));
+    }
+    void armForeignResetStop(Operation operation) {
+        var work=requireScope(operation,Kind.WORK);
+        lock.lock();
+        try {
+            check(foreignAcceptanceEnabled() && foreign==null && operation.ordinal()==3 && operation.command()==Command.RERUN,
+                    "Foreign boundary requires original RERUN3 reset-stop");
+            foreign=new ForeignBoundary(operation,work); projectForeign();
+        } finally { lock.unlock(); }
+    }
+    private void projectForeign() {
+        var f=foreign;
+        foreignObservation=f==null?null:new ScenarioCommands.ForeignObservation(f.operation.sessionId(),f.operation.operationId(),
+                f.operation.ordinal(),f.stage,f.workDeadline,f.entered,f.replayRejected,cancelled,f.retired,
+                f.request,f.cleanupDeadline,foreignGuardFacts(),f.facts,f.ack);
+    }
+    List<ScenarioCommands.ForeignGuardFact> foreignGuardFacts() {
+        lock.lock();
+        try { return foreignGuards.entrySet().stream().map(e -> new ScenarioCommands.ForeignGuardFact(
+                e.getKey(),e.getValue()[0],e.getValue()[1],e.getValue()[2],e.getValue()[3])).toList(); }
+        finally { lock.unlock(); }
+    }
+    void foreignGuard(String site,Runnable guard) {
+        lock.lock();
+        try {
+            if(foreign==null) { guard.run(); return; }
+            var counts=foreignGuards.computeIfAbsent(site,key -> new int[4]); counts[0]++;
+            try { guard.run(); counts[2]++; }
+            catch(RuntimeException | Error failure) { counts[1]++; throw failure; }
+            finally { projectForeign(); }
+        } finally { lock.unlock(); }
+    }
+    void foreignEffect(String site) {
+        lock.lock();
+        try { if(foreign!=null) { foreignGuards.computeIfAbsent(site,key -> new int[4])[3]++; projectForeign(); } }
+        finally { lock.unlock(); }
+    }
+    ScenarioCommands.ForeignObservation observeForeignAcceptance() { return foreignObservation; }
+    private void requireForeignOpen(ForeignBoundary f,long deadline) {
+        check(foreign==f && foreignAcceptanceEnabled() && !foreignAbandoned.get() && !stopped && !stopNotified.get(),
+                "Foreign acceptance abandoned/stopped/disabled");
+        if(clock.getAsLong()-deadline>=0) throw new ScopeTimeoutException();
+    }
+    private boolean nativeForeignClaim(MinecraftClient nativeClient) {
+        return clientThread.getAsBoolean() && (client==null || nativeClient==client) && foreignAcceptanceEnabled()
+                && !foreignAbandoned.get() && !stopped && !stopNotified.get();
+    }
+    boolean releaseForeignAcceptanceBoundary(MinecraftClient nativeClient) {
+        if(!nativeForeignClaim(nativeClient) || !lock.tryLock()) return false;
+        try {
+            var f=foreign;
+            if(f==null || !(f.stage.equals("HELD") || f.stage.equals("CANCELLED_HOLD")) || current!=f.work
+                    || !cancelled || clock.getAsLong()-f.workDeadline>=0) return false;
+            f.stage="RELEASE_REQUESTED"; projectForeign(); changed.signalAll(); return true;
+        } finally { lock.unlock(); }
+    }
+    boolean acknowledgeForeignReplayMeasurement(MinecraftClient nativeClient,UUID operationId,long workDeadline) {
+        if(!nativeForeignClaim(nativeClient) || !lock.tryLock()) return false;
+        try {
+            var f=foreign;
+            if(f==null || !f.stage.equals("REPLAY_REJECTED") || !f.operation.operationId().equals(operationId)
+                    || f.workDeadline!=workDeadline || clock.getAsLong()-workDeadline>=0) return false;
+            f.measured=true; f.stage="POST_REPLAY_MEASURED"; projectForeign(); changed.signalAll(); return true;
+        } finally { lock.unlock(); }
+    }
+    /** Scheduling wait only; do not validate/rebind/dispatch cancelled WORK here. */
+    void awaitForeignReplacementBeforeCleanup(Scope work,Throwable primary) {
+        rejectNativeWait(); lock.lock();
+        try {
+            var f=foreign;
+            if(f==null || f.operation!=work.operation()) return;
+            check(f.work==work && f.entered && cancelled && primary==cancellationFailure.get(),"Foreign hold lacks original cancellation");
+            if(f.stage.equals("HELD")) { f.stage="CANCELLED_HOLD"; projectForeign(); }
+            while(!f.stage.equals("RELEASE_REQUESTED")) { requireForeignOpen(f,f.workDeadline); pause(work); }
+            requireForeignOpen(f,f.workDeadline);
+            var replay=f.continuation;
+            check(replay!=null,"Foreign continuation already consumed");
+            f.continuation=null; f.stage="REPLAY_QUEUED"; projectForeign();
+            // Consume under the owner lock before submission; no native callback can consume this twice.
+            lock.unlock();
+            try { clientQueue.accept(replay); }
+            finally { lock.lock(); }
+            while(!f.measured) {
+                requireForeignOpen(f,f.workDeadline);
+                check(!f.stage.equals("REPLAY_FAILED"),"Original wrapper did not reject live cancellation"); pause(work);
+            }
+            requireForeignOpen(f,f.workDeadline);
+            check(f.replayRejected,"No original-wrapper cancellation acknowledgement");
+        } finally { lock.unlock(); }
+    }
+    void retireForeignReplacementBoundary(Scope work) {
+        rejectNativeWait(); lock.lock();
+        try {
+            var f=foreign;
+            if(f==null || f.operation!=work.operation() || f.retired) return;
+            f.retired=true; f.work=null; f.continuation=null;
+            f.stage=f.measured?"CLEANUP_PENDING":"ABANDONED";
+            projectForeign(); changed.signalAll();
+        } finally { lock.unlock(); }
+    }
+    /** Nonblocking native exit notification, including the cancelled Commands early return. */
+    void abandonForeignAcceptance() {
+        var observation=foreignObservation;
+        if(observation==null || Set.of("INCOMPLETE","ABANDONED").contains(observation.stage())
+                || observation.stage().equals("SEALED_BEFORE_END") && current==null) return;
+        foreignAbandoned.set(true);
+        if(lock.tryLock()) try {
+            if(foreign!=null) {
+                foreign.continuation=null; foreign.stage=foreign.request==0?"ABANDONED":"INCOMPLETE"; projectForeign();
+            }
+            changed.signalAll();
+        } finally { lock.unlock(); }
+    }
+    void awaitForeignFinalProof(Operation operation,Scope cleanup,ScenarioCommands.ForeignFinalFacts facts) {
+        check(requireScope(operation,Kind.CLEANUP)==cleanup,"Foreign final proof requires exact cleanup");
+        boolean completed=false;
+        lock.lock();
+        try {
+            var f=foreign;
+            check(f!=null && f.operation==operation && f.retired && f.measured && f.replayRejected && f.request==0,
+                    "Foreign final proof lacks measured original replay");
+            requireForeignOpen(f,cleanup.deadlineNanos());
+            f.cleanup=cleanup; f.cleanupDeadline=cleanup.deadlineNanos(); f.facts=Objects.requireNonNull(facts);
+            f.request=1; f.stage="FINAL_NATIVE_READ_REQUIRED";
+            projectForeign(); changed.signalAll();
+            while(f.ack==null) { requireForeignOpen(f,cleanup.deadlineNanos()); pause(cleanup); }
+            requireForeignOpen(f,cleanup.deadlineNanos());
+            check(requireScope(operation,Kind.CLEANUP)==cleanup,"Foreign final cleanup changed");
+            completed=true;
+        } finally {
+            if(foreign!=null && foreign.operation==operation) {
+                foreign.cleanup=null; foreign.continuation=null;
+                foreign.stage=completed?"SEALED_BEFORE_END":"INCOMPLETE"; projectForeign();
+            }
+            lock.unlock();
+        }
+    }
+    boolean acknowledgeForeignFinalProof(MinecraftClient nativeClient,ScenarioCommands.ForeignProofAck ack) {
+        if(ack==null || !nativeForeignClaim(nativeClient) || !lock.tryLock()) return false;
+        try {
+            var f=foreign;
+            if(f==null || !f.stage.equals("FINAL_NATIVE_READ_REQUIRED") || f.cleanup==null || current!=f.cleanup || f.ack!=null
+                    || !f.operation.operationId().equals(ack.operationId()) || f.request!=ack.requestOrdinal()
+                    || clock.getAsLong()-f.cleanup.deadlineNanos()>=0 || ack.rows()<=0 || ack.bytes()<=0
+                    || ack.sha256()==null || !ack.sha256().matches("[0-9a-f]{64}")
+                    || ack.finalObservationIdentity()==null || ack.finalObservationIdentity().isBlank()) return false;
+            f.ack=ack; f.stage="SEAL_ACKNOWLEDGED"; projectForeign(); changed.signalAll(); return true;
+        } finally { lock.unlock(); }
+    }
+
     InspectScenarioHost(MinecraftClient client) { this(client, null); }
 
     InspectScenarioHost(MinecraftClient client, Consumer<FinalOutcome> publish) {
@@ -191,6 +366,9 @@ final class InspectScenarioHost implements Inspect {
                 }
                 valid(scope); // A visible late END cannot turn an expired cleanup into local settlement.
                 if (outcome.cleanup() == CleanupStatus.UNRESOLVED) { cancelled = true; unresolved=true; }
+                if(foreign!=null && foreign.operation==scope.operation() && foreign.request!=0 && foreignAbandoned.get()) {
+                    foreign.stage="INCOMPLETE"; projectForeign();
+                }
                 current = null; changed.signalAll();
             } finally { settling = false; }
         } finally { lock.unlock(); }
@@ -200,7 +378,7 @@ final class InspectScenarioHost implements Inspect {
         cancellationFailure.compareAndSet(null, cause);
         retain(cause); cancelled = true;
         // Native callbacks never wait for phase filesystem IO; worker condition waits already poll within 50ms.
-        if (lock.tryLock()) try { changed.signalAll(); } finally { lock.unlock(); }
+        if (lock.tryLock()) try { projectForeign(); changed.signalAll(); } finally { lock.unlock(); }
     }
     private void retain(Throwable failure) { if (failure != null) originalFailure.compareAndSet(null, failure); }
 
@@ -212,6 +390,7 @@ final class InspectScenarioHost implements Inspect {
         check(clientThread.getAsBoolean(), "Stopping callback is not on client thread");
         check(client == null || nativeClient == client, "Foreign client stopping callback");
         if (!stopNotified.compareAndSet(false, true)) return;
+        abandonForeignAcceptance();
         cancelSession(new IllegalStateException("Inspect client is stopping"));
         stopped = true;
         // Never wait on the native thread. Contention refuses effects; bounded waits also poll stopped.
@@ -280,14 +459,44 @@ final class InspectScenarioHost implements Inspect {
     }
     private <V> V dispatch(Consumer<Runnable> queue, Supplier<V> action) {
         var scope = dispatchScope(); var result = new CompletableFuture<V>();
-        queue.accept(() -> {
-            lock.lock();
-            try {
-                valid(scope); if (stopped) throwOriginal();
-                result.complete(action.get());
-            } catch (RuntimeException | Error error) { result.completeExceptionally(error); }
-            finally { changed.signalAll(); lock.unlock(); }
-        });
+        class QueuedAction implements Runnable {
+            private Supplier<V> pending;
+            private boolean held, consumed;
+            QueuedAction(Supplier<V> supplied) { pending=supplied; }
+            @Override public void run() {
+                lock.lock();
+                try {
+                    if(consumed) return;
+                    var f=foreign;
+                    if(queue==clientQueue && f!=null && f.work==scope && f.stage.equals("ARMED")) {
+                        valid(scope); requireForeignOpen(f,scope.deadlineNanos());
+                        f.entered=true; f.continuation=this; f.stage="HELD"; held=true; projectForeign(); return;
+                    }
+                    // Re-entry is accepted only after the worker consumed the retained continuation.
+                    if(held && (f==null || f.work!=scope || !f.stage.equals("REPLAY_QUEUED"))) {
+                        if(f==null || f.retired || foreignAbandoned.get()) {
+                            consumed=true; pending=null; result.completeExceptionally(new IllegalStateException("Foreign wrapper retired"));
+                        }
+                        return;
+                    }
+                    consumed=true;
+                    try {
+                        valid(scope); if (stopped) throwOriginal();
+                        result.complete(pending.get());
+                        if(held) { f.stage="REPLAY_FAILED"; projectForeign(); }
+                    } catch(RuntimeException | Error error) {
+                        if(held) {
+                            f.replayRejected=cancelled && error==cancellationFailure.get() && !stopped && !stopNotified.get()
+                                    && clock.getAsLong()-scope.deadlineNanos()<0;
+                            f.stage=f.replayRejected?"REPLAY_REJECTED":"REPLAY_FAILED"; projectForeign();
+                        }
+                        result.completeExceptionally(error);
+                    } finally { pending=null; }
+                } catch(RuntimeException | Error error) { consumed=true; pending=null; result.completeExceptionally(error); }
+                finally { changed.signalAll(); lock.unlock(); }
+            }
+        }
+        queue.accept(new QueuedAction(action));
         return await(scope, result);
     }
     private <V> V await(Scope scope, CompletableFuture<V> result) {
@@ -401,7 +610,8 @@ final class InspectScenarioHost implements Inspect {
                 System.out.println("INSPECT_NATIVE_CLOSE ENTER; "+operation+"; world="+System.identityHashCode(c.world)
                         +"; server="+System.identityHashCode(c.getServer())+"; connection="+System.identityHashCode(connection)
                         +"; connectionOpen="+connection.isOpen());
-            },() -> c.world.disconnect(Text.translatable("menu.savingLevel")),() -> c.disconnect(new TitleScreen(), false));
+            },() -> { foreignEffect("CLOSE_NATIVE_WORLD"); c.world.disconnect(Text.translatable("menu.savingLevel")); },
+                    () -> { foreignEffect("CLOSE_NATIVE_CLIENT"); c.disconnect(new TitleScreen(), false); });
             var connection=c.getNetworkHandler()==null?null:c.getNetworkHandler().getConnection();
             System.out.println("INSPECT_NATIVE_CLOSE RETURN; "+operation+"; world="+System.identityHashCode(c.world)
                     +"; server="+System.identityHashCode(c.getServer())+"; connection="+System.identityHashCode(connection)
@@ -460,7 +670,10 @@ final class InspectScenarioHost implements Inspect {
                                               BiConsumer<MinecraftClient,Consumer<I>> capture, CompletableFuture<I> result) {
         try {
             check(dispatchScope()==scope,"Foreign capture scope"); Objects.requireNonNull(beforeCapture);
-            runOnClient(c -> { beforeCapture.accept(c); valid(scope); capture.accept(c,image -> receiveImage(scope,image,result)); });
+            runOnClient(c -> {
+                foreignGuard("SCREENSHOT",() -> { beforeCapture.accept(c); valid(scope); });
+                foreignEffect("SCREENSHOT"); capture.accept(c,image -> receiveImage(scope,image,result));
+            });
         } catch(RuntimeException | Error original) { abandonImage(result,original); throw original; }
     }
     private static <I extends AutoCloseable> void abandonImage(CompletableFuture<I> result,Throwable original) {
