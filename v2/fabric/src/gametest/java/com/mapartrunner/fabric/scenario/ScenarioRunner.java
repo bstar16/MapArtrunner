@@ -72,6 +72,7 @@ import javax.imageio.stream.MemoryCacheImageOutputStream;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.function.Supplier;
 
 import static com.mapartrunner.fabric.scenario.ScenarioHost.*;
 
@@ -2439,11 +2440,19 @@ final class ScenarioRunner implements AutoCloseable {
         if(!baseline()) fullPlayerCheckpoint(CheckpointKind.INITIAL);
         boolean paused=false;
         int budget = i(definition.data().getAsJsonObject("budgets"),"runTicks");
+        var physics=ordinaryPhysics(inspectMode,baseline())?new PhysicsAllowance(budget):null;
         var profileText="fixture="+fixture+"; physicsRunTicks="+budget
                 +"; productionEligibleAllowance="+BuildEngine.runLimit(plan,settings)+"; targets="+plan.targets().size();
         if(baseline()) writeNew(roots,stage.resolve("fixture-profile.txt"),profileText); else scalar("fixture-profile.txt",profileText);
-        for (int tick=0; tick<budget; tick++) {
-            host.waitTick();
+        for (int tick=0; physics==null?tick<budget:physics.consumed()<budget; tick++) {
+            int outerOrdinal=physics==null?tick:physics.consumed();
+            var anchorClocks=physics==null?null:PhysicsClocks.of(current);
+            PhysicsClocks candidateClocks=null;
+            PhysicsInvariants candidateInvariants=null;
+            int candidatePredicates=-1;
+            try {
+            if(physics==null) host.waitTick();
+            else physics.waitTick(false,host::waitTick);
             if(baseline() && supportCase==SupportCase.CONTROLLED) host.runOnClient(c -> {
                 requireClient(c);
                 PredictionFaults.supportHold(c,id).ifPresent(held -> {
@@ -2461,8 +2470,14 @@ final class ScenarioRunner implements AutoCloseable {
                 });
             });
             if(baseline()) {
-                current=live(); checkpoints.add(current);
-                writeNew(roots,stage.resolve("physics-"+tick+".txt"),current.toString());
+                var next=live();
+                if(physics!=null) {
+                    candidateClocks=PhysicsClocks.of(next);
+                    candidatePredicates=physicsPredicates(current,next);
+                    candidateInvariants=PhysicsInvariants.of(current,next,id);
+                }
+                current=next; checkpoints.add(current);
+                writeNew(roots,stage.resolve("physics-"+outerOrdinal+".txt"),current.toString());
                 requireRun(current.sample,id);
             } else {
                 poll=traversalPoll();
@@ -2484,6 +2499,14 @@ final class ScenarioRunner implements AutoCloseable {
                 if(capture.hasCheckpoint(CheckpointKind.FIRST_VERIFY) && !playerCheckpoints.contains(CheckpointKind.FIRST_VERIFY))
                     fullPlayerCheckpoint(CheckpointKind.FIRST_VERIFY);
             }
+            } catch(RuntimeException | Error failure) {
+                if(physics!=null) recordPhysics(new PhysicsAttempt("construction",outerOrdinal,physics.consumed(),budget,
+                        anchorClocks,candidateClocks,candidatePredicates,candidateInvariants,false,"FAIL:"+failure.getClass().getSimpleName()),failure,
+                        row -> physicsEvidence(stage,row));
+                throw failure;
+            }
+            if(physics!=null) recordPhysics(new PhysicsAttempt("construction",outerOrdinal,physics.consumed(),budget,
+                    anchorClocks,candidateClocks,candidatePredicates,candidateInvariants,false,"PASS"),null,row -> physicsEvidence(stage,row));
             if ((baseline()?current.sample.status().engine().lifecycle().phase():poll.phase)==Phase.TERMINAL) break;
             if (baseline() && substage(current.sample,ForwardTraversal.Substage.SHIFT)) {
                 if (shiftStart==null) shiftStart=current;
@@ -2491,9 +2514,11 @@ final class ScenarioRunner implements AutoCloseable {
                         && moved(shiftStart,current,"z",.25,1) && (supportCase==SupportCase.ORDINARY
                             || host.computeOnClient(c -> findSupportWitness(id,plan,origin,supportArm,
                                     PredictionFaults.resetSnapshot().support(),watch.copy()).isPresent()))) {
-                    require(tick+20<budget,"SHIFT pause would exceed the shared run physics budget");
-                    resumed=pauseShift(id,current,stage,checkpoints);
-                    tick+=20; paused=true;
+                    if(physics==null) require(tick+20<budget,"SHIFT pause would exceed the shared run physics budget");
+                    else physics.requirePauseRoom();
+                    resumed=pauseShift(id,current,stage,checkpoints,physics);
+                    if(physics==null) tick+=20;
+                    paused=true;
                 }
             }
         }
@@ -2532,9 +2557,19 @@ final class ScenarioRunner implements AutoCloseable {
                 .findFirst().orElseThrow().status().engine().eligibleTicks(),"VERIFY did not precede an advancing SUCCESS decision");
         checkCurrentScan(id,current.sample.tick(),plan.targets(),current.sample.observations());
         } else fullPlayerCheckpoint(CheckpointKind.TERMINAL);
+        int constructionRequests=physics==null?0:physics.consumed();
+        if(physics!=null) writeNew(roots,stage.resolve("physics-request-allocation.txt"),"constructionLimit="+budget
+                +"; constructionRequests="+constructionRequests+"; releaseRequestMaximum="+(budget-constructionRequests+20)
+                +"; totalRequestLimit="+physics.limit(true)+"; requiredAcceptedReleaseIntervals=20; requests are not elapsed native ticks");
         Live released=current;
         TraversalPoll releasedPoll=poll;
         for (int tick=0;tick<20;tick++) {
+            if(physics!=null) {
+                released=awaitPhysics(released,current,id,physics,true,tick,host::waitTick,this::live,
+                        () -> host.runOnClient(c -> { requireClient(c); requireReleased(c); }),row -> physicsEvidence(stage,row));
+                writeNew(roots,stage.resolve("release-"+tick+".txt"),released.toString());
+                continue;
+            }
             if(!baseline() && tick==19) host.runOnClient(c->{ requireClient(c); watch.requestReleaseEnd(); });
             host.waitTick();
             if(baseline()) {
@@ -2559,6 +2594,9 @@ final class ScenarioRunner implements AutoCloseable {
             }
         }
         if(baseline()) {
+        if(physics!=null) writeNew(roots,stage.resolve("physics-request-consumption.txt"),"constructionRequests="+constructionRequests
+                +"; releaseRequests="+(physics.consumed()-constructionRequests)+"; totalRequests="+physics.consumed()
+                +"; totalRequestLimit="+physics.limit(true)+"; acceptedReleaseIntervals=20");
         require(released.sample.tick()>current.sample.tick(),"Final current scan did not advance observer time");
         checkCurrentScan(id,released.sample.tick(),plan.targets(),released.sample.observations());
         writeNew(roots,stage.resolve("release-summary.txt"),"first="+current+"\nlast="+released);
@@ -2707,7 +2745,7 @@ final class ScenarioRunner implements AutoCloseable {
         return currentCompactFiles(artifacts,outputs,sealed,run,current);
     }
 
-    private Live pauseShift(UUID id, Live before, Path stage, List<Live> checkpoints) {
+    private Live pauseShift(UUID id, Live before, Path stage, List<Live> checkpoints,PhysicsAllowance physics) {
         require(substage(before.sample,ForwardTraversal.Substage.SHIFT) && nativeForward(before.sample),"Pause checkpoint is not moving SHIFT");
         var pause=pauseOnClient(host,this::clientLive,c -> { requireClient(c); MapArtClient.pause(); requireReleased(c); },id);
         Live immediateBefore=withServer(pause.before);
@@ -2715,10 +2753,17 @@ final class ScenarioRunner implements AutoCloseable {
         writeNew(roots,stage.resolve("pause-before.txt"),"before="+immediateBefore+"\nimmediate="+paused);
         Live prior=paused;
         for (int tick=0;tick<20;tick++) {
-            host.waitTick();
-            Live next=live(); checkpoints.add(next);
-            requirePhysics(prior,next); requirePaused(paused,next,id);
-            host.runOnClient(ScenarioRunner::requireReleased);
+            Live next;
+            if(physics!=null) next=awaitPhysics(prior,paused,id,physics,false,tick,host::waitTick,this::live,
+                    () -> host.runOnClient(c -> { requireClient(c); requireReleased(c); }),row -> physicsEvidence(stage,row));
+            else {
+                host.waitTick();
+                next=live();
+                checkpoints.add(next);
+                requirePhysics(prior,next); requirePaused(paused,next,id);
+                host.runOnClient(ScenarioRunner::requireReleased);
+            }
+            if(physics!=null) checkpoints.add(next);
             writeNew(roots,stage.resolve("pause-"+tick+".txt"),next.toString());
             prior=next;
         }
@@ -2735,6 +2780,112 @@ final class ScenarioRunner implements AutoCloseable {
     }
 
     record ClientTransition(Live before, Live after) { }
+
+    static boolean ordinaryPhysics(boolean inspect,boolean baseline) { return inspect && baseline; }
+
+    /** One worker owns requests for one run; pause retains this count, release alone gains the original twenty. */
+    static final class PhysicsAllowance {
+        final int constructionLimit;
+        private int consumed;
+        PhysicsAllowance(int constructionLimit) { this.constructionLimit=constructionLimit; }
+        int consumed() { return consumed; }
+        int limit(boolean release) { return release?Math.addExact(constructionLimit,20):constructionLimit; }
+        void requirePauseRoom() {
+            require(constructionLimit-consumed>=20,"SHIFT pause would exceed the shared run physics budget");
+        }
+        void waitTick(boolean release,Runnable wait) {
+            require(consumed<limit(release),"Physics request allowance exhausted: consumed="+consumed+"; limit="+limit(release));
+            consumed++;
+            wait.run();
+        }
+    }
+
+    record PhysicsClocks(long observerTick,int clientAge,Integer poseAge,long clientTime,Long poseTime,
+                         int serverAge,long serverTime,int serverTick) {
+        static PhysicsClocks of(Live live) {
+            var pose=live.sample.pose();
+            return new PhysicsClocks(live.sample.tick(),live.client.age,pose==null?null:pose.age(),live.client.time,
+                    pose==null?null:pose.worldTime(),live.server.age,live.server.time,live.server.serverTick);
+        }
+    }
+
+    // Predicate bits in order: client age/time, server age/time/tick. Rejected clocks never become anchors.
+    record PhysicsAttempt(String phase,int interval,int request,int limit,PhysicsClocks anchor,PhysicsClocks candidate,
+                          int predicates,PhysicsInvariants state,boolean accepted,String invariant) { }
+
+    record PhysicsInvariants(Phase phase,boolean nativePaused,BuildEngine.ControlOwner owner,int keys,int nativeSequence,
+                             long eligible,long verify,boolean runValid,boolean retainedProgress,boolean engineSame) {
+        static PhysicsInvariants of(Live held,Live next,UUID id) {
+            var sample=next.sample; var status=sample.status(); var engine=status.engine(); int keys=0;
+            for(int k=0;k<sample.keys().size();k++) if(sample.keys().get(k)) keys|=1<<k;
+            return new PhysicsInvariants(engine.lifecycle().phase(),sample.paused(),status.controlOwner(),keys,next.nativeSequence,
+                    engine.eligibleTicks(),engine.verifyTicks(),sample.originalWorld() && sample.pose()!=null && status.failure().isEmpty()
+                        && engine.lifecycle().context().filter(c -> c.runId().equals(id)).isPresent(),
+                    ScenarioRunner.retainedProgress(held.sample.status().engine(),engine),held.sample.status().engine().equals(engine));
+        }
+    }
+
+    static Live awaitPhysics(Live anchor,Live held,UUID id,PhysicsAllowance allowance,boolean release,int interval,
+                             Runnable wait,Supplier<Live> capture,Runnable freshReleased,Consumer<PhysicsAttempt> evidence) {
+        String phase=release?"release":"pause";
+        var first=PhysicsClocks.of(anchor);
+        for(;;) {
+            int limit=allowance.limit(release);
+            require(allowance.consumed()<limit,"Physics request allowance exhausted: phase="+phase+"; interval="+interval
+                    +"; consumed="+allowance.consumed()+"; limit="+limit+"; charged=false; anchor="+first+"; candidate=null");
+            Live next=null; PhysicsClocks candidate=null; PhysicsInvariants state=null;
+            int predicates=-1; boolean qualifies=false; Throwable failure=null;
+            try {
+                allowance.waitTick(release,wait);
+                next=capture.get();
+                candidate=PhysicsClocks.of(next);
+                predicates=physicsPredicates(anchor,next); // Retain exact numeric facts before any candidate guard.
+                state=PhysicsInvariants.of(held,next,id);
+                qualifies=advancing(new Checkpoint(anchor.client,anchor.server,anchor.sample.status()),
+                        new Checkpoint(next.client,next.server,next.sample.status()));
+                if(release) requireTerminal(held,next,id);
+                else requirePaused(held,next,id);
+                freshReleased.run();
+            } catch(RuntimeException | Error error) { failure=error; }
+            var row=new PhysicsAttempt(phase,interval,allowance.consumed(),limit,first,candidate,predicates,state,
+                    failure==null && qualifies,failure==null?"PASS":"FAIL:"+failure.getClass().getSimpleName());
+            recordPhysics(row,failure,evidence);
+            if(row.accepted()) return next;
+        }
+    }
+
+    private static int physicsPredicates(Live a,Live b) {
+        return (b.client.age>a.client.age?1:0) | (b.client.time>a.client.time?2:0) | (b.server.age>a.server.age?4:0)
+                | (b.server.time>a.server.time?8:0) | (b.server.serverTick>a.server.serverTick?16:0);
+    }
+
+    private static void requireTerminal(Live terminal,Live next,UUID id) {
+        requireRun(next.sample,id);
+        require(next.sample.status().engine().equals(terminal.sample.status().engine()) && next.nativeSequence==terminal.nativeSequence
+                        && !next.sample.paused() && next.sample.keys().stream().noneMatch(Boolean::booleanValue)
+                        && next.sample.status().controlOwner()==BuildEngine.ControlOwner.NONE,
+                "Terminal release20 changed engine/controls/native issuance");
+    }
+
+    private void physicsEvidence(Path stage,PhysicsAttempt row) {
+        requireInspectWork(Command.RUN,Command.RERUN);
+        writeNew(roots,stage.resolve(row.phase()+"-attempt-"+row.request()+".txt"),row.toString());
+    }
+
+    private static void recordPhysics(PhysicsAttempt row,Throwable primary,Consumer<PhysicsAttempt> evidence) {
+        try { evidence.accept(row); }
+        catch(RuntimeException | Error sink) {
+            if(primary==null) primary=sink;
+            else if(primary!=sink) primary.addSuppressed(sink);
+        }
+        if(primary!=null) {
+            // Keep typed Host/guard failure primary even if its owned evidence scope is already unavailable.
+            primary.addSuppressed(new AssertionError("Physics diagnostic: "+new PhysicsAttempt(row.phase,row.interval,row.request,row.limit,
+                    row.anchor,row.candidate,row.predicates,row.state,false,row.invariant)));
+            if(primary instanceof RuntimeException runtime) throw runtime;
+            throw (Error)primary;
+        }
+    }
 
     // Inspect ticks may run between dispatches; capture/action/exact assertions must share one client callback.
     static ClientTransition pauseOnClient(ScenarioHost host, Function<MinecraftClient,Live> capture,

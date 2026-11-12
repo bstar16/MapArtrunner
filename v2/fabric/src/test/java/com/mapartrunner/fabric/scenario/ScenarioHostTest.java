@@ -149,6 +149,86 @@ class ScenarioHostTest {
         }
     }
 
+    @Test void physicsWaitChargesAnOutstandingClientStallAndKeepsTheOriginalDeadline() throws Exception {
+        try(var h=new DispatchHarness()) {
+            var fixture=new ScenarioClientTransitionTest.QueueFixture(); fixture.engine.pause();
+            var held=ScenarioClientTransitionTest.clocks(fixture.sample(),100,100,100,100,100,100);
+            var work=h.host.beginWork(operation(1)); var allowance=new ScenarioRunner.PhysicsAllowance(40);
+            var rows=new CopyOnWriteArrayList<ScenarioRunner.PhysicsAttempt>();
+            var pending=h.worker.submit(() -> h.host.inScope(work,() -> ScenarioRunner.awaitPhysics(held,held,fixture.context.runId(),allowance,false,0,
+                    h.host::waitTick,() -> fail("No complete sample after client stall"),() -> fail("No guard without sample"),rows::add)));
+            await(() -> h.host.waitingCount()==1);
+            assertFalse(pending.isDone()); assertEquals(1,allowance.consumed());
+            h.now.set(work.deadlineNanos()); h.host.onTick();
+            assertInstanceOf(ScopeTimeoutException.class,failure(pending)); assertEquals(1,allowance.consumed());
+            assertEquals(1,rows.size()); assertNull(rows.getFirst().candidate());
+            assertEquals(600_000_000_001L,work.deadlineNanos());
+            assertThrows(ScopeTimeoutException.class,() -> h.host.inScope(work,() -> fail("Expired original scope renewed")));
+        }
+    }
+
+    @Test void physicsSamplingCannotAcceptExpiryBeforeDispatchDuringCaptureOrAfterServerCompletion() throws Exception {
+        for(int stage=0;stage<4;stage++) try(var h=new DispatchHarness()) {
+            int expiry=stage; var fixture=new ScenarioClientTransitionTest.QueueFixture(); fixture.engine.pause();
+            var held=ScenarioClientTransitionTest.clocks(fixture.sample(),100,100,100,100,100,100);
+            var next=ScenarioClientTransitionTest.clocks(held,101,101,101,101,101,101);
+            var work=h.host.beginWork(operation(1)); var allowance=new ScenarioRunner.PhysicsAllowance(40);
+            var rows=new CopyOnWriteArrayList<ScenarioRunner.PhysicsAttempt>(); var effects=new AtomicInteger();
+            var pending=h.worker.submit(() -> h.host.inScope(work,() -> ScenarioRunner.awaitPhysics(held,held,fixture.context.runId(),allowance,false,0,
+                    () -> { if(expiry==0) h.now.set(work.deadlineNanos()); h.host.waitTick(); },
+                    () -> {
+                        h.host.computeOnClient(c -> { effects.incrementAndGet(); if(expiry==1) h.now.set(work.deadlineNanos()); return held; });
+                        return h.host.computeOnServer(s -> { effects.incrementAndGet(); if(expiry==2) h.now.set(work.deadlineNanos()); return next; });
+                    },() -> h.host.runOnClient(c -> { effects.incrementAndGet(); h.now.set(work.deadlineNanos()); }),rows::add)));
+            if(expiry>0) {
+                await(() -> h.host.waitingCount()==1); h.host.onTick();
+                var client=h.client.poll(2,TimeUnit.SECONDS); assertNotNull(client); h.nativeCall(client);
+                if(expiry>1) {
+                    var server=h.server.poll(2,TimeUnit.SECONDS); assertNotNull(server);
+                    h.serverThread.set(true); try { server.run(); } finally { h.serverThread.remove(); }
+                    if(expiry==3) { var fresh=h.client.poll(2,TimeUnit.SECONDS); assertNotNull(fresh); h.nativeCall(fresh); }
+                }
+            }
+            var error=failure(pending); assertInstanceOf(ScopeTimeoutException.class,error);
+            assertEquals(1,allowance.consumed()); assertEquals(1,rows.size()); assertFalse(rows.getFirst().accepted());
+            if(expiry==3) assertEquals(101,rows.getFirst().candidate().observerTick()); else assertNull(rows.getFirst().candidate());
+            assertEquals(expiry,effects.get()); assertEquals(600_000_000_001L,work.deadlineNanos());
+            assertTrue(List.of(error.getSuppressed()).stream().anyMatch(t -> t.getMessage().startsWith("Physics diagnostic:")));
+        }
+    }
+
+    @Test void physicsWaitRefusesEqualStaleAndCancelledScopesAndLateCallbacksWithoutRetry() throws Exception {
+        for(String kind:List.of("equal","stale","cancelled","binding","stopped")) try(var h=new DispatchHarness()) {
+            var fixture=new ScenarioClientTransitionTest.QueueFixture(); fixture.engine.pause();
+            var held=ScenarioClientTransitionTest.clocks(fixture.sample(),100,100,100,100,100,100);
+            var work=h.host.beginWork(operation(1)); var allowance=new ScenarioRunner.PhysicsAllowance(40);
+            var rows=new CopyOnWriteArrayList<ScenarioRunner.PhysicsAttempt>(); var effects=new AtomicInteger();
+            var original=new IllegalStateException(kind+" original sentinel");
+            if(kind.equals("equal") || kind.equals("stale")) {
+                Scope refused=kind.equals("equal")?new Scope(work.operation(),Kind.WORK,work.deadlineNanos()):work;
+                if(kind.equals("stale")) h.host.beginCleanup(work,null);
+                var error=assertThrows(IllegalStateException.class,() -> ScenarioRunner.awaitPhysics(held,held,fixture.context.runId(),allowance,false,0,
+                        () -> h.host.inScope(refused,h.host::waitTick),() -> fail("Invalid handle sampled"),() -> { },rows::add));
+                assertEquals("Unbound/foreign/stale inspect scope",error.getMessage());
+            } else {
+                var pending=h.worker.submit(() -> h.host.inScope(work,() -> ScenarioRunner.awaitPhysics(held,held,fixture.context.runId(),allowance,false,0,
+                        h.host::waitTick,() -> h.host.computeOnClient(c -> { effects.incrementAndGet(); throw original; }),() -> { },rows::add)));
+                await(() -> h.host.waitingCount()==1);
+                if(kind.equals("stopped")) h.nativeCall(() -> h.host.onStopping(null));
+                else {
+                    h.host.onTick(); var late=h.client.poll(2,TimeUnit.SECONDS); assertNotNull(late);
+                    if(kind.equals("cancelled")) h.host.cancelSession(original);
+                    h.nativeCall(late);
+                }
+                var error=failure(pending);
+                if(kind.equals("stopped")) assertInstanceOf(IllegalStateException.class,error); else assertSame(original,error);
+                assertEquals(kind.equals("binding")?1:0,effects.get());
+            }
+            assertEquals(1,allowance.consumed()); assertEquals(1,rows.size()); assertNull(rows.getFirst().candidate());
+            assertFalse(rows.getFirst().accepted()); assertTrue(h.client.isEmpty()); assertTrue(h.server.isEmpty());
+        }
+    }
+
     @Test void inspectStoppingClaimsOnlyExistingCleanupAndSettlementWaitsForClaim() throws Exception {
         try (var h = new DispatchHarness()) {
             var op = operation(1);
