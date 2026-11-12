@@ -307,7 +307,11 @@ function Read-V2InspectOperationReceipt {
         if ($RequireGame -and [IO.Path]::GetFullPath($Evidence) -cne (Join-Path $moduleRoot ('launch-'+$StartReceipt.launchId))) { throw 'Wrong module launch directory.' }
         $path=Join-Path $Evidence "inspect-op-$Ordinal.$Phase.json"
         $item=Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
-        if (!$item) { return [pscustomobject]@{Status='Missing'} }
+        if (!$item) {
+            Update-V2ProcessExits @($Held) -IncludeExiting
+            if ($null -ne $Held.Record.ExitCode -and !$Held.Record.ExitedUtc) { return [pscustomobject]@{Status='PendingExitMetadata'} }
+            return [pscustomobject]@{Status='Missing'}
+        }
         if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Phase must be an ordinary file.' }
         $stream=[IO.File]::Open($path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
         try {
@@ -353,11 +357,10 @@ function Read-V2InspectOperationReceipt {
             [Math]::Abs(($Held.Process.StartTime.ToUniversalTime()-[DateTimeOffset]::Parse($StartIdentity.StartedUtc).UtcDateTime).TotalMilliseconds) -gt 10) { throw 'Original held process identity changed.' }
         if ($RequireGame -and (!$StartIdentity.IsGame -or !$Held.Record.IdentityVerified)) { throw 'Original configured JDK identity unavailable.' }
         $exitBound=$null
-        if ($Held.Process.HasExited) {
-            # Exit may occur after this poll's inventory. The retained handle still supplies the actual bound.
-            $exitBound=[DateTimeOffset]$Held.Process.ExitTime.ToUniversalTime()
-            if (($null -ne $Held.Record.ExitCode -and $Held.Process.ExitCode -ne $Held.Record.ExitCode) -or
-                ($Held.Record.ExitedUtc -and [DateTimeOffset]::Parse($Held.Record.ExitedUtc) -ne $exitBound)) { throw 'Original native exit identity changed.' }
+        if ($Held.Process.HasExited -or $null -ne $Held.Record.ExitCode) {
+            Update-V2ProcessExits @($Held) -IncludeExiting
+            if (!$Held.Record.ExitedUtc) { return [pscustomobject]@{Status='PendingExitMetadata'} }
+            $exitBound=[DateTimeOffset]::Parse($Held.Record.ExitedUtc)
         }
         # Sample after the complete candidate/held-identity read, never before a concurrently published phase.
         $sampledElapsed=$(if($Clock){$Clock.Elapsed.TotalMilliseconds}else{$null})
@@ -408,9 +411,12 @@ function Update-V2InspectOperations {
         if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $item.Length -gt 4096 -or
             [Text.UTF8Encoding]::new($false,$true).GetString([IO.File]::ReadAllBytes($entry.Path)) -cne $entry.Text) { throw 'Accepted inspect receipt was rewritten/removed.' }
     }
+    # Pending metadata is transient; it never latches a frame, ordinal or watchdog cap.
+    $State.MetadataPending=$false
     while ($true) {
         $checked=Read-V2InspectOperationReceipt -Evidence $Result.Evidence -WorkingDirectory $WorkingDirectory -StartReceipt $Result.StartReceipt -StartIdentity $Result.StartIdentity `
             -Held $State.Held -Ordinal $State.NextOrdinal -Phase $State.NextPhase -Previous $State.Previous -PreviousSettledUtc $State.SettledUtc -RequireGame:$RequireGame -InternalInspectTest $InternalInspectTest -Clock $Clock
+        if ($checked.Status -ceq 'PendingExitMetadata') { $State.MetadataPending=$true; return }
         if ($checked.Status -ceq 'Missing') { return }
         if ($checked.Status -cne 'Accepted') { throw "Invalid inspect phase: $($checked.Reason)" }
         $name="inspect-op-$($State.NextOrdinal).$($State.NextPhase).json"
@@ -598,10 +604,25 @@ function Update-V2ProcessExits {
     $observedUtc=[DateTime]::UtcNow.ToString('o')
     foreach ($held in $Handles) {
         # HasExited can expose the real exit code before Windows signals WaitForExit(0).
-        if ($null -eq $held.Record.ExitCode -and ($held.Process.WaitForExit(0) -or ($IncludeExiting -and $held.Process.HasExited))) {
+        $signaled=$held.Process.WaitForExit(0)
+        if ($null -eq $held.Record.ExitCode -and ($signaled -or ($IncludeExiting -and $held.Process.HasExited))) {
             $held.Record.ExitCode=$held.Process.ExitCode; $held.Record.ObservedExitUtc=$observedUtc
-            try { $held.Record.ExitedUtc=$held.Process.ExitTime.ToUniversalTime().ToString('o') } catch { }
         }
+        if (!$signaled) { if ($null -ne $held.Record.ExitCode) { $held.Record.ExitedUtc=$null }; continue }
+        # Codes may arrive early; only a signaled original handle can supply/repair the exit bound.
+        $previous=$held.Record.ExitedUtc; $held.Record.ExitedUtc=$null
+        try {
+            $held.Process.Refresh()
+            $started=$held.Process.StartTime.ToUniversalTime(); $exit=$held.Process.ExitTime.ToUniversalTime()
+        } catch { continue }
+        if ($held.Process.Id -ne $held.Record.Pid -or
+            [Math]::Abs(($started-[DateTimeOffset]::Parse($held.Record.StartedUtc).UtcDateTime).TotalMilliseconds) -gt 10 -or
+            $held.Process.ExitCode -ne $held.Record.ExitCode) { throw 'Original held exit identity changed.' }
+        if ($exit -lt $started -or $exit -gt [DateTime]::UtcNow) { continue }
+        if ($previous -and [DateTimeOffset]::Parse($previous).UtcDateTime -ge $started -and
+            [DateTimeOffset]::Parse($previous).UtcDateTime -le [DateTime]::UtcNow -and
+            [DateTimeOffset]::Parse($previous).UtcDateTime -ne $exit) { throw 'Original held exit timestamp changed.' }
+        $held.Record.ExitedUtc=$exit.ToString('o')
     }
 }
 
@@ -728,7 +749,7 @@ function Invoke-V2Supervisor {
                     if ($null -eq $rootRecord.ExitCode) {
                         # The worker can exit after inventory; latch that observation before testing either deadline.
                         $rootRecord.ExitCode=$process.ExitCode; $rootRecord.ObservedExitUtc=[DateTime]::UtcNow.ToString('o')
-                        try { $rootRecord.ExitedUtc=$process.ExitTime.ToUniversalTime().ToString('o') } catch { }
+                        Update-V2ProcessExits @($handles) -IncludeExiting
                     }
                     if (!$result.PrimaryFailure) { $result.ExitCode=$process.ExitCode }
                 }
@@ -760,6 +781,7 @@ function Invoke-V2Supervisor {
                             if (!$result.PrimaryFailure) { $result.ExitCode=125 }
                             break
                         }
+                        if ($inspectExitObserved -and $inspectState.MetadataPending) { $inspectEnded=$true; break }
                         if ($inspectState.Active -and $clock.Elapsed.TotalMilliseconds -ge $inspectState.CapElapsed) {
                             $result.TimedOut=$true; $result.TimeoutPhase='INSPECT_'+$inspectState.NextPhase.ToUpperInvariant()
                             $result.InspectEscalation='Inspect operation did not settle by its original cleanup cap.'; $result.InspectIncomplete=$true
@@ -810,7 +832,7 @@ function Invoke-V2Supervisor {
                         $result.StartupAcceptedElapsedMilliseconds=$clock.ElapsedMilliseconds
                         if ($inspectMode) {
                             $inspectState=[pscustomobject]@{Held=$held[0];NextOrdinal=1;NextPhase='begin';Previous=$null;SettledUtc=$null
-                                Active=$false;CapElapsed=$null;Accepted=@{};Outcomes=$result.InspectOperations}
+                                Active=$false;CapElapsed=$null;Accepted=@{};Outcomes=$result.InspectOperations;MetadataPending=$false}
                             # Inspect phases/exits are processed by the same next iteration, before their clocks.
                             continue
                         }
@@ -864,8 +886,30 @@ function Invoke-V2Supervisor {
                     if (!$held.Process.WaitForExit($remaining)) { throw "Held owned process did not settle: $($held.Record.Pid)" }
                     $held.Record.ExitCode=$held.Process.ExitCode
                 }
+                Update-V2ProcessExits @($handles) -IncludeExiting
                 if ($result.WorkerPid -and $process.WaitForExit(0)) { $result.WorkerExitCode=$process.ExitCode }
                 Set-V2ObservedFailure $result $records
+                if ($inspectEnded -and !$result.InspectEscalation) {
+                    # Reconcile only after held settlement, sharing the original process/stream allowance.
+                    do {
+                        Update-V2ProcessExits @($handles) -IncludeExiting
+                        try { Update-V2InspectOperations $inspectState $result $WorkingDirectory $clock -RequireGame:$RequireGame -InternalInspectTest $InternalInspectTest }
+                        catch {
+                            $result.InspectIncomplete=$true; $result.InspectEscalation=$_.Exception.Message
+                            if (!$result.PrimaryFailure) { $result.ExitCode=125 }; break
+                        }
+                        if (!$inspectState.MetadataPending) { break }
+                        if ($cleanupClock.ElapsedMilliseconds -ge 10000) {
+                            $result.InspectIncomplete=$true; $result.InspectEscalation='Inspect exit metadata did not settle within10000ms.'
+                            throw $result.InspectEscalation
+                        }
+                        Start-Sleep -Milliseconds ([Math]::Max(0,[Math]::Min(25,10000-[int]$cleanupClock.ElapsedMilliseconds)))
+                    } while ($true)
+                    if ($inspectState.Active -and !$result.InspectEscalation) {
+                        $result.InspectIncomplete=$true; $result.InspectEscalation='Process exited with unfinished inspect operation.'
+                        if (!$result.PrimaryFailure) { $result.ExitCode=125 }
+                    }
+                }
                 if ($inspectEnded -and !$result.PrimaryFailure -and !$result.InspectEscalation -and !$result.TimedOut -and !$result.SupervisorError -and $null -ne $result.WorkerExitCode) {
                     $result.ExitCode=$result.WorkerExitCode
                 }

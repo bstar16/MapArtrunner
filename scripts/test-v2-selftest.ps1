@@ -1143,6 +1143,106 @@ Write-Output ('TRANSPORT='+(@{support=$env:MAPART_TWO_LANE_SUPPORT_CASE;launchId
         Assert-V2Settled $outcome
         Assert ($proof.Done -and $outcome.ExitCode -eq 0) 'phase parser dummy failed'
     }
+    Run 'Task7b exit metadata policy withholds phases until the same signaled handle supplies a valid bound' {
+        # Policy model, not a reproduction of the historical Windows timestamp failures.
+        foreach($code in 0,7) {
+            $start=[DateTimeOffset]::UtcNow.AddSeconds(-30); $time=$start.AddMilliseconds(100)
+            $model=[pscustomobject]@{Id=9000+$code;StartTime=$start.UtcDateTime;HasExited=$true;ExitCode=$code
+                Signal=$false;Unknown=($code -eq 0);CachedExit=[DateTime]::FromFileTimeUtc(0);ValidExit=$start.AddSeconds(2).UtcDateTime;Refreshes=0}
+            $model | Add-Member ScriptMethod WaitForExit {param($Milliseconds) $this.Signal}
+            $model | Add-Member ScriptMethod Refresh { $this.Refreshes++; if($this.Signal){$this.CachedExit=$this.ValidExit;$this.Unknown=$false} }
+            $model | Add-Member ScriptProperty ExitTime {if($this.Unknown){throw 'policy model exit time unknown'};$this.CachedExit}
+            $record=[pscustomobject]@{Pid=$model.Id;StartedUtc=$start.ToString('o');Executable='policy-model';IsGame=$false;ExitCode=$null;ExitedUtc=$null;ObservedExitUtc=$null}
+            $held=[pscustomobject]@{Process=$model;Record=$record}
+            Update-V2ProcessExits @($held) -IncludeExiting
+            Assert ($record.ExitCode -eq $code -and $null -eq $record.ExitedUtc) 'early actual code became a known nonsignaled exit bound'
+            $launch=[guid]::NewGuid().ToString('D'); $session=[guid]::NewGuid().ToString('D'); $operation=[guid]::NewGuid().ToString('D')
+            $evidence=Join-Path $testRoot "launch-$launch"
+            $directory=Join-Path $repo "v2/fabric/build/scenario-results/two-lane-$session/inspect-operations/op-1-$operation"
+            New-Item -ItemType Directory -Path $evidence,$directory -Force | Out-Null
+            $ready=[pscustomobject]@{launchId=$launch;pid=$model.Id;startedUtc=$record.StartedUtc;mode='inspect';sessionId=$session}
+            $identity=[pscustomobject]@{Pid=$record.Pid;StartedUtc=$record.StartedUtc;Executable=$record.Executable;IsGame=$false}
+            $data=@{schema='mapartrunner-inspect-operation-v1';launchId=$launch;pid=$model.Id;startedUtc=$record.StartedUtc;mode='inspect';sessionId=$session;ordinal=1;operationId=$operation;command='RUN';evidenceDir=$directory}
+            $frames=@{}
+            foreach($phase in 'begin','cleanup','end') {
+                $frame=@{}+$data; $frame.phase=@{begin='WORK';cleanup='CLEANUP';end='SETTLED'}[$phase]
+                $frame.phaseStartedUtc=$time.AddMilliseconds(@{begin=0;cleanup=10;end=20}[$phase]).ToString('o')
+                $frame.phaseDeadlineUtc=$(if($phase -ceq 'end'){$null}else{$time.AddMilliseconds(@{begin=1000;cleanup=1010}[$phase]).ToString('o')})
+                $frame.verdict=$(if($phase -ceq 'begin'){$null}else{'SUCCESS'}); $frame.cleanupStatus=$(if($phase -ceq 'end'){'SETTLED'}else{$null})
+                $frames[$phase]=$frame; $frame|ConvertTo-Json -Compress|Set-Content (Join-Path $evidence "inspect-op-1.$phase.json")
+            }
+            $outcome=[pscustomobject]@{Evidence=$evidence;StartReceipt=$ready;StartIdentity=$identity;WorkerPid=$model.Id;TerminationRequested=$false;ExitCode=0;PrimaryFailure=$null;ObservedFailures=[Collections.Generic.List[object]]::new()}
+            Set-V2ObservedFailure $outcome @($record)
+            Assert ($outcome.ExitCode -eq $code) 'early code7 failure precedence was delayed'
+            $state=[pscustomobject]@{Held=$held;NextOrdinal=1;NextPhase='begin';Previous=$null;SettledUtc=$null;Active=$false;CapElapsed=$null;Accepted=@{};Outcomes=[Collections.Generic.List[object]]::new();MetadataPending=$false}
+            $clock=[Diagnostics.Stopwatch]::StartNew(); $allowance=@{WorkMilliseconds=1000;CleanupMilliseconds=1000}
+            Update-V2InspectOperations $state $outcome $repo $clock -InternalInspectTest $allowance
+            Assert ($state.MetadataPending -and !$state.Accepted.Count -and !$state.Outcomes.Count -and $state.NextOrdinal -eq 1 -and $null -eq $state.CapElapsed) 'unknown metadata advanced provisional phase/ordinal/watchdog state'
+            $model.Signal=$true
+            # Repair is required even though the code was already latched; a cached zero is not a bound.
+            $record.ExitedUtc=[DateTime]::FromFileTimeUtc(0).ToString('o')
+            Update-V2ProcessExits @($held) -IncludeExiting
+            Assert ($record.ExitCode -eq $code -and [DateTimeOffset]$record.ExitedUtc -eq [DateTimeOffset]$model.ValidExit -and $model.Refreshes -gt 0) 'signaled held timestamp was not repaired independently of latched code'
+            Update-V2InspectOperations $state $outcome $repo $clock -InternalInspectTest $allowance
+            Assert (!$state.MetadataPending -and $state.Outcomes.Count -eq 1 -and $state.NextOrdinal -eq 2 -and $outcome.ExitCode -eq $code) 'verified final frames did not reconcile with original failure precedence'
+            $arguments=@{Evidence=$evidence;WorkingDirectory=$repo;StartReceipt=$ready;StartIdentity=$identity;Held=$held;Ordinal=1;Phase='end';Previous=[pscustomobject]$frames.cleanup;InternalInspectTest=$allowance}
+            foreach($late in @($start.AddSeconds(2).AddMilliseconds(1),$time.AddMilliseconds(1011))) {
+                $frame=@{}+$frames.end; $frame.phaseStartedUtc=$late.ToString('o'); $frame|ConvertTo-Json -Compress|Set-Content (Join-Path $evidence 'inspect-op-1.end.json')
+                Assert ((Read-V2InspectOperationReceipt @arguments).Status -ceq 'Rejected') 'real post-exit or END deadline +1ms was accepted'
+            }
+        }
+    }
+    Run 'Task7b final held settlement reconciles pending metadata within the original cleanup allowance' {
+        $proofs=[Collections.Generic.List[object]]::new()
+        foreach($case in 'code0','code7','unknown') {
+            $originalUpdate=${function:Update-V2Processes}; $originalExits=${function:Update-V2ProcessExits}
+            $proof=@{Case=$case;Published=$false;CleanupSamples=0;PendingSamples=0}
+            $caseRoot=Join-Path $testRoot ('exit-metadata-'+$case)
+            try {
+                Set-Item Function:Update-V2ProcessExits -Value {
+                    param($Handles,[switch]$IncludeExiting)
+                    & $originalExits @PSBoundParameters
+                    if (!$proof.Published) {return}
+                    foreach($entry in $Handles) {
+                        if($entry.Record.Pid -ne $process.Id){continue}
+                        if($cleanupClock){$proof.CleanupSamples++;$proof.CleanupElapsed=$cleanupClock.ElapsedMilliseconds}
+                        if($proof.Case -ceq 'unknown' -or !$cleanupClock -or $proof.CleanupSamples -lt 2) {
+                            $entry.Record.ExitedUtc=$null; $proof.PendingSamples++
+                            Assert (!$inspectState.Accepted.Count -and $inspectState.NextOrdinal -eq 1 -and $null -eq $inspectState.CapElapsed) 'metadata-withholding fixture saw provisional acceptance'
+                        }
+                    }
+                }
+                Set-Item Function:Update-V2Processes -Value {
+                    param($Job,$Records,$Handles,[switch]$Fast)
+                    & $originalUpdate @PSBoundParameters
+                    if($Fast -or !$result.StartReceipt -or $proof.Published){return}
+                    $proof.Published=$true; $stamp=[DateTimeOffset]::UtcNow; $operation=[guid]::NewGuid().ToString('D'); $session=$result.StartReceipt.sessionId
+                    $directory=Join-Path $repo "v2/fabric/build/scenario-results/two-lane-$session/inspect-operations/op-1-$operation"
+                    New-Item -ItemType Directory -Path $directory -Force|Out-Null
+                    foreach($phase in 'begin','cleanup','end') {
+                        $frame=@{schema='mapartrunner-inspect-operation-v1';launchId=$launchId;pid=$process.Id;startedUtc=$result.StartReceipt.startedUtc;mode='inspect';sessionId=$session;ordinal=1;operationId=$operation;command='RUN';evidenceDir=$directory
+                            phase=@{begin='WORK';cleanup='CLEANUP';end='SETTLED'}[$phase];phaseStartedUtc=$stamp.ToString('o');phaseDeadlineUtc=$(if($phase -ceq 'end'){$null}else{$stamp.AddMilliseconds(1000).ToString('o')});verdict=$(if($phase -ceq 'begin'){$null}else{'SUCCESS'});cleanupStatus=$(if($phase -ceq 'end'){'SETTLED'}else{$null})}
+                        $frame|ConvertTo-Json -Compress|Set-Content (Join-Path $evidence "inspect-op-1.$phase.json")
+                    }
+                    Set-Content (Join-Path $evidence 'metadata-done') 'done'
+                    Assert ($process.WaitForExit(3000)) 'metadata fixture worker did not exit'
+                }
+                $code=$(if($case -ceq 'code7'){7}else{0})
+                $body=New-V2ReceiptWorker '$receipt=@{schema="mapartrunner-inspect-ready-v1";launchId=$receipt.launchId;pid=$receipt.pid;startedUtc=$receipt.startedUtc;scenario="grounded-two-lane";mode="inspect";sessionId=[guid]::NewGuid().ToString("D");event="INSPECT_WORLD_BOUND_COMMANDS_READY"}' 0
+                $text=$body.ToString() -replace 'Start-Sleep -Milliseconds 0\s+exit 0',('$bound=[Diagnostics.Stopwatch]::StartNew();while(!(Test-Path (Join-Path $env:MAPART_TEST_LAUNCH_DIR "metadata-done"))){if($bound.ElapsedMilliseconds -gt 8000){exit 99};Start-Sleep -Milliseconds 10};exit '+$code)
+                $outcome=Invoke-V2Supervisor -Worker ([scriptblock]::Create($text)) -Request ([pscustomobject]@{Mode='inspect';Scenario='grounded-two-lane'}) -EvidenceRoot $caseRoot -WorkingDirectory $repo -StartupMilliseconds 3000 -InternalInspectTest @{WorkMilliseconds=1000;CleanupMilliseconds=1000}
+                $proof.Outcome=$outcome
+            } finally {Set-Item Function:Update-V2Processes -Value $originalUpdate;Set-Item Function:Update-V2ProcessExits -Value $originalExits}
+            $proofs.Add($proof); $proofs|ConvertTo-Json -Depth 14|Set-Content (Join-Path $testRoot 'exit-metadata-proofs.json')
+            Assert ($proof.PendingSamples -gt 0 -and $outcome.WorkerExitCode -eq $code) 'metadata withholding missed actual raw worker exit'
+            if($case -ceq 'unknown') {
+                Assert ($outcome.ExitCode -eq 125 -and $outcome.CleanupStatus -ceq 'unresolved' -and $outcome.InspectIncomplete -and $outcome.CleanupError -like '*exit metadata*' -and !$outcome.InspectOperations.Count -and (Get-Item (Join-Path $caseRoot 'supervisor.lock')).Length -gt 0) 'persistent unknown metadata did not fail closed/retain ownership'
+            } else {
+                Assert-V2Settled $outcome
+                Assert ($outcome.ExitCode -eq $code -and $outcome.InspectOperations.Count -eq 1 -and !$outcome.InspectIncomplete -and !$outcome.TerminationRequested -and (Get-Item (Join-Path $caseRoot 'supervisor.lock')).Length -eq 0) 'final held drain lost valid frames or original code precedence'
+            }
+        }
+    }
     Run 'inspect ordered polling idle timeout cleanup exit and escalation share the owned backend' {
         Reject { Invoke-V2Supervisor -RequireGame -InternalInspectTest @{} -Worker {exit 0} } 'real inspect clock override accepted'
         # Policy-only reproduction of Windows exit-code visibility before its wait handle is signaled.
@@ -1153,7 +1253,7 @@ Write-Output ('TRANSPORT='+(@{support=$env:MAPART_TWO_LANE_SUPPORT_CASE;launchId
         Update-V2ProcessExits $exitHandles
         Assert ($null -eq $exitRecord.ExitCode) 'automatic wait-based exit policy changed'
         Update-V2ProcessExits $exitHandles -IncludeExiting
-        Assert ($exitRecord.ExitCode -eq 7 -and $exitRecord.ExitedUtc) 'inspect observed exit code was lost before wait signal'
+        Assert ($exitRecord.ExitCode -eq 7 -and $null -eq $exitRecord.ExitedUtc) 'inspect early code was lost or nonsignaled timestamp became a bound'
         $phaseProofs=[Collections.Generic.List[object]]::new()
         foreach($case in 'idle','all-at-once-aged','aged-begin','timeout-settled','missing-cleanup','stuck-cleanup','close-stuck','unresolved','rewrite','exit-final','exit-late-phase','worker7','missing-ordinal','ready-dies-before-anchor') {
             $originalUpdate=${function:Update-V2Processes}; $originalReader=${function:Read-V2StartReceipt}
