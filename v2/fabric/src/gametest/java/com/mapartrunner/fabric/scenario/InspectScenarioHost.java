@@ -378,10 +378,29 @@ final class InspectScenarioHost implements Inspect {
     @Override public void closeWorld(Consumer<MinecraftClient> beforeClose) {
         var scope=dispatchScope(); check(scope.kind()==Kind.CLEANUP,"Inspect close requires CLEANUP"); Objects.requireNonNull(beforeClose);
         runOnClient(c -> {
-            beforeClose.accept(c); valid(scope);
-            check(c.getServer() == server && server != null, "Foreign close server"); c.disconnect(new TitleScreen(), false);
+            String operation=scope.operation().command()+" #"+scope.operation().ordinal()+" "+scope.operation().operationId()
+                    +"; session="+scope.operation().sessionId();
+            disconnectOwnedWorld(scope,() -> {
+                beforeClose.accept(c); check(c.getServer() == server && server != null, "Foreign close server");
+                var connection=c.getNetworkHandler().getConnection();
+                System.out.println("INSPECT_NATIVE_CLOSE ENTER; "+operation+"; world="+System.identityHashCode(c.world)
+                        +"; server="+System.identityHashCode(c.getServer())+"; connection="+System.identityHashCode(connection)
+                        +"; connectionOpen="+connection.isOpen());
+            },() -> c.world.disconnect(Text.translatable("menu.savingLevel")),() -> c.disconnect(new TitleScreen(), false));
+            var connection=c.getNetworkHandler()==null?null:c.getNetworkHandler().getConnection();
+            System.out.println("INSPECT_NATIVE_CLOSE RETURN; "+operation+"; world="+System.identityHashCode(c.world)
+                    +"; server="+System.identityHashCode(c.getServer())+"; connection="+System.identityHashCode(connection)
+                    +"; connectionOpen="+(connection!=null && connection.isOpen()));
         });
         while (!computeOnClient(c -> c.getServer() == null && c.world == null && c.player == null)) waitTick();
+    }
+    void disconnectOwnedWorld(Scope scope, Runnable beforeDisconnect, Runnable disconnectConnection, Runnable disconnectScreen) {
+        check(clientThread.getAsBoolean() && scope.kind()==Kind.CLEANUP,"Native close requires client CLEANUP");
+        beforeDisconnect.run(); valid(scope);
+        // One owned teardown: vanilla's screen disconnect waits for the server logout caused by this connection close.
+        // Expected DISCONNECT cancellation must retain this cleanup through the second half, without a live-connection recheck.
+        disconnectConnection.run();
+        disconnectScreen.run();
     }
     @Override public void awaitNeutralChat() {
         var scope = dispatchScope(); check(scope.kind() == Kind.WORK, "Neutral chat wait requires WORK");

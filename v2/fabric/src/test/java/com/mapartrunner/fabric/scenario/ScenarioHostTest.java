@@ -407,6 +407,85 @@ class ScenarioHostTest {
         }
     }
 
+    @Test void nativeCloseChecksFreshAuthorityThenDisconnectsConnectionBeforeScreen() throws Exception {
+        try(var h=new DispatchHarness()) {
+            var cleanup=h.host.beginCleanup(h.host.beginWork(operation(1)),null);
+            var calls=new ArrayList<String>();
+            var closing=h.worker.submit(() -> h.host.inScope(cleanup,() -> h.host.runOnClient(client ->
+                    h.host.disconnectOwnedWorld(cleanup,() -> calls.add("authority"),
+                            () -> calls.add("connection"),() -> calls.add("screen")))));
+            var action=h.client.poll(2,TimeUnit.SECONDS); assertNotNull(action); assertTrue(calls.isEmpty());
+            h.nativeCall(action); closing.get(2,TimeUnit.SECONDS);
+            assertEquals(List.of("authority","connection","screen"),calls);
+        }
+    }
+
+    @Test void nativeCloseRefusedOrExpiredDuringFreshAuthorityCheckHasZeroEffects() throws Exception {
+        for(boolean expired:List.of(false,true)) try(var h=new DispatchHarness()) {
+            var cleanup=h.host.beginCleanup(h.host.beginWork(operation(1)),null);
+            var refusal=new IllegalStateException("replacement world/connection"); var effects=new AtomicInteger();
+            var closing=h.worker.submit(() -> h.host.inScope(cleanup,() -> h.host.runOnClient(client ->
+                    h.host.disconnectOwnedWorld(cleanup,() -> {
+                        if(expired) h.now.set(cleanup.deadlineNanos()); else throw refusal;
+                    },effects::incrementAndGet,effects::incrementAndGet))));
+            var action=h.client.poll(2,TimeUnit.SECONDS); assertNotNull(action); h.nativeCall(action);
+            if(expired) assertInstanceOf(ScopeTimeoutException.class,failure(closing));
+            else assertSame(refusal,failure(closing));
+            assertEquals(0,effects.get()); assertTrue(h.client.isEmpty());
+        }
+    }
+
+    @Test void nativeConnectionCloseFailureDoesNotEnterWaitingScreenDisconnect() throws Exception {
+        try(var h=new DispatchHarness()) {
+            var cleanup=h.host.beginCleanup(h.host.beginWork(operation(1)),null);
+            var first=new IllegalStateException("channel close failed"); var calls=new ArrayList<String>();
+            var closing=h.worker.submit(() -> h.host.inScope(cleanup,() -> h.host.runOnClient(client ->
+                    h.host.disconnectOwnedWorld(cleanup,() -> calls.add("authority"),
+                            () -> { calls.add("connection"); throw first; },() -> calls.add("screen")))));
+            var action=h.client.poll(2,TimeUnit.SECONDS); assertNotNull(action); h.nativeCall(action);
+            assertSame(first,failure(closing)); assertEquals(List.of("authority","connection"),calls);
+        }
+    }
+
+    @Test void expectedNativeDisconnectCancellationCompletesOriginalCloseWithoutNewPermission() throws Exception {
+        try(var h=new DispatchHarness()) {
+            var close=new Operation(inspectSession,1,UUID.randomUUID(),Command.CLOSE,temporary.resolve("close"));
+            var work=h.host.beginWork(close); var cleanup=h.host.beginCleanup(work,null);
+            var original=new IllegalStateException("expected DISCONNECT"); var calls=new ArrayList<String>();
+            var closing=h.worker.submit(() -> h.host.inScope(cleanup,() -> h.host.runOnClient(client ->
+                    h.host.disconnectOwnedWorld(cleanup,() -> calls.add("authority"),() -> {
+                        calls.add("connection"); h.host.cancelSession(original);
+                        h.host.cancelSession(new IllegalStateException("duplicate exit"));
+                    },() -> calls.add("screen")))));
+            var action=h.client.poll(2,TimeUnit.SECONDS); assertNotNull(action); h.nativeCall(action);
+            closing.get(2,TimeUnit.SECONDS); assertEquals(List.of("authority","connection","screen"),calls);
+            assertEquals(10_000_000_001L,cleanup.deadlineNanos());
+            h.host.settleCleanup(cleanup,new FinalOutcome(close,Verdict.SUCCESS,CleanupStatus.SETTLED));
+            assertThrows(IllegalStateException.class,() -> h.host.inScope(cleanup,() -> fail("second close")));
+            assertThrows(IllegalStateException.class,() -> h.host.beginCleanup(work,original));
+            assertThrows(IllegalStateException.class,() -> h.host.beginWork(operation(2)));
+            assertEquals(1,h.published.size()); assertTrue(h.client.isEmpty());
+        }
+    }
+
+    @Test void nativeCloseReturningAtOriginalDeadlineCannotSettleOrRenewCleanup() throws Exception {
+        try(var h=new DispatchHarness()) {
+            var close=new Operation(inspectSession,1,UUID.randomUUID(),Command.CLOSE,temporary.resolve("late-close"));
+            var work=h.host.beginWork(close); var cleanup=h.host.beginCleanup(work,null); var effects=new AtomicInteger();
+            var closing=h.worker.submit(() -> h.host.inScope(cleanup,() -> h.host.runOnClient(client ->
+                    h.host.disconnectOwnedWorld(cleanup,() -> { },effects::incrementAndGet,() -> {
+                        effects.incrementAndGet(); h.now.set(cleanup.deadlineNanos());
+                    }))));
+            var action=h.client.poll(2,TimeUnit.SECONDS); assertNotNull(action); h.nativeCall(action);
+            assertInstanceOf(ScopeTimeoutException.class,failure(closing)); assertEquals(2,effects.get());
+            assertThrows(ScopeTimeoutException.class,() -> h.host.settleCleanup(cleanup,
+                    new FinalOutcome(close,Verdict.SUCCESS,CleanupStatus.SETTLED)));
+            assertThrows(IllegalStateException.class,() -> h.host.beginCleanup(work,null));
+            assertThrows(IllegalStateException.class,() -> h.host.beginWork(operation(2)));
+            assertTrue(h.published.isEmpty()); assertEquals(work.deadlineNanos(),cleanup.deadlineNanos());
+        }
+    }
+
     @Test void inspectStaleImagesAreClosedAndFinalImageNeverReplaced() throws Exception {
         try (var h = new DispatchHarness()) {
             var op = operation(1); var work = h.host.beginWork(op);
