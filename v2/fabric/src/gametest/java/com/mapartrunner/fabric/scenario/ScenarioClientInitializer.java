@@ -34,7 +34,6 @@ public final class ScenarioClientInitializer implements ClientModInitializer {
         var commands = new ScenarioCommands(worker, host);
         inspectClient = client;
         inspectCommands = commands;
-        var watch = ScenarioObserver.install(client);
         ClientCommandRegistrationCallback.EVENT.register((dispatcher, access) -> commands.register(dispatcher));
         ClientTickEvents.END_CLIENT_TICK.register(current -> {
             host.onTick(); commands.checkWorld(current);
@@ -49,7 +48,10 @@ public final class ScenarioClientInitializer implements ClientModInitializer {
             worker.shutdown();
         });
         // Commands and lifecycle callbacks are installed before STARTED can enqueue world creation.
-        ClientLifecycleEvents.CLIENT_STARTED.register(current -> commands.initialize(watch,
-                ScenarioLaunchReceipt.fromEnvironment(), () -> current.execute(current::scheduleStop)));
+        ClientLifecycleEvents.CLIENT_STARTED.register(current -> {
+            // Fabric entrypoints run before Minecraft assigns its client thread.
+            var watch = ScenarioObserver.install(client);
+            commands.initialize(watch, ScenarioLaunchReceipt.fromEnvironment(), () -> current.execute(current::scheduleStop));
+        });
     }
 }
