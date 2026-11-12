@@ -608,9 +608,13 @@ function Update-V2ProcessExits {
         if ($null -eq $held.Record.ExitCode -and ($signaled -or ($IncludeExiting -and $held.Process.HasExited))) {
             $held.Record.ExitCode=$held.Process.ExitCode; $held.Record.ObservedExitUtc=$observedUtc
         }
-        if (!$signaled) { if ($null -ne $held.Record.ExitCode) { $held.Record.ExitedUtc=$null }; continue }
+        [DateTimeOffset]$previousTime=[DateTimeOffset]::MinValue
+        if (![DateTimeOffset]::TryParse($held.Record.ExitedUtc,[ref]$previousTime) -or
+            $previousTime -lt [DateTimeOffset]::Parse($held.Record.StartedUtc)) { $held.Record.ExitedUtc=$null }
+        if (!$signaled) { continue }
         # Codes may arrive early; only a signaled original handle can supply/repair the exit bound.
-        $previous=$held.Record.ExitedUtc; $held.Record.ExitedUtc=$null
+        # A verified bound remains authoritative through unavailable/invalid later samples.
+        $previous=$held.Record.ExitedUtc
         try {
             $held.Process.Refresh()
             $started=$held.Process.StartTime.ToUniversalTime(); $exit=$held.Process.ExitTime.ToUniversalTime()
@@ -619,9 +623,7 @@ function Update-V2ProcessExits {
             [Math]::Abs(($started-[DateTimeOffset]::Parse($held.Record.StartedUtc).UtcDateTime).TotalMilliseconds) -gt 10 -or
             $held.Process.ExitCode -ne $held.Record.ExitCode) { throw 'Original held exit identity changed.' }
         if ($exit -lt $started -or $exit -gt [DateTime]::UtcNow) { continue }
-        if ($previous -and [DateTimeOffset]::Parse($previous).UtcDateTime -ge $started -and
-            [DateTimeOffset]::Parse($previous).UtcDateTime -le [DateTime]::UtcNow -and
-            [DateTimeOffset]::Parse($previous).UtcDateTime -ne $exit) { throw 'Original held exit timestamp changed.' }
+        if ($previous -and [DateTimeOffset]::Parse($previous).UtcDateTime -ne $exit) { throw 'Original held exit timestamp changed.' }
         $held.Record.ExitedUtc=$exit.ToString('o')
     }
 }

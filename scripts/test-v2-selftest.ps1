@@ -1148,9 +1148,13 @@ Write-Output ('TRANSPORT='+(@{support=$env:MAPART_TWO_LANE_SUPPORT_CASE;launchId
         foreach($code in 0,7) {
             $start=[DateTimeOffset]::UtcNow.AddSeconds(-30); $time=$start.AddMilliseconds(100)
             $model=[pscustomobject]@{Id=9000+$code;StartTime=$start.UtcDateTime;HasExited=$true;ExitCode=$code
-                Signal=$false;Unknown=($code -eq 0);CachedExit=[DateTime]::FromFileTimeUtc(0);ValidExit=$start.AddSeconds(2).UtcDateTime;Refreshes=0}
+                Signal=$false;Unknown=($code -eq 0);CachedExit=[DateTime]::FromFileTimeUtc(0);ValidExit=$start.AddSeconds(2).UtcDateTime;Refreshes=0;RefreshMode='valid'}
             $model | Add-Member ScriptMethod WaitForExit {param($Milliseconds) $this.Signal}
-            $model | Add-Member ScriptMethod Refresh { $this.Refreshes++; if($this.Signal){$this.CachedExit=$this.ValidExit;$this.Unknown=$false} }
+            $model | Add-Member ScriptMethod Refresh {
+                $this.Refreshes++
+                if($this.RefreshMode -ceq 'throw'){throw 'policy model refresh unavailable'}
+                if($this.Signal){$this.CachedExit=$(if($this.RefreshMode -ceq 'invalid'){[DateTime]::FromFileTimeUtc(0)}else{$this.ValidExit});$this.Unknown=$false}
+            }
             $model | Add-Member ScriptProperty ExitTime {if($this.Unknown){throw 'policy model exit time unknown'};$this.CachedExit}
             $record=[pscustomobject]@{Pid=$model.Id;StartedUtc=$start.ToString('o');Executable='policy-model';IsGame=$false;ExitCode=$null;ExitedUtc=$null;ObservedExitUtc=$null}
             $held=[pscustomobject]@{Process=$model;Record=$record}
@@ -1183,6 +1187,21 @@ Write-Output ('TRANSPORT='+(@{support=$env:MAPART_TWO_LANE_SUPPORT_CASE;launchId
             $record.ExitedUtc=[DateTime]::FromFileTimeUtc(0).ToString('o')
             Update-V2ProcessExits @($held) -IncludeExiting
             Assert ($record.ExitCode -eq $code -and [DateTimeOffset]$record.ExitedUtc -eq [DateTimeOffset]$model.ValidExit -and $model.Refreshes -gt 0) 'signaled held timestamp was not repaired independently of latched code'
+            $verified=$model.ValidExit
+            foreach($failure in 'throw','invalid') {
+                foreach($replacement in 'same','changed') {
+                    $model.RefreshMode=$failure
+                    Update-V2ProcessExits @($held) -IncludeExiting
+                    Assert ($record.ExitedUtc -and [DateTimeOffset]$record.ExitedUtc -eq [DateTimeOffset]$verified) "verified exit bound was erased by $failure observation"
+                    $model.RefreshMode='valid'; $model.ValidExit=$(if($replacement -ceq 'changed'){$verified.AddSeconds(1)}else{$verified})
+                    if($replacement -ceq 'changed') {
+                        Reject {Update-V2ProcessExits @($held) -IncludeExiting} "changed verified bound survived $failure observation"
+                    } else {Update-V2ProcessExits @($held) -IncludeExiting}
+                    Assert ($record.ExitCode -eq $code -and [DateTimeOffset]$record.ExitedUtc -eq [DateTimeOffset]$verified) 'replacement changed immutable bound or original code'
+                    $model.ValidExit=$verified
+                    Update-V2ProcessExits @($held) -IncludeExiting
+                }
+            }
             Update-V2InspectOperations $state $outcome $repo $clock -InternalInspectTest $allowance
             Assert (!$state.MetadataPending -and $state.Outcomes.Count -eq 1 -and $state.NextOrdinal -eq 2 -and $outcome.ExitCode -eq $code) 'verified final frames did not reconcile with original failure precedence'
             $arguments=@{Evidence=$evidence;WorkingDirectory=$repo;StartReceipt=$ready;StartIdentity=$identity;Held=$held;Ordinal=1;Phase='end';Previous=[pscustomobject]$frames.cleanup;InternalInspectTest=$allowance}
