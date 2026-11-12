@@ -118,7 +118,9 @@ final class ScenarioObserver {
     }
     record ServerReading(ServerBinding binding, double x, double y, double z, double reach,
                          int age, long worldTime, int serverTick) { }
-    record ServerRead(EndPublication publication, long callback) { }
+    record ServerRead(Binding binding, List<EndPublication> publications, long callback) {
+        ServerRead { publications=List.copyOf(publications); }
+    }
     record ServerWitness(EndPublication publication, long callback, ServerReading reading) { }
 
     static ClientBinding clientBinding(MinecraftClient client) {
@@ -143,7 +145,9 @@ final class ScenarioObserver {
         private final List<Sample> samples = new ArrayList<>();
         private final List<ServerWitness> witnesses=new ArrayList<>();
         private Binding binding;
-        private EndPublication latest;
+        private final List<EndPublication> pending=new ArrayList<>();
+        private ServerRead inFlight;
+        private long lastPublishedFrame=-1;
         private long serverCallbacks;
         private BuildPlan plan;
         private RunLifecycle.Context run;
@@ -164,7 +168,7 @@ final class ScenarioObserver {
         }
 
         // Inspect settlement retains the original binding and failure until archive-before-clear/arm.
-        void freeze() { synchronized(gate) { frozen = true; latest=null; } }
+        void freeze() { synchronized(gate) { frozen = true; pending.clear(); inFlight=null; } }
 
         Retained retained() { synchronized(gate) { return new Retained(samples, failure,binding,witnesses); } }
 
@@ -229,8 +233,8 @@ final class ScenarioObserver {
         void clear() {
             if(traversalCapture!=null) traversalCapture.requireSealedForClear();
             synchronized(gate) {
-                binding=null; latest=null; // Invalidate generation before resetting any references or clocks.
-                witnesses.clear(); serverCallbacks=0;
+                binding=null; pending.clear(); inFlight=null; // Invalidate claims/generation before histories; reopen last.
+                witnesses.clear(); serverCallbacks=0; lastPublishedFrame=-1;
                 traversalCapture=null; originalPlayer=null; originalConnection=null;
                 traversalWriting=false; releaseEndRequested=false;
                 plan = null; run = null; world = null; handler = null;
@@ -242,7 +246,7 @@ final class ScenarioObserver {
         void closeWorld() {
             if(traversalCapture!=null) traversalCapture.requireSealedForClear();
             synchronized(gate) {
-                if(binding!=null) { frozen=true; latest=null; } // Disarm paired callbacks before automatic native close.
+                if(binding!=null) { frozen=true; pending.clear(); inFlight=null; } // Disarm before automatic native close.
             }
             world = null; handler = null;
         }
@@ -278,14 +282,24 @@ final class ScenarioObserver {
                         || !Double.isFinite(reach) || reach<=0) {
                     latch(new IllegalStateException("Native client END lost exact observation binding/reach")); return;
                 }
-                latest=new EndPublication(armed,sample,reach); // Replace even ENDPOINT -> SHIFT; never pin an endpoint.
+                if(sample.tick<=lastPublishedFrame) {
+                    latch(new IllegalStateException("Duplicate/reordered client END publication")); return;
+                }
+                lastPublishedFrame=sample.tick;
+                pending.add(new EndPublication(armed,sample,reach)); // Every actual END waits for its next claim, regardless of stage.
             }
         }
 
         ServerRead beginServerRead() {
             synchronized(gate) {
-                if(frozen || failure!=null || latest==null || !binding.currentScope()) return null;
-                return new ServerRead(latest,++serverCallbacks);
+                if(frozen || failure!=null || binding==null) return null;
+                if(!binding.currentScope()) { pending.clear(); inFlight=null; return null; }
+                long callback=++serverCallbacks; // Physical callback ordinal, including idle callbacks without a scalar read.
+                if(inFlight!=null || pending.isEmpty()) return null;
+                // Detach under the gate. ENDs published during the outside-gate read belong to the next callback.
+                inFlight=new ServerRead(binding,pending,callback);
+                pending.clear();
+                return inFlight;
             }
         }
 
@@ -293,7 +307,7 @@ final class ScenarioObserver {
             var read=beginServerRead();
             if(read==null) return;
             try {
-                var expected=read.publication.binding.server;
+                var expected=read.binding.server;
                 // All mutable reads below are server-owned. Never consult the client or Runner.requireServer here.
                 if(!server.isOnThread()) throw new IllegalStateException("Server END requires owning thread");
                 var world=server.getOverworld();
@@ -308,20 +322,24 @@ final class ScenarioObserver {
 
         void commitServer(ServerRead read, ServerReading reading) {
             synchronized(gate) {
-                if(!current(read)) return;
+                if(!consume(read)) return;
+                if(read.publications.isEmpty() || read.publications.stream().anyMatch(p -> p.binding!=binding)) {
+                    latch(new IllegalStateException("Server claim lost exact publication binding")); return;
+                }
                 if(!binding.server.matches(reading.binding) || !Double.isFinite(reading.reach) || reading.reach<=0) {
                     latch(new IllegalStateException("Native server END lost exact binding/reach")); return;
                 }
-                if(witnesses.size()>=6000) { latch(new AssertionError("Server observer exceeded 6000 witnesses")); return; }
-                witnesses.add(new ServerWitness(read.publication,read.callback,reading));
+                if(read.publications.size()>6000-witnesses.size()) { latch(new AssertionError("Server observer exceeded 6000 witnesses")); return; }
+                for(var publication:read.publications) witnesses.add(new ServerWitness(publication,read.callback,reading));
             }
         }
 
-        private boolean current(ServerRead read) {
-            return read!=null && !frozen && failure==null && latest==read.publication
-                    && binding==read.publication.binding && binding.currentScope();
+        private boolean consume(ServerRead read) {
+            if(read==null || inFlight!=read) return false;
+            inFlight=null; // Exact one-use claim retires even when its original scope became unavailable.
+            return !frozen && failure==null && binding==read.binding && binding.currentScope();
         }
-        void failRead(ServerRead read, Throwable error) { synchronized(gate) { if(current(read)) latch(error); } }
+        void failRead(ServerRead read, Throwable error) { synchronized(gate) { if(consume(read)) latch(error); } }
         private void fail(Binding armed, Throwable error) {
             synchronized(gate) { if(!frozen && binding==armed && (armed==null || armed.currentScope())) latch(error); }
         }

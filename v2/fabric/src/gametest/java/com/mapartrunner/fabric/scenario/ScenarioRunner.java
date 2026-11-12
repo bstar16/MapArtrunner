@@ -2824,7 +2824,8 @@ final class ScenarioRunner implements AutoCloseable {
     }
 
     private static String pairedEvidence(ScenarioObserver.Watch.Retained retained) {
-        return "pair=actual client END publication precedes independent server END read; clocks are distinct, no acknowledgement implied"
+        return "pairingVersion=2; pair=actual client END publication precedes its first subsequent server END claim, then one independent read"
+                +"; equal callback/tick rows alias ONE physical ServerReading; clocks are distinct, no acknowledgement implied"
                 +"\nbinding="+retained.binding()+"\nfirstFailure="+retained.failure()+"\n"
                 +String.join("\n",retained.witnesses().stream().map(Object::toString).toList())+"\n";
     }
@@ -2847,13 +2848,17 @@ final class ScenarioRunner implements AutoCloseable {
         var points=retained.witnesses();
         int east=-1,eastTravel=-1,endpoint=-1,shift=-1,south=-1,westEntry=-1,west=-1,westTravel=-1;
         long frame=-1,callback=-1,serverTick=-1;
+        ScenarioObserver.ServerReading previousReading=null;
         for (int k=0;k<points.size();k++) {
             var point=points.get(k); var publication=point.publication(); var sample=publication.sample();
             require(publication.binding()==binding && nativeEnds.contains(sample) && sample.phase().equals("END")
                     && binding.server().matches(point.reading().binding()),"Foreign publication/generation/native binding");
-            require(sample.tick()>=frame && point.callback()>callback && point.reading().serverTick()>serverTick,
+            require(sample.tick()>frame && point.callback()>0 && (point.callback()==callback
+                            ? point.reading()==previousReading && point.reading().serverTick()==serverTick
+                            : point.callback()>callback && point.reading().serverTick()>serverTick && point.reading()!=previousReading),
                     "Duplicate/reordered native frame/server callback/tick");
             frame=sample.tick(); callback=point.callback(); serverTick=point.reading().serverTick();
+            previousReading=point.reading();
             require(Double.isFinite(publication.reach()) && publication.reach()>0
                     && Double.isFinite(point.reading().reach()) && point.reading().reach()>0,"Invalid actual native reach");
             var traversal=sample.status().engine().traversal().orElse(null);
@@ -2862,20 +2867,23 @@ final class ScenarioRunner implements AutoCloseable {
                     && sample.status().engine().lifecycle().activity().orElse(null)==Activity.BUILD && nativeForward(sample);
             if (walking && traversal.laneIndex()==0 && traversal.entry().lane().direction().name().equals("EAST")) {
                 if (east<0) east=k;
-                if (pairedBeyondReach(points.get(east),point,1)) eastTravel=k;
+                if (eastTravel<0 && laterObservation(point,points.get(east)) && pairedBeyondReach(points.get(east),point,1)) eastTravel=k;
             }
-            if (eastTravel>=0 && endpoint<0 && traversal.substage()==ForwardTraversal.Substage.ENDPOINT && pairedEntry(point,11.5,2.5)) endpoint=k;
+            if (eastTravel>=0 && endpoint<0 && laterObservation(point,points.get(eastTravel))
+                    && traversal.substage()==ForwardTraversal.Substage.ENDPOINT && pairedEntry(point,11.5,2.5)) endpoint=k;
             if (endpoint>=0 && traversal.substage()==ForwardTraversal.Substage.SHIFT
                     && traversal.entry().lane().direction().name().equals("SOUTH")) {
-                if (shift<0) shift=k;
-                if (nativeForward(sample) && Math.abs(MathHelper.wrapDegrees(sample.pose().yaw()))<=1.5
+                if (shift<0 && laterObservation(point,points.get(endpoint))) shift=k;
+                if (shift>=0 && south<0 && laterObservation(point,points.get(shift))
+                        && nativeForward(sample) && Math.abs(MathHelper.wrapDegrees(sample.pose().yaw()))<=1.5
                         && Math.abs(MathHelper.wrapDegrees(sample.pose().headYaw()))<=1.5 && Math.abs(MathHelper.wrapDegrees(sample.pose().bodyYaw()))<=1.5
                         && pairedMoved(points.get(shift),point,.25)) south=k;
             }
-            if (south>=0 && westEntry<0 && traversal.substage()==ForwardTraversal.Substage.NEXT_ENTRY && pairedEntry(point,11.5,7.5)) westEntry=k;
+            if (south>=0 && westEntry<0 && laterObservation(point,points.get(south))
+                    && traversal.substage()==ForwardTraversal.Substage.NEXT_ENTRY && pairedEntry(point,11.5,7.5)) westEntry=k;
             if (westEntry>=0 && walking && traversal.laneIndex()==1 && traversal.entry().lane().direction().name().equals("WEST")) {
-                if (west<0) west=k;
-                if (pairedBeyondReach(points.get(west),point,-1)) westTravel=k;
+                if (west<0 && laterObservation(point,points.get(westEntry))) west=k;
+                if (west>=0 && westTravel<0 && laterObservation(point,points.get(west)) && pairedBeyondReach(points.get(west),point,-1)) westTravel=k;
             }
         }
         ordered(east,eastTravel,endpoint,shift,south,westEntry,west,westTravel);
@@ -2927,6 +2935,11 @@ final class ScenarioRunner implements AutoCloseable {
                 && distance(coordinate(resumed.server,"z"),p.reading().z(),0,1)),
                 "No actual independent SOUTH progress after manual resume");
         return new TraversalProof(chain,first,second);
+    }
+
+    private static boolean laterObservation(ScenarioObserver.ServerWitness point,ScenarioObserver.ServerWitness previous) {
+        return point.publication().sample().tick()>previous.publication().sample().tick()
+                && point.callback()>previous.callback() && point.reading().serverTick()>previous.reading().serverTick();
     }
 
     private static boolean pairedEntry(ScenarioObserver.ServerWitness point,double x,double z) {

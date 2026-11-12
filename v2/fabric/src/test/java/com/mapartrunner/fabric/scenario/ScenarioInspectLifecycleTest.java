@@ -28,6 +28,27 @@ class ScenarioInspectLifecycleTest {
     }
     @TempDir Path directory;
 
+    @Test void simulatedCadenceRetainsBothEntryEndsBeforeLaneInOnePhysicalRead() {
+        var context=witnessContext(); var watch=new ScenarioObserver.Watch();
+        var binding=witnessBinding(context,null,null); watch.bind(binding);
+        var samples=witnessSamples(context);
+        var ends=List.of(samples.get(13),samples.get(15),samples.get(17));
+        for(var end:ends) watch.append(binding,end,binding.client(),4.5);
+        var claim=watch.beginServerRead(); assertNotNull(claim);
+        var scalar=reading(binding.server(),ends.getLast(),4.5,110);
+        watch.commitServer(claim,scalar);
+        var retained=watch.retained();
+        assertNull(retained.failure());
+        assertEquals(ends,retained.witnesses().stream().map(w -> w.publication().sample()).toList());
+        for(int n=0;n<ends.size();n++) {
+            assertSame(ends.get(n),retained.witnesses().get(n).publication().sample());
+            assertSame(scalar,retained.witnesses().get(n).reading());
+            assertEquals(claim.callback(),retained.witnesses().get(n).callback());
+        }
+        assertNull(watch.beginServerRead());
+        assertEquals(3,watch.retained().witnesses().size());
+    }
+
     @Test void denseNativeEvidenceMustNotDependOnSparseHeldWorkerSelection() throws Exception {
         var context=witnessContext();
         var dense=witnessSamples(context);
@@ -40,12 +61,157 @@ class ScenarioInspectLifecycleTest {
         assertRejected(retained,List.of(),retained.samples());
     }
 
+    @Test void sharedEntryReadSkipsSameBatchWestAndPreservesEarlierSouthThenUsesLaterIndependentReads() {
+        var context=witnessContext(); var samples=witnessSamples(context,true);
+        var earlyWalk=samples.stream().map(s -> s.phase().equals("END") && s.tick()==10
+                ? witnessSample(context,10,com.mapartrunner.core.run.ForwardTraversal.Substage.LANE,1,"WEST",11.5,7.5,true,0,0):s).toList();
+        // Simulated cadence: late SHIFT, two entry ENDs and first WEST WALK alias one real-seam scalar fixture.
+        var r=batchedWatch(context,earlyWalk,null,null,Set.of(1L,2L,3L,4L,5L,6L,10L,11L,12L)).retained();
+        var proof=ScenarioRunner.evaluateTraversal(context.runId(),r,null);
+        assertEquals(List.of(2L,3L,4L,5L,6L,8L,11L,12L),proof.ordered().stream().map(w -> w.publication().sample().tick()).toList());
+        assertEquals(8,proof.ordered().stream().map(ScenarioObserver.ServerWitness::callback).distinct().count());
+        assertEquals(8,proof.ordered().stream().map(w -> w.reading().serverTick()).distinct().count());
+        var batch=r.witnesses().stream().filter(w -> w.publication().sample().tick()>=7 && w.publication().sample().tick()<=10).toList();
+        assertEquals(4,batch.size()); for(var row:batch) assertSame(batch.getFirst().reading(),row.reading());
+        assertRejectedBecause(r,r.witnesses().stream().filter(w -> w.publication().sample().tick()<=10).toList(),
+                "Missing/unordered native traversal witnesses");
+        // Retention still cannot manufacture the next physical read's full server entry rectangle.
+        var wrong=reading(r.binding().server(),laterEnd(context,10),4.5,110);
+        var noServerEntry=r.witnesses().stream().map(w -> batch.contains(w)?new ScenarioObserver.ServerWitness(w.publication(),w.callback(),wrong):w).toList();
+        assertRejectedBecause(r,noServerEntry,"Missing/unordered native traversal witnesses");
+    }
+
+    @Test void endpointAndShiftBatchRetainsBothButNeedsAnIndependentShiftAnchor() {
+        var context=witnessContext(); var r=batchedWatch(context,witnessSamples(context,true),null,null,
+                Set.of(1L,2L,3L,5L,6L,7L,8L,9L,10L,11L,12L)).retained();
+        var endpoint=r.witnesses().get(3); var shift=r.witnesses().get(4);
+        assertSame(endpoint.reading(),shift.reading()); assertEquals(endpoint.callback(),shift.callback());
+        var proof=ScenarioRunner.evaluateTraversal(context.runId(),r,null);
+        assertEquals(List.of(2L,3L,4L,6L,7L,8L,11L,12L),proof.ordered().stream().map(w -> w.publication().sample().tick()).toList());
+        var outside=new ScenarioObserver.ServerReading(endpoint.reading().binding(),11.249,66,2.5,4.5,25,205,105);
+        assertRejectedBecause(r,r.witnesses().stream().map(w -> w.callback()==endpoint.callback()
+                ?new ScenarioObserver.ServerWitness(w.publication(),w.callback(),outside):w).toList(),"Missing/unordered native traversal witnesses");
+    }
+
+    @Test void claimBoundaryExcludesNewEndsBeforeAndAfterScalarConstructionAndRejectsOverlapForgeryReplay() {
+        for(boolean scalarFirst:List.of(false,true)) {
+            var context=witnessContext(); var watch=new ScenarioObserver.Watch(); var binding=witnessBinding(context,null,null); watch.bind(binding);
+            var ends=witnessSamples(context); var endpoint=ends.get(7); var shift=ends.get(9); var later=ends.get(11);
+            watch.append(binding,endpoint,binding.client(),4.5); watch.append(binding,shift,binding.client(),4.5);
+            var claim=watch.beginServerRead(); assertNotNull(claim); assertEquals(2,claim.publications().size());
+            assertThrows(UnsupportedOperationException.class,() -> claim.publications().clear());
+            assertNull(watch.beginServerRead()); // Cannot replace the outstanding exact claim.
+            ScenarioObserver.ServerReading scalar=null;
+            if(scalarFirst) scalar=reading(binding.server(),shift,4.5,105);
+            watch.append(binding,later,binding.client(),4.5);
+            if(!scalarFirst) scalar=reading(binding.server(),shift,4.5,105);
+            var forged=new ScenarioObserver.ServerRead(claim.binding(),claim.publications(),claim.callback());
+            assertEquals(claim,forged); assertNotSame(claim,forged);
+            var before=watch.retained(); watch.commitServer(forged,scalar); watch.failRead(forged,new AssertionError("forged"));
+            assertEquals(before,watch.retained());
+            watch.commitServer(claim,scalar);
+            var committed=watch.retained(); assertEquals(2,committed.witnesses().size());
+            for(var row:committed.witnesses()) assertSame(scalar,row.reading());
+            watch.commitServer(claim,scalar); watch.failRead(claim,new AssertionError("replayed")); assertEquals(committed,watch.retained());
+            var next=watch.beginServerRead(); assertNotNull(next); assertEquals(3,next.callback());
+            assertEquals(1,next.publications().size()); assertSame(later,next.publications().getFirst().sample());
+            watch.commitServer(next,reading(binding.server(),later,4.5,106));
+            assertEquals(3,watch.retained().witnesses().size()); assertNull(watch.beginServerRead()); assertNull(watch.retained().failure());
+        }
+    }
+
+    @Test void serverFailureSurvivesLaterValidPublicationAndBindingLossRejectsWholeBatch() {
+        for(String cause:List.of("read-error","server-binding","client-binding")) {
+            var context=witnessContext(); var watch=new ScenarioObserver.Watch(); var binding=witnessBinding(context,null,null); watch.bind(binding);
+            var ends=witnessSamples(context); var first=ends.get(7); var second=ends.get(9); var third=ends.get(11);
+            watch.append(binding,first,binding.client(),4.5); watch.append(binding,second,binding.client(),4.5);
+            var claim=watch.beginServerRead(); assertNotNull(claim);
+            watch.append(binding,third,binding.client(),4.5);
+            Throwable expected;
+            switch(cause) {
+                case "read-error" -> { expected=new IllegalStateException("actual earlier read failure"); watch.failRead(claim,expected); }
+                case "server-binding" -> {
+                    var invalid=witnessBinding(context,null,null).server();
+                    watch.commitServer(claim,reading(invalid,first,4.5,105)); expected=watch.retained().failure();
+                    assertEquals("Native server END lost exact binding/reach",expected.getMessage());
+                }
+                default -> {
+                    watch.append(binding,laterEnd(context,12),witnessBinding(context,null,null).client(),4.5);
+                    expected=watch.retained().failure(); assertEquals("Native client END lost exact observation binding/reach",expected.getMessage());
+                    watch.commitServer(claim,reading(binding.server(),first,4.5,105));
+                }
+            }
+            assertNotNull(expected); assertSame(expected,watch.retained().failure()); assertTrue(watch.retained().witnesses().isEmpty());
+            watch.failRead(claim,new AssertionError("second cause")); watch.commitServer(claim,reading(binding.server(),first,4.5,106));
+            assertSame(expected,watch.retained().failure()); assertNull(watch.beginServerRead());
+        }
+    }
+
+    @Test void idleCallbacksCountPhysicalOrdinalsWithoutRereadingOneConsumedEnd() throws Exception {
+        var context=witnessContext(); var watch=new ScenarioObserver.Watch(); var binding=witnessBinding(context,null,null); watch.bind(binding);
+        var end=laterEnd(context,1); watch.append(binding,end,binding.client(),4.5);
+        var first=watch.beginServerRead(); watch.commitServer(first,reading(binding.server(),end,4.5,101));
+        for(int n=0;n<6001;n++) { assertNull(watch.beginServerRead()); watch.recordServer(null); }
+        assertEquals(12003,field("serverCallbacks").getLong(watch));
+        assertEquals(1,watch.retained().witnesses().size()); assertNull(watch.retained().failure());
+        watch.append(binding,laterEnd(context,2),binding.client(),4.5);
+        var next=watch.beginServerRead(); assertNotNull(next); assertEquals(12004,next.callback());
+    }
+
+    @Test void duplicateOrReorderedEndPublicationLatchesAtTheActualWatchSeam() {
+        for(long nextFrame:List.of(1L,2L)) {
+            var context=witnessContext(); var watch=new ScenarioObserver.Watch(); var binding=witnessBinding(context,null,null); watch.bind(binding);
+            watch.append(binding,laterEnd(context,2),binding.client(),4.5);
+            var claim=watch.beginServerRead(); assertNotNull(claim);
+            watch.append(binding,laterEnd(context,nextFrame),binding.client(),4.5);
+            var first=watch.retained().failure(); assertEquals("Duplicate/reordered client END publication",first.getMessage());
+            watch.commitServer(claim,reading(binding.server(),laterEnd(context,2),4.5,102));
+            assertTrue(watch.retained().witnesses().isEmpty()); assertSame(first,watch.retained().failure());
+        }
+    }
+
+    @Test void rawBatchStreamRejectsFalseAliasesDuplicateFramesAndNoncontiguousCallbackGroups() {
+        var context=witnessContext(); var r=batchedWatch(context,witnessSamples(context),null,null,
+                Set.of(1L,2L,3L,4L,5L,6L,9L,10L,11L)).retained();
+        assertDoesNotThrow(() -> ScenarioRunner.evaluateTraversal(context.runId(),r,null));
+        for(String forgery:List.of("equal-new-reading","different-reading","same-callback-new-tick","new-callback-same-tick",
+                "reuse-reading","nonadjacent-reuse","duplicate-frame","reordered-frame","reordered-group")) {
+            var bad=changeWitness(r,forgery.equals("nonadjacent-reuse")?11:forgery.equals("new-callback-same-tick")
+                    || forgery.equals("reuse-reading") || forgery.equals("reordered-group")?10:8,w -> {
+                var prior=r.witnesses().get(6); var value=prior.reading();
+                return switch(forgery) {
+                    case "equal-new-reading","different-reading","same-callback-new-tick" -> new ScenarioObserver.ServerWitness(w.publication(),w.callback(),
+                            new ScenarioObserver.ServerReading(value.binding(),value.x()+(forgery.equals("different-reading")?1:0),value.y(),value.z(),value.reach(),
+                                    value.age(),value.worldTime(),value.serverTick()+(forgery.equals("same-callback-new-tick")?1:0)));
+                    case "new-callback-same-tick" -> new ScenarioObserver.ServerWitness(w.publication(),w.callback(),reading(value.binding(),w.publication().sample(),4.5,value.serverTick()));
+                    case "reuse-reading","nonadjacent-reuse" -> new ScenarioObserver.ServerWitness(w.publication(),w.callback(),value);
+                    case "duplicate-frame" -> new ScenarioObserver.ServerWitness(prior.publication(),w.callback(),value);
+                    case "reordered-frame" -> new ScenarioObserver.ServerWitness(r.witnesses().get(5).publication(),w.callback(),value);
+                    default -> new ScenarioObserver.ServerWitness(w.publication(),prior.callback(),w.reading());
+                };
+            });
+            assertRejectedBecause(r,bad,"Duplicate/reordered native frame/server callback/tick");
+        }
+        var duplicate=new java.util.ArrayList<>(r.witnesses()); duplicate.add(7,r.witnesses().get(6));
+        assertRejectedBecause(r,duplicate,"Duplicate/reordered native frame/server callback/tick");
+    }
+
+    private static void assertRejectedBecause(ScenarioObserver.Watch.Retained original,List<ScenarioObserver.ServerWitness> witnesses,String reason) {
+        var retained=new ScenarioObserver.Watch.Retained(original.samples(),original.failure(),original.binding(),witnesses);
+        var failure=assertThrows(AssertionError.class,() -> ScenarioRunner.evaluateTraversal(original.binding().context().runId(),retained,null));
+        assertTrue(failure.getMessage().startsWith(reason),failure.getMessage());
+    }
+
     private static RunLifecycle.Context witnessContext() {
         return new RunLifecycle.Context(UUID.randomUUID(),"paired-connection","paired-world","minecraft:overworld",
                 "paired-plan",new BuildPlan.GridPos(0,65,0),"paired-settings");
     }
 
     private static List<ScenarioObserver.Sample> witnessSamples(RunLifecycle.Context context) {
+        return witnessSamples(context,false);
+    }
+
+    private static List<ScenarioObserver.Sample> witnessSamples(RunLifecycle.Context context,boolean lateShift) {
         var ends=new java.util.ArrayList<ScenarioObserver.Sample>();
         var lane=com.mapartrunner.core.run.ForwardTraversal.Substage.LANE;
         var endpoint=com.mapartrunner.core.run.ForwardTraversal.Substage.ENDPOINT;
@@ -57,11 +223,13 @@ class ScenarioInspectLifecycleTest {
         ends.add(witnessSample(context,4,endpoint,0,"EAST",11.5,2.5,false,0,1));
         ends.add(witnessSample(context,5,shift,0,"SOUTH",11.5,2.5,true,0,2));
         ends.add(witnessSample(context,6,shift,0,"SOUTH",11.5,3,true,0,3));
-        ends.add(witnessSample(context,7,entry,1,"WEST",11.5,7.5,false,0,4));
-        ends.add(witnessSample(context,8,entry,1,"WEST",11.5,7.5,false,1,5));
-        ends.add(witnessSample(context,9,lane,1,"WEST",11.5,7.5,false,0,0));
-        ends.add(witnessSample(context,10,lane,1,"WEST",11.5,7.5,true,0,0));
-        ends.add(witnessSample(context,11,lane,1,"WEST",5,7.5,true,0,0));
+        int offset=lateShift?1:0;
+        if(lateShift) ends.add(witnessSample(context,7,shift,0,"SOUTH",11.5,7.5,true,0,4));
+        ends.add(witnessSample(context,7+offset,entry,1,"WEST",11.5,7.5,false,0,4+offset));
+        ends.add(witnessSample(context,8+offset,entry,1,"WEST",11.5,7.5,false,1,5+offset));
+        ends.add(witnessSample(context,9+offset,lane,1,"WEST",11.5,7.5,false,0,0));
+        ends.add(witnessSample(context,10+offset,lane,1,"WEST",11.5,7.5,true,0,0));
+        ends.add(witnessSample(context,11+offset,lane,1,"WEST",5,7.5,true,0,0));
         var result=new java.util.ArrayList<ScenarioObserver.Sample>();
         ScenarioObserver.Sample previous=ends.getFirst();
         for(var end:ends) {
@@ -112,10 +280,16 @@ class ScenarioInspectLifecycleTest {
     }
 
     private static ScenarioObserver.Watch pairedWatch(RunLifecycle.Context context,List<ScenarioObserver.Sample> samples,Inspect host,Scope scope) {
+        return batchedWatch(context,samples,host,scope,samples.stream().filter(s -> s.phase().equals("END"))
+                .map(ScenarioObserver.Sample::tick).collect(java.util.stream.Collectors.toSet()));
+    }
+
+    private static ScenarioObserver.Watch batchedWatch(RunLifecycle.Context context,List<ScenarioObserver.Sample> samples,
+                                                       Inspect host,Scope scope,Set<Long> drainFrames) {
         var watch=new ScenarioObserver.Watch(); var binding=witnessBinding(context,host,scope); watch.bind(binding);
         for(var sample:samples) {
             watch.append(binding,sample,binding.client(),4.5);
-            if(sample.phase().equals("END")) {
+            if(sample.phase().equals("END") && drainFrames.contains(sample.tick())) {
                 var read=watch.beginServerRead();
                 assertNotNull(read);
                 watch.commitServer(read,reading(binding.server(),sample,4.5,(int)sample.tick()+100));
@@ -223,6 +397,9 @@ class ScenarioInspectLifecycleTest {
 
     @Test void watchFreezeLinearizesAgainstInflightReadsAndMoreThan6000LateCallbacks() throws Exception {
         var context=witnessContext(); var watch=pairedWatch(context,witnessSamples(context),null,null);
+        var binding=watch.retained().binding();
+        watch.append(binding,laterEnd(context,12),binding.client(),4.5);
+        watch.append(binding,laterEnd(context,13),binding.client(),4.5);
         var started=new java.util.concurrent.CountDownLatch(1); var finish=new java.util.concurrent.CountDownLatch(1);
         var inFlight=new java.util.concurrent.atomic.AtomicReference<ScenarioObserver.ServerRead>();
         var error=new java.util.concurrent.atomic.AtomicReference<Throwable>();
@@ -230,7 +407,7 @@ class ScenarioInspectLifecycleTest {
             try {
                 var read=watch.beginServerRead(); inFlight.set(read); started.countDown();
                 if(!finish.await(2,java.util.concurrent.TimeUnit.SECONDS)) throw new AssertionError("Freeze test did not release server read");
-                watch.commitServer(read,reading(read.publication().binding().server(),read.publication().sample(),4.5,999));
+                watch.commitServer(read,reading(read.publications().getFirst().binding().server(),read.publications().getFirst().sample(),4.5,999));
                 watch.failRead(read,new AssertionError("late read must not mutate failure"));
             } catch(Throwable failure) { error.set(failure); }
         },"simulated-server-read");
@@ -238,21 +415,29 @@ class ScenarioInspectLifecycleTest {
         ScenarioObserver.Watch.Retained archived;
         try {
             assertTrue(started.await(2,java.util.concurrent.TimeUnit.SECONDS)); assertNotNull(inFlight.get());
+            assertEquals(2,inFlight.get().publications().size());
+            watch.append(binding,laterEnd(context,14),binding.client(),4.5);
+            assertEquals(1,((List<?>)field("pending").get(watch)).size());
             watch.freeze(); archived=watch.retained();
         } finally { finish.countDown(); server.join(2000); }
         assertFalse(server.isAlive()); assertNull(error.get());
         var read=inFlight.get();
+        long callbacks=field("serverCallbacks").getLong(watch);
         for(int n=0;n<6002;n++) {
             assertNull(watch.beginServerRead()); watch.recordServer(null);
-            watch.append(archived.binding(),read.publication().sample(),archived.binding().client(),4.5);
+            watch.append(archived.binding(),read.publications().getFirst().sample(),archived.binding().client(),4.5);
         }
         assertEquals(archived,watch.retained());
+        assertEquals(callbacks,field("serverCallbacks").getLong(watch));
+        assertNull(field("inFlight").get(watch)); assertTrue(((List<?>)field("pending").get(watch)).isEmpty());
         watch.clear();
         var fresh=witnessBinding(witnessContext(),null,null); watch.bind(fresh);
         var freshEnd=witnessSamples(fresh.context()).get(7); watch.append(fresh,freshEnd,fresh.client(),4.5);
-        watch.commitServer(read,reading(archived.binding().server(),read.publication().sample(),4.5,1000));
+        var freshRead=watch.beginServerRead(); assertNotNull(freshRead); assertEquals(1,freshRead.callback());
+        watch.commitServer(read,reading(archived.binding().server(),read.publications().getFirst().sample(),4.5,1000));
+        watch.failRead(read,new AssertionError("old completion cannot consume fresh claim"));
+        assertSame(freshRead,field("inFlight").get(watch));
         assertTrue(watch.retained().witnesses().isEmpty()); assertSame(fresh,watch.retained().binding());
-        var freshRead=watch.beginServerRead(); assertEquals(1,freshRead.callback());
         watch.commitServer(freshRead,reading(fresh.server(),freshEnd,4.5,101));
         assertEquals(1,watch.retained().witnesses().size());
         assertEquals(11,archived.witnesses().size());
@@ -272,32 +457,44 @@ class ScenarioInspectLifecycleTest {
 
     @Test void automaticObserverCloseDisarmsPairedReadsWithoutClearingRetainedBinding() {
         var context=witnessContext(); var watch=pairedWatch(context,witnessSamples(context),null,null);
-        var read=watch.beginServerRead(); watch.closeWorld(); var archived=watch.retained();
+        var binding=watch.retained().binding(); watch.append(binding,laterEnd(context,12),binding.client(),4.5);
+        var read=watch.beginServerRead(); assertNotNull(read);
+        watch.append(binding,laterEnd(context,13),binding.client(),4.5);
+        watch.closeWorld(); var archived=watch.retained();
         assertNotNull(archived.binding());
-        watch.commitServer(read,reading(archived.binding().server(),read.publication().sample(),4.5,999));
+        watch.commitServer(read,reading(archived.binding().server(),read.publications().getFirst().sample(),4.5,999));
         assertNull(watch.beginServerRead()); assertEquals(archived,watch.retained());
     }
 
-    @Test void changedPublicationDiscardsInflightReadAndServerCapLatchesFirstCause() {
+    @Test void uniqueEndPublicationsBoundCommittedPendingAndClaimedRowsByCombinedSampleCap() throws Exception {
         var context=witnessContext(); var watch=new ScenarioObserver.Watch(); var binding=witnessBinding(context,null,null); watch.bind(binding);
-        var samples=witnessSamples(context); var endpoint=samples.get(7); var shift=samples.get(9);
-        watch.append(binding,endpoint,binding.client(),4.5); var old=watch.beginServerRead();
-        watch.append(binding,shift,binding.client(),4.5);
-        watch.commitServer(old,reading(binding.server(),endpoint,4.5,101));
-        watch.failRead(old,new AssertionError("discard replaced publication error"));
-        assertTrue(watch.retained().witnesses().isEmpty()); assertNull(watch.retained().failure());
-        for(int n=0;n<6000;n++) {
-            var read=watch.beginServerRead();
-            assertSame(shift,read.publication().sample());
-            watch.commitServer(read,reading(binding.server(),shift,4.5,n+200));
+        ScenarioObserver.ServerRead claim=null;
+        for(int n=1;n<=6000;n++) {
+            watch.append(binding,laterEnd(context,n),binding.client(),4.5);
+            if(n%2000==0) {
+                int claimed=claim==null?0:claim.publications().size();
+                assertEquals(n,watch.retained().witnesses().size()+((List<?>)field("pending").get(watch)).size()+claimed);
+                if(claim!=null) watch.commitServer(claim,reading(binding.server(),claim.publications().getLast().sample(),4.5,n));
+                claim=watch.beginServerRead(); assertNotNull(claim);
+                assertEquals(2000,claim.publications().size());
+            }
         }
-        var extra=watch.beginServerRead(); watch.commitServer(extra,reading(binding.server(),shift,4.5,6200));
+        watch.commitServer(claim,reading(binding.server(),claim.publications().getLast().sample(),4.5,6200));
         assertEquals(6000,watch.retained().witnesses().size());
+        assertEquals(6000,watch.retained().samples().size()); assertNull(watch.retained().failure());
+        assertEquals(6000,watch.retained().witnesses().stream().map(w -> w.publication().sample().tick()).distinct().count());
+        assertNull(watch.beginServerRead());
+        watch.append(binding,laterEnd(context,6001),binding.client(),4.5);
         var failure=watch.retained().failure(); assertInstanceOf(AssertionError.class,failure);
-        watch.failRead(extra,new IllegalStateException("second cause")); assertSame(failure,watch.retained().failure());
+        assertEquals("Client observer exceeded 6000 samples",failure.getMessage());
+        watch.failRead(claim,new IllegalStateException("second cause")); assertSame(failure,watch.retained().failure());
         watch.freeze(); var retained=watch.retained();
         for(int n=0;n<6002;n++) watch.recordServer(null);
         assertEquals(retained,watch.retained());
+    }
+
+    private static ScenarioObserver.Sample laterEnd(RunLifecycle.Context context,long frame) {
+        return witnessSample(context,frame,com.mapartrunner.core.run.ForwardTraversal.Substage.LANE,1,"WEST",5,7.5,true,0,0);
     }
 
     @Test void watchRejectsClientAndServerIdentityLossAndNeverPublishesStartOrTest() {
@@ -404,7 +601,8 @@ class ScenarioInspectLifecycleTest {
             var lookalike=new ScenarioObserver.Binding(UUID.randomUUID(),context,legitimate.client(),legitimate.server(),host,
                     new Scope(operation,Kind.WORK,work.deadlineNanos()));
             assertThrows(IllegalStateException.class,() -> new ScenarioObserver.Watch().bind(lookalike));
-            var read=watch.beginServerRead();
+            watch.append(legitimate,laterEnd(context,12),legitimate.client(),4.5);
+            var read=watch.beginServerRead(); assertNotNull(read);
             switch(invalidation) {
                 case "expiry" -> now.set(work.deadlineNanos());
                 case "cancel" -> host.cancelSession(new IllegalStateException("cancelled"));
@@ -419,8 +617,8 @@ class ScenarioInspectLifecycleTest {
             }
             var retained=watch.retained();
             assertFalse(host.observationScopeValid(work)); assertNull(watch.beginServerRead());
-            watch.commitServer(read,reading(retained.binding().server(),read.publication().sample(),4.5,999));
-            watch.append(retained.binding(),read.publication().sample(),retained.binding().client(),4.5);
+            watch.commitServer(read,reading(retained.binding().server(),read.publications().getFirst().sample(),4.5,999));
+            watch.append(retained.binding(),read.publications().getFirst().sample(),retained.binding().client(),4.5);
             assertEquals(retained,watch.retained());
         }
     }
