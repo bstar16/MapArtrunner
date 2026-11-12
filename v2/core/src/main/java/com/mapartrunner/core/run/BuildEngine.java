@@ -2,6 +2,7 @@ package com.mapartrunner.core.run;
 
 import com.mapartrunner.core.model.BuildPlan;
 import com.mapartrunner.core.model.BuildPlan.Target;
+import com.mapartrunner.core.movement.MovementPolicy;
 import com.mapartrunner.core.movement.MovementPolicy.*;
 import com.mapartrunner.core.placement.PlacementLedger;
 import com.mapartrunner.core.placement.PlacementObservation;
@@ -207,7 +208,10 @@ public final class BuildEngine {
         if (input.player().isPresent()) {
             PlayerObservation player = input.player().orElseThrow();
             boolean shifting = lifecycle.snapshot().activity().orElseThrow() == Activity.SHIFT;
-            var lane = traversal.snapshot().entry().lane();
+            var selection = traversal.snapshot();
+            var lane = selection.entry().lane();
+            var entrySupport = verifying ? Set.<BuildPlan.GridPos>of()
+                    : new MovementPolicy().entrySupportFootprint(player, selection.entry());
             double center = lane.direction().lateralCoordinate(lane.start().x(), lane.start().z())
                     * lane.direction().lateralStrafeSign();
             Comparator<Target> order = verifying
@@ -220,7 +224,7 @@ public final class BuildEngine {
             Optional<Target> selected = ledger.unfinishedTargets().stream()
                     .filter(t -> input.availability().get(t.id()) == PlacementAvailability.READY)
                     .filter(t -> retryReady(t, current))
-                    .filter(t -> verifying || bucket(t, player) < 3 || shifting && transitionRegionContains(t))
+                    .filter(t -> verifying || placementGeometry(t, player, selection, entrySupport))
                     .min(order);
             if (selected.isPresent()) {
                 int id = selected.orElseThrow().id(); long action = nextActionId++;
@@ -288,9 +292,27 @@ public final class BuildEngine {
     }
 
     private boolean transitionRegionContains(Target target) {
-        return traversal.snapshot().transitionRegion().filter(r -> target.relativePos().x() >= r.minX()
-                && target.relativePos().x() <= r.maxX() && target.relativePos().z() >= r.minZ()
-                && target.relativePos().z() <= r.maxZ()).isPresent();
+        return traversal.snapshot().transitionRegion().filter(r -> rectangleContains(r, target)).isPresent();
+    }
+
+    private boolean placementGeometry(Target target, PlayerObservation player, ForwardTraversal.Snapshot selection,
+                                      Set<BuildPlan.GridPos> entrySupport) {
+        // Use the post-advance stage: handoffs retain canonical bounds, while SHIFT owns only the turn rectangle.
+        boolean local = bucket(target, player) < 3;
+        boolean entry = local && entrySupport.contains(target.relativePos());
+        boolean canonical = local && rectangleContains(selection.entry().lane().corridor(), target);
+        boolean turn = selection.transitionRegion().filter(r -> rectangleContains(r, target)).isPresent();
+        return switch (selection.substage()) {
+            case LANE, TRANSIT -> canonical || entry;
+            case ENDPOINT, NEXT_ENTRY -> canonical || turn || entry;
+            case SHIFT -> turn || entry;
+        };
+    }
+
+    private static boolean rectangleContains(LanePlanner.Corridor rectangle, Target target) {
+        var p = target.relativePos();
+        return p.x() >= rectangle.minX() && p.x() <= rectangle.maxX()
+                && p.z() >= rectangle.minZ() && p.z() <= rectangle.maxZ();
     }
 
     private int shiftPriority(Target target, PlayerObservation player) {

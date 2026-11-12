@@ -543,6 +543,165 @@ class MovementPolicyTest {
         assertEquals(0, result.nextSupportHoldTicks());
     }
 
+    @ParameterizedTest
+    @EnumSource(Direction.class)
+    void entryProgressPriorityChecksOnlyCurrentAndCommandedNextSupport(Direction direction) {
+        Lane base = lane(direction);
+        double start = direction.progressCoordinate(base.start().x(), base.start().z()) + .5;
+        var player = player(direction, start - direction.forwardSign() * .5, 3.5, direction.yawDegrees());
+        int x = (int) Math.floor(player.x()), z = (int) Math.floor(player.z());
+        var current = new GridPos(x, 0, z);
+        var next = new GridPos(x + (direction.alongX() ? direction.forwardSign() : 0), 0,
+                z + (direction.alongX() ? 0 : direction.forwardSign()));
+        var lateralNeighbor = new GridPos(x + (direction.alongX() ? 0 : -1), 0,
+                z + (direction.alongX() ? -1 : 0));
+        Lane lane = withTargets(base, current, next, lateralNeighbor);
+        var entry = context(lane, Stage.ENTER_POSITION, 7, 13, 0, 21, 0, Set.of(), true);
+        var ready = new MovementIntent(Status.ENTERING, Failure.NONE, direction.yawDegrees(),
+                true, false, Strafe.NONE, false, Stage.ENTER_POSITION, 8, 14, 0, 0, 0);
+        assertEquals(ready, policy.decide(player, entry, observed(lane, STONE)));
+        // A missing unrelated lateral neighbor does not override progress-axis entry.
+        assertEquals(ready, policy.decide(player, entry, new SupportObservation(Map.of(
+                current, sample(Evidence.OBSERVED, STONE), next, sample(Evidence.OBSERVED, STONE)))));
+        for (GridPos missing : List.of(current, next)) {
+            var cells = new HashMap<>(observed(lane, STONE).cells());
+            cells.remove(missing);
+            assertEquals(new MovementIntent(Status.HOLDING_SUPPORT, Failure.NONE, direction.yawDegrees(),
+                    false, false, Strafe.NONE, false, Stage.ENTER_POSITION, 8, 14, 0, 22, 0),
+                    policy.decide(player, entry, new SupportObservation(cells)));
+        }
+    }
+
+    @Test
+    void entryMixedSupportKeepsStrictestTimeoutBeforeEntryTimeout() {
+        var current = new GridPos(0, 0, 2);
+        var next = new GridPos(1, 0, 2);
+        Lane lane = withTargets(lane(Direction.EAST), current, next);
+        var player = new PlayerObservation(0, 1, 2.5, 0);
+        var entry = context(lane, Stage.ENTER_POSITION, 40, 52, 0, 39, 0, Set.of(), true);
+        for (GridPos wrong : List.of(current, next)) {
+            terminal(policy.decide(player, entry, new SupportObservation(Map.of(
+                    wrong, sample(Evidence.OBSERVED, AIR)))), Failure.SUPPORT_TIMEOUT);
+        }
+        terminal(policy.decide(player, entry, UNKNOWN), Failure.ENTRY_TIMEOUT);
+    }
+
+    @Test
+    void nonzeroPlaneEntryKeepsSupportAndPositionedDebtBehavior() {
+        var current = new GridPos(-1, 17, 2);
+        var next = new GridPos(0, 17, 2);
+        Lane lane = withTargets(new Lane(0, Direction.EAST, new GridPos(0, 17, 2), new GridPos(10, 17, 2),
+                new Corridor(0, 10, 0, 4), new ExpectedFloor(Map.of())), current, next);
+        var entry = context(lane, Stage.ENTER_POSITION, 4, 8, 0, 79, 0, Set.of(), true);
+        terminal(policy.decide(new PlayerObservation(-.4, 18, 2.5, -90), entry, UNKNOWN), Failure.SUPPORT_TIMEOUT);
+        assertEquals(new MovementIntent(Status.ENTERING, Failure.NONE, -90,
+                        true, false, Strafe.NONE, false, Stage.ENTER_POSITION, 5, 9, 0, 0, 0),
+                policy.decide(new PlayerObservation(-.4, 18, 2.5, -90), entry, observed(lane, STONE)));
+        assertEquals(new MovementIntent(Status.ALIGNING_YAW, Failure.NONE, -90,
+                        false, false, Strafe.NONE, false, Stage.ENTER_YAW, 0, 9, 0, 79, 0),
+                policy.decide(new PlayerObservation(.25, 18, 2.75, 0), entry, UNKNOWN));
+    }
+
+    @ParameterizedTest
+    @CsvSource({"EAST,0,2.5,1,2", "EAST,1,2.5,0,2",
+            "WEST,11,2.5,10,2", "WEST,10,2.5,11,2",
+            "SOUTH,2.5,0,2,1", "SOUTH,2.5,1,2,0",
+            "NORTH,2.5,11,2,10", "NORTH,2.5,10,2,11",
+            "EAST,0.5,3,0,2", "EAST,0.5,2,0,3",
+            "WEST,10.5,3,10,2", "WEST,10.5,2,10,3",
+            "SOUTH,3,0.5,2,0", "SOUTH,2,0.5,3,0",
+            "NORTH,3,10.5,2,10", "NORTH,2,10.5,3,10",
+            "EAST,0,3.5,1,3", "WEST,11,3.5,10,3",
+            "SOUTH,3.5,0,3,1", "NORTH,3.5,11,3,10"})
+    void entryGeometryContainsOnlyCurrentAndExactCommandedNextCell(Direction direction, double x, double z, int nextX, int nextZ) {
+        var player = new PlayerObservation(x, 1, z, 45); // Geometry remains available during a yaw hold.
+        var entry = fresh(lane(direction), Stage.ENTER_POSITION);
+        var footprint = policy.entrySupportFootprint(player, entry);
+        assertEquals(Set.of(new GridPos((int) Math.floor(x), 0, (int) Math.floor(z)),
+                new GridPos(nextX, 0, nextZ)), footprint);
+        assertThrows(UnsupportedOperationException.class, () -> footprint.add(new GridPos(99, 0, 99)));
+        assertThrows(UnsupportedOperationException.class, footprint::clear);
+        assertEquals(footprint, new MovementPolicy().entrySupportFootprint(player, entry));
+    }
+
+    @ParameterizedTest
+    @CsvSource({"0.25,2.25", "0.25,2.75", "0.75,2.25", "0.75,2.75", "0.5,2.5"})
+    void entryGeometryIsEmptyAtInclusivePositionTolerance(double x, double z) {
+        var entry = context(lane(Direction.EAST), Stage.ENTER_POSITION, 40, 51, 0, 79, 0, Set.of(), true);
+        var player = new PlayerObservation(x, 1, z, 0);
+        var before = policy.decide(player, entry, UNKNOWN);
+        assertEquals(Set.of(), policy.entrySupportFootprint(player, entry));
+        assertEquals(before, policy.decide(player, entry, UNKNOWN));
+        assertEquals(79, before.nextSupportHoldTicks());
+    }
+
+    @Test
+    void entryGeometryIncludesExactNeighborsImmediatelyOutsideTolerance() {
+        var entry = fresh(lane(Direction.EAST), Stage.ENTER_POSITION);
+        assertEquals(Set.of(new GridPos(0, 0, 2), new GridPos(1, 0, 2)),
+                policy.entrySupportFootprint(new PlayerObservation(Math.nextDown(.25), 1, 2.5, -90), entry));
+        assertEquals(Set.of(new GridPos(0, 0, 2), new GridPos(-1, 0, 2)),
+                policy.entrySupportFootprint(new PlayerObservation(Math.nextUp(.75), 1, 2.5, -90), entry));
+        assertEquals(Set.of(new GridPos(0, 0, 2), new GridPos(0, 0, 3)),
+                policy.entrySupportFootprint(new PlayerObservation(.5, 1, Math.nextDown(2.25), -90), entry));
+        assertEquals(Set.of(new GridPos(0, 0, 2), new GridPos(0, 0, 1)),
+                policy.entrySupportFootprint(new PlayerObservation(.5, 1, Math.nextUp(2.75), -90), entry));
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = Stage.class, names = {"ENTER_YAW", "WALK"})
+    void entryGeometryIsEmptyDuringOtherStagesEvenWhenNotPositioned(Stage stage) {
+        var entry = fresh(lane(Direction.EAST), stage);
+        var player = new PlayerObservation(0, 1, 3.5, -90);
+        var before = policy.decide(player, entry, UNKNOWN);
+        assertEquals(Set.of(), policy.entrySupportFootprint(player, entry));
+        assertEquals(before, policy.decide(player, entry, UNKNOWN));
+    }
+
+    @Test
+    void entryGeometryUsesActualPlaneAndIncludesOffPlanOutsideCorridorCells() {
+        Lane lane = new Lane(0, Direction.EAST, new GridPos(0, 17, 2), new GridPos(10, 17, 2),
+                new Corridor(0, 10, 0, 4), new ExpectedFloor(Map.of()));
+        var entry = fresh(lane, Stage.ENTER_POSITION);
+        assertEquals(Set.of(new GridPos(-1, 17, 2), new GridPos(0, 17, 2)),
+                policy.entrySupportFootprint(new PlayerObservation(-.4, 18, 2.5, -90), entry));
+        assertEquals(Set.of(new GridPos(0, 17, 5), new GridPos(0, 17, 4)),
+                policy.entrySupportFootprint(new PlayerObservation(.5, 18, 5.25, -90), entry));
+    }
+
+    @ParameterizedTest
+    @EnumSource(Direction.class)
+    void entryGeometryOmitsOutOfIntegerRangeCurrentOrNextWithoutWrapping(Direction direction) {
+        int edge = direction.forwardSign() > 0 ? Integer.MIN_VALUE : Integer.MAX_VALUE;
+        var start = direction.alongX() ? new GridPos(edge, 9, 2) : new GridPos(2, 9, edge);
+        var end = direction.alongX() ? new GridPos(edge + direction.forwardSign() * 5, 9, 2)
+                : new GridPos(2, 9, edge + direction.forwardSign() * 5);
+        var corridor = direction.alongX() ? new Corridor(Math.min(start.x(), end.x()), Math.max(start.x(), end.x()), 0, 4)
+                : new Corridor(0, 4, Math.min(start.z(), end.z()), Math.max(start.z(), end.z()));
+        Lane lane = new Lane(0, direction, start, end, corridor, new ExpectedFloor(Map.of()));
+        double progress = direction.forwardSign() > 0 ? (double) edge - .25 : (double) edge + 1;
+        var player = direction.alongX() ? new PlayerObservation(progress, 10, 2.5, direction.yawDegrees())
+                : new PlayerObservation(2.5, 10, progress, direction.yawDegrees());
+        assertEquals(Set.of(start), policy.entrySupportFootprint(player, fresh(lane, Stage.ENTER_POSITION)));
+
+        int opposite = direction.forwardSign() > 0 ? Integer.MAX_VALUE : Integer.MIN_VALUE;
+        var point = direction.alongX() ? new GridPos(opposite, 9, 2) : new GridPos(2, 9, opposite);
+        Lane pointLane = new Lane(0, direction, point, point,
+                new Corridor(point.x(), point.x(), point.z(), point.z()), new ExpectedFloor(Map.of()));
+        double pointProgress = (double) opposite + (direction.forwardSign() > 0 ? 0 : .9);
+        var pointPlayer = direction.alongX() ? new PlayerObservation(pointProgress, 10, 2.5, direction.yawDegrees())
+                : new PlayerObservation(2.5, 10, pointProgress, direction.yawDegrees());
+        assertEquals(Set.of(point), policy.entrySupportFootprint(pointPlayer, fresh(pointLane, Stage.ENTER_POSITION)));
+        assertEquals(Set.of(), policy.entrySupportFootprint(new PlayerObservation(Double.MAX_VALUE, 10,
+                Double.MAX_VALUE, 0), fresh(lane, Stage.ENTER_POSITION)));
+    }
+
+    @Test
+    void entryGeometryRejectsNullInputs() {
+        assertThrows(NullPointerException.class, () -> policy.entrySupportFootprint(null, fresh(lane(Direction.EAST), Stage.WALK)));
+        assertThrows(NullPointerException.class, () -> policy.entrySupportFootprint(new PlayerObservation(0, 1, 2, -90), null));
+    }
+
     private static Lane lane(Direction direction) {
         return switch (direction) {
             case EAST -> new Lane(0, direction, new GridPos(0, 0, 2), new GridPos(10, 0, 2), new Corridor(0, 10, 0, 4), new ExpectedFloor(Map.of()));

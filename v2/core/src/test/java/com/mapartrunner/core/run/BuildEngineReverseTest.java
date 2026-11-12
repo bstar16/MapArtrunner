@@ -21,6 +21,53 @@ import static org.junit.jupiter.api.Assertions.*;
 
 /** Canonical pose samples exercise source policy only; these are not native travel evidence. */
 class BuildEngineReverseTest {
+    @Test void reverseTransitCleansCanonicalStripeButRefusesOtherStripe() {
+        var h = new Harness(plan(12, 15, target(900, 0, 2), target(863, 4, 7), target(826, 4, 12)));
+        forward(h, Set.of(863), true);
+        assertEquals(Substage.TRANSIT, state(h).substage());
+        for (int k = 0; k < 3; k++) drive(h, Set.of(863));
+        h.available.put(863, PlacementAvailability.READY); h.available.put(826, PlacementAvailability.READY);
+        var cleaned = sample(h, new PlayerObservation(4.5, 1, 12.5, 90), Set.of(863, 826));
+        assertEquals(826, cleaned.placement().orElseThrow().targetId());
+        var refused = sample(h, new PlayerObservation(4.5, 1, 12.5, 90), Set.of(863));
+        assertTrue(refused.placement().isEmpty());
+        assertEquals(List.of(863), refused.snapshot().unfinishedTargetIds());
+        assertTrue(refused.snapshot().pendingTargetIds().isEmpty());
+    }
+
+    @Test void reverseStripeRefusesEarlierReadyWorkAndLaterIssuesIt() {
+        var route = forward(12, 15, Set.of(900, 863)); var h = route.h;
+        while (state(h).substage() != Substage.NEXT_ENTRY || state(h).laneIndex() != 1) drive(h, route.unfinished);
+        h.available.put(900, PlacementAvailability.READY); h.available.put(863, PlacementAvailability.READY);
+        assertEquals(863, drive(h, route.unfinished).placement().orElseThrow().targetId());
+        drive(h, Set.of(900));
+        var refused = drive(h, Set.of(900));
+        assertTrue(refused.placement().isEmpty());
+        assertEquals(List.of(900), refused.snapshot().unfinishedTargetIds());
+        assertFalse(refused.snapshot().pendingTargetIds().contains(900));
+        boolean issued = false;
+        for (int k = 0; k < 60 && !issued; k++) {
+            var d = drive(h, Set.of(900));
+            if (d.placement().isPresent()) { assertEquals(900, d.placement().orElseThrow().targetId()); issued = true; }
+        }
+        assertTrue(issued);
+        assertEquals(0, state(h).laneIndex());
+    }
+
+    @Test void northCheckpointRetainsCanonicalXStripeBeyondTurnRectangle() {
+        var h = new Harness(plan(12, 20, target(900, 0, 2), target(863, 0, 7),
+                target(826, 0, 12), target(789, 0, 17), target(10, 9, 12)));
+        forward(h, Set.of(900), true);
+        while (state(h).substage() != Substage.NEXT_ENTRY || state(h).laneIndex() != 2) drive(h, Set.of(900));
+        assertEquals(Direction.NORTH, state(h).entry().lane().direction());
+        assertEquals(10, state(h).entry().lane().corridor().minZ());
+        h.available.put(10, PlacementAvailability.READY);
+        var repaired = drive(h, Set.of(900, 10));
+        assertEquals(10, repaired.placement().orElseThrow().targetId());
+        assertTrue(repaired.snapshot().unfinishedTargetIds().contains(900));
+        assertFalse(repaired.snapshot().pendingTargetIds().contains(900));
+    }
+
     @Test void middleOnlyReverseReachesWestXBeforeEastBuild() {
         var route = forward(12, 15, Set.of(863));
         var h = route.h;

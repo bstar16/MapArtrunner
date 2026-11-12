@@ -20,6 +20,24 @@ import java.util.Set;
  * changes retain unresolved support; only an evaluated ready footprint or termination clears it.
  */
 public final class MovementPolicy {
+    /**
+     * Exact current/commanded-next entry support geometry at the lane's build-plane Y.
+     * Empty outside unpositioned ENTER_POSITION; out-of-int-range cells are omitted.
+     * This immutable projection supplies no evidence that a cell is loaded, observed or safe.
+     */
+    public Set<GridPos> entrySupportFootprint(PlayerObservation player, LaneEntry entry) {
+        Objects.requireNonNull(player, "player");
+        Objects.requireNonNull(entry, "entry");
+        if (entry.stage() != Stage.ENTER_POSITION || positioned(player, entry.lane())) return Set.of();
+        var footprint = new HashSet<GridPos>();
+        for (Cell cell : entryCells(player, entryCommand(player, entry.lane()))) {
+            if (cell.x() < Integer.MIN_VALUE || cell.x() > Integer.MAX_VALUE
+                    || cell.z() < Integer.MIN_VALUE || cell.z() > Integer.MAX_VALUE) continue;
+            footprint.add(new GridPos((int) cell.x(), entry.lane().start().y(), (int) cell.z()));
+        }
+        return Set.copyOf(footprint);
+    }
+
     public MovementIntent decide(PlayerObservation player, LaneEntry entry, SupportObservation support) {
         Objects.requireNonNull(player, "player");
         Objects.requireNonNull(entry, "entry");
@@ -37,14 +55,12 @@ public final class MovementPolicy {
     private MovementIntent enter(PlayerObservation player, LaneEntry entry, SupportObservation support) {
         Lane lane = entry.lane();
         Direction direction = lane.direction();
-        boolean positioned = withinEntry(player.x(), lane.start().x() + .5)
-                && withinEntry(player.z(), lane.start().z() + .5);
+        boolean positioned = positioned(player, lane);
         Command command = null;
         SupportResult floor = new SupportResult(false, false, entry.supportHoldTicks());
         if (entry.stage() == Stage.ENTER_POSITION && !positioned) {
             command = entryCommand(player, lane);
-            Cell current = new Cell((long) Math.floor(player.x()), (long) Math.floor(player.z()));
-            floor = checkSupport(Set.of(current, new Cell(current.x() + command.dx(), current.z() + command.dz())), entry, support);
+            floor = checkSupport(entryCells(player, command), entry, support);
             if (floor.expired()) return terminal(entry, Failure.SUPPORT_TIMEOUT);
         }
         if (entry.entryElapsedTicks() >= 52) return terminal(entry, Failure.ENTRY_TIMEOUT);
@@ -123,6 +139,16 @@ public final class MovementPolicy {
         Strafe strafe = correction(lateral, center, .25, direction);
         int delta = direction.forwardSign() * (strafe == Strafe.LEFT ? 1 : -1);
         return new Command(false, false, strafe, direction.alongX() ? 0 : delta, direction.alongX() ? -delta : 0);
+    }
+
+    private static Set<Cell> entryCells(PlayerObservation player, Command command) {
+        Cell current = new Cell((long) Math.floor(player.x()), (long) Math.floor(player.z()));
+        return Set.of(current, new Cell(current.x() + command.dx(), current.z() + command.dz()));
+    }
+
+    private static boolean positioned(PlayerObservation player, Lane lane) {
+        return withinEntry(player.x(), lane.start().x() + .5)
+                && withinEntry(player.z(), lane.start().z() + .5);
     }
 
     private static Strafe correction(double lateral, double center, double tolerance, Direction direction) {

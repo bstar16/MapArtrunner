@@ -15,6 +15,52 @@ import static com.mapartrunner.core.run.RunLifecycle.*;
 import static org.junit.jupiter.api.Assertions.*;
 
 class BuildEngineResumeTest {
+    @Test void clippedEntriesRepairBehindStartButRetainOtherStripeForItsOwnPass() {
+        for (int index : List.of(0, 1)) {
+            int start = index == 0 ? 40 : 60, z = index == 0 ? 2 : 7, other = index == 0 ? 7 : 2;
+            var h = new Harness(plan(100, 10, target(1, start, z), target(2, start + (index == 0 ? -1 : 1), z),
+                    target(3, index == 0 ? 70 : 20, z), target(4, start, other), target(900, 0, other)));
+            h.support = support(h.plan, STONE, Evidence.OBSERVED);
+            h.observations = h.plan.targets().stream().map(t -> observation(h, t.id(), h.nextTick,
+                    Set.of(1, 3, 900).contains(t.id()) ? AIR : STONE, Evidence.OBSERVED)).toList();
+            h.at(new PlayerObservation(start + .5, 1, z + .5, index == 0 ? -90 : 90));
+            h.step();
+            assertEquals(new GridPos(start, 0, z), h.engine.snapshot().laneEntry().orElseThrow().lane().start());
+            h.observations = List.of(); h.step(); h.step();
+            h.observations = List.of(observation(h, 2, h.nextTick, AIR, Evidence.OBSERVED),
+                    observation(h, 4, h.nextTick, AIR, Evidence.OBSERVED));
+            h.available.put(2, PlacementAvailability.READY); h.available.put(4, PlacementAvailability.READY);
+            assertEquals(2, h.step().placement().orElseThrow().targetId());
+            h.observations = List.of(observation(h, 2, h.nextTick, STONE, Evidence.OBSERVED));
+            var refused = h.step(); assertTrue(refused.placement().isEmpty());
+            assertTrue(refused.snapshot().unfinishedTargetIds().containsAll(List.of(4, 900)));
+            assertFalse(refused.snapshot().pendingTargetIds().contains(4));
+            h.available.replaceAll((id, value) -> id == 900 ? PlacementAvailability.READY : PlacementAvailability.NO_VALID_HIT);
+            boolean issued = false;
+            for (int k = 0; k < 80 && !issued; k++) {
+                var entry = h.engine.snapshot().laneEntry().orElseThrow();
+                var at = entry.stage() == Stage.WALK ? entry.lane().end() : entry.lane().start();
+                h.at(new PlayerObservation(at.x() + .5, 1, at.z() + .5, entry.lane().direction().yawDegrees()));
+                h.observations = h.plan.targets().stream().map(t -> observation(h, t.id(), h.nextTick,
+                        t.id() == 900 ? AIR : STONE, Evidence.OBSERVED)).toList();
+                var d = h.step(); assertRunning(d);
+                if (d.placement().isPresent()) {
+                    assertEquals(900, d.placement().orElseThrow().targetId()); issued = true;
+                }
+            }
+            assertTrue(issued, "Earlier retained work must remain issuable on its rightful stripe/reverse");
+            for (int k = 0; k < 80 && h.engine.snapshot().lifecycle().activity().orElseThrow() != Activity.VERIFY; k++) {
+                var entry = h.engine.snapshot().laneEntry().orElseThrow();
+                var at = entry.stage() == Stage.WALK ? entry.lane().end() : entry.lane().start();
+                h.at(new PlayerObservation(at.x() + .5, 1, at.z() + .5, entry.lane().direction().yawDegrees()));
+                h.observations = h.scan(STONE); assertRunning(h.step());
+            }
+            assertEquals(Activity.VERIFY, h.engine.snapshot().lifecycle().activity().orElseThrow());
+            h.observations = h.scan(STONE);
+            assertEquals(Outcome.SUCCESS, h.step().snapshot().lifecycle().outcome().orElseThrow());
+        }
+    }
+
     @Test void nearLane20RetainsLane0() {
         var h = new Harness(twentyOneLanes());
         var canonical = new LanePlanner().plan(h.plan, 2, 5);
