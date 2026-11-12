@@ -174,6 +174,15 @@ final class ScenarioCommands {
         return new InspectObservation(isReady(), queued, exit != Exit.OPEN || cancelled || terminal != null, published);
     }
 
+    /** Fresh read-only input guard; equality authenticates values, never a reusable scope or permission. */
+    synchronized void requireAcceptanceIdle(MinecraftClient client, PublishedCompletion expected) {
+        if (!Boolean.getBoolean("mapart.test.inspect") || !Boolean.getBoolean("mapart.test.inspect.acceptance")
+                || System.getProperty("fabric.client.gametest") != null || refusal() != null
+                || expected == null || !observeInspect().last().filter(expected::equals).isPresent())
+            throw new IllegalStateException("Acceptance input requires settled current completion and ordinary gates");
+        runner.requireInspectCommandWorld(client);
+    }
+
     /** Native intent only: no scope, IO, wait, interrupt or replacement worker. */
     synchronized boolean requestStop() {
         if (releaseNativeStop()) return false;

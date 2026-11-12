@@ -1,7 +1,10 @@
 package com.mapartrunner.fabric.scenario;
 
 import com.mapartrunner.fabric.scenario.mixin.InspectKeyboardInvoker;
+import com.mapartrunner.fabric.MapArtClient;
+import com.mapartrunner.core.run.BuildEngine;
 import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.option.KeyBinding;
 import net.minecraft.client.gui.screen.ChatScreen;
 import net.minecraft.client.gui.widget.TextFieldWidget;
 import net.minecraft.client.input.CharInput;
@@ -19,7 +22,8 @@ final class InspectAcceptanceDriver {
     private static final long INPUT_NANOS = 30_000_000_000L;
     private static final int ENTER = 257;
     private static final Command[] MUTATIONS = {Command.RUN, Command.RESET, Command.RUN, Command.RERUN, Command.RERUN};
-    private enum Stage { WAIT_STARTUP, NEXT_COMMAND, OPEN_CHAT, WAIT_HANDOFF, WAIT_COMPLETION, STOPPED }
+    private static final Command[] DISPLACED = {Command.RUN, Command.RESET, Command.RUN, Command.RESET, Command.RUN};
+    private enum Stage { WAIT_STARTUP, NEXT_COMMAND, MOVING, OPEN_CHAT, WAIT_HANDOFF, WAIT_COMPLETION, STOPPED }
 
     // This driver alone owns its sequence and synthetic key. No Runner/Host state is changed here.
     private final Supplier<InspectObservation> observations;
@@ -27,6 +31,7 @@ final class InspectAcceptanceDriver {
     private final LongSupplier clock;
     private final BooleanSupplier enabled;
     private final Consumer<String> log;
+    private final Consumer<PublishedCompletion> idleGuard;
     private final Set<UUID> operations = new HashSet<>(), runs = new LinkedHashSet<>();
     private final Set<String> directories = new HashSet<>(), summaries = new HashSet<>();
     private Stage stage = Stage.WAIT_STARTUP;
@@ -36,16 +41,26 @@ final class InspectAcceptanceDriver {
     private PublishedCompletion retained, pending;
     private UUID session;
     private boolean advancing, failed, stopRequested;
+    private boolean selected, displaced, moved, middleLast, carryInputDeadline;
+    private int movementCallbacks;
+    private Object heldForward;
+    private Pose movementStart;
 
     InspectAcceptanceDriver(MinecraftClient client, ScenarioCommands commands) {
         this(commands::observeInspect, new NativeChat(client), System::nanoTime, InspectAcceptanceDriver::enabled,
-                message -> System.out.println(message));
+                message -> System.out.println(message), completion -> commands.requireAcceptanceIdle(client, completion));
     }
 
     /** Only this fixed policy has a simulated boundary in unit tests; it grants no native acceptance. */
     InspectAcceptanceDriver(Supplier<InspectObservation> observations, ChatBoundary input, LongSupplier clock,
                             BooleanSupplier enabled, Consumer<String> log) {
+        this(observations, input, clock, enabled, log, completion -> { });
+    }
+
+    InspectAcceptanceDriver(Supplier<InspectObservation> observations, ChatBoundary input, LongSupplier clock,
+                            BooleanSupplier enabled, Consumer<String> log, Consumer<PublishedCompletion> idleGuard) {
         this.observations = observations; this.input = input; this.clock = clock; this.enabled = enabled; this.log = log;
+        this.idleGuard = idleGuard;
     }
 
     static boolean enabled() {
@@ -57,9 +72,16 @@ final class InspectAcceptanceDriver {
     }
 
     void tick(MinecraftClient current) {
-        if (!enabled.getAsBoolean() || advancing) return;
+        if (advancing) return;
+        if (!enabled.getAsBoolean() && heldForward == null) return;
         advancing = true;
         try {
+            require(enabled.getAsBoolean(), "Acceptance gate disabled while forward held");
+            if (!selected) {
+                var value = System.getProperty("mapart.test.inspect.acceptance.case", "baseline");
+                require(value.equals("baseline") || value.equals("displaced"), "Unknown acceptance case: " + value);
+                displaced = value.equals("displaced"); selected = true;
+            }
             if (stage == Stage.STOPPED) { requestStop(current); return; }
             input.requireClient(current);
             var observed = observations.get();
@@ -76,6 +98,7 @@ final class InspectAcceptanceDriver {
             require(observed.ready(), "Inspect session unavailable");
             switch (stage) {
                 case NEXT_COMMAND -> beginInput(observed);
+                case MOVING -> advanceMovement(observed);
                 case OPEN_CHAT -> {
                     inputDeadline(); requireUnchanged(observed);
                     require(!observed.busy(), "Unexpected admission before Enter");
@@ -96,9 +119,12 @@ final class InspectAcceptanceDriver {
                 case WAIT_HANDOFF -> {
                     inputDeadline();
                     if (input.screen() != null) { input.requireChat(chat, commandText()); return; }
-                    if (index == MUTATIONS.length) {
+                    if (isLast()) {
                         requireUnchanged(observed); require(!observed.busy(), "Unexpected LAST admission");
                         marker("LAST submitted; response requires external retained CHAT check");
+                        if (displaced && index == 3 && !middleLast) {
+                            middleLast = true; stage = Stage.NEXT_COMMAND; return;
+                        }
                         marker("SEQUENCE_COMPLETE; published results observed; normal close remains external");
                         stage = Stage.STOPPED; requestStop(current);
                     } else {
@@ -123,8 +149,67 @@ final class InspectAcceptanceDriver {
     private void beginInput(InspectObservation observed) {
         requireUnchanged(observed); require(!observed.busy(), "Unexpected busy before input");
         require(input.screen() == null, "Unexpected input screen");
-        inputStarted = clock.getAsLong(); stage = Stage.OPEN_CHAT; chat = null; pending = null;
+        if (displaced && index == 2 && !moved) { beginMovement(); return; }
+        if (!carryInputDeadline) inputStarted = clock.getAsLong();
+        carryInputDeadline = false;
+        inputDeadline(); stage = Stage.OPEN_CHAT; chat = null; pending = null;
         marker("OPEN_CHAT"); pairedKey(input.chatKey(), null);
+    }
+
+    private void beginMovement() {
+        inputStarted = clock.getAsLong(); movementCallbacks = 0;
+        idleGuard.accept(retained); input.requireBinding();
+        movementStart = input.pose(); requireFinite(movementStart);
+        var binding = input.forwardBinding();
+        // Acquire debt before the callback, which may apply the key and then throw/reenter.
+        heldForward = binding; stage = Stage.MOVING;
+        idleGuard.accept(retained); inputDeadline(); input.forward(binding, true);
+        marker("FORWARD_PRESS start=" + movementStart);
+    }
+
+    private void advanceMovement(InspectObservation observed) {
+        inputDeadline(); requireUnchanged(observed); require(!observed.busy(), "Unexpected admission while moving");
+        idleGuard.accept(retained); input.requireBinding();
+        var now = input.pose(); requireFinite(now); movementCallbacks++;
+        double distance = Math.hypot(now.x() - movementStart.x(), now.z() - movementStart.z());
+        require(Double.isFinite(distance), "Nonfinite displacement");
+        if (distance >= 0.5) {
+            releaseForward(); moved = true; carryInputDeadline = true; stage = Stage.NEXT_COMMAND;
+            marker("FORWARD_RELEASE distance=" + distance + " callbacks=" + movementCallbacks + " pose=" + now);
+        } else require(movementCallbacks < 20, "Forward displacement exhausted 20 END callbacks");
+    }
+
+    private static void requireFinite(Pose pose) {
+        require(Double.isFinite(pose.x()) && Double.isFinite(pose.z()), "Nonfinite forward pose");
+    }
+
+    private void releaseForward() {
+        if (heldForward == null) return;
+        if (!input.forwardPressed(heldForward)) { heldForward = null; return; }
+        Throwable primary = null;
+        try {
+            require(enabled.getAsBoolean(), "Acceptance gate disabled while forward held");
+            idleGuard.accept(retained); input.forward(heldForward, false);
+        }
+        catch (RuntimeException | Error failure) { primary = failure; }
+        try {
+            if (input.forwardPressed(heldForward)) input.clearForward(heldForward);
+            require(!input.forwardPressed(heldForward), "Forward release remains pressed");
+            heldForward = null; // Clear only after the exact captured binding is verified false.
+        } catch (RuntimeException | Error release) {
+            if (primary != null) primary.addSuppressed(release); else throw release;
+        }
+        if (primary instanceof RuntimeException failure) throw failure;
+        if (primary instanceof Error failure) throw failure;
+    }
+
+    /** Used by the existing CLIENT_STOPPING listener even when no later END callback arrives. */
+    void releaseOnStopping(MinecraftClient current) {
+        if (advancing) return;
+        advancing = true;
+        try { input.requireClient(current); releaseForward(); }
+        catch (RuntimeException | Error failure) { fail(failure); }
+        finally { advancing = false; }
     }
 
     private void inputDeadline() {
@@ -142,7 +227,7 @@ final class InspectAcceptanceDriver {
         }
         require(completion != null, "Retained completion changed");
         require(retained == null || completion.ordinal() != retained.ordinal(), "Retained completion changed");
-        require(completion.ordinal() == index + 1 && completion.command() == MUTATIONS[index]
+        require(completion.ordinal() == index + 1 && completion.command() == mutations()[index]
                 && completion.sessionId() != null && (session == null || session.equals(completion.sessionId()))
                 && completion.operationId() != null && !operations.contains(completion.operationId())
                 && completion.evidenceDirectory() != null && !completion.evidenceDirectory().isBlank()
@@ -151,13 +236,13 @@ final class InspectAcceptanceDriver {
                 && completion.evidenceComplete() && completion.cleanupSettled() && "RELEASED".equals(completion.cleanupStatus()),
                 "Invalid completion identity/evidence/cleanup");
         boolean expected;
-        if (index == 0) {
+        if (index == 0 || displaced && index == 2) {
             expected = "FAIL".equals(completion.verdict()) && completion.runId().isEmpty()
                     && completion.failure().filter(f -> "java.lang.AssertionError".equals(f.className())
-                    && "Run requires this invocation's successful reset".equals(f.message())).isPresent();
+                    && (index == 0 ? "Run requires this invocation's successful reset" : "Start state changed without physics").equals(f.message())).isPresent();
         } else {
             expected = "PASS".equals(completion.verdict()) && completion.failure().isEmpty()
-                    && (index == 1 ? completion.runId().isEmpty() : completion.runId().filter(id -> !runs.contains(id)).isPresent());
+                    && (mutations()[index] == Command.RESET ? completion.runId().isEmpty() : completion.runId().filter(id -> !runs.contains(id)).isPresent());
         }
         require(expected, "Unexpected completion verdict/failure/run");
         require(pending == null || pending.equals(completion), "Published completion changed before settlement");
@@ -196,6 +281,7 @@ final class InspectAcceptanceDriver {
     }
 
     private void fail(Throwable failure) {
+        try { releaseForward(); } catch (RuntimeException | Error release) { if (release != failure) failure.addSuppressed(release); }
         if (failed) return;
         failed = true;
         try { releaseKey(); } catch (RuntimeException | Error release) { failure.addSuppressed(release); }
@@ -205,6 +291,10 @@ final class InspectAcceptanceDriver {
 
     private void requestStop(MinecraftClient current) {
         if (stopRequested) return;
+        if (heldForward != null) {
+            try { releaseForward(); } catch (RuntimeException | Error failure) { fail(failure); }
+            if (heldForward != null) return;
+        }
         // A wrong-thread/client callback cannot issue native stop. A later valid tick may deliver this same intent.
         try { input.requireClient(current); } catch (RuntimeException | Error unavailable) { return; }
         stopRequested = true;
@@ -212,9 +302,12 @@ final class InspectAcceptanceDriver {
     }
 
     private String commandText() {
-        return index == MUTATIONS.length ? "/maparttest last" : "/maparttest "
-                + MUTATIONS[index].name().toLowerCase(Locale.ROOT) + " grounded-two-lane";
+        return isLast() ? "/maparttest last" : "/maparttest "
+                + mutations()[index].name().toLowerCase(Locale.ROOT) + " grounded-two-lane";
     }
+
+    private Command[] mutations() { return displaced ? DISPLACED : MUTATIONS; }
+    private boolean isLast() { return index == mutations().length || displaced && index == 3 && !middleLast; }
 
     private void marker(String detail) {
         var message = ("[mapart-inspect-acceptance] stage=" + stage + " command=" + commandText()
@@ -235,6 +328,23 @@ final class InspectAcceptanceDriver {
         void key(int code, boolean press, Object expectedScreen);
         void character(int codepoint);
         void stop();
+        Object forwardBinding();
+        Pose pose();
+        boolean forwardPressed(Object binding);
+        void forward(Object binding, boolean press);
+        void clearForward(Object binding);
+    }
+
+    record Pose(double x, double z) { }
+
+    static void requireForwardKeys(KeyBinding binding, KeyBinding[] allKeys, List<KeyBinding> controls,
+                                   BuildEngine.ControlOwner owner) {
+        require(binding.isDefault() && binding.getDefaultKey().getCategory() == InputUtil.Type.KEYSYM,
+                "Unsupported forward binding");
+        require(controls.stream().noneMatch(KeyBinding::isPressed) && owner == BuildEngine.ControlOwner.NONE,
+                "Forward input requires neutral keys/control owner");
+        var key = new KeyInput(binding.getDefaultKey().getCode(), 0, 0);
+        require(Arrays.stream(allKeys).noneMatch(other -> other != binding && other.matchesKey(key)), "Forward binding collision");
     }
 
     private static final class NativeChat implements ChatBoundary {
@@ -293,6 +403,26 @@ final class InspectAcceptanceDriver {
             ((InspectKeyboardInvoker) client.keyboard).mapart$onChar(handle, new CharInput(codepoint, 0));
         }
         @Override public void stop() { requireClient(client); client.scheduleStop(); }
+        @Override public Object forwardBinding() {
+            requireBinding(); require(client.currentScreen == null, "Unexpected movement screen");
+            var o = client.options; var binding = o.forwardKey;
+            requireForwardKeys(binding, o.allKeys,
+                    List.of(o.forwardKey,o.backKey,o.leftKey,o.rightKey,o.jumpKey,o.sneakKey,o.sprintKey,o.useKey,o.attackKey),
+                    MapArtClient.status().controlOwner());
+            return binding;
+        }
+        @Override public Pose pose() {
+            requireBinding(); require(client.currentScreen == null, "Unexpected movement screen");
+            return new Pose(client.player.getX(), client.player.getZ());
+        }
+        @Override public boolean forwardPressed(Object binding) { requireClient(client); return ((KeyBinding) binding).isPressed(); }
+        @Override public void forward(Object binding, boolean press) {
+            requireBinding(); require(binding == client.options.forwardKey, "Forward binding replaced");
+            key(((KeyBinding) binding).getDefaultKey().getCode(), press, null);
+        }
+        @Override public void clearForward(Object binding) {
+            requireClient(client); ((KeyBinding) binding).setPressed(false);
+        }
     }
 
     private static void require(boolean condition, String reason) { if (!condition) throw new IllegalStateException(reason); }

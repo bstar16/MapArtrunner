@@ -46,6 +46,8 @@ public final class ScenarioClientInitializer implements ClientModInitializer {
         ClientPlayConnectionEvents.DISCONNECT.register((handler, current) ->
                 commands.cancel(new IllegalStateException("Inspect connection disconnected; restart required")));
         ClientLifecycleEvents.CLIENT_STOPPING.register(current -> {
+            var acceptance = inspectAcceptance;
+            if (acceptance != null) acceptance.releaseOnStopping(current);
             host.onStopping(current);
             commands.cancel(new IllegalStateException("Inspect client stopping"));
             worker.shutdown();

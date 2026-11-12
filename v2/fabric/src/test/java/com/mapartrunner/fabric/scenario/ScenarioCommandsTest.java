@@ -182,6 +182,54 @@ class ScenarioCommandsTest {
         }
     }
 
+    @Test void acceptanceGuardRequiresGatesSettledValueEqualCurrentResultAndNativeAuthorityWithoutAllocation() throws Exception {
+        var names = List.of("mapart.test.inspect", "mapart.test.inspect.acceptance", "fabric.client.gametest");
+        var previous = new HashMap<String, String>(); names.forEach(name -> previous.put(name, System.getProperty(name)));
+        try {
+            System.setProperty(names.get(0), "true"); System.setProperty(names.get(1), "true"); System.clearProperty(names.get(2));
+            var f = fixture(null, null);
+            f.commands.enqueue(Command.RUN, message -> {
+                var publishedWhileBusy = f.commands.observeInspect().last().orElseThrow();
+                assertThrows(IllegalStateException.class, () -> f.commands.requireAcceptanceIdle(null, publishedWhileBusy));
+            });
+            f.queue.remove().run(); var current = f.commands.observeInspect().last().orElseThrow();
+            var equal = new ScenarioCommands.PublishedCompletion(current.sessionId(), current.operationId(), current.ordinal(),
+                    current.command(), current.runId(), current.verdict(), current.evidenceComplete(), current.cleanupStatus(),
+                    current.cleanupSettled(), current.evidenceDirectory(), current.summaryPath(), current.failure());
+            assertNotSame(current, equal); assertEquals(current, equal);
+            // Equal values reach Runner's real native-world guard. This unit fixture owns no native world.
+            assertEquals("Inspect command session/world unavailable",
+                    assertThrows(AssertionError.class, () -> f.commands.requireAcceptanceIdle(null, equal)).getMessage());
+            assertThrows(IllegalStateException.class, () -> f.commands.requireAcceptanceIdle(null, null));
+            var changed = new ScenarioCommands.PublishedCompletion(equal.sessionId(), UUID.randomUUID(), equal.ordinal(),
+                    equal.command(), equal.runId(), equal.verdict(), equal.evidenceComplete(), equal.cleanupStatus(),
+                    equal.cleanupSettled(), equal.evidenceDirectory(), equal.summaryPath(), equal.failure());
+            assertThrows(IllegalStateException.class, () -> f.commands.requireAcceptanceIdle(null, changed));
+            for (var name : names) {
+                System.setProperty(name, "false");
+                assertThrows(IllegalStateException.class, () -> f.commands.requireAcceptanceIdle(null, equal));
+                if (name.equals("fabric.client.gametest")) System.clearProperty(name); else System.setProperty(name, "true");
+            }
+            set(f.commands, "ready", false);
+            assertThrows(IllegalStateException.class, () -> f.commands.requireAcceptanceIdle(null, equal));
+            set(f.commands, "ready", true);
+            set(f.commands, "terminal", new IllegalStateException("terminal"));
+            assertThrows(IllegalStateException.class, () -> f.commands.requireAcceptanceIdle(null, equal));
+            set(f.commands, "terminal", null);
+            assertTrue(f.commands.requestStop());
+            assertThrows(IllegalStateException.class, () -> f.commands.requireAcceptanceIdle(null, equal));
+            assertEquals(1, fieldInt(f.runner, "inspectOrdinal"));
+            assertEquals(1, f.queue.size(), "Only the existing explicit close request may enqueue work");
+            assertEquals(0, f.nativeEffects.get(), "Read-only guards must not dispatch native actions");
+            var cancelled = fixture(null, null); cancelled.commands.enqueue(Command.RUN, message -> { }); cancelled.queue.remove().run();
+            var old = cancelled.commands.observeInspect().last().orElseThrow(); cancelled.commands.cancel(new IllegalStateException("test cancel"));
+            assertThrows(IllegalStateException.class, () -> cancelled.commands.requireAcceptanceIdle(null, old));
+            assertEquals(1, fieldInt(cancelled.runner, "inspectOrdinal")); assertTrue(cancelled.queue.isEmpty());
+        } finally {
+            names.forEach(name -> { if (previous.get(name) == null) System.clearProperty(name); else System.setProperty(name, previous.get(name)); });
+        }
+    }
+
     @Test void runBeforeResetAndTwoResetFailuresHaveDistinctOwnedNoUuidEvidence() throws Exception {
         var f = fixture(null, null);
         for (var command : List.of(Command.RUN, Command.RESET, Command.RESET)) {
