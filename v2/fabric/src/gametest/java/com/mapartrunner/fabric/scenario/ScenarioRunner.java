@@ -782,13 +782,9 @@ final class ScenarioRunner implements AutoCloseable {
                 var effects=inspectEffects.seal(cleanup,null);
                 require(inspectFailureCaptured && effects.releaseAttempts()==1 && effects.freezeAttempts()==1,"Expiry capture/release/freeze attempts differ");
                 ((InspectScenarioHost)host).awaitExpiryBusyProof(operation,cleanup);
-                var proof=new JsonObject(); var gson=new GsonBuilder().setPrettyPrinting().create();
-                proof.add("pairs",gson.toJsonTree(List.of(p.baseline,p.expired,p.replayed)));
-                proof.add("firstAdmission",gson.toJsonTree(p.firstAdmission)); proof.add("latestAdmission",gson.toJsonTree(p.latestAdmission));
-                proof.addProperty("admissionRequests",p.admissionCount); proof.addProperty("captureAttempts",inspectFailureCaptured?1:0);
-                proof.addProperty("releaseAttempts",effects.releaseAttempts()); proof.addProperty("freezeAttempts",effects.freezeAttempts());
-                proof.add("boundary",gson.toJsonTree(((InspectScenarioHost)host).observeExpiryAcceptance()));
-                writeNew(roots,artifacts.resolve("work-expiry-proof.json"),gson.toJson(proof));
+                writeNew(roots,artifacts.resolve("work-expiry-proof.json"),encodeExpiryProof(List.of(p.baseline,p.expired,p.replayed),
+                        p.firstAdmission,p.latestAdmission,p.admissionCount,inspectFailureCaptured?1:0,effects.releaseAttempts(),effects.freezeAttempts(),
+                        ((InspectScenarioHost)host).observeExpiryAcceptance()));
             } catch(RuntimeException | Error error) { inspectEvidenceIncomplete=true; failure=retain(failure,error); }
         }
         // Transport settlement cannot resolve an unverified release/freeze owned by this Runner.
@@ -844,6 +840,21 @@ final class ScenarioRunner implements AutoCloseable {
     private static boolean timeoutFailure(Throwable failure) {
         if(failure instanceof ScopeTimeoutException) return true;
         return failure!=null && failure.getCause() instanceof ScopeTimeoutException;
+    }
+
+    /** Pure encoding of the already detached fixed proof; no native binding or cleanup authority enters this helper. */
+    static String encodeExpiryProof(List<ExpiryPair> pairs,ExpiryPair firstAdmission,ExpiryPair latestAdmission,int admissionRequests,
+                                    int captureAttempts,int releaseAttempts,int freezeAttempts,ScenarioCommands.ExpiryObservation boundary) {
+        var proof=new JsonObject();
+        var gson=new GsonBuilder().serializeNulls().registerTypeHierarchyAdapter(Optional.class,
+                (JsonSerializer<Optional<?>>)(value,type,context) -> value.isPresent()?context.serialize(value.orElseThrow()):JsonNull.INSTANCE)
+                .setPrettyPrinting().create();
+        proof.add("pairs",gson.toJsonTree(pairs));
+        proof.add("firstAdmission",gson.toJsonTree(firstAdmission)); proof.add("latestAdmission",gson.toJsonTree(latestAdmission));
+        proof.addProperty("admissionRequests",admissionRequests); proof.addProperty("captureAttempts",captureAttempts);
+        proof.addProperty("releaseAttempts",releaseAttempts); proof.addProperty("freezeAttempts",freezeAttempts);
+        proof.add("boundary",gson.toJsonTree(boundary));
+        return gson.toJson(proof);
     }
 
     private String inspectObservations(MinecraftClient client) {

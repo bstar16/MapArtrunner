@@ -4,6 +4,7 @@ import com.mapartrunner.core.model.BuildPlan.GridPos;
 import com.mapartrunner.core.run.BuildEngine;
 import com.mapartrunner.core.run.RunLifecycle;
 import com.mapartrunner.fabric.runtime.FabricBuildAdapter;
+import com.google.gson.*;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
@@ -207,6 +208,75 @@ class InspectExpiryTest {
         assertThrows(AssertionError.class,() -> ScenarioRunner.validateExpiryPair(f.baseline,e,e,null));
         var foreign=new ScenarioRunner.ExpiryPair(UUID.randomUUID(),e.operationId(),e.runId(),e.identity(),e.deadline(),e.cutoff(),e.ordinal(),e.client(),e.server());
         assertThrows(AssertionError.class,() -> ScenarioRunner.validateExpiryPair(f.baseline,f.baseline,foreign,null));
+    }
+    @Test void productionProofEncoderRetainsCompletePairsAdmissionAndPresentAndEmptyOptionals() {
+        var f=new PairFixture(); var e=f.pair(1,11,11,11,11,11); var r=f.pair(2,12,12,12,12,12);
+        var ack=new ScenarioCommands.ExpiryBusyAck(f.operation,1,110);
+        var failure=new ScenarioCommands.FailureObservation(ScopeTimeoutException.class.getName(),"original WORK timeout");
+        var boundary=new ScenarioCommands.ExpiryObservation(f.session,f.operation,f.support.context.runId(),2,"SEALED_BEFORE_END",100,10_000_000_100L,
+                2,0,1,true,true,110,1,1,ack,failure,failure,true);
+        var text=ScenarioRunner.encodeExpiryProof(List.of(f.baseline,e,r),f.baseline,f.baseline,2,1,1,1,boundary);
+        var proof=JsonParser.parseString(text).getAsJsonObject();
+        assertEquals(Set.of("pairs","firstAdmission","latestAdmission","admissionRequests","captureAttempts","releaseAttempts","freezeAttempts","boundary"),proof.keySet());
+        assertEquals(2,proof.get("admissionRequests").getAsInt());
+        for(String count:List.of("captureAttempts","releaseAttempts","freezeAttempts")) assertEquals(1,proof.get(count).getAsInt());
+        var pairs=proof.getAsJsonArray("pairs"); assertEquals(3,pairs.size());
+        assertEquals(pairs.get(0),proof.get("firstAdmission")); assertEquals(pairs.get(0),proof.get("latestAdmission"));
+        for(int ordinal=0;ordinal<3;ordinal++) {
+            var pair=pairs.get(ordinal).getAsJsonObject();
+            assertEquals(Set.of("sessionId","operationId","runId","identity","deadline","cutoff","ordinal","client","server"),pair.keySet());
+            assertEquals(f.session.toString(),pair.get("sessionId").getAsString()); assertEquals(f.operation.toString(),pair.get("operationId").getAsString());
+            assertEquals(f.support.context.runId().toString(),pair.get("runId").getAsString()); assertEquals(ordinal,pair.get("ordinal").getAsInt());
+            assertEquals(100,pair.get("deadline").getAsLong()); assertEquals(10_000_000_100L,pair.get("cutoff").getAsLong());
+            var identity=pair.getAsJsonObject("identity");
+            assertEquals(Set.of("arm","context","workDeadlineNanos","adapterIdentity"),identity.keySet());
+            assertEquals(f.hold.identity().arm().toString(),identity.get("arm").getAsString());
+            var client=pair.getAsJsonObject("client");
+            assertEquals(Set.of("hold","status","keyMask","nativeSequence","pending","expectedTargets","planFingerprint","side"),client.keySet());
+            assertEquals(0,client.get("keyMask").getAsInt()); assertEquals(7,client.get("nativeSequence").getAsInt());
+            assertEquals(0,client.getAsJsonArray("pending").size()); assertEquals(2,client.getAsJsonArray("expectedTargets").size());
+            assertEquals(f.support.plan.fingerprint(),client.get("planFingerprint").getAsString());
+            var target=client.getAsJsonArray("expectedTargets").get(0).getAsJsonObject();
+            assertEquals(Set.of("id","relativePos","block"),target.keySet());
+            var hold=client.getAsJsonObject("hold");
+            assertEquals(Set.of("identity","disposed","invalidity","samples","first","latest"),hold.keySet());
+            if(ordinal==0) assertTrue(hold.get("invalidity").isJsonNull());
+            else assertEquals("Original WORK expired",hold.get("invalidity").getAsString());
+            for(String observation:List.of("first","latest")) {
+                var observed=hold.getAsJsonObject(observation);
+                assertEquals(Set.of("nanos","lifecycle","owner","keys","pose","sameNative","suspended"),observed.keySet());
+                assertEquals(9,observed.getAsJsonArray("keys").size()); assertTrue(observed.get("sameNative").getAsBoolean());
+            }
+            var status=client.getAsJsonObject("status"); assertEquals(Set.of("engine","controlOwner","failure"),status.keySet());
+            assertTrue(status.get("failure").isJsonNull());
+            var engine=status.getAsJsonObject("engine");
+            assertEquals(Set.of("lifecycle","eligibleTicks","verifyTicks","traversal","unfinishedTargetIds","pendingTargetIds","diagnostic","effectResults"),engine.keySet());
+            assertTrue(engine.get("diagnostic").isJsonNull()); assertTrue(engine.get("traversal").isJsonObject());
+            var lifecycle=engine.getAsJsonObject("lifecycle"); assertEquals(Set.of("phase","context","activity","outcome"),lifecycle.keySet());
+            assertEquals("RUNNING",lifecycle.get("phase").getAsString()); assertEquals("SHIFT",lifecycle.get("activity").getAsString());
+            assertEquals(f.support.context.runId().toString(),lifecycle.getAsJsonObject("context").get("runId").getAsString());
+            assertTrue(lifecycle.get("outcome").isJsonNull());
+            var traversal=engine.getAsJsonObject("traversal");
+            assertEquals(Set.of("laneIndex","substage","entry","transitionTicks","transitionRegion","pass","walkNoProgressTicks"),traversal.keySet());
+            assertTrue(traversal.has("transitionRegion"));
+            for(var side:List.of(client.getAsJsonObject("side"),pair.getAsJsonObject("server"))) {
+                assertEquals(Set.of("nanos","age","time","serverTick","pose","selectedSlot","inventory","menu","blocks","support"),side.keySet());
+                assertEquals(10+ordinal,side.get("age").getAsInt()); assertEquals(10+ordinal,side.get("time").getAsLong());
+                assertEquals(f.baseline.client().side().inventory(),side.get("inventory").getAsString());
+                assertEquals(f.baseline.client().side().menu(),side.get("menu").getAsString());
+                assertEquals(1,side.getAsJsonObject("blocks").size()); assertEquals(65,side.getAsJsonObject("support").get("y").getAsInt());
+                var pose=side.getAsJsonObject("pose");
+                assertEquals(Set.of("x","y","z","vx","vy","vz","yaw","headYaw","bodyYaw","pitch","physics","flying","sprinting"),pose.keySet());
+                assertEquals(0xBFB41205C28F5C29L,Double.doubleToRawLongBits(pose.get("vy").getAsDouble()));
+                assertEquals(Set.of("onGround","noGravity","noDrag","jumping","vehicle","fluid","water","submerged","lava","climbing","gliding","swimming","sneaking","usingItem","hasEffects","fallDistance","gravity"),pose.getAsJsonObject("physics").keySet());
+            }
+        }
+        var retained=proof.getAsJsonObject("boundary");
+        assertEquals("SEALED_BEFORE_END",retained.get("stage").getAsString()); assertEquals(0,retained.get("actionEntries").getAsInt());
+        assertEquals(1,retained.get("busyRefusals").getAsInt()); assertTrue(retained.get("distinctReplayFailure").getAsBoolean());
+        assertEquals(f.operation.toString(),retained.getAsJsonObject("acknowledgement").get("operationId").getAsString());
+        assertEquals(ScopeTimeoutException.class.getName(),retained.getAsJsonObject("primary").get("className").getAsString());
+        assertEquals(retained.get("primary"),retained.get("replay"));
     }
     @Test void completeCoreExpectedTargetsPendingAndEachProtectedNativeValueMustStayUnchanged() {
         var f=new PairFixture(); var e=f.pair(1,11,11,11,11,11); var c=e.client(); var engine=c.status().engine();
