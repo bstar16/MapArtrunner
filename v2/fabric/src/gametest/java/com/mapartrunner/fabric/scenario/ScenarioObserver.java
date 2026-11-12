@@ -65,14 +65,16 @@ final class ScenarioObserver {
 
     // Native references are authority. Hashes in existing Sample/output remain diagnostics only.
     record ClientBinding(Object world, Object player, Object handler, Object connection, UUID playerId,
-                         String dimension, boolean onThread) {
+                         String dimension, boolean onThread, boolean connectionOpen, boolean handlerWorldMatches) {
         @Override public String toString() {
             return "ClientBinding[world="+System.identityHashCode(world)+", player="+System.identityHashCode(player)
                     +", handler="+System.identityHashCode(handler)+", connection="+System.identityHashCode(connection)
-                    +", UUID="+playerId+", dimension="+dimension+", onClientThread="+onThread+"]";
+                    +", UUID="+playerId+", dimension="+dimension+", onClientThread="+onThread
+                    +", connectionOpen="+connectionOpen+", handlerWorldMatches="+handlerWorldMatches+"]";
         }
         boolean matches(ClientBinding other) {
             return other!=null && onThread && other.onThread && world!=null && player!=null && handler!=null && connection!=null
+                    && connectionOpen && other.connectionOpen && handlerWorldMatches && other.handlerWorldMatches
                     && world==other.world && player==other.player && handler==other.handler && connection==other.connection
                     && playerId.equals(other.playerId) && dimension.equals(other.dimension);
         }
@@ -121,9 +123,11 @@ final class ScenarioObserver {
 
     static ClientBinding clientBinding(MinecraftClient client) {
         var p=client.player; var handler=client.getNetworkHandler();
-        return new ClientBinding(client.world,p,handler,handler==null?null:handler.getConnection(),
+        var connection=handler==null?null:handler.getConnection();
+        return new ClientBinding(client.world,p,handler,connection,
                 p==null?null:p.getUuid(),client.world==null?null:client.world.getRegistryKey().getValue().toString(),
-                client.isOnThread() && p!=null && p.getEntityWorld()==client.world);
+                client.isOnThread() && p!=null && p.getEntityWorld()==client.world,
+                connection!=null && connection.isOpen(),handler!=null && handler.getWorld()==client.world);
     }
 
     static ServerBinding serverBinding(MinecraftServer server, ServerWorld world, ServerPlayerEntity player) {

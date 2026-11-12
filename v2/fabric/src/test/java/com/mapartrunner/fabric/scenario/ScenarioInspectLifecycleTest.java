@@ -107,7 +107,7 @@ class ScenarioInspectLifecycleTest {
     private static ScenarioObserver.Binding witnessBinding(RunLifecycle.Context context,Inspect host,Scope scope) {
         var player=UUID.randomUUID();
         return new ScenarioObserver.Binding(UUID.randomUUID(),context,
-                new ScenarioObserver.ClientBinding(new Object(),new Object(),new Object(),new Object(),player,context.dimension(),true),
+                new ScenarioObserver.ClientBinding(new Object(),new Object(),new Object(),new Object(),player,context.dimension(),true,true,true),
                 new ScenarioObserver.ServerBinding(new Object(),new Object(),new Object(),player,context.dimension(),true,true),host,scope);
     }
 
@@ -311,7 +311,7 @@ class ScenarioInspectLifecycleTest {
             assertNull(watch.beginServerRead());
             var client=new ScenarioObserver.ClientBinding(side.equals("client-world")?new Object():c.world(),side.equals("client-player")?new Object():c.player(),
                     side.equals("handler")?new Object():c.handler(),side.equals("connection")?new Object():c.connection(),
-                    side.equals("client-uuid")?UUID.randomUUID():c.playerId(),side.equals("client-dimension")?"foreign":c.dimension(),!side.equals("client-thread"));
+                    side.equals("client-uuid")?UUID.randomUUID():c.playerId(),side.equals("client-dimension")?"foreign":c.dimension(),!side.equals("client-thread"),true,true);
             watch.append(b,sample,client,4.5);
             if(side.startsWith("server") || side.equals("member")) {
                 var read=watch.beginServerRead(); assertNotNull(read);
@@ -322,6 +322,36 @@ class ScenarioInspectLifecycleTest {
             }
             assertNotNull(watch.retained().failure(),side); assertTrue(watch.retained().witnesses().isEmpty(),side);
         }
+    }
+
+    @Test void endPublicationRequiresOpenConnectionAndHandlerWorldForAutomaticAndInspect() {
+        assertAll(
+                () -> rejectLostLiveClientFacts(false,false,true),
+                () -> rejectLostLiveClientFacts(false,true,false),
+                () -> rejectLostLiveClientFacts(true,false,true),
+                () -> rejectLostLiveClientFacts(true,true,false));
+    }
+
+    private void rejectLostLiveClientFacts(boolean inspect,boolean connectionOpen,boolean handlerWorldMatches) {
+        var host=inspect?new InspectScenarioHost(() -> 1L,() -> false,() -> false,
+                a -> fail("No client dispatch"),a -> fail("No server dispatch"),null):null;
+        var scope=inspect?host.beginWork(new Operation(UUID.randomUUID(),1,UUID.randomUUID(),Command.RUN,directory)):null;
+        if(inspect) assertTrue(host.observationScopeValid(scope));
+        var context=witnessContext(); var watch=new ScenarioObserver.Watch();
+        var binding=witnessBinding(context,host,scope); watch.bind(binding); var client=binding.client();
+        var samples=witnessSamples(context); var previous=samples.get(5); var next=samples.get(7);
+        watch.append(binding,previous,client,4.5); var inFlight=watch.beginServerRead(); assertNotNull(inFlight);
+        var invalid=new ScenarioObserver.ClientBinding(client.world(),client.player(),client.handler(),client.connection(),
+                client.playerId(),client.dimension(),client.onThread(),connectionOpen,handlerWorldMatches);
+        watch.append(binding,next,invalid,4.5);
+        var first=watch.retained().failure(); assertNotNull(first,"same references lost live connection/world binding");
+        assertNull(watch.beginServerRead()); assertTrue(watch.retained().witnesses().isEmpty());
+        watch.commitServer(inFlight,reading(binding.server(),previous,4.5,101));
+        watch.failRead(inFlight,new AssertionError("later server failure must not replace client binding loss"));
+        watch.append(binding,next,client,4.5);
+        assertSame(first,watch.retained().failure()); assertNull(watch.beginServerRead());
+        assertTrue(watch.retained().witnesses().isEmpty());
+        if(inspect) assertTrue(host.observationScopeValid(scope)); // Refusal is the per-END binding, not scope cancellation.
     }
 
     @Test void watchRejectsEveryChangedRunContextFieldAndOldGenerationPublication() {
