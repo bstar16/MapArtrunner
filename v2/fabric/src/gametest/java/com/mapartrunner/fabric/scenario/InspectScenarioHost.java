@@ -330,20 +330,28 @@ final class InspectScenarioHost implements Inspect {
     @Override public void runOnServer(Consumer<MinecraftServer> action) { computeOnServer(s -> { action.accept(s); return null; }); }
     @Override public <V> V computeOnServer(Function<MinecraftServer, V> action) { return dispatch(serverQueue, () -> action.apply(server)); }
 
+    boolean runWhenClientReady(Predicate<MinecraftClient> ready, Consumer<MinecraftClient> action) {
+        return computeOnClient(c -> {
+            if (!ready.test(c)) return false;
+            action.accept(c); return true;
+        });
+    }
+
     @Override public void createWorld() { throw new IllegalStateException("Inspect creation requires Runner prospective-save guard"); }
     @Override public void createWorld(BiConsumer<MinecraftClient, Path> beforeCreate) {
         var scope = dispatchScope(); check(scope.kind() == Kind.STARTUP, "Creation requires STARTUP"); Objects.requireNonNull(beforeCreate);
-        runOnClient(c -> {
+        // CLIENT_STARTED still has the initial splash; its continuation can replace a screen until the overlay clears.
+        while (!runWhenClientReady(c -> c.isFinishedLoading() && c.getOverlay() == null, c -> {
             check(c.world==null && c.getServer()==null && c.player==null,"Creation cannot open over a foreign world");
             beforeCreate.accept(c,c.getLevelStorage().getSavesDirectory().resolve("mapart-inspect-"+scope.operation().sessionId()).toAbsolutePath().normalize());
             valid(scope);
+            check(c.world==null && c.getServer()==null && c.player==null,"Creation cannot open over a foreign world");
             CreateWorldScreen.show(c, () -> cancelSession(new IllegalStateException("World creation cancelled")));
-        });
-        CreateWorldScreen screen;
-        while ((screen = computeOnClient(c -> c.currentScreen instanceof CreateWorldScreen s ? s : null)) == null) waitTick();
-        var actualScreen = screen;
-        runOnClient(c -> {
-            check(c.currentScreen == actualScreen, "Creation screen replaced");
+            // Pinned show() installs the screen synchronously but pumps native tasks; retain only the original authority.
+            valid(scope);
+            check(c.world==null && c.getServer()==null && c.player==null,"Creation opened over a foreign world");
+            check(c.currentScreen instanceof CreateWorldScreen, "Creation screen replaced");
+            var actualScreen = (CreateWorldScreen)c.currentScreen;
             var creator = actualScreen.getWorldCreator();
             creator.setWorldName("mapart-inspect-" + scope.operation().sessionId());
             creator.setGameMode(WorldCreator.Mode.SURVIVAL); creator.setCheatsEnabled(false);
@@ -354,18 +362,20 @@ final class InspectScenarioHost implements Inspect {
             creator.getGameRules().setValue(GameRules.ADVANCE_WEATHER, false, null);
             creator.getGameRules().setValue(GameRules.DO_MOB_SPAWNING, false, null);
             Path prospective = c.getLevelStorage().getSavesDirectory().resolve(creator.getWorldDirectoryName()).toAbsolutePath().normalize();
+            beforeCreate.accept(c, prospective); // Runner authority; only fresh validation remains before the press.
+            valid(scope);
+            check(c.world==null && c.getServer()==null && c.player==null,"Creation cannot press over a foreign world");
+            check(c.currentScreen == actualScreen && actualScreen.getWorldCreator() == creator
+                    && c.getLevelStorage().getSavesDirectory().resolve(creator.getWorldDirectoryName()).toAbsolutePath().normalize().equals(prospective),
+                    "Creation screen/creator/save changed");
             var buttons = new ArrayList<ButtonWidget>();
             discover(actualScreen, Collections.newSetFromMap(new IdentityHashMap<>()), buttons);
             String create = Text.translatable("selectWorld.create").getString();
             var matches = buttons.stream().filter(b -> b.getMessage().getString().equals(create)).toList();
             check(matches.size() == 1 && matches.getFirst().active && matches.getFirst().visible, "Expected one active visible create button");
             valid(scope);
-            check(c.currentScreen == actualScreen && actualScreen.getWorldCreator() == creator
-                    && c.getLevelStorage().getSavesDirectory().resolve(creator.getWorldDirectoryName()).toAbsolutePath().normalize().equals(prospective),
-                    "Creation screen/creator/save changed");
-            beforeCreate.accept(c, prospective); // Runner authority; no wait or native action before the press.
             matches.getFirst().onPress(new MouseInput(0, 0));
-        });
+        })) waitTick();
         while (!computeOnClient(c -> {
             if (c.currentScreen != null || c.getServer() == null || c.world == null || c.player == null
                     || c.getNetworkHandler() == null || !c.getNetworkHandler().getConnection().isOpen()) return false;

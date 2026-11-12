@@ -10,6 +10,7 @@ import net.fabricmc.fabric.api.client.gametest.v1.world.TestWorldSave;
 import net.fabricmc.fabric.impl.client.gametest.screenshot.TestScreenshotOptionsImpl;
 import org.apache.commons.lang3.function.FailableConsumer;
 import org.apache.commons.lang3.function.FailableFunction;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -31,7 +32,102 @@ import static com.mapartrunner.fabric.scenario.ScenarioHost.*;
 import static org.junit.jupiter.api.Assertions.*;
 
 class ScenarioHostTest {
+    @BeforeAll static void bootstrap() {
+        net.minecraft.SharedConstants.createGameVersion();
+        net.minecraft.Bootstrap.initialize();
+    }
     @TempDir Path temporary;
+
+    @Test void startupReadinessUsesCurrentClientStateAndActsExactlyOnce() throws Exception {
+        try (var h = new DispatchHarness()) {
+            var startup = h.host.beginStartup(startupOperation());
+            var ready = new AtomicBoolean(); var effects = new AtomicInteger();
+            var loading = h.worker.submit(() -> h.host.inScope(startup,
+                    () -> h.host.runWhenClientReady(c -> ready.get(), c -> effects.incrementAndGet())));
+            var first = h.client.poll(2, TimeUnit.SECONDS); assertNotNull(first); h.nativeCall(first);
+            assertFalse(loading.get(2, TimeUnit.SECONDS)); assertEquals(0, effects.get());
+            var finishing = h.worker.submit(() -> h.host.inScope(startup,
+                    () -> h.host.runWhenClientReady(c -> ready.get(), c -> effects.incrementAndGet())));
+            var current = h.client.poll(2, TimeUnit.SECONDS); assertNotNull(current);
+            ready.set(true); h.nativeCall(current);
+            assertTrue(finishing.get(2, TimeUnit.SECONDS)); assertEquals(1, effects.get());
+            assertTrue(h.client.isEmpty()); assertEquals(600_000_000_001L, startup.deadlineNanos());
+        }
+    }
+
+    @Test void startupReadinessAndActionPrecedeQueuedReplacementWithoutRedispatch() throws Exception {
+        try (var h = new DispatchHarness()) {
+            var startup = h.host.beginStartup(startupOperation());
+            var current = new AtomicReference<>("ready"); var calls = new CopyOnWriteArrayList<String>();
+            Runnable completed = () -> { };
+            var pending = h.worker.submit(() -> {
+                try {
+                    return h.host.inScope(startup, () -> h.host.runWhenClientReady(c -> {
+                        calls.add("ready");
+                        h.client.add(() -> { current.set("replacement"); calls.add("replacement"); });
+                        return current.get().equals("ready");
+                    }, c -> {
+                        assertEquals("ready", current.get(), "Creation action lost its freshly observed readiness");
+                        calls.add("action");
+                    }));
+                } finally { h.client.add(completed); }
+            });
+            Runnable queued;
+            while ((queued = h.client.poll(2, TimeUnit.SECONDS)) != completed) {
+                assertNotNull(queued); h.nativeCall(queued);
+            }
+            assertTrue(pending.get(2, TimeUnit.SECONDS));
+            assertEquals(List.of("ready", "action", "replacement"), calls);
+            assertTrue(h.client.isEmpty());
+        }
+    }
+
+    @Test void queuedStartupCancellationAndExpiryHaveNoReadinessOrActionEffects() throws Exception {
+        for (boolean expired : List.of(false, true)) try (var h = new DispatchHarness()) {
+            var startup = h.host.beginStartup(startupOperation());
+            var observations = new AtomicInteger(); var effects = new AtomicInteger();
+            var original = new IllegalStateException("cancelled startup sentinel");
+            var pending = h.worker.submit(() -> h.host.inScope(startup,
+                    () -> h.host.runWhenClientReady(c -> { observations.incrementAndGet(); return true; }, c -> effects.incrementAndGet())));
+            var queued = h.client.poll(2, TimeUnit.SECONDS); assertNotNull(queued);
+            if (expired) h.now.set(startup.deadlineNanos()); else h.host.cancelSession(original);
+            h.nativeCall(queued);
+            if (expired) assertInstanceOf(ScopeTimeoutException.class, failure(pending)); else assertSame(original, failure(pending));
+            assertEquals(0, observations.get()); assertEquals(0, effects.get()); assertTrue(h.client.isEmpty());
+            assertEquals(600_000_000_001L, startup.deadlineNanos());
+        }
+    }
+
+    @Test void startupLoadingWaitRetainsItsOriginalAbsoluteDeadline() throws Exception {
+        try (var h = new DispatchHarness()) {
+            var startup = h.host.beginStartup(startupOperation()); var effects = new AtomicInteger(); var attempts = new AtomicInteger();
+            var pending = h.worker.submit(() -> h.host.inScope(startup, () -> {
+                while (!h.host.runWhenClientReady(c -> false, c -> effects.incrementAndGet())) {
+                    attempts.incrementAndGet(); h.host.waitTick();
+                }
+            }));
+            var loading = h.client.poll(2, TimeUnit.SECONDS); assertNotNull(loading); h.nativeCall(loading);
+            await(() -> attempts.get() == 1 && h.host.waitingCount() == 1);
+            h.now.set(600_000_000_000L); h.host.onTick();
+            var last = h.client.poll(2, TimeUnit.SECONDS); assertNotNull(last);
+            h.now.set(600_000_000_001L); h.nativeCall(last);
+            assertInstanceOf(ScopeTimeoutException.class, failure(pending)); assertEquals(0, effects.get());
+            assertThrows(ScopeTimeoutException.class, () -> h.host.inScope(startup, () -> fail("Expired startup renewed")));
+            assertEquals(600_000_000_001L, startup.deadlineNanos()); assertTrue(h.client.isEmpty());
+        }
+    }
+
+    @Test void startupReadinessActionPropagatesOriginalErrorsWithoutRedispatch() throws Exception {
+        for (Throwable original : List.of(new IllegalStateException("startup action"), new AssertionError("startup action"))) {
+            try (var h = new DispatchHarness()) {
+                var startup = h.host.beginStartup(startupOperation());
+                var pending = h.worker.submit(() -> h.host.inScope(startup,
+                        () -> h.host.runWhenClientReady(c -> true, c -> rethrow(original))));
+                var action = h.client.poll(2, TimeUnit.SECONDS); assertNotNull(action); h.nativeCall(action);
+                assertSame(original, failure(pending)); assertTrue(h.client.isEmpty());
+            }
+        }
+    }
 
     @Test void directCancellationReturnsBeforeRealBeginPublicationReleasesLockAndRetainsFirstCause() throws Exception {
         var source = Path.of(ScenarioHost.class.getProtectionDomain().getCodeSource().getLocation().toURI()).toRealPath();
@@ -633,6 +729,9 @@ class ScenarioHostTest {
     }
 
     private final UUID inspectSession = UUID.randomUUID();
+    private Operation startupOperation() {
+        return new Operation(inspectSession, 0, UUID.randomUUID(), Command.STARTUP, temporary.resolve("startup"));
+    }
     private Operation operation(int ordinal) {
         return new Operation(inspectSession, ordinal, UUID.randomUUID(), Command.RUN, temporary.resolve("op-" + ordinal));
     }
