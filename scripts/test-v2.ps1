@@ -545,15 +545,111 @@ function Get-V2ScenarioInventory {
     }
 }
 
-function Save-V2Artifacts {
-    param([string]$Evidence, [string]$Game, [string]$ScenarioRoot, [object[]]$Before, [string]$Owner)
+function Assert-V2EvidenceName {
+    param([string]$Name)
+    # Reject Windows aliases as well as escapes; metadata must name one unambiguous child.
+    if (!$Name -or $Name -match '[\\/:\x00-\x1f<>"|?*]' -or $Name -match '[. ]$|^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\.|$)') { throw "Ambiguous evidence name: $Name" }
+}
+
+function Get-V2ReferenceEntries {
+    param([string]$Path, [string]$Owner, [string]$Relative='.')
+    [void](Assert-V2ManagedPath (Split-Path $Path) $Owner)
+    $item=Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        if ($item.LinkType -cnotin 'Junction','SymbolicLink' -or !$item.LinkTarget) { throw "Unknown reparse metadata: $Path" }
+        [pscustomobject][ordered]@{Path=$Relative;Kind='link';Attributes=[int]$item.Attributes;LinkType=$item.LinkType;LinkTarget=$item.LinkTarget}
+        return
+    }
+    [void](Assert-V2ManagedPath $Path $Owner)
+    if ($item.PSIsContainer) {
+        [pscustomobject][ordered]@{Path=$Relative;Kind='directory'}
+        $seen=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($child in Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop | Sort-Object Name) {
+            Assert-V2EvidenceName $child.Name
+            if (!$seen.Add($child.Name)) { throw "Duplicate evidence name: $($child.Name)" }
+            $relativeChild=$(if($Relative -ceq '.'){$child.Name}else{$Relative+'/'+$child.Name})
+            Get-V2ReferenceEntries $child.FullName $Owner $relativeChild
+        }
+    } else {
+        [pscustomobject][ordered]@{Path=$Relative;Kind='file';Size=[long]$item.Length;Sha256=(Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop).Hash}
+    }
+}
+
+function Assert-V2ScenarioReferences {
+    param($Manifest,[string]$Evidence,[string]$ScenarioRoot,[string]$Owner,[string]$LaunchId,[string]$ClosureId)
     [void](Assert-V2ManagedPath $Evidence $Owner)
+    [void](Assert-V2ManagedPath $ScenarioRoot $Owner)
+    if ((@($Manifest.PSObject.Properties.Name | Sort-Object) -join ',') -cne 'After,Before,CleanupStatus,ClosureId,Evidence,LaunchId,Roots,ScenarioRoot,Schema,State') { throw 'Invalid scenario reference schema fields.' }
+    $uuid=[guid]::Empty
+    if (![guid]::TryParseExact($LaunchId,'D',[ref]$uuid) -or (Split-Path $Evidence -Leaf) -cne ('launch-'+$LaunchId) -or
+        $Manifest.Schema -cne 'mapartrunner-scenario-references-v1' -or $Manifest.State -cne 'closed' -or
+        $Manifest.LaunchId -cne $LaunchId -or $Manifest.CleanupStatus -cne 'settled' -or
+        ![guid]::TryParseExact($Manifest.ClosureId,'D',[ref]$uuid) -or ($ClosureId -and $Manifest.ClosureId -cne $ClosureId) -or
+        $Manifest.Evidence -cne [IO.Path]::GetFullPath($Evidence) -or $Manifest.ScenarioRoot -cne [IO.Path]::GetFullPath($ScenarioRoot)) { throw 'Invalid scenario reference closure/launch identity.' }
+    foreach ($phase in 'Before','After') {
+        $path=Join-Path $Evidence ('scenarios-'+$phase.ToLowerInvariant()+'.json')
+        [void](Assert-V2ManagedPath $path $Owner)
+        $inventory=@(Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop)
+        if ((ConvertTo-Json -InputObject $inventory -Depth 5 -Compress) -cne (ConvertTo-Json -InputObject @($Manifest.$phase) -Depth 5 -Compress)) { throw "Reference $phase inventory mismatch." }
+        $seen=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($entry in $inventory) {
+            Assert-V2EvidenceName $entry.Name
+            if ($entry.Name -cnotmatch '^(environment-probe|single-lane|lane-import|schematic-import|two-lane|archive-self-check)-' -or !$seen.Add($entry.Name)) { throw 'Invalid/duplicate scenario inventory name.' }
+        }
+    }
+    $selected=@($Manifest.After | Where-Object { $_.Name -notin @($Manifest.Before | ForEach-Object Name) })
+    if (@($Manifest.Roots).Count -ne $selected.Count) { throw 'Reference selected root count mismatch.' }
+    for ($i=0;$i -lt $selected.Count;$i++) {
+        $root=$Manifest.Roots[$i]
+        if ((@($root.PSObject.Properties.Name | Sort-Object) -join ',') -cne 'Entries,Name' -or $root.Name -cne $selected[$i].Name) { throw 'Reference selected root identity mismatch.' }
+        # Manifest entry paths are never traversed: regenerate the complete set from this exact owned root.
+        $actual=@(Get-V2ReferenceEntries (Join-Path $ScenarioRoot $root.Name) $ScenarioRoot)
+        if ((ConvertTo-Json -InputObject $actual -Depth 8 -Compress) -cne (ConvertTo-Json -InputObject @($root.Entries) -Depth 8 -Compress)) { throw "Reference payload changed: $($root.Name)" }
+    }
+}
+
+function Read-V2ScenarioReferences {
+    param([string]$Evidence,[string]$ScenarioRoot,[string]$Owner,[string]$LaunchId,[string]$ClosureId)
+    $path=Join-Path $Evidence 'scenario-references.json'
+    [void](Assert-V2ManagedPath $path $Owner)
+    $manifest=Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    Assert-V2ScenarioReferences $manifest $Evidence $ScenarioRoot $Owner $LaunchId $ClosureId
+    return $manifest
+}
+
+function Save-V2Artifacts {
+    param([string]$Evidence, [string]$Game, [string]$ScenarioRoot, [object[]]$Before, [string]$Owner, $Context=$null)
+    [void](Assert-V2ManagedPath $Evidence $Owner)
+    [void](Assert-V2ManagedPath $ScenarioRoot $Owner)
     $after=@(Get-V2ScenarioInventory $ScenarioRoot)
-    @($Before) | ConvertTo-Json -Depth 5 -AsArray | Set-Content (Join-Path $Evidence 'scenarios-before.json')
-    $after | ConvertTo-Json -Depth 5 -AsArray | Set-Content (Join-Path $Evidence 'scenarios-after.json')
+    ConvertTo-Json -InputObject @($Before) -Depth 5 | Set-Content (Join-Path $Evidence 'scenarios-before.json')
+    ConvertTo-Json -InputObject $after -Depth 5 | Set-Content (Join-Path $Evidence 'scenarios-after.json')
     $links=[Collections.Generic.List[object]]::new()
     foreach ($folder in 'logs','crash-reports') {
         foreach ($link in @(Copy-V2Evidence (Join-Path $Game $folder) (Join-Path $Evidence $folder) $Game $Evidence)) { $links.Add($link) }
+    }
+    if ($Context -and !($Context.Request.PSObject.Properties['Mode'] -and $Context.Request.Mode -ceq 'inspect')) {
+        ConvertTo-Json -InputObject $links.ToArray() -Depth 5 | Set-Content (Join-Path $Evidence 'reparse-points.json')
+        # Only the existing finalizer can settle writers. Closure precedes outcome publication/lock release.
+        if ($Context.CleanupStatus -cne 'settled' -or $Context.Evidence -cne $Evidence) { throw 'Automatic reference retention requires settled launch cleanup.' }
+        $roots=@(foreach ($artifact in $after) {
+            if (@($Before | Where-Object Name -EQ $artifact.Name).Count) { continue }
+            Assert-V2EvidenceName $artifact.Name
+            [pscustomobject][ordered]@{Name=$artifact.Name;Entries=@(Get-V2ReferenceEntries (Join-Path $ScenarioRoot $artifact.Name) $ScenarioRoot)}
+        })
+        $manifest=[pscustomobject][ordered]@{Schema='mapartrunner-scenario-references-v1';State='closed';LaunchId=$Context.LaunchId
+            ClosureId=[guid]::NewGuid().ToString('D');CleanupStatus=$Context.CleanupStatus;Evidence=[IO.Path]::GetFullPath($Evidence)
+            ScenarioRoot=[IO.Path]::GetFullPath($ScenarioRoot);Before=@($Before);After=$after;Roots=$roots}
+        $partial=Join-Path $Evidence 'scenario-references.partial.json'; $closed=Join-Path $Evidence 'scenario-references.json'
+        [void](Assert-V2ManagedPath $partial $Owner); [void](Assert-V2ManagedPath $closed $Owner)
+        $bytes=[Text.UTF8Encoding]::new($false).GetBytes(($manifest | ConvertTo-Json -Depth 20))
+        $stream=[IO.File]::Open($partial,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+        try { $stream.Write($bytes); $stream.Flush($true) } finally { $stream.Dispose() }
+        $readback=Get-Content -LiteralPath $partial -Raw | ConvertFrom-Json -ErrorAction Stop
+        Assert-V2ScenarioReferences $readback $Evidence $ScenarioRoot $Owner $Context.LaunchId $manifest.ClosureId
+        [IO.File]::Move($partial,$closed)
+        [void](Read-V2ScenarioReferences -Evidence $Evidence -ScenarioRoot $ScenarioRoot -Owner $Owner -LaunchId $Context.LaunchId -ClosureId $manifest.ClosureId)
+        return
     }
     foreach ($artifact in $after) {
         # UUID directories present before launch are never credited as this invocation's artifacts.
@@ -562,7 +658,7 @@ function Save-V2Artifacts {
         New-Item -ItemType Directory -Path (Split-Path $destination) -Force | Out-Null
         foreach ($link in @(Copy-V2Evidence (Join-Path $ScenarioRoot $artifact.Name) $destination $ScenarioRoot $Evidence)) { $links.Add($link) }
     }
-    $links | ConvertTo-Json -Depth 5 -AsArray | Set-Content (Join-Path $Evidence 'reparse-points.json')
+    ConvertTo-Json -InputObject $links.ToArray() -Depth 5 | Set-Content (Join-Path $Evidence 'reparse-points.json')
 }
 
 function Update-V2Processes {
@@ -684,7 +780,7 @@ function Invoke-V2Supervisor {
             $Request | Add-Member ScenarioInventoryBefore $before -Force
             $workerText='& ' + "'" + $wrapper.Replace("'","''") + "' " + (($Request.Arguments | ForEach-Object { "'" + $_.Replace("'","''") + "'" }) -join ' ') + "`n`$nativeExit=`$LASTEXITCODE`nexit `$nativeExit"
             $Worker=[scriptblock]::Create($workerText)
-            $Archive={ param($evidence,$before) Save-V2Artifacts -Evidence $evidence -Game $game -ScenarioRoot $EvidenceRoot -Before $before -Owner $WorkingDirectory }
+            $Archive={ param($evidence,$before,$context) Save-V2Artifacts -Evidence $evidence -Game $game -ScenarioRoot $EvidenceRoot -Before $before -Owner $WorkingDirectory -Context $context }
         }
         $launchId=[guid]::NewGuid().ToString('D')
         $evidence=Join-Path $EvidenceRoot ('launch-' + $launchId)
@@ -932,7 +1028,7 @@ function Invoke-V2Supervisor {
                 if ($result.ExitCode -eq 0) { $result.ExitCode=125 }
             }
             if ($result.ExitCode -eq 0 -and @($result.NativeGameExitCodes | Where-Object { $_ -ne 0 }).Count) { $result.ExitCode=125; $result.SupervisorError += ' Native game failed despite worker0.' }
-            try { & $Archive $evidence $before; $result.ArchiveStatus='retained' }
+            try { & $Archive $evidence $before $result; $result.ArchiveStatus='retained' }
             catch { $result.ArchiveStatus='failed'; $result.ArchiveError=$_.Exception.ToString(); if ($result.ExitCode -eq 0) { $result.ExitCode=125 } }
             $result | ConvertTo-Json -Depth 12 | Set-Content (Join-Path $evidence 'outcome.json')
             "exitCode=$($result.ExitCode); workerExitCode=$($result.WorkerExitCode); timedOut=$($result.TimedOut); cleanup=$($result.CleanupStatus); archive=$($result.ArchiveStatus)" | Set-Content (Join-Path $evidence 'exit-code.txt')

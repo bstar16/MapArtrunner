@@ -39,6 +39,162 @@ try {
         }
         $regressions | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $testRoot 'review-regressions.json')
     }
+    Run 'Task8g automatic archive closes exact original roots once and rejects payload drift' {
+        $root=Join-Path $testRoot 'reference-fixture'; $game=Join-Path $root game
+        New-Item -ItemType Directory -Path (Join-Path $game logs),(Join-Path $root 'two-lane-stale') -Force | Out-Null
+        Set-Content (Join-Path $game 'logs/latest.log') 'reference diagnostics'
+        $before=@(Get-V2ScenarioInventory $root)
+        $payload=Join-Path $root ('two-lane-'+[guid]::NewGuid())
+        New-Item -ItemType Directory -Path (Join-Path $payload empty) -Force | Out-Null
+        Set-Content (Join-Path $payload bytes.txt) 'canonical bytes'
+        $launchId=[guid]::NewGuid().ToString('D'); $evidence=Join-Path $root ('launch-'+$launchId)
+        New-Item -ItemType Directory -Path $evidence | Out-Null
+        $context=[pscustomobject]@{LaunchId=$launchId;Evidence=$evidence;CleanupStatus='settled';Request=[pscustomobject]@{Mode='automatic'}}
+        Save-V2Artifacts -Evidence $evidence -Game $game -ScenarioRoot $root -Before $before -Owner $repo -Context $context
+        Assert (!(Test-Path (Join-Path $evidence scenarios))) 'automatic archive duplicated scenario payload'
+        $manifest=Read-V2ScenarioReferences -Evidence $evidence -ScenarioRoot $root -Owner $repo -LaunchId $launchId
+        Assert ($manifest.Roots.Count -eq 1 -and $manifest.Roots[0].Name -ceq (Split-Path $payload -Leaf)) 'stale root credited or fresh root lost'
+        Assert (@($manifest.Roots[0].Entries | Where-Object { $_.Path -ceq 'empty' -and $_.Kind -ceq 'directory' }).Count -eq 1) 'empty directory identity omitted'
+        $read={ Read-V2ScenarioReferences -Evidence $evidence -ScenarioRoot $root -Owner $repo -LaunchId $launchId -ClosureId $manifest.ClosureId }
+        foreach ($case in 'changed','missing','added','type','directory','root') {
+            $file=Join-Path $payload bytes.txt; $original=[IO.File]::ReadAllBytes($file)
+            try {
+                switch ($case) {
+                    changed { Set-Content $file 'different bytes' }
+                    missing { Remove-Item -LiteralPath $file }
+                    added { Set-Content (Join-Path $payload added.txt) 'extra' }
+                    type { Remove-Item -LiteralPath $file; New-Item -ItemType Directory -Path $file | Out-Null }
+                    directory { Remove-Item -LiteralPath (Join-Path $payload empty) }
+                    root { Remove-Item -LiteralPath $file; Remove-Item -LiteralPath (Join-Path $payload empty); Remove-Item -LiteralPath $payload }
+                }
+                Reject $read "reference reader accepted $case payload"
+            } finally {
+                if ($case -ceq 'type') { Remove-Item -LiteralPath $file }
+                if ($case -ceq 'added') { Remove-Item -LiteralPath (Join-Path $payload added.txt) }
+                if ($case -cin 'directory','root') { New-Item -ItemType Directory -Path (Join-Path $payload empty) -Force | Out-Null }
+                [IO.File]::WriteAllBytes($file,$original)
+            }
+        }
+        $path=Join-Path $evidence 'scenario-references.json'; $original=Get-Content $path -Raw
+        foreach ($case in 'schema','identity','closure','escape','duplicate','partial','root') {
+            try {
+                $bad=$original | ConvertFrom-Json
+                switch ($case) {
+                    schema { $bad.Schema='unknown' }
+                    identity { $bad.LaunchId=[guid]::NewGuid().ToString('D') }
+                    closure { $bad.ClosureId=[guid]::NewGuid().ToString('D') }
+                    escape { $bad.Roots[0].Entries[0].Path='../outside' }
+                    duplicate { $bad.Roots=@($bad.Roots)+@($bad.Roots) }
+                    partial { $bad.State='partial' }
+                    root { $bad.Roots[0].Name='../outside' }
+                }
+                $bad | ConvertTo-Json -Depth 30 | Set-Content $path
+                Reject $read "reference reader accepted $case manifest"
+            } finally { Set-Content $path $original }
+        }
+        & $read | Out-Null
+        $failedEvidence=Join-Path $root ('launch-'+[guid]::NewGuid()); New-Item -ItemType Directory -Path $failedEvidence | Out-Null
+        $failedContext=[pscustomobject]@{LaunchId=(Split-Path $failedEvidence -Leaf).Substring(7);Evidence=$failedEvidence;CleanupStatus='settled';Request=[pscustomobject]@{}}
+        $originalEntries=${function:Get-V2ReferenceEntries}; $mutation=@{Done=$false}; $originalBytes=[IO.File]::ReadAllBytes((Join-Path $payload bytes.txt))
+        try {
+            function Get-V2ReferenceEntries {
+                param($Path,$Owner,$Relative='.')
+                & $originalEntries $Path $Owner $Relative
+                if ($Path -eq $payload -and $Relative -ceq '.' -and !$mutation.Done) {
+                    $mutation.Done=$true; Set-Content (Join-Path $payload bytes.txt) 'changed during closure'
+                }
+            }
+            Reject { Save-V2Artifacts -Evidence $failedEvidence -Game $game -ScenarioRoot $root -Before $before -Owner $repo -Context $failedContext } 'writer accepted payload drift before closure'
+            Assert ($mutation.Done -and (Test-Path (Join-Path $failedEvidence scenario-references.partial.json)) -and !(Test-Path (Join-Path $failedEvidence scenario-references.json))) 'failed readback published a closed manifest'
+            Reject { Read-V2ScenarioReferences -Evidence $failedEvidence -ScenarioRoot $root -Owner $repo -LaunchId $failedContext.LaunchId } 'partial manifest consumed as retained archive'
+        } finally {
+            Set-Item Function:Get-V2ReferenceEntries $originalEntries
+            [IO.File]::WriteAllBytes((Join-Path $payload bytes.txt),$originalBytes)
+        }
+        $empty=Join-Path $root ('launch-'+[guid]::NewGuid()); New-Item -ItemType Directory -Path $empty | Out-Null
+        $emptyContext=[pscustomobject]@{LaunchId=(Split-Path $empty -Leaf).Substring(7);Evidence=$empty;CleanupStatus='settled';Request=[pscustomobject]@{}}
+        Save-V2Artifacts -Evidence $empty -Game $game -ScenarioRoot $root -Before @(Get-V2ScenarioInventory $root) -Owner $repo -Context $emptyContext
+        Assert ((Read-V2ScenarioReferences -Evidence $empty -ScenarioRoot $root -Owner $repo -LaunchId $emptyContext.LaunchId).Roots.Count -eq 0) 'empty startup invented scenario evidence'
+    }
+    Run 'Task8g automatic cancellation and failures retain diagnostics first cause and ownership' {
+        foreach ($case in 'cancelled','cancelled-invalid','worker0-invalid','worker7-invalid','timeout-invalid','unresolved') {
+            $root=Join-Path $testRoot ('reference-'+$case); $game=Join-Path $root game
+            $payload=Join-Path $root ('two-lane-'+[guid]::NewGuid())
+            New-Item -ItemType Directory -Path (Join-Path $game logs),(Join-Path $game crash-reports) -Force | Out-Null
+            Set-Content (Join-Path $game 'logs/latest.log') 'automatic diagnostics'
+            Set-Content (Join-Path $game 'crash-reports/failure.txt') 'automatic failure'
+            $worker="New-Item -ItemType Directory -Path '"+$payload.Replace("'","''")+"' | Out-Null; Set-Content -LiteralPath '"+(Join-Path $payload bytes.txt).Replace("'","''")+"' payload; Start-Sleep -Milliseconds "+$(if($case -cin 'worker7-invalid','unresolved'){'300; exit 7'}elseif($case -ceq 'worker0-invalid'){'300; exit 0'}else{'30000'})
+            $observation=[hashtable]::Synchronized(@{}); $pipeline=[Management.Automation.PowerShell]::Create()
+            $invocation=$null; $stopping=$null
+            try {
+                [void]$pipeline.AddScript({
+                    param($Source,$Owner,$Root,$Game,$Payload,$Worker,$Case,$Observation)
+                    $ErrorActionPreference='Stop'; . $Source
+                    $original=${function:Update-V2Processes}
+                    function Update-V2Processes {
+                        param($Job,$Records,$Handles,[switch]$Fast)
+                        & $original @PSBoundParameters
+                        if (Test-Path -LiteralPath (Join-Path $Payload bytes.txt)) {
+                            if (!$Observation.Ready) { $Observation.Snapshot=$result | ConvertTo-Json -Depth 12 -Compress; $Observation.Ready=$true }
+                            if ($Fast -and $Case -ceq 'unresolved') { throw 'Task8g deliberately unresolved after owned worker exit' }
+                        }
+                    }
+                    $archive={
+                        param($Evidence,$Before,$Context)
+                        Save-V2Artifacts -Evidence $Evidence -Game $Game -ScenarioRoot $Root -Before $Before -Owner $Owner -Context $Context
+                        if ($Case -like '*-invalid') {
+                            Set-Content -LiteralPath (Join-Path $Payload bytes.txt) 'changed before retention'
+                            [void](Read-V2ScenarioReferences -Evidence $Evidence -ScenarioRoot $Root -Owner $Owner -LaunchId $Context.LaunchId)
+                        }
+                    }
+                    Invoke-V2Supervisor -Worker ([scriptblock]::Create($Worker)) -EvidenceRoot $Root -WorkingDirectory $Owner -TimeoutMilliseconds $(if($Case -ceq 'timeout-invalid'){1800}else{10000}) -Archive $archive
+                }.ToString()).AddArgument((Join-Path $repo 'scripts/test-v2.ps1')).AddArgument($repo).AddArgument($root).AddArgument($game).AddArgument($payload).AddArgument($worker).AddArgument($case).AddArgument($observation)
+                $invocation=$pipeline.BeginInvoke(); $wait=[Diagnostics.Stopwatch]::StartNew()
+                while (!$observation.Ready -and !$invocation.IsCompleted -and $wait.ElapsedMilliseconds -lt 10000) { Start-Sleep -Milliseconds 20 }
+                Assert $observation.Ready "automatic $case did not reach owned payload observation"
+                $observed=$observation.Snapshot | ConvertFrom-Json
+                if ($case -like 'cancelled*') {
+                    $stopping=$pipeline.BeginStop($null,$null)
+                    Assert ($stopping.AsyncWaitHandle.WaitOne(15000)) 'HOLD: automatic cancelled pipeline did not settle'
+                    $pipeline.EndStop($stopping)
+                }
+                try { $returned=@($pipeline.EndInvoke($invocation)) }
+                catch [Management.Automation.MethodInvocationException] {
+                    if ($case -notlike 'cancelled*' -or $_.Exception.InnerException -isnot [Management.Automation.PipelineStoppedException]) { throw }
+                }
+                Assert (@($pipeline.Streams.Error | Where-Object { $_.Exception -isnot [Management.Automation.PipelineStoppedException] }).Count -eq 0) "automatic $case pipeline errors: $($pipeline.Streams.Error -join '; ')"
+                if ($case -like 'cancelled*') { Assert ($pipeline.InvocationStateInfo.State -eq 'Stopped') 'automatic pipeline was not actually stopped' }
+                else { Assert ($returned.Count -eq 1) 'automatic archive polluted scalar result pipeline' }
+                $outcome=Get-Content (Join-Path $observed.Evidence outcome.json) -Raw | ConvertFrom-Json
+                $lockBytes=(Get-Item (Join-Path $root supervisor.lock)).Length
+                Assert ((Get-Content (Join-Path $outcome.Evidence 'logs/latest.log') -Raw).Trim() -ceq 'automatic diagnostics') 'automatic failure lost logs'
+                Assert ((Test-Path (Join-Path $outcome.Evidence 'crash-reports/failure.txt')) -and (Test-Path (Join-Path $outcome.Evidence exit-code.txt))) 'automatic failure lost crash/exit evidence'
+                Assert ($outcome.LaunchId -ceq $observed.LaunchId -and @($outcome.Processes).Count -gt 0) 'automatic cancellation lost launch/held process identity'
+                if ($case -ceq 'unresolved') {
+                    Assert ($outcome.CleanupStatus -ceq 'unresolved' -and $outcome.CleanupError -like '*Task8g deliberately unresolved*' -and !(Test-Path (Join-Path $outcome.Evidence scenario-references.json))) 'unresolved cleanup closed immutable references'
+                } else {
+                    Assert ($outcome.CleanupStatus -ceq 'settled' -and $null -ne $outcome.WorkerExitCode -and @($outcome.Processes | Where-Object { $null -eq $_.ExitCode }).Count -eq 0) 'automatic failure lost settled held exits'
+                }
+                if ($case -ceq 'cancelled') {
+                    Assert ($outcome.ArchiveStatus -ceq 'retained' -and $lockBytes -eq 0 -and $outcome.ExitCode -ne 0 -and $outcome.TerminationRequested -and !$outcome.TimedOut) 'automatic cancellation lost truthful retained outcome'
+                    $manifest=Read-V2ScenarioReferences -Evidence $outcome.Evidence -ScenarioRoot $root -Owner $repo -LaunchId $outcome.LaunchId
+                    Assert ($manifest.Roots.Count -eq 1 -and !(Test-Path (Join-Path $outcome.Evidence scenarios))) 'automatic cancellation duplicated/lost payload'
+                } else {
+                    Assert ($outcome.ArchiveStatus -ceq 'failed' -and $outcome.ArchiveError -and $lockBytes -gt 0) 'automatic retention failure cleared ownership'
+                    Reject { Invoke-V2Supervisor -Worker { exit 0 } -EvidenceRoot $root -WorkingDirectory $repo } 'reference failure allowed rerun'
+                }
+                if ($case -cin 'worker7-invalid','unresolved') { Assert ($outcome.ExitCode -eq 7 -and $outcome.WorkerExitCode -eq 7 -and $outcome.PrimaryFailure.ExitCode -eq 7) 'reference/cleanup failure replaced primary worker7' }
+                if ($case -ceq 'worker0-invalid') { Assert ($outcome.ExitCode -eq 125 -and $outcome.WorkerExitCode -eq 0 -and !$outcome.PrimaryFailure) 'reference failure did not convert otherwise-successful0 to125' }
+                if ($case -ceq 'timeout-invalid') { Assert ($outcome.ExitCode -eq 124 -and $outcome.TimedOut) 'reference failure replaced timeout124' }
+                if ($case -ceq 'cancelled-invalid') { Assert ($outcome.ExitCode -ne 0 -and $outcome.TerminationRequested -and !$outcome.TimedOut) 'reference failure hid automatic cancellation' }
+            } finally {
+                if ($invocation -and !$invocation.IsCompleted) { $pipeline.Stop() }
+                if ($stopping) { $stopping.AsyncWaitHandle.Dispose() }
+                if ($invocation) { $invocation.AsyncWaitHandle.Dispose() }
+                $pipeline.Dispose()
+            }
+        }
+    }
     Run 'Task7 inspect selection is explicit and leaves automatic requests intact' {
         $request=New-V2Request -Inspect -Scenario grounded-two-lane -EulaAccepted
         Assert ($request.Mode -ceq 'inspect' -and $request.Scenario -ceq 'grounded-two-lane') 'inspect mode/selection missing'
@@ -139,13 +295,13 @@ try {
             } }
         }
     }
-    Run 'Task7 fixture registers the gated ordinary initializer beside five providers and nine mixins' {
+    Run 'Task7 fixture registers the gated ordinary initializer beside five providers and ten mixins' {
         $fixture=Join-Path $repo 'v2/fabric/src/gametest'
         $metadata=Get-Content (Join-Path $fixture 'resources/fabric.mod.json') -Raw | ConvertFrom-Json
         Assert ((@($metadata.entrypoints.client) -join ',') -ceq 'com.mapartrunner.fabric.scenario.ScenarioClientInitializer') 'ordinary initializer missing/duplicated'
         Assert (@($metadata.entrypoints.'fabric-client-gametest').Count -eq 5) 'automatic provider count changed'
         $mixins=Get-Content (Join-Path $fixture 'resources/mapart-test.mixins.json') -Raw | ConvertFrom-Json
-        Assert (@($mixins.client).Count -eq 9 -and $mixins.client -contains 'InspectExitMixin') 'accepted mixin configuration changed'
+        Assert (@($mixins.client).Count -eq 10 -and $mixins.client -contains 'InspectExitMixin' -and $mixins.client -contains 'InspectKeyboardInvoker') 'accepted mixin configuration changed'
     }
     Run 'Task7 real inspect constructor shares its launch root with the existing archiver' {
         $request=New-V2Request -Inspect -Scenario grounded-two-lane -EulaAccepted
@@ -439,14 +595,15 @@ try {
                 $inventoryProof.Add(@{ ScenarioRoot=$ScenarioRoot; ExclusiveHandleHeld=$held })
                 & $inventoryImplementation $ScenarioRoot
             }
-            $archive={ param($evidence,$before) Save-V2Artifacts -Evidence $evidence -Game $game -ScenarioRoot $atomicRoot -Before $before -Owner $repo }
+            $archive={ param($evidence,$before,$context) Save-V2Artifacts -Evidence $evidence -Game $game -ScenarioRoot $atomicRoot -Before $before -Owner $repo -Context $context }
             $a=Invoke-V2Supervisor -Worker ([scriptblock]::Create("New-Item -ItemType Directory -Path '" + $aPath.Replace("'","''") + "' | Out-Null; Set-Content -LiteralPath '" + (Join-Path $aPath artifact.txt).Replace("'","''") + "' A")) -EvidenceRoot $atomicRoot -WorkingDirectory $repo -TimeoutMilliseconds 10000 -Archive $archive
         } finally { Set-Item Function:Get-V2ScenarioInventory -Value $inventoryImplementation }
         @{ StaleExternalSnapshot=$staleSnapshot; InventoryEvents=@($inventoryProof); InvocationA=$a.Evidence; InvocationB=$b.Evidence } | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $testRoot 'atomic-inventory-proof.json')
         if ($a.CleanupStatus -ne 'settled') { throw 'HOLD: interleaved A ownership unresolved; no more launches.' }
         Assert ($a.ExitCode -eq 0 -and @($inventoryProof | Where-Object { !$_.ExclusiveHandleHeld }).Count -eq 0 -and $inventoryProof.Count -ge 2) 'inventory not taken under the exclusive launch handle'
-        Assert (Test-Path (Join-Path $a.Evidence 'scenarios/two-lane-A/artifact.txt')) 'A artifact missing'
-        Assert (!(Test-Path (Join-Path $a.Evidence 'scenarios/two-lane-B'))) 'completed interleaved B credited to A'
+        $references=Read-V2ScenarioReferences -Evidence $a.Evidence -ScenarioRoot $atomicRoot -Owner $repo -LaunchId $a.LaunchId
+        Assert ($references.Roots.Count -eq 1 -and $references.Roots[0].Name -ceq 'two-lane-A' -and (Get-Content (Join-Path $aPath artifact.txt) -Raw).Trim() -ceq 'A') 'A artifact missing or interleaved B credited'
+        Assert (!(Test-Path (Join-Path $a.Evidence scenarios))) 'automatic atomic inventory duplicated payload'
     }
     Regression 7 {
         $childPidFile=Join-Path $testRoot 'failed-worker-child-pid.txt'
@@ -573,6 +730,39 @@ try {
         Assert ($links.Count -eq 2 -and @($links | Where-Object { !$_.LinkTarget }).Count -eq 0) 'opaque live/dangling link provenance missing'
         Assert ((Get-Content "$scenarios/two-lane-new/ordinary/sentinel.bin" -Raw).Trim() -eq 'owned sentinel') 'sentinel bytes changed'
         Reject { Copy-V2Evidence "$scenarios/two-lane-new/ordinary" "$archiveFixture/../escape" $archiveFixture $archiveFixture } 'destination escape accepted'
+        $referenceLaunch=[guid]::NewGuid().ToString('D'); $referenceEvidence=Join-Path $archiveFixture ('launch-'+$referenceLaunch)
+        New-Item -ItemType Directory -Path $referenceEvidence | Out-Null
+        New-Item -ItemType Junction -Path "$scenarios/two-lane-redirect" -Target "$scenarios/two-lane-new/ordinary" | Out-Null
+        $context=[pscustomobject]@{LaunchId=$referenceLaunch;Evidence=$referenceEvidence;CleanupStatus='settled';Request=[pscustomobject]@{}}
+        Save-V2Artifacts -Evidence $referenceEvidence -Game $game -ScenarioRoot $scenarios -Before $before -Owner $archiveFixture -Context $context
+        $references=Read-V2ScenarioReferences -Evidence $referenceEvidence -ScenarioRoot $scenarios -Owner $archiveFixture -LaunchId $referenceLaunch
+        $ordinaryRoot=$references.Roots | Where-Object Name -CEQ 'two-lane-new'
+        $redirect=$references.Roots | Where-Object Name -CEQ 'two-lane-redirect'
+        Assert ($redirect.Entries.Count -eq 1 -and $redirect.Entries[0].Kind -ceq 'link') 'top redirect acquired ordinary provider authority'
+        $opaque=@($ordinaryRoot.Entries | Where-Object Kind -CEQ 'link')
+        Assert ($opaque.Count -eq 2 -and @($opaque | Where-Object { !$_.LinkTarget -or !$_.LinkType }).Count -eq 0) 'reference live/dangling metadata missing'
+        Assert (!(Test-Path "$referenceEvidence/scenarios") -and !(Test-Path -LiteralPath $absentPath)) 'reference archive followed/created link targets'
+        Assert ((Get-Item -LiteralPath "$scenarios/two-lane-new/alias" -Force).LinkTarget -ceq ($opaque | Where-Object Path -CEQ alias).LinkTarget) 'live link metadata changed'
+        Assert ((Get-Item -LiteralPath $linkPath -Force).LinkTarget -ceq ($opaque | Where-Object Path -CEQ dangling).LinkTarget) 'dangling link metadata changed'
+        $read={ Read-V2ScenarioReferences -Evidence $referenceEvidence -ScenarioRoot $scenarios -Owner $archiveFixture -LaunchId $referenceLaunch -ClosureId $references.ClosureId }
+        try {
+            Remove-Item -LiteralPath "$scenarios/two-lane-new/alias"
+            New-Item -ItemType Directory -Path "$scenarios/two-lane-new/alias" | Out-Null
+            Reject $read 'reference reader accepted reparse replacement'
+        } finally {
+            Remove-Item -LiteralPath "$scenarios/two-lane-new/alias"
+            New-Item -ItemType Junction -Path "$scenarios/two-lane-new/alias" -Target "$scenarios/two-lane-new/ordinary" | Out-Null
+        }
+        try {
+            function Get-Item {
+                param($LiteralPath,[switch]$Force)
+                $item=Microsoft.PowerShell.Management\Get-Item -LiteralPath $LiteralPath -Force:$Force -ErrorAction Stop
+                if ([IO.Path]::GetFullPath($LiteralPath) -eq [IO.Path]::GetFullPath((Join-Path $scenarios 'two-lane-new/alias'))) { $item | Add-Member LinkType 'Unknown' -Force }
+                $item
+            }
+            Reject $read 'unknown link metadata accepted'
+        } finally { Remove-Item Function:Get-Item }
+        & $read | Out-Null
     }
     Run 'frozen closed traversal calculation includes all and rejects malformed admissions' {
         Assert ((Get-V2TimeoutMilliseconds all 1) -eq 6433400) 'all repeat1 omits traversal deadline'
