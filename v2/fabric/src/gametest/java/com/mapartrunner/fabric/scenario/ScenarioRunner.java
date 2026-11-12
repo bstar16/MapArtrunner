@@ -143,6 +143,46 @@ final class ScenarioRunner implements AutoCloseable {
     private final List<ScenarioResult> assertedSuccesses = new ArrayList<>();
     private Checkpoint priorCountedStart;
     private PredictionFaults.SupportArmIdentity supportArm;
+    private ExpiryProof expiryProof;
+    record ExpiryPose(double x,double y,double z,double vx,double vy,double vz,float yaw,float headYaw,float bodyYaw,float pitch,
+                      Physics physics,boolean flying,boolean sprinting) { }
+    record ExpirySide(long nanos,int age,long time,int serverTick,ExpiryPose pose,int selectedSlot,String inventory,String menu,
+                      Map<GridPos,BuildPlan.BlockSpec> blocks,GridPos support) {
+        ExpirySide { blocks=Map.copyOf(blocks); }
+    }
+    record ExpiryClient(PredictionFaults.ExpirySnapshot hold,FabricBuildAdapter.Status status,int keyMask,int nativeSequence,
+                        List<GridPos> pending,List<BuildPlan.Target> expectedTargets,String planFingerprint,ExpirySide side) {
+        ExpiryClient { pending=List.copyOf(pending); expectedTargets=List.copyOf(expectedTargets); }
+    }
+    record ExpiryPair(UUID sessionId,UUID operationId,UUID runId,PredictionFaults.ExpiryIdentity identity,long deadline,long cutoff,
+                      int ordinal,ExpiryClient client,ExpirySide server) { }
+    record ExpiryReadResult(ExpiryPair pair,boolean advanced) { }
+    record ExpiryClocks(int clientAge,long clientTime,int serverAge,long serverTime,int serverTick) {
+        static ExpiryClocks of(ExpiryPair p) { return new ExpiryClocks(p.client.side.age,p.client.side.time,p.server.age,p.server.time,p.server.serverTick); }
+        boolean regressed(ExpiryClocks p) { return clientAge<p.clientAge || clientTime<p.clientTime || serverAge<p.serverAge || serverTime<p.serverTime || serverTick<p.serverTick; }
+        boolean advances(ExpiryClocks p) { return clientAge>p.clientAge && clientTime>p.clientTime && serverAge>p.serverAge && serverTime>p.serverTime && serverTick>p.serverTick; }
+    }
+    private static final class ExpiryProof {
+        final Operation operation;
+        final Scope work;
+        final PredictionFaults.ExpiryIdentity identity;
+        final StopBinding client;
+        final ServerWorld world;
+        final ServerPlayerEntity player;
+        final UUID playerId;
+        final PredictionFaults.SupportPose footprint;
+        final FabricBuildAdapter.Status heldStatus;
+        final List<BuildPlan.Target> expectedTargets;
+        ExpiryPair baseline,expired,replayed;
+        ExpiryPair firstAdmission,latestAdmission;
+        int admissionCount;
+        ExpiryProof(Operation operation,Scope work,PredictionFaults.ExpiryIdentity identity,StopBinding client,
+                    ServerWorld world,ServerPlayerEntity player,ScenarioObserver.Sample held,List<BuildPlan.Target> expectedTargets) {
+            this.operation=operation; this.work=work; this.identity=identity; this.client=client; this.world=world;
+            this.player=player; playerId=client.player.getUuid(); footprint=PredictionFaults.SupportPose.of(held.pose());
+            heldStatus=held.status(); this.expectedTargets=List.copyOf(expectedTargets);
+        }
+    }
     private boolean supportReceipt;
     // Constructor diagnostics spend the first pre-UUID budget; first start adopts it without renewal.
     private TraversalCapture capture;
@@ -202,7 +242,7 @@ final class ScenarioRunner implements AutoCloseable {
                                PredictionFaults.SupportArmIdentity arm) { }
 
     record InspectEffectResult(String before, String after, Throwable observationFailure, Throwable releaseFailure,
-                               Throwable freezeFailure, Throwable aftermathFailure) { }
+                               Throwable freezeFailure, Throwable aftermathFailure,int releaseAttempts,int freezeAttempts) { }
 
     /** Client-owned effects are attempted once per identity; the worker seals their immutable result before files. */
     static final class InspectEffects {
@@ -214,18 +254,19 @@ final class ScenarioRunner implements AutoCloseable {
             bind(cleanup);
             if (result != null || sealed) return result;
             String before = null, aftermath = null;
+            int releaseAttempts=0,freezeAttempts=0;
             Throwable observation = null, releaseError = null, freezeError = null, aftermathError = null;
             try { before = observe.get(); } catch (RuntimeException | Error error) { observation = error; }
-            try { release.run(); } catch (RuntimeException | Error error) { releaseError = error; }
+            try { releaseAttempts++; release.run(); } catch (RuntimeException | Error error) { releaseError = error; }
             try { aftermath = after.get(); } catch (RuntimeException | Error error) { aftermathError=error; }
-            try { freeze.run(); } catch (RuntimeException | Error error) { freezeError = error; }
-            return result = new InspectEffectResult(before,aftermath,observation,releaseError,freezeError,aftermathError);
+            try { freezeAttempts++; freeze.run(); } catch (RuntimeException | Error error) { freezeError = error; }
+            return result = new InspectEffectResult(before,aftermath,observation,releaseError,freezeError,aftermathError,releaseAttempts,freezeAttempts);
         }
         synchronized InspectEffectResult seal(Scope cleanup, Throwable unavailable) {
             bind(cleanup);
             if (result == null) {
                 require(unavailable != null,"Cannot seal unattempted cleanup as healthy");
-                result = new InspectEffectResult(null,null,unavailable,unavailable,unavailable,null);
+                result = new InspectEffectResult(null,null,unavailable,unavailable,unavailable,null,0,0);
             }
             sealed = true; return result;
         }
@@ -336,6 +377,7 @@ final class ScenarioRunner implements AutoCloseable {
     Optional<Operation> failedInspectAdmission() { return Optional.ofNullable(failedInspectAdmission); }
     Optional<InspectCompletion> lastInspectCompletion() { return Optional.ofNullable(inspectLast); }
     UUID inspectSessionId() { require(inspectMode,"Not an inspect session"); return invocation; }
+    boolean usesInspectHost(Inspect candidate) { return inspectMode && host==candidate; }
 
     /** Opaque retained value, never a native binding/scope capability. No Runner cache owns a second history. */
     static final class InspectIdleObservation {
@@ -514,7 +556,7 @@ final class ScenarioRunner implements AutoCloseable {
     static ResetFault selectResetFault(boolean inspect, String inspectGate, String acceptance, String automatic,
                                        String selection, Command command, int ordinal, int resets, boolean predecessor) {
         if(!inspect || !Boolean.parseBoolean(inspectGate) || !Boolean.parseBoolean(acceptance) || automatic!=null) return null;
-        require(Set.of("baseline","displaced","reset-archive","foreign-world").contains(selection),"Unknown acceptance case: "+selection);
+        require(Set.of("baseline","displaced","reset-archive","foreign-world","work-expiry").contains(selection),"Unknown acceptance case: "+selection);
         if(!selection.equals("reset-archive") || command!=Command.RESET) return null;
         if(ordinal==1 || ordinal==5) {
             require(resets==(ordinal==1?0:2) && predecessor,"Invalid reset fault counter/predecessor");
@@ -732,6 +774,23 @@ final class ScenarioRunner implements AutoCloseable {
                         failure==null?null:failure.getClass().getName(),failure==null?null:failure.getMessage(),concrete.foreignGuardFacts()));
             } catch(RuntimeException | Error error) { inspectEvidenceIncomplete=true; failure=retain(failure,error); }
         }
+        if(expiryProof!=null && expiryProof.operation==operation) {
+            try {
+                var p=expiryProof;
+                require(cleanupStatus.equals("RELEASED") && p.baseline!=null && p.expired!=null && p.replayed!=null && failure==primary
+                        && primary instanceof ScopeTimeoutException,"Expiry lacks original timeout, fresh pairs or successful actual release/freeze");
+                var effects=inspectEffects.seal(cleanup,null);
+                require(inspectFailureCaptured && effects.releaseAttempts()==1 && effects.freezeAttempts()==1,"Expiry capture/release/freeze attempts differ");
+                ((InspectScenarioHost)host).awaitExpiryBusyProof(operation,cleanup);
+                var proof=new JsonObject(); var gson=new GsonBuilder().setPrettyPrinting().create();
+                proof.add("pairs",gson.toJsonTree(List.of(p.baseline,p.expired,p.replayed)));
+                proof.add("firstAdmission",gson.toJsonTree(p.firstAdmission)); proof.add("latestAdmission",gson.toJsonTree(p.latestAdmission));
+                proof.addProperty("admissionRequests",p.admissionCount); proof.addProperty("captureAttempts",inspectFailureCaptured?1:0);
+                proof.addProperty("releaseAttempts",effects.releaseAttempts()); proof.addProperty("freezeAttempts",effects.freezeAttempts());
+                proof.add("boundary",gson.toJsonTree(((InspectScenarioHost)host).observeExpiryAcceptance()));
+                writeNew(roots,artifacts.resolve("work-expiry-proof.json"),gson.toJson(proof));
+            } catch(RuntimeException | Error error) { inspectEvidenceIncomplete=true; failure=retain(failure,error); }
+        }
         // Transport settlement cannot resolve an unverified release/freeze owned by this Runner.
         if(cleanupStatus.equals("FAILED")) inspectUnresolvedCleanupFailure=failure;
         ready=ready && failure==null && operation.command()==Command.RESET;
@@ -776,7 +835,10 @@ final class ScenarioRunner implements AutoCloseable {
                 Optional.ofNullable(inspectRun),failure==null?"PASS":"FAIL",failure,artifacts,complete,cleanupStatus,true,summary);
         inspectLast=completion; inspectLastSummaryHash=summaryHash; inspectOperation=null;
         return completion;
-        } finally { inspectResetDiagnostic=null; inspectForeignPrior=null; inspectForeignOperation=null; }
+        } finally {
+            inspectResetDiagnostic=null; inspectForeignPrior=null; inspectForeignOperation=null;
+            if(inspectUnresolvedCleanupFailure==null) expiryProof=null;
+        }
     }
 
     private static boolean timeoutFailure(Throwable failure) {
@@ -785,7 +847,7 @@ final class ScenarioRunner implements AutoCloseable {
     }
 
     private String inspectObservations(MinecraftClient client) {
-        return MapArtClient.status()+"\n"+watch.retained()+"\n"+PredictionFaults.snapshot()+"\n"+PredictionFaults.stateSnapshot();
+        return MapArtClient.status()+"\nkeys="+keys(client)+"\n"+watch.retained()+"\n"+PredictionFaults.snapshot()+"\n"+PredictionFaults.stateSnapshot();
     }
 
     private InspectEffectResult finishInspectEffects(Scope cleanup) {
@@ -800,7 +862,7 @@ final class ScenarioRunner implements AutoCloseable {
             return host.computeOnClient(c -> {
                 inspectEffects.attempt(cleanup,() -> { requireClient(c); return inspectObservations(c); },
                         () -> releaseInspectOnClient(c,false,cleanup),() -> watch.freeze(),() -> {
-                            requireClient(c); return MapArtClient.status().toString();
+                            requireClient(c); return MapArtClient.status()+";keys="+keys(c);
                         });
                 return inspectEffects.seal(cleanup,null);
             });
@@ -843,6 +905,19 @@ final class ScenarioRunner implements AutoCloseable {
                     "Cleanup refuses another run's controls");
         });
         foreignEffect("CLEANUP_STOP"); MapArtClient.stop(); requireReleased(c);
+        if(expiryProof!=null) {
+            var p=expiryProof; var status=MapArtClient.status();
+            require(status.engine().lifecycle().context().filter(p.identity.context()::equals).isPresent()
+                    && status.engine().lifecycle().phase()==Phase.TERMINAL && status.controlOwner()==BuildEngine.ControlOwner.NONE,
+                    "Expiry retirement requires actual owned terminal/NONE release");
+            boolean retired=PredictionFaults.retireExpiryHold(c,p.identity);
+            if(!retired) {
+                var disposed=PredictionFaults.observeExpiryHold(c,p.identity);
+                require(disposed.disposed() && disposed.latest()!=null && disposed.latest().lifecycle().phase()==Phase.TERMINAL
+                        && disposed.latest().owner()==BuildEngine.ControlOwner.NONE && disposed.latest().keys().size()==9
+                        && disposed.latest().keys().stream().noneMatch(Boolean::booleanValue),"Expiry already-disposed owner lacks terminal release facts");
+            }
+        }
         var arm=stopping?inspectStopBinding.arm:supportArm;
         if(arm!=null) {
             if(stopping) requireInspectStopClient(c,cleanup); else requireClient(c);
@@ -855,7 +930,7 @@ final class ScenarioRunner implements AutoCloseable {
         inspectEffects.attempt(cleanup,() -> { requireInspectStopClient(c,cleanup); return inspectObservations(c); },
                 () -> releaseInspectOnClient(c,true,cleanup),() -> {
                     ((Inspect)host).requireStoppingScope(cleanup); watch.freeze();
-                },() -> { requireInspectStopClient(c,cleanup); return MapArtClient.status().toString(); });
+                },() -> { requireInspectStopClient(c,cleanup); return MapArtClient.status()+";keys="+keys(c); });
     }
 
     private JsonArray inspectClosedFiles() {
@@ -1182,8 +1257,8 @@ final class ScenarioRunner implements AutoCloseable {
                 "Reset refuses failed output or renewal of an unadopted compact budget");
         if(baseline() && (inspectMode || !supportReceipt)) {
             writeNew(roots,artifacts.resolve("support-coverage.txt"),"invocation="+invocation+"; definition="+definition.definitionHash()
-                    +"; case="+supportCase.label()+"; selector="+(supportSelector==null?"absent":supportSelector)
-                    +"; expectedCounted="+expectedCountedRuns+"; meaning="+supportMeaning());
+                    +"; case="+(expiryRunSelected()?"work-expiry":supportCase.label())+"; selector="+(supportSelector==null?"absent":supportSelector)
+                    +"; expectedCounted="+expectedCountedRuns+"; meaning="+(expiryRunSelected()?"ordinary reset for private expiry; no ordinary support coverage claim":supportMeaning()));
             supportReceipt=true;
         }
         boolean release = host.computeOnClient(c -> {
@@ -1276,6 +1351,9 @@ final class ScenarioRunner implements AutoCloseable {
     }
 
     private UUID start(ScenarioDefinition definition, boolean counted) {
+        return start(definition,counted,false);
+    }
+    private UUID start(ScenarioDefinition definition,boolean counted,boolean expiryStart) {
         var observationScope=requireInspectWork(Command.RUN,Command.RERUN);
         preflight(definition);
         require(baseline() || compactArchiveFailure==null,"Start refuses an earlier failed compact archive");
@@ -1290,6 +1368,8 @@ final class ScenarioRunner implements AutoCloseable {
             return ScenarioObserver.serverBinding(s,serverWorld,serverPlayer);
         }):null;
         UUID started=host.computeOnClient(c -> {
+            if(expiryStart) require(expiryRunSelected() && inspectOperation.command()==Command.RUN && inspectOperation.ordinal()==2
+                    && ((Inspect)host).observationScopeValid(observationScope),"Expiry native start gates/original WORK changed");
             foreignGuard("START",() -> { requireClient(c); requireReleased(c); });
             var now = readClient(c, true);
             if(!baseline()) now=withRegion(now,region(c.player,true,"prestart-client"));
@@ -1314,7 +1394,7 @@ final class ScenarioRunner implements AutoCloseable {
                 forwardHistory=new TraversalAssertions.ForwardHistory(fixture,plan);
                 watch.armTraversal(c,plan,capture);
             }
-            if(baseline() && counted && supportCase==SupportCase.CONTROLLED) {
+            if(baseline() && counted && (supportCase==SupportCase.CONTROLLED || expiryStart)) {
                 supportArm=PredictionFaults.armSupportAvailability(c,server,save,fresh,plan,settings,watch).identity();
                 bindInspectStop(c);
                 verifySupportArmRefusals(c,fresh);
@@ -2706,7 +2786,210 @@ final class ScenarioRunner implements AutoCloseable {
         } catch(NoSuchAlgorithmException error) { throw new AssertionError(error); }
     }
 
+    private boolean expiryRunSelected() {
+        return inspectMode && host instanceof InspectScenarioHost && InspectScenarioHost.expiryAcceptanceEnabled();
+    }
+    private void requireExpiryRun(ScenarioDefinition definition) {
+        var work=requireInspectWork(Command.RUN,Command.RUN);
+        require(expiryRunSelected() && baseline() && inspectOperation.ordinal()==2 && inspectOperation.sessionId().equals(invocation)
+                && inspectLast!=null && inspectLast.ordinal()==1 && inspectLast.command()==Command.RESET && inspectLast.cleanupSettled()
+                && inspectLast.verdict().equals("PASS") && inspectLast.failure()==null && resetOrdinal==1 && countedStarts==0 && runs.isEmpty()
+                && ready && admitted!=null && definition.definitionHash().equals(admitted.definitionHash()) && expiryProof==null
+                && work.operation()==inspectOperation,"Expiry requires successful RESET1 and original baseline RUN2");
+    }
+    private void runExpiry(ScenarioDefinition definition) {
+        requireExpiryRun(definition);
+        var work=requireInspectWork(Command.RUN,Command.RUN);
+        UUID id=start(definition,true,true);
+        var allowance=new PhysicsAllowance(i(definition.data().getAsJsonObject("budgets"),"runTicks"));
+        while(allowance.consumed()<allowance.constructionLimit) {
+            allowance.waitTick(false,host::waitTick);
+            if(expiryProof==null) host.runOnClient(c -> {
+                requireClient(c);
+                PredictionFaults.supportHold(c,id).ifPresent(held -> {
+                    var identity=PredictionFaults.latchExpiryHold(c,server,save,id,held,work.deadlineNanos());
+                    bindInspectStop(c);
+                    expiryProof=new ExpiryProof(inspectOperation,work,identity,inspectStopBinding,serverWorld,serverPlayer,held,plan.targets());
+                });
+            });
+            if(expiryProof==null) continue;
+            var local=host.computeOnClient(c -> readExpiryClient(null,c));
+            var remote=host.computeOnServer(s -> readExpiryServer(null,s));
+            var candidate=host.computeOnClient(c -> {
+                requireExpiryBinding(null,c);
+                var pair=expiryPair(0,local,remote); var proof=expiryProof; var clocks=ExpiryClocks.of(pair);
+                require(local.side.nanos<work.deadlineNanos() && remote.nanos<work.deadlineNanos(),"Expiry baseline read reached original deadline");
+                if(proof.latestAdmission!=null) require(!clocks.regressed(ExpiryClocks.of(proof.latestAdmission)),"Expiry admission clocks regressed");
+                if(proof.firstAdmission==null) proof.firstAdmission=pair;
+                else {
+                    require(pair.client.nativeSequence==proof.firstAdmission.client.nativeSequence,"Expiry admission native sequence changed");
+                    requireExpiryProtected(proof.firstAdmission,pair,false);
+                }
+                proof.latestAdmission=pair; proof.admissionCount++;
+                // Only natural residual horizontal motion and owned predictions may stabilize, using this shared request allowance.
+                if(!local.pending.isEmpty() || !expiryStationary(local.side.pose) || !expiryStationary(remote.pose)) return null;
+                proof.baseline=pair; return pair;
+            });
+            if(candidate==null) continue;
+            var concrete=(InspectScenarioHost)host;
+            concrete.armExpiryPause(inspectOperation,expiryProof.identity,this);
+            // The immediately following real guarded action is deliberately held by its actual Host QueuedAction.
+            host.runOnClient(c -> { requireClient(c); MapArtClient.pause(); requireReleased(c); });
+            throw new IllegalStateException("Expiry held pause action unexpectedly returned");
+        }
+        throw new IllegalStateException("Expiry support/baseline unavailable within original construction requests");
+    }
+    private void requireExpiryBinding(InspectScenarioHost.ExpiryRead request,MinecraftClient c) {
+        var p=expiryProof;
+        require(p!=null && inspectOperation==p.operation && p.operation.sessionId().equals(invocation) && expiryRunSelected(),"Expiry operation/gates changed");
+        if(request==null) require(((Inspect)host).observationScopeValid(p.work),"Expiry baseline lost original WORK");
+        else require(request.operation==p.operation && request.identity==p.identity && request.deadline==p.work.deadlineNanos()
+                && request.cutoff==request.deadline+10_000_000_000L,"Expiry read token changed");
+        var b=p.client;
+        require(c!=null && c.isOnThread() && c.getServer()==b.server && c.world==b.world && c.player==b.player
+                && c.getNetworkHandler()==b.handler && b.handler.getConnection()==b.connection && b.connection.isOpen()
+                && b.handler.getWorld()==b.world && b.player.getEntityWorld()==b.world && c.player.getUuid().equals(p.playerId)
+                && c.currentScreen==null && !c.isPaused() && server==b.server && clientWorld==b.world && clientPlayer==b.player
+                && serverWorld==p.world && serverPlayer==p.player && save.equals(b.save) && !closed,"Expiry original native client binding changed");
+    }
+    ExpiryClient readExpiryClient(InspectScenarioHost.ExpiryRead request,MinecraftClient c) {
+        requireExpiryBinding(request,c);
+        var p=expiryProof; var hold=PredictionFaults.observeExpiryHold(c,p.identity); var status=MapArtClient.status();
+        int mask=0; var nativeKeys=keys(c); for(int k=0;k<nativeKeys.size();k++) if(nativeKeys.get(k)) mask|=1<<k;
+        requireExpiryHold(hold,p.identity,status,mask,InspectScenarioHost.expiryAcceptanceEnabled(),request!=null);
+        require(status.equals(p.heldStatus) && plan.targets().equals(p.expectedTargets),"Expiry held engine/expected targets changed");
+        var manager=((ClientWorldPendingUpdateAccessor)c.world).mapart$getPendingUpdateManager();
+        require(manager instanceof PendingPredictionView,"Expiry pending-update native view unavailable");
+        var pending=new ArrayList<GridPos>();
+        for(var at:expiryCells(p,c.player)) if(((PendingPredictionView)manager).mapart$hasPendingPrediction(new BlockPos(at.x(),at.y(),at.z()))) pending.add(at);
+        return new ExpiryClient(hold,status,mask,manager.getSequence(),pending,p.expectedTargets,plan.fingerprint(),readExpirySide(c.player,-1,p));
+    }
+    ExpirySide readExpiryServer(InspectScenarioHost.ExpiryRead request,MinecraftServer actual) {
+        var p=expiryProof;
+        require(p!=null && expiryRunSelected() && inspectOperation==p.operation && actual==p.client.server && actual==server && actual.isOnThread()
+                && actual.getWorld(World.OVERWORLD)==p.world && p.player.getEntityWorld()==p.world && p.player.getUuid().equals(p.playerId)
+                && actual.getPlayerManager().getPlayer(p.playerId)==p.player && serverPlayer==p.player && serverWorld==p.world
+                && actual.getSavePath(WorldSavePath.ROOT).toAbsolutePath().normalize().equals(p.client.save),"Expiry original native server binding changed");
+        if(request!=null) require(request.operation==p.operation && request.identity==p.identity && request.deadline==p.work.deadlineNanos(),"Expiry server read token changed");
+        return readExpirySide(p.player,actual.getTicks(),p);
+    }
+    private Set<GridPos> expiryCells(ExpiryProof proof,PlayerEntity player) {
+        var cells=new LinkedHashSet<>(admitted.worldCells().keySet());
+        for(var target:plan.targets()) { var at=target.relativePos(); cells.add(new GridPos(origin.x()+at.x(),origin.y()+at.y(),origin.z()+at.z())); }
+        var support=player.getBlockPos().down();
+        for(int y=0;y<3;y++) cells.add(new GridPos(support.getX(),support.getY()+y,support.getZ()));
+        return cells;
+    }
+    private ExpirySide readExpirySide(PlayerEntity player,int tick,ExpiryProof proof) {
+        var level=player.getEntityWorld(); var velocity=player.getVelocity();
+        var pose=new ExpiryPose(player.getX(),player.getY(),player.getZ(),velocity.x,velocity.y,velocity.z,player.getYaw(),player.headYaw,player.bodyYaw,player.getPitch(),
+                physics(player),player.getAbilities().flying,player.isSprinting());
+        requireExpiryPose(pose,proof.footprint);
+        var defaults=playerDefaults(BASELINE_ATTRIBUTES);
+        for(var attribute:BASELINE_ATTRIBUTES) require(player.getAttributeBaseValue(attribute)==defaults.getBaseValue(attribute)
+                && player.getAttributeValue(attribute)==defaults.getValue(attribute)
+                && player.getAttributes().getAttributesToSend().stream().noneMatch(a -> a.getAttribute().equals(attribute) && !a.getModifiers().isEmpty()),
+                "Expiry ordinary motion attribute/modifier changed: "+attribute);
+        require(player.getInventory().size()==43,"Expiry native inventory is not all43 slots");
+        var slots=new JsonArray();
+        for(int slot=0;slot<43;slot++) slots.add(ItemStack.OPTIONAL_CODEC.encodeStart(level.getRegistryManager().getOps(JsonOps.INSTANCE),player.getInventory().getStack(slot)).getOrThrow());
+        var menu=new JsonObject();
+        menu.addProperty("playerHandler",player.currentScreenHandler==player.playerScreenHandler);
+        menu.addProperty("syncId",player.currentScreenHandler.syncId); menu.addProperty("revision",player.currentScreenHandler.getRevision());
+        menu.add("cursor",ItemStack.OPTIONAL_CODEC.encodeStart(level.getRegistryManager().getOps(JsonOps.INSTANCE),player.currentScreenHandler.getCursorStack()).getOrThrow());
+        var crafting=new JsonArray();
+        for(int k=0;k<player.playerScreenHandler.getCraftingInput().size();k++) crafting.add(ItemStack.OPTIONAL_CODEC.encodeStart(level.getRegistryManager().getOps(JsonOps.INSTANCE),player.playerScreenHandler.getCraftingInput().getStack(k)).getOrThrow());
+        menu.add("crafting",crafting);
+        menu.add("output",ItemStack.OPTIONAL_CODEC.encodeStart(level.getRegistryManager().getOps(JsonOps.INSTANCE),player.playerScreenHandler.getOutputSlot().getStack()).getOrThrow());
+        var blocks=new LinkedHashMap<GridPos,BuildPlan.BlockSpec>();
+        for(var cell:expiryCells(proof,player)) {
+            var at=new BlockPos(cell.x(),cell.y(),cell.z());
+            require(level.getChunkManager().getChunk(Math.floorDiv(at.getX(),16),Math.floorDiv(at.getZ(),16),ChunkStatus.FULL,false)!=null,
+                    "Expiry protected FULL chunk unavailable: "+cell);
+            blocks.put(cell,WorldEvidenceReader.blockSpec(level.getBlockState(at)));
+        }
+        var support=player.getBlockPos().down();
+        require(level.getBlockState(support).isFullCube(level,support) && player.isSupportedBy(support)
+                && level.getBlockState(support.up()).isAir() && level.getBlockState(support.up(2)).isAir(),"Expiry actual support/clearance changed");
+        return new ExpirySide(System.nanoTime(),player.age,level.getTime(),tick,pose,player.getInventory().getSelectedSlot(),sorted(slots).toString(),
+                sorted(menu).toString(),blocks,new GridPos(support.getX(),support.getY(),support.getZ()));
+    }
+    static void requireExpiryPose(ExpiryPose pose,PredictionFaults.SupportPose footprint) {
+        for(double value:new double[]{pose.x,pose.y,pose.z,pose.vx,pose.vy,pose.vz,pose.yaw,pose.headYaw,pose.bodyYaw,pose.pitch})
+            require(Double.isFinite(value),"Expiry nonfinite pose");
+        require(Math.abs(pose.x-footprint.x())<=.25 && Math.abs(pose.z-footprint.z())<=.25 && Math.abs(pose.y-footprint.y())<=1e-6,
+                "Expiry left actual retained END footprint");
+        var p=pose.physics;
+        require(p.onGround() && !p.noGravity() && !p.noDrag() && !p.jumping() && !p.vehicle() && !p.fluid() && !p.water() && !p.submerged()
+                && !p.lava() && !p.climbing() && !p.gliding() && !p.swimming() && !p.sneaking() && !p.usingItem() && !p.hasEffects()
+                && p.fallDistance()==0 && p.gravity()==.08 && !pose.flying && !pose.sprinting
+                && Double.doubleToRawLongBits(pose.vy)==0xBFB41205C28F5C29L,"Expiry ordinary grounded physics changed");
+    }
+    static boolean expiryStationary(ExpiryPose p) { return Math.abs(p.vx)<=1e-7 && Math.abs(p.vz)<=1e-7; }
+    static void requireExpiryHold(PredictionFaults.ExpirySnapshot hold,PredictionFaults.ExpiryIdentity identity,FabricBuildAdapter.Status status,
+                                  int keys,boolean gates,boolean expired) {
+        var latest=hold.latest();
+        require(gates && hold.identity()==identity && !hold.disposed() && latest!=null && latest.sameNative() && !latest.suspended()
+                && latest.lifecycle().context().filter(identity.context()::equals).isPresent() && latest.lifecycle().phase()==Phase.RUNNING
+                && latest.owner()==BuildEngine.ControlOwner.NATIVE && latest.keys().size()==9 && latest.keys().stream().noneMatch(Boolean::booleanValue)
+                && keys==0 && status.controlOwner()==BuildEngine.ControlOwner.NATIVE && status.failure().isEmpty()
+                && status.engine().lifecycle().equals(latest.lifecycle()) && (hold.invalidity().isEmpty()
+                    || expired && hold.invalidity().orElseThrow().equals("Original WORK expired")),"Expiry lost current gates/native neutral lease/context");
+    }
+    private ExpiryPair expiryPair(int ordinal,ExpiryClient local,ExpirySide remote) {
+        var p=expiryProof;
+        return new ExpiryPair(p.operation.sessionId(),p.operation.operationId(),p.identity.context().runId(),p.identity,p.work.deadlineNanos(),
+                p.work.deadlineNanos()+10_000_000_000L,ordinal,local,remote);
+    }
+    ExpiryReadResult acceptExpiryPair(InspectScenarioHost.ExpiryRead request,MinecraftClient c,ExpiryClient local,ExpirySide remote) {
+        requireExpiryBinding(request,c);
+        var p=expiryProof; var fresh=PredictionFaults.observeExpiryHold(c,p.identity);
+        requireExpiryHold(fresh,p.identity,MapArtClient.status(),keys(c).stream().anyMatch(Boolean::booleanValue)?1:0,InspectScenarioHost.expiryAcceptanceEnabled(),true);
+        require(MapArtClient.status().equals(local.status),"Expiry engine changed between native reads");
+        var pair=expiryPair(request.ordinal,local,remote);
+        var previous=request.ordinal==1?p.baseline:p.expired;
+        require(previous!=null && (request.ordinal==1?p.expired==null:p.replayed==null),"Expiry fixed pair missing predecessor/already accepted");
+        boolean advanced=validateExpiryPair(p.baseline,previous,pair,request.latestClocks);
+        return new ExpiryReadResult(pair,advanced);
+    }
+    /** Immutable retention only, after Host revalidates and claims the exact pending request under its lock. */
+    void retainExpiryPair(InspectScenarioHost.ExpiryRead request,ExpiryPair pair) {
+        var p=expiryProof;
+        require(p!=null && p.operation==request.operation && p.identity==request.identity && pair.identity==p.identity,"Expiry pair commit changed");
+        if(request.ordinal==1) { require(p.expired==null,"Expiry E already accepted"); p.expired=pair; }
+        else { require(request.ordinal==2 && p.expired!=null && p.replayed==null,"Expiry R predecessor/duplicate"); p.replayed=pair; }
+    }
+    static boolean validateExpiryPair(ExpiryPair baseline,ExpiryPair previous,ExpiryPair pair,ExpiryClocks latest) {
+        require(pair.sessionId.equals(baseline.sessionId) && pair.operationId.equals(baseline.operationId) && pair.runId.equals(baseline.runId)
+                && pair.identity==baseline.identity && pair.deadline==baseline.deadline && pair.cutoff==baseline.cutoff
+                && pair.ordinal==previous.ordinal+1,"Expiry pair identity/phase/deadline changed");
+        requireExpiryHold(pair.client.hold,pair.identity,pair.client.status,pair.client.keyMask,true,true);
+        require(pair.client.status.equals(baseline.client.status) && pair.client.nativeSequence==baseline.client.nativeSequence
+                && pair.client.expectedTargets.equals(baseline.client.expectedTargets) && pair.client.planFingerprint.equals(baseline.client.planFingerprint)
+                && pair.client.pending.equals(baseline.client.pending) && pair.client.pending.isEmpty(),"Expiry engine/target/ledger/pending/sequence changed");
+        requireExpiryProtected(baseline,pair,true);
+        var clocks=ExpiryClocks.of(pair); var prior=ExpiryClocks.of(previous);
+        require(!clocks.regressed(prior) && (latest==null || !clocks.regressed(latest)),"Expiry native clocks regressed");
+        require(pair.client.side.nanos>=pair.deadline && pair.server.nanos>=pair.deadline && pair.client.side.nanos<pair.cutoff && pair.server.nanos<pair.cutoff
+                && pair.client.side.nanos>previous.client.side.nanos && pair.server.nanos>previous.server.nanos,"Expiry native observation time/cutoff changed");
+        return clocks.advances(prior);
+    }
+    private static void requireExpiryProtected(ExpiryPair baseline,ExpiryPair pair,boolean stationary) {
+        for(var sides:List.of(List.of(baseline.client.side,pair.client.side),List.of(baseline.server,pair.server))) {
+            var before=sides.getFirst(); var after=sides.getLast();
+            require(before.inventory.equals(after.inventory) && before.menu.equals(after.menu) && before.selectedSlot==after.selectedSlot
+                    && before.blocks.equals(after.blocks) && before.support.equals(after.support) && (!stationary || expiryStationary(after.pose)),
+                    "Expiry protected inventory/handler/block/support/velocity changed");
+        }
+    }
+
     ScenarioResult run(ScenarioDefinition definition) {
+        if(expiryRunSelected()) {
+            requireExpiryRun(definition);
+            ((InspectScenarioHost)host).awaitExpiryStart(inspectOperation);
+            runExpiry(definition);
+            throw new AssertionError("Expiry pause returned without actual original WORK timeout");
+        }
         UUID id = start(definition,true);
         boolean firstSuccess=inspectMode?assertedSuccesses.isEmpty():countedStarts==1;
         var stage=artifacts.resolve("success-"+countedStarts+"-"+id);

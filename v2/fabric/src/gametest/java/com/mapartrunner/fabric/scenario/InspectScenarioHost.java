@@ -75,6 +75,277 @@ final class InspectScenarioHost implements Inspect {
     private volatile MinecraftServer server;
     private volatile Path save;
 
+    // WORK owns wrapper/read retirement; A owns suppression until actual terminal release. CLEANUP owns only the busy rendezvous.
+    private static final class ExpiryBoundary {
+        final Operation operation;
+        final PredictionFaults.ExpiryIdentity identity;
+        final long deadline, cutoff;
+        Scope work, cleanup;
+        ScenarioRunner runner;
+        Runnable continuation, retireWrapper;
+        CompletableFuture<?> result;
+        ExpiryRead read;
+        String stage="ARMED";
+        int wrapperEntries, actionEntries, replayCount, busyRefusals;
+        long cleanupDeadline, busyRequest;
+        boolean retired, replayRejected;
+        Throwable primary, replayFailure;
+        ScenarioCommands.ExpiryBusyAck ack;
+        ExpiryBoundary(Operation operation,Scope work,PredictionFaults.ExpiryIdentity identity,ScenarioRunner runner) {
+            this.operation=operation; this.work=work; this.identity=identity; this.runner=runner;
+            deadline=work.deadlineNanos(); cutoff=deadline+CLEANUP_NANOS;
+        }
+    }
+    /** Fixed read token only: no caller-supplied action or effect permission. */
+    static final class ExpiryRead {
+        final Operation operation;
+        final PredictionFaults.ExpiryIdentity identity;
+        final int ordinal;
+        final long deadline, cutoff;
+        final Object boundary;
+        String step="CLIENT";
+        boolean queued;
+        ScenarioRunner.ExpiryClient local;
+        ScenarioRunner.ExpirySide remote;
+        ScenarioRunner.ExpiryPair accepted;
+        Throwable failure;
+        long attempts;
+        ScenarioRunner.ExpiryClocks latestClocks;
+        ExpiryRead(ExpiryBoundary b,int ordinal) {
+            boundary=b; operation=b.operation; identity=b.identity; this.ordinal=ordinal; deadline=b.deadline; cutoff=b.cutoff;
+        }
+    }
+    private ExpiryBoundary expiryBoundary;
+    private final AtomicBoolean expiryAbandoned=new AtomicBoolean();
+    private volatile ScenarioCommands.ExpiryObservation expiryObservation;
+
+    static boolean expiryAcceptanceEnabled() {
+        return PredictionFaults.expiryEnabled(System.getProperty("mapart.test.inspect"),System.getProperty("mapart.test.inspect.acceptance"),
+                System.getProperty("fabric.client.gametest"),System.getProperty("mapart.test.inspect.acceptance.case"));
+    }
+    void awaitExpiryStart(Operation operation) {
+        rejectNativeWait();
+        var work=requireScope(operation,Kind.WORK);
+        check(expiryAcceptanceEnabled() && operation.command()==Command.RUN && operation.ordinal()==2,"Expiry start requires RUN2");
+        lock.lock();
+        try {
+            while(clock.getAsLong()<work.deadlineNanos()-TimeUnit.MILLISECONDS.toNanos(30_000)) {
+                valid(work); check(expiryAcceptanceEnabled() && !stopped && !stopNotified.get(),"Expiry start disabled/stopped"); pause(work);
+            }
+            valid(work); check(expiryAcceptanceEnabled() && !stopped && !stopNotified.get(),"Expiry start disabled/stopped");
+        } finally { lock.unlock(); }
+    }
+    void armExpiryPause(Operation operation,PredictionFaults.ExpiryIdentity identity,ScenarioRunner runner) {
+        rejectNativeWait();
+        var work=requireScope(operation,Kind.WORK);
+        lock.lock();
+        try {
+            check(expiryAcceptanceEnabled() && foreign==null && expiryBoundary==null && operation.command()==Command.RUN && operation.ordinal()==2
+                    && identity!=null && identity.workDeadlineNanos()==work.deadlineNanos() && runner!=null && runner.usesInspectHost(this)
+                    && runner.inspectSessionId().equals(operation.sessionId()),"Expiry pause requires original RUN2 WORK/identity/owner");
+            expiryBoundary=new ExpiryBoundary(operation,work,identity,Objects.requireNonNull(runner)); projectExpiry();
+        } finally { lock.unlock(); }
+    }
+    private void projectExpiry() {
+        var b=expiryBoundary;
+        expiryObservation=b==null?null:new ScenarioCommands.ExpiryObservation(b.operation.sessionId(),b.operation.operationId(),b.identity.context().runId(),
+                b.operation.ordinal(),b.stage,b.deadline,b.cutoff,b.wrapperEntries,b.actionEntries,b.replayCount,b.replayRejected,
+                b.retired,b.cleanupDeadline,b.busyRequest,b.busyRefusals,b.ack,
+                b.primary==null?null:new ScenarioCommands.FailureObservation(b.primary.getClass().getName(),b.primary.getMessage()),
+                b.replayFailure==null?null:new ScenarioCommands.FailureObservation(b.replayFailure.getClass().getName(),b.replayFailure.getMessage()),
+                b.replayFailure!=null && b.replayFailure!=b.primary);
+    }
+    ScenarioCommands.ExpiryObservation observeExpiryAcceptance() { return expiryObservation; }
+    private void requireExpiryOpen(ExpiryBoundary b) {
+        check(expiryBoundary==b && expiryAcceptanceEnabled() && !expiryAbandoned.get() && !cancelled && !stopped && !stopNotified.get(),
+                "Expiry acceptance disabled/cancelled/stopped");
+        if(clock.getAsLong()-b.cutoff>=0) throw new ScopeTimeoutException();
+    }
+    /** Uses the absolute outer cutoff, never valid/pause on the expired WORK. Condition releases the owner lock. */
+    private void pauseExpiry(ExpiryBoundary b) {
+        requireExpiryOpen(b);
+        waiting++;
+        try { changed.awaitNanos(Math.min(b.cutoff-clock.getAsLong(),TimeUnit.MILLISECONDS.toNanos(50))); }
+        catch(InterruptedException error) { Thread.currentThread().interrupt(); throw new IllegalStateException("Inspect worker interrupted",error); }
+        finally { waiting--; }
+    }
+    private void awaitExpiryRead(ExpiryBoundary b,int ordinal) {
+        check(b.read==null,"Expiry read already pending");
+        var request=b.read=new ExpiryRead(b,ordinal);
+        b.stage=ordinal==1?"BEFORE_REPLAY_READ":"AFTER_REPLAY_READ"; projectExpiry();
+        while(request.accepted==null && request.failure==null) { requireExpiryOpen(b); pauseExpiry(b); }
+        if(request.failure instanceof Error fatal) throw fatal;
+        if(request.failure instanceof RuntimeException error) throw error;
+        check(request.accepted!=null,"Expiry read missing pair");
+        b.read=null;
+    }
+    /** Commands calls before its original single beginCleanup; the actual await exception stays primary. */
+    void awaitExpiryReplayBeforeCleanup(Scope work,Throwable primary) {
+        rejectNativeWait(); lock.lock();
+        try {
+            var b=expiryBoundary;
+            if(b==null || b.operation!=work.operation()) return;
+            check(b.work==work && current==work && primary instanceof ScopeTimeoutException && clock.getAsLong()>=b.deadline
+                    && b.stage.equals("HELD"),"Expiry lacks actual current-WORK await timeout/entered wrapper");
+            b.primary=primary; b.stage="EXPIRED"; projectExpiry(); requireExpiryOpen(b);
+            awaitExpiryRead(b,1);
+            lock.unlock();
+            try { replayExpiryWrapper(work,primary); } finally { lock.lock(); }
+            awaitExpiryRead(b,2); b.stage="POST_REPLAY_MEASURED"; projectExpiry();
+        } finally { lock.unlock(); }
+    }
+    /** Non-authorizing replay mechanics; the joined owner calls only after its fixed E read. */
+    void replayExpiryWrapper(Scope work,Throwable primary) {
+        rejectNativeWait(); lock.lock();
+        try {
+            var b=expiryBoundary;
+            check(b!=null && b.work==work && current==work && !b.retired && primary instanceof ScopeTimeoutException
+                    && clock.getAsLong()>=b.deadline && Set.of("HELD","BEFORE_REPLAY_READ").contains(b.stage),
+                    "Expiry replay requires exact entered expired current WORK");
+            requireExpiryOpen(b); b.primary=primary;
+            var replay=b.continuation;
+            check(replay!=null && b.replayCount==0,"Expiry continuation already consumed");
+            b.continuation=null; b.replayCount++; b.stage="REPLAY_QUEUED"; projectExpiry();
+            lock.unlock();
+            try { clientQueue.accept(replay); } finally { lock.lock(); }
+            while(b.replayFailure==null) { requireExpiryOpen(b); check(!b.stage.equals("REPLAY_FAILED"),"Expiry replay entered action"); pauseExpiry(b); }
+            check(b.replayFailure instanceof ScopeTimeoutException && b.replayFailure!=primary && b.stage.equals("REPLAY_REJECTED"),
+                    "Expiry replay did not reject original current expired WORK");
+        } finally { lock.unlock(); }
+    }
+    void retireExpiryReplay(Scope work) {
+        rejectNativeWait(); lock.lock();
+        try {
+            var b=expiryBoundary;
+            if(b==null || b.operation!=work.operation() || b.retired) return;
+            b.retired=true; b.read=null; b.continuation=null;
+            try { if(b.retireWrapper!=null) b.retireWrapper.run(); }
+            finally {
+                b.retireWrapper=null; b.result=null; b.work=null; b.runner=null;
+                b.stage=b.stage.equals("POST_REPLAY_MEASURED")?"CLEANUP_PENDING":"INCOMPLETE"; projectExpiry(); changed.signalAll();
+            }
+        } finally { lock.unlock(); }
+    }
+    void abandonExpiryAcceptance() {
+        expiryAbandoned.set(true);
+        if(lock.tryLock()) try {
+            var b=expiryBoundary;
+            if(b!=null && !b.stage.equals("SEALED_BEFORE_END")) {
+                b.read=null; b.continuation=null; b.stage="INCOMPLETE"; projectExpiry();
+            }
+            changed.signalAll();
+        } finally { lock.unlock(); }
+    }
+    private boolean expiryReadCurrent(ExpiryRead r,boolean local,String step) {
+        var b=expiryBoundary;
+        return b!=null && r.boundary==b && b.read==r && !b.retired && current==b.work && b.work!=null && r.operation==b.operation
+                && r.identity==b.identity && r.step.equals(step) && expiryAcceptanceEnabled() && !expiryAbandoned.get()
+                && !cancelled && !stopped && !stopNotified.get() && clock.getAsLong()<r.cutoff
+                && (local?clientThread:serverThread).getAsBoolean();
+    }
+    /** Invoked by natural Host ticks. A too-early pair retains this exact request until a later tick. */
+    private void scheduleExpiryRead() {
+        if(!lock.tryLock()) return;
+        ExpiryRead r;
+        try {
+            var b=expiryBoundary; r=b==null?null:b.read;
+            if(r==null || r.queued || r.failure!=null || r.accepted!=null || !expiryReadCurrent(r,true,"CLIENT")) return;
+            r.queued=true;
+        } finally { lock.unlock(); }
+        try { clientQueue.accept(() -> readExpiryClient(r)); }
+        catch(RuntimeException | Error error) { failExpiryRead(r,error); }
+    }
+    private boolean claimExpiryRead(ExpiryRead r,boolean local,String step) {
+        if(!lock.tryLock()) return false;
+        try { return expiryReadCurrent(r,local,step); } finally { lock.unlock(); }
+    }
+    private void failExpiryRead(ExpiryRead r,Throwable failure) {
+        if(!lock.tryLock()) return; // Worker cutoff remains authoritative even if a native commit is contended.
+        try { if(expiryBoundary!=null && expiryBoundary.read==r) { r.failure=failure; changed.signalAll(); } }
+        finally { lock.unlock(); }
+    }
+    private void readExpiryClient(ExpiryRead r) {
+        if(!claimExpiryRead(r,true,"CLIENT")) return;
+        try {
+            var value=expiryBoundary.runner.readExpiryClient(r,client);
+            if(!lock.tryLock()) return;
+            try { if(!expiryReadCurrent(r,true,"CLIENT")) return; r.local=value; r.step="SERVER"; }
+            finally { lock.unlock(); }
+            serverQueue.accept(() -> readExpiryServer(r));
+        } catch(RuntimeException | Error error) { failExpiryRead(r,error); }
+    }
+    private void readExpiryServer(ExpiryRead r) {
+        if(!claimExpiryRead(r,false,"SERVER")) return;
+        try {
+            var value=expiryBoundary.runner.readExpiryServer(r,server);
+            if(!lock.tryLock()) return;
+            try { if(!expiryReadCurrent(r,false,"SERVER")) return; r.remote=value; r.step="ACCEPT"; }
+            finally { lock.unlock(); }
+            clientQueue.accept(() -> acceptExpiryRead(r));
+        } catch(RuntimeException | Error error) { failExpiryRead(r,error); }
+    }
+    private void acceptExpiryRead(ExpiryRead r) {
+        if(!claimExpiryRead(r,true,"ACCEPT")) return;
+        try {
+            var observed=expiryBoundary.runner.acceptExpiryPair(r,client,r.local,r.remote);
+            if(!lock.tryLock()) return;
+            try {
+                if(!expiryReadCurrent(r,true,"ACCEPT")) return;
+                r.attempts++; r.latestClocks=ScenarioRunner.ExpiryClocks.of(observed.pair());
+                if(observed.advanced()) { expiryBoundary.runner.retainExpiryPair(r,observed.pair()); r.accepted=observed.pair(); }
+                else { r.local=null; r.remote=null; r.step="CLIENT"; r.queued=false; }
+                changed.signalAll();
+            } finally { lock.unlock(); }
+        } catch(RuntimeException | Error error) { failExpiryRead(r,error); }
+    }
+    void awaitExpiryBusyProof(Operation operation,Scope cleanup) {
+        rejectNativeWait();
+        check(requireScope(operation,Kind.CLEANUP)==cleanup,"Expiry busy proof requires exact CLEANUP");
+        lock.lock(); boolean complete=false;
+        try {
+            var b=expiryBoundary;
+            check(b!=null && b.operation==operation && b.retired && b.stage.equals("CLEANUP_PENDING") && b.actionEntries==0 && b.replayCount==1
+                    && b.wrapperEntries==2 && b.replayRejected,"Expiry busy proof lacks measured original replay/zero action entry");
+            requireExpiryOpen(b); b.cleanup=cleanup; b.cleanupDeadline=cleanup.deadlineNanos(); b.busyRequest=1; b.stage="BUSY_REQUIRED"; projectExpiry();
+            while(b.ack==null) { requireExpiryOpen(b); valid(cleanup); pause(cleanup); }
+            requireExpiryOpen(b); valid(cleanup); complete=true;
+        } finally {
+            if(expiryBoundary!=null && expiryBoundary.operation==operation) {
+                expiryBoundary.cleanup=null; expiryBoundary.runner=null;
+                expiryBoundary.stage=complete?"SEALED_BEFORE_END":"INCOMPLETE"; projectExpiry();
+            }
+            lock.unlock();
+        }
+    }
+    void recordExpiryBusyRefusal() {
+        if(!lock.tryLock()) return;
+        try {
+            var b=expiryBoundary;
+            if(b!=null && b.cleanup!=null && current==b.cleanup && b.stage.equals("BUSY_REQUIRED") && expiryAcceptanceEnabled()
+                    && !cancelled && !stopped && !expiryAbandoned.get() && clock.getAsLong()<b.cleanup.deadlineNanos()) {
+                if(b.busyRefusals<Integer.MAX_VALUE) b.busyRefusals++; projectExpiry();
+            }
+        } finally { lock.unlock(); }
+    }
+    boolean acknowledgeExpiryBusyProof(MinecraftClient nativeClient,ScenarioCommands.ExpiryBusyAck ack) {
+        if(ack==null || !clientThread.getAsBoolean() || client!=null && nativeClient!=client || !lock.tryLock()) return false;
+        try {
+            var b=expiryBoundary;
+            if(b==null || b.cleanup==null || current!=b.cleanup
+                    || !expiryAcceptanceEnabled() || cancelled || stopped || stopNotified.get() || expiryAbandoned.get()
+                    || !expiryBusyAckMatches(expiryObservation,ack,clock.getAsLong())) return false;
+            b.ack=ack; projectExpiry(); changed.signalAll(); return true;
+        } finally { lock.unlock(); }
+    }
+    /** Detached value validation only; native thread/binding/current-CLEANUP authority remains at the owner entry. */
+    static boolean expiryBusyAckMatches(ScenarioCommands.ExpiryObservation request,ScenarioCommands.ExpiryBusyAck ack,long now) {
+        return request!=null && ack!=null && request.stage().equals("BUSY_REQUIRED") && request.boundaryRetired()
+                && request.requestOrdinal()==1 && request.busyRefusals()>0 && request.acknowledgement()==null
+                && now<request.cleanupDeadlineNanos() && now<request.outerCutoffNanos()
+                && request.operationId().equals(ack.operationId()) && request.requestOrdinal()==ack.requestOrdinal()
+                && request.cleanupDeadlineNanos()==ack.cleanupDeadlineNanos();
+    }
+
     // One finite probe: arm -> entered hold -> worker consumes/replays -> measured -> cleanup proof -> retire.
     // Native callers only claim detached requests. WORK cancellation never authorizes an action or another scope.
     private static final class ForeignBoundary {
@@ -105,7 +376,7 @@ final class InspectScenarioHost implements Inspect {
         var work=requireScope(operation,Kind.WORK);
         lock.lock();
         try {
-            check(foreignAcceptanceEnabled() && foreign==null && operation.ordinal()==3 && operation.command()==Command.RERUN,
+            check(foreignAcceptanceEnabled() && foreign==null && expiryBoundary==null && operation.ordinal()==3 && operation.command()==Command.RERUN,
                     "Foreign boundary requires original RERUN3 reset-stop");
             foreign=new ForeignBoundary(operation,work); projectForeign();
         } finally { lock.unlock(); }
@@ -390,6 +661,7 @@ final class InspectScenarioHost implements Inspect {
         check(clientThread.getAsBoolean(), "Stopping callback is not on client thread");
         check(client == null || nativeClient == client, "Foreign client stopping callback");
         if (!stopNotified.compareAndSet(false, true)) return;
+        abandonExpiryAcceptance();
         abandonForeignAcceptance();
         cancelSession(new IllegalStateException("Inspect client is stopping"));
         stopped = true;
@@ -461,13 +733,24 @@ final class InspectScenarioHost implements Inspect {
         var scope = dispatchScope(); var result = new CompletableFuture<V>();
         class QueuedAction implements Runnable {
             private Supplier<V> pending;
-            private boolean held, consumed;
+            private boolean held, expiryHeld, consumed;
             QueuedAction(Supplier<V> supplied) { pending=supplied; }
             @Override public void run() {
                 lock.lock();
                 try {
                     if(consumed) return;
                     var f=foreign;
+                    var b=expiryBoundary;
+                    if(queue==clientQueue && b!=null && b.work==scope && b.stage.equals("ARMED")) {
+                        check(clientThread.getAsBoolean(),"Expiry wrapper requires native client thread"); valid(scope); requireExpiryOpen(b);
+                        b.wrapperEntries++; b.continuation=this; b.result=result; b.stage="HELD"; expiryHeld=true;
+                        b.retireWrapper=() -> {
+                            consumed=true; pending=null;
+                            result.completeExceptionally(new IllegalStateException("Expiry wrapper retired"));
+                        };
+                        projectExpiry(); return;
+                    }
+                    if(expiryHeld && (b==null || b.work!=scope || !b.stage.equals("REPLAY_QUEUED") || !clientThread.getAsBoolean())) return;
                     if(queue==clientQueue && f!=null && f.work==scope && f.stage.equals("ARMED")) {
                         valid(scope); requireForeignOpen(f,scope.deadlineNanos());
                         f.entered=true; f.continuation=this; f.stage="HELD"; held=true; projectForeign(); return;
@@ -479,12 +762,21 @@ final class InspectScenarioHost implements Inspect {
                         }
                         return;
                     }
+                    if(expiryHeld) b.wrapperEntries++;
                     consumed=true;
                     try {
                         valid(scope); if (stopped) throwOriginal();
+                        if(expiryHeld) { b.actionEntries++; projectExpiry(); }
                         result.complete(pending.get());
                         if(held) { f.stage="REPLAY_FAILED"; projectForeign(); }
+                        if(expiryHeld) { b.stage="REPLAY_FAILED"; projectExpiry(); }
                     } catch(RuntimeException | Error error) {
+                        if(expiryHeld) {
+                            b.replayFailure=error;
+                            boolean rejected=current==scope && expiryAcceptanceEnabled() && !expiryAbandoned.get() && error instanceof ScopeTimeoutException && error!=b.primary && !cancelled && !stopped
+                                    && !stopNotified.get() && clock.getAsLong()>=scope.deadlineNanos();
+                            b.replayRejected=rejected; b.stage=rejected?"REPLAY_REJECTED":"REPLAY_FAILED"; projectExpiry();
+                        }
                         if(held) {
                             f.replayRejected=cancelled && error==cancellationFailure.get() && !stopped && !stopNotified.get()
                                     && clock.getAsLong()-scope.deadlineNanos()<0;
@@ -525,6 +817,7 @@ final class InspectScenarioHost implements Inspect {
     void onTick() {
         ticks.incrementAndGet();
         if (lock.tryLock()) try { changed.signalAll(); } finally { lock.unlock(); }
+        scheduleExpiryRead();
     }
     @Override public void waitTick() {
         var scope = dispatchScope(); lock.lock();

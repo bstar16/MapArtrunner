@@ -22,6 +22,11 @@ final class ScenarioCommands {
                                String verdict, boolean evidenceComplete, String cleanupStatus, boolean cleanupSettled,
                                String evidenceDirectory, String summaryPath, Optional<FailureObservation> failure) { }
     record FailureObservation(String className, String message) { }
+    record ExpiryBusyAck(UUID operationId,long requestOrdinal,long cleanupDeadlineNanos) { }
+    record ExpiryObservation(UUID sessionId,UUID operationId,UUID runId,int ordinal,String stage,long workDeadlineNanos,long outerCutoffNanos,
+                             int wrapperEntries,int actionEntries,int replayCount,boolean replayRejected,boolean boundaryRetired,
+                             long cleanupDeadlineNanos,long requestOrdinal,int busyRefusals,ExpiryBusyAck acknowledgement,
+                             FailureObservation primary,FailureObservation replay,boolean distinctReplayFailure) { }
     record ForeignGuardFact(String site,int entered,int refused,int passed,int effectCalled) { }
     record ForeignFinalFacts(boolean retainedWatchUnchanged,boolean closedRunEvidenceUnchanged,
                              String primaryClass,String primaryMessage,java.util.List<ForeignGuardFact> guards) {
@@ -52,6 +57,12 @@ final class ScenarioCommands {
     ScenarioCommands(Executor worker, Inspect host) {
         this.worker = Objects.requireNonNull(worker);
         this.host = Objects.requireNonNull(host);
+    }
+    /** Source owner tests enter the real worker without native startup; submit still requires the ordinary world guard. */
+    ScenarioCommands(Executor worker,Inspect host,ScenarioRunner prepared) {
+        this(worker,host);
+        if(!Objects.requireNonNull(prepared).usesInspectHost(host)) throw new IllegalArgumentException("Foreign inspect Runner/Host");
+        runner=prepared; ready=true;
     }
 
     void register(CommandDispatcher<FabricClientCommandSource> dispatcher) {
@@ -95,7 +106,7 @@ final class ScenarioCommands {
     int submit(Command command, MinecraftClient client, Consumer<String> reply) {
         synchronized (this) {
             String refusal = refusal();
-            if (refusal != null) { reply.accept(refusal); return 0; }
+            if (refusal != null) { recordBusyRefusal(); reply.accept(refusal); return 0; }
             try { runner.requireInspectCommandWorld(client); }
             catch (RuntimeException | Error failure) {
                 reply.accept("Inspect command refused: " + failure.getMessage()); return 0;
@@ -109,7 +120,7 @@ final class ScenarioCommands {
         if (command != Command.RESET && command != Command.RUN && command != Command.RERUN)
             throw new IllegalArgumentException("Not a public mutation");
         String refusal = refusal();
-        if (refusal != null) { reply.accept(refusal); return 0; }
+        if (refusal != null) { recordBusyRefusal(); reply.accept(refusal); return 0; }
         queued = true;
         try { worker.execute(() -> execute(command, reply)); }
         catch (RuntimeException | Error failure) { terminate(failure); queued = false; throw failure; }
@@ -123,7 +134,13 @@ final class ScenarioCommands {
         return null;
     }
 
+    private void recordBusyRefusal() {
+        if(queued && exit==Exit.OPEN && terminal==null && !cancelled && host instanceof InspectScenarioHost concrete)
+            concrete.recordExpiryBusyRefusal();
+    }
+
     private void execute(Command command, Consumer<String> reply) {
+        Throwable primary = null;
         try {
             synchronized (this) { if (exit != Exit.OPEN || cancelled || terminal != null) return; }
             var operation = runner.beginInspectOperation(command);
@@ -133,7 +150,6 @@ final class ScenarioCommands {
             catch (RuntimeException | Error failure) {
                 runner.failInspectAdmission(operation, failure); throw failure;
             }
-            Throwable primary = null;
             try {
                 host.inScope(work, () -> {
                     host.awaitNeutralChat();
@@ -143,6 +159,12 @@ final class ScenarioCommands {
                 });
             } catch (RuntimeException | Error failure) { primary = failure; }
             if(host instanceof InspectScenarioHost concrete) {
+                try { concrete.awaitExpiryReplayBeforeCleanup(work,primary); }
+                catch(RuntimeException | Error secondary) { primary=retain(primary,secondary); }
+                finally {
+                    try { concrete.retireExpiryReplay(work); }
+                    catch(RuntimeException | Error secondary) { primary=retain(primary,secondary); }
+                }
                 try { concrete.awaitForeignReplacementBeforeCleanup(work,primary); }
                 catch(RuntimeException | Error secondary) { primary=retain(primary,secondary); }
                 finally {
@@ -155,8 +177,9 @@ final class ScenarioCommands {
             var completion = host.inScope(cleanup, () -> runner.finishInspectOperation(operation, cleanup, failure));
             feedback(reply, publish(operation, completion) ? describe(completion) : "Inspect session unavailable; restart required");
         } catch (RuntimeException | Error failure) {
-            terminate(failure);
-            feedback(reply, "Inspect session unavailable; restart required: " + failure.getMessage());
+            var retained=retain(primary,failure);
+            terminate(retained);
+            feedback(reply, "Inspect session unavailable; restart required: " + retained.getMessage());
         } finally {
             // A terminal failure still clears scheduling state, never the terminal admission latch or retained last.
             workerFinished();
@@ -197,6 +220,17 @@ final class ScenarioCommands {
     ForeignObservation observeForeignAcceptance() {
         return host instanceof InspectScenarioHost concrete?concrete.observeForeignAcceptance():null;
     }
+    ExpiryObservation observeExpiryAcceptance() {
+        return host instanceof InspectScenarioHost concrete?concrete.observeExpiryAcceptance():null;
+    }
+    synchronized boolean acknowledgeExpiryBusyProof(MinecraftClient client,ExpiryBusyAck ack) {
+        if(!(queued && active!=null && last!=null && last.ordinal()==1 && last.command()==Command.RESET
+                && ack!=null && active.operationId().equals(ack.operationId()) && exit==Exit.OPEN && !cancelled && terminal==null
+                && host instanceof InspectScenarioHost)) return false;
+        try { runner.requireInspectCommandWorld(client); }
+        catch(RuntimeException | Error unavailable) { return false; }
+        return ((InspectScenarioHost)host).acknowledgeExpiryBusyProof(client,ack);
+    }
     boolean releaseForeignAcceptanceBoundary(MinecraftClient client) {
         return host instanceof InspectScenarioHost concrete && concrete.releaseForeignAcceptanceBoundary(client);
     }
@@ -227,6 +261,8 @@ final class ScenarioCommands {
     /** Native intent only: no scope, IO, wait, interrupt or replacement worker. */
     synchronized boolean requestStop() {
         if(host instanceof InspectScenarioHost concrete) {
+            try { concrete.abandonExpiryAcceptance(); }
+            catch(RuntimeException | Error failure) { if(terminal==null) terminal=failure; else retain(terminal,failure); }
             try { concrete.abandonForeignAcceptance(); }
             catch(RuntimeException | Error failure) { if(terminal==null) terminal=failure; else retain(terminal,failure); }
         }
@@ -323,7 +359,7 @@ final class ScenarioCommands {
         return operation.command() + " #" + operation.ordinal() + " " + operation.operationId();
     }
 
-    private static Throwable retain(Throwable primary,Throwable secondary) {
+    static Throwable retain(Throwable primary,Throwable secondary) {
         if(primary==null) return secondary;
         if(secondary!=null && secondary!=primary) primary.addSuppressed(secondary);
         return primary;
