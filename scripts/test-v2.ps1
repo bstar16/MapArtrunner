@@ -4,16 +4,59 @@ param(
     [ValidateSet('1','2',IgnoreCase=$false)][string]$Repeat = '2',
     [ValidateScript({ ![string]::IsNullOrWhiteSpace($_) })][string]$JavaHome,
     [switch]$EulaAccepted,
-    [switch]$WrongExpectedBlock
+    [switch]$WrongExpectedBlock,
+    [switch]$Inspect
 )
+
+# Validate dot-sourced callers too, before they can reach any launch side effects.
+if ($Inspect -and (!$PSBoundParameters.ContainsKey('Scenario') -or $Scenario -cne 'grounded-two-lane' -or
+    $PSBoundParameters.ContainsKey('Repeat') -or $PSBoundParameters.ContainsKey('WrongExpectedBlock'))) {
+    throw '-Inspect requires explicit -Scenario grounded-two-lane and forbids -Repeat and -WrongExpectedBlock.'
+}
+
+function Assert-V2InheritedMode {
+    param([switch]$Inspect)
+    foreach ($name in 'JAVA_TOOL_OPTIONS','JDK_JAVA_OPTIONS','_JAVA_OPTIONS','JAVA_OPTS','GRADLE_OPTS') {
+        $options=[Environment]::GetEnvironmentVariable($name)
+        # JVM option names are case-sensitive; Boolean.getBoolean accepts only case-insensitive true.
+        # The batch wrapper uses cmd double quotes; JVM environment options also accept single quotes.
+        $wrapper=$name -in 'JAVA_OPTS','GRADLE_OPTS'
+        $tokens=$(if($wrapper){'(?:[^\s"]+|"[^"]*")+'}else{'(?:[^\s"'']+|"[^"]*"|''[^'']*'')+'})
+        $quotes=$(if($wrapper){'"([^"]*)"'}else{'"([^"]*)"|''([^'']*)'''})
+        foreach ($token in [regex]::Matches($options ?? '', $tokens)) {
+            $option=[regex]::Replace($token.Value,$quotes,{param($match)
+                if($match.Groups[1].Success){$match.Groups[1].Value}else{$match.Groups[2].Value}})
+            $property=[regex]::Match($option,'^-D(fabric\.client\.gametest|mapart\.test\.inspect)(?:=(.*))?$')
+            if (!$property.Success) { continue }
+            if ($Inspect -and $property.Groups[1].Value -ceq 'fabric.client.gametest') {
+                throw "-Inspect conflicts with inherited fabric.client.gametest in $name (even false enables it)."
+            }
+            if ($property.Groups[1].Value -ceq 'mapart.test.inspect') {
+                $enabled=$property.Groups[2].Value -ieq 'true'
+                if ([bool]$Inspect -ne $enabled) { throw "Requested mode conflicts with inherited mapart.test.inspect in $name." }
+            }
+        }
+    }
+}
 
 function New-V2Request {
     param([ValidateSet('all','grounded-two-lane','grounded-traversal',IgnoreCase=$false)][string]$Scenario = 'all',
         [ValidateSet('1','2',IgnoreCase=$false)][string]$Repeat = '2', [switch]$EulaAccepted,
-        [string]$EulaEnvironment = $env:MAPART_TEST_EULA_ACCEPTED, [switch]$WrongExpectedBlock)
+        [string]$EulaEnvironment = $env:MAPART_TEST_EULA_ACCEPTED, [switch]$WrongExpectedBlock, [switch]$Inspect)
+    if ($Inspect -and (!$PSBoundParameters.ContainsKey('Scenario') -or $Scenario -cne 'grounded-two-lane' -or
+        $PSBoundParameters.ContainsKey('Repeat') -or $PSBoundParameters.ContainsKey('WrongExpectedBlock'))) {
+        throw '-Inspect requires explicit -Scenario grounded-two-lane and forbids -Repeat and -WrongExpectedBlock.'
+    }
+    Assert-V2InheritedMode -Inspect:$Inspect
     if ($WrongExpectedBlock -and $Scenario -ne 'grounded-two-lane') { throw '-WrongExpectedBlock requires -Scenario grounded-two-lane.' }
     if (!$EulaAccepted -and $EulaEnvironment -cne '1') {
         throw 'Accept the Minecraft EULA for these disposable instances, then pass -EulaAccepted or set process MAPART_TEST_EULA_ACCEPTED=1.'
+    }
+    if ($Inspect) {
+        # configureTests EULA acceptance also deletes the automatic directory; ordinary inspect avoids it.
+        return [pscustomobject]@{Mode='inspect';Scenario=$Scenario;WrongExpectedBlock=$false
+            EulaProvenance=$(if ($EulaAccepted) {'operator-switch'} else {'process MAPART_TEST_EULA_ACCEPTED=1'})
+            Arguments=@('-p','v2',':fabric:runInspect','--no-daemon','--console=plain')}
     }
     $arguments = @('-p','v2',':fabric:runClientGameTest','-PmapartTestEula=true','--no-daemon','--console=plain')
     # Omit defaults so the public default invocation exercises the source defaults.
@@ -92,9 +135,10 @@ function Find-V2Jdk {
 }
 
 function New-V2Environment {
-    param($Jdk, [switch]$WrongExpectedBlock)
+    param($Jdk, [switch]$WrongExpectedBlock, [switch]$Inspect)
+    Assert-V2InheritedMode -Inspect:$Inspect
     $options = $env:JAVA_TOOL_OPTIONS
-    $options = "$options -Dfabric.client.gametest.modid=mapart-test -Djava.awt.headless=true".Trim()
+    if (!$Inspect) { $options = "$options -Dfabric.client.gametest.modid=mapart-test -Djava.awt.headless=true".Trim() }
     @{
         JAVA_HOME=$Jdk.Home; PATH="$(Join-Path $Jdk.Home bin);$env:PATH"; JAVA_TOOL_OPTIONS=$options
         MAPART_PROBE_WRONG_EXPECTED_BLOCK=$null; MAPART_WITHHELD_OBSERVATION_EXPECT_SUCCESS=$null
@@ -106,7 +150,9 @@ function New-V2Environment {
 
 function Resolve-V2GameEnvironment {
     param($Jdk, $Request, [ValidateSet('ordinary','controlled',IgnoreCase=$false)][string]$InternalSupportCase='ordinary')
-    $environment=New-V2Environment -Jdk $Jdk -WrongExpectedBlock:($Request.WrongExpectedBlock)
+    $inspect=$Request.PSObject.Properties['Mode'] -and $Request.Mode -ceq 'inspect'
+    if ($inspect -and $InternalSupportCase -cne 'ordinary') { throw 'Inspect forbids controlled support.' }
+    $environment=New-V2Environment -Jdk $Jdk -WrongExpectedBlock:($Request.WrongExpectedBlock) -Inspect:$inspect
     if ($InternalSupportCase -ceq 'controlled') { $environment.MAPART_TWO_LANE_SUPPORT_CASE='controlled' }
     $environment
 }
@@ -563,6 +609,9 @@ function Invoke-V2Supervisor {
         [ValidateSet('ordinary','controlled',IgnoreCase=$false)][string]$InternalSupportCase='ordinary',
         [hashtable]$InternalInspectTest=@{})
     $ErrorActionPreference='Stop'
+    $inspectMode=$Request -and $Request.PSObject.Properties['Mode'] -and $Request.Mode -ceq 'inspect'
+    if ($inspectMode -and $InternalSupportCase -cne 'ordinary') { throw 'Inspect forbids controlled support.' }
+    if ($RequireGame) { Assert-V2InheritedMode -Inspect:$inspectMode }
     if ($RequireGame -and $PSBoundParameters.ContainsKey('InternalInspectTest')) { throw 'Inspect test clocks/allowances are dummy-only.' }
     if ($InternalSupportCase -ceq 'controlled') {
         $canonical=New-V2Request -Scenario grounded-two-lane -Repeat 2 -EulaAccepted
@@ -594,8 +643,8 @@ function Invoke-V2Supervisor {
         # Snapshot and final launch preflight share this handle through cleanup and archive.
         $before=@(Get-V2ScenarioInventory $EvidenceRoot)
         if ($RequireGame) {
-            $TimeoutMilliseconds=Get-V2TimeoutMilliseconds $Request.Scenario $Request.Repeat
-            $game=Join-Path $WorkingDirectory 'v2/fabric/build/run/clientGameTest'
+            if (!$inspectMode) { $TimeoutMilliseconds=Get-V2TimeoutMilliseconds $Request.Scenario $Request.Repeat }
+            $game=Join-Path $WorkingDirectory $(if($inspectMode){'v2/fabric/build/run/inspect'}else{'v2/fabric/build/run/clientGameTest'})
             [void](Assert-V2ManagedPath $game $WorkingDirectory)
             $jdkArguments=@{}
             if ($Request.PSObject.Properties['JavaHome']) { $jdkArguments.JavaHome=$Request.JavaHome }
@@ -852,7 +901,11 @@ function Invoke-V2Supervisor {
 if ($MyInvocation.InvocationName -ne '.') {
     $ErrorActionPreference='Stop'
     try {
-        $request=New-V2Request -Scenario $Scenario -Repeat $Repeat -EulaAccepted:$EulaAccepted -WrongExpectedBlock:$WrongExpectedBlock
+        $selection=@{}
+        foreach ($name in 'Scenario','Repeat','EulaAccepted','WrongExpectedBlock','Inspect') {
+            if ($PSBoundParameters.ContainsKey($name)) { $selection[$name]=$PSBoundParameters[$name] }
+        }
+        $request=New-V2Request @selection
         if (!$IsWindows -or $PSVersionTable.PSVersion.Major -lt 7) { throw 'Requires Windows and PowerShell7.' }
         $repo=Split-Path $PSScriptRoot
         $scenarioRoot=Join-Path $repo 'v2/fabric/build/scenario-results'

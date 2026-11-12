@@ -22,6 +22,22 @@ The script discovers JDK 21 from `JAVA_HOME`, PATH and bounded standard installa
 
 Use the independent v2 build. Never install/load v1 and v2 together. Production registers `com.mapartrunner.fabric.MapArtClient` and has a Path-based schematic importer; normal command and UI wiring remain later parity work. These automated scenarios do not provide an in-game `/mapart load/start` recipe or replace v1.
 
+## Ordinary inspect session
+
+The separate inspect launch is wired for a managed two-lane world and in-game commands:
+
+```powershell
+pwsh -NoProfile -File scripts/test-v2.ps1 -Inspect -Scenario grounded-two-lane -EulaAccepted
+```
+
+Keep the supervisor terminal open. After real world binding and command readiness, use `/maparttest reset grounded-two-lane`, `/maparttest run grounded-two-lane`, `/maparttest rerun grounded-two-lane` or read-only `/maparttest last`. Run requires a successful reset; rerun performs reset→run→assert in one operation. Mutation requests stay busy through cleanup. Close the client normally when finished. Readiness and process exit0 do not establish a successful scenario; inspect each owned operation's asserted result/evidence.
+
+`-Inspect` requires the explicit exact selector and forbids explicit `-Repeat` (including 2), `-WrongExpectedBlock` and support controls. It reuses EULA provenance and local JDK 21 discovery, with no persistent environment changes. It selects ordinary Loom `:fabric:runInspect`, fixture classes/resources and gated client initializer, using only `v2/fabric/build/run/inspect` for game state and copied logs/crashes. It does not adopt/copy a saved world or clear the automatic game directory. Inspect omits `mapartTestEula=true`, whose pinned automatic EULA task also deletes the automatic directory; explicit operator acceptance remains required and recorded.
+
+Inherited JVM options in `JAVA_TOOL_OPTIONS`, `JDK_JAVA_OPTIONS`, `_JAVA_OPTIONS`, `JAVA_OPTS` and `GRADLE_OPTS` are checked before launch work. Inspect rejects any `fabric.client.gametest` property, including false/empty, and an inherited `mapart.test.inspect` value other than case-insensitive true. Automatic launches reject inherited `mapart.test.inspect=true`. JVM property names are case-sensitive. Compatible diagnostics/inactive settings remain intact; inspect appends no automatic provider/filter/headless settings. Do not add `fabric.client.gametest=false`: the pinned module enables on presence.
+
+Inspect uses the existing owned-process/receipt/archive supervisor: startup remains 600000 ms, an admitted WORK gets 600000 ms with bounded cleanup, and CLOSE shares one 10000 ms ceiling. Idle readiness does not renew automatic clocks or grant PASS. Configuration/classpath resolution and compilation are source checks only. Native loaded classpath, property isolation, mixins, real session startup and normal/pending shutdown acceptance remain open; this source slice launches no Minecraft.
+
 ## Compile without launching
 
 Use an installed **JDK 21** in a fresh PowerShell process. Set `JAVA_HOME` to its installation directory in that process if it is not already configured; otherwise these snippets discover the JDK from `javac` on PATH. They validate the version and do not change user/machine environment settings:
@@ -70,26 +86,27 @@ The pinned screenshot implementation waits for its screenshot future without a d
 
 ## Selection and exact case manifest
 
-The script accepts case-sensitive `-Scenario all|grounded-two-lane` and `-Repeat 1|2`; defaults are `all` and `2`. Repeat counts successful starts requested from the new provider, excluding its dirty failed prelude. Repeat1 therefore has two starts; Repeat2 has three. It does not repeat the 17 old cases. `-WrongExpectedBlock` requires `-Scenario grounded-two-lane`.
+Automatic mode accepts case-sensitive `-Scenario all|grounded-two-lane|grounded-traversal` and `-Repeat 1|2`; defaults are `all` and `2`. For two-lane, Repeat counts successful starts requested after its dirty failed prelude: Repeat1 has two starts; Repeat2 has three. Traversal repeats each of its seven fixture profiles. Repeat does not repeat the 17 old cases. `-WrongExpectedBlock` requires automatic `-Scenario grounded-two-lane`.
 
-A full default invocation starts these four providers in order:
+A full default invocation starts these five providers in order:
 
 1. `EnvironmentProbeGameTest`: one probe.
 2. `GroundedSingleLaneGameTest`: BASELINE, STOP, FAILURE, DISCONNECT, REPLACEMENT, WITHHELD_RESPONSE, POST_FAULT_BASELINE, WITHHELD_OBSERVATION, POST_OBSERVATION_BASELINE, COMPUTED_STOP, COMPUTED_PAUSE_RESUME, WITHHELD_STATE, POST_STATE_BASELINE, REPEATED_STATE, POST_REPEATED_STATE_BASELINE.
 3. `SchematicImportGameTest`: one import/empty case.
 4. `GroundedSmokeGameTest`: the two-lane failed-prelude/reset/repeat invocation.
+5. `TraversalGameTest`: seven managed traversal fixture profiles with the selected repeat count.
 
-That is **17 old cases plus one new provider invocation = 18 published case directories**. The recovery also produced two lane-import directories and one archive self-check directory; these three auxiliaries are not extra passing cases. Selected two-lane runs mark the three old providers `NOT_EXECUTED`, never PASS. A fatal assertion stops execution; scheduled later cases or starts receive no credit.
+Historical four-provider results below contain 17 old cases plus one two-lane invocation (18 published case directories); they do not prove traversal. The recovery also produced two lane-import directories and one archive self-check directory; these auxiliaries are not extra passing cases. Selected runs mark unselected providers `NOT_EXECUTED`, never PASS. A fatal assertion stops execution; later cases or starts receive no credit.
 
 The pinned Fabric API **0.141.1+1.21.11**, client gametest module **4.3.5+bfe9fcf43e**, filters entrypoints by mod ID through `fabric.client.gametest.modid`; it does not select Java methods/classes. The public script selects `mapart-test`, and the project's own validated scenario/repeat properties control provider dispatch. Gradle transports those properties into the actual game JVM. No method-name filter or private selector is required. The [test metadata](../fabric/src/gametest/resources/fabric.mod.json) and [test mixin configuration](../fabric/src/gametest/resources/mapart-test.mixins.json) are excluded from production.
 
-The child environment clears the old probe/observation/state negative flags and ordinary support selector, setting only the two-lane wrong-expectation flag when requested. It retains operator `JAVA_TOOL_OPTIONS` and appends the mod filter and `-Djava.awt.headless=true`. The latter disables Loader's AWT error dialog; Minecraft still needs GLFW/LWJGL graphics and renders actual screenshots. It is not headless gameplay or a universal native-shutdown repair.
+The child environment clears the old probe/observation/state negative flags and ordinary support selector, setting only the two-lane wrong-expectation flag when requested. Automatic mode retains compatible operator `JAVA_TOOL_OPTIONS` and appends the mod filter and `-Djava.awt.headless=true`. The latter disables Loader's AWT error dialog; Minecraft still needs GLFW/LWJGL graphics and renders actual screenshots. It is not headless gameplay or a universal native-shutdown repair.
 
 Pinned API references: [client context](https://maven.fabricmc.net/docs/fabric-api-0.141.1%2B1.21.11/net/fabricmc/fabric/api/client/gametest/v1/context/ClientGameTestContext.html), [server context](https://maven.fabricmc.net/docs/fabric-api-0.141.1%2B1.21.11/net/fabricmc/fabric/api/client/gametest/v1/context/TestServerContext.html), [source JAR](https://maven.fabricmc.net/net/fabricmc/fabric-api/fabric-client-gametest-api-v1/4.3.5%2Bbfe9fcf43e/fabric-client-gametest-api-v1-4.3.5%2Bbfe9fcf43e-sources.jar). Implementation uses Yarn **1.21.11+build.4** names.
 
 ## Supervision and retained evidence
 
-[The public script](../../scripts/test-v2.ps1) owns a hidden worker and its Gradle/game descendants through a Windows Job Object before allowing the worker to launch. It uses `--no-daemon`, a **600000 ms** launch deadline, up to **1000 ms** normal descendant drain within that deadline, and a shared **10000 ms** cleanup allowance. JDK version probes have their own 5000 ms wait and bounded cleanup. These are infrastructure limits, not gameplay timing goals or a bound on every preflight/archive operation.
+[The public script](../../scripts/test-v2.ps1) owns a hidden worker and its Gradle/game descendants through a Windows Job Object before allowing the worker to launch. Automatic startup is **600000 ms**; selected two-lane overall is **600000 ms**, while all/traversal overall is the checked `600000 + 50 * repeat * sum(seven runTicks)` allowance. Neither clock renews at readiness. It uses `--no-daemon`, up to **1000 ms** normal descendant drain within the applicable deadline, and a shared **10000 ms** process cleanup allowance. JDK probes have a 5000 ms wait and bounded cleanup. These are infrastructure limits, not gameplay timing goals or a bound on every preflight/archive operation.
 
 The exclusive `v2/fabric/build/scenario-results/supervisor.lock` prevents overlapping launches from clearing each other's game directory. A nonempty marker blocks rerun until ownership/evidence retention is resolved. Preserve the marker and evidence on failure; do not bypass it or kill unrelated Java processes.
 

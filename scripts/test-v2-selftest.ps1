@@ -39,6 +39,108 @@ try {
         }
         $regressions | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $testRoot 'review-regressions.json')
     }
+    Run 'Task7 inspect selection is explicit and leaves automatic requests intact' {
+        $request=New-V2Request -Inspect -Scenario grounded-two-lane -EulaAccepted
+        Assert ($request.Mode -ceq 'inspect' -and $request.Scenario -ceq 'grounded-two-lane') 'inspect mode/selection missing'
+        Assert (($request.Arguments -join ' ') -ceq '-p v2 :fabric:runInspect --no-daemon --console=plain') 'inspect manufactured automatic/EULA arguments'
+        Assert ($request.EulaProvenance -ceq 'operator-switch') 'inspect EULA provenance missing'
+        Assert ((New-V2Request -Inspect -Scenario grounded-two-lane -EulaEnvironment 1).EulaProvenance -ceq 'process MAPART_TEST_EULA_ACCEPTED=1') 'inspect process EULA provenance missing'
+        foreach ($selection in @(@{},@{Scenario='all'},@{Scenario='grounded-traversal'},@{Scenario='GROUNDED-TWO-LANE'},
+            @{Scenario='grounded-two-lane';Repeat='2'},@{Scenario='grounded-two-lane';Repeat='1'},@{Scenario='grounded-two-lane';WrongExpectedBlock=$true})) {
+            Reject { New-V2Request -Inspect @selection -EulaAccepted } 'invalid inspect request accepted'
+            Reject { . (Join-Path $PSScriptRoot 'test-v2.ps1') -Inspect @selection -EulaAccepted } 'invalid public inspect selection accepted'
+        }
+        Reject { New-V2Request -Inspect -Scenario grounded-two-lane -EulaEnvironment '' } 'inspect missing EULA accepted'
+        Reject { . (Join-Path $PSScriptRoot 'test-v2.ps1') -Inspect -Scenario grounded-two-lane -InternalSupportCase controlled -EulaAccepted } 'public inspect support accepted'
+        $automatic=New-V2Request -EulaAccepted
+        Assert ($automatic.Scenario -ceq 'all' -and $automatic.Repeat -eq 2 -and $automatic.Arguments -contains ':fabric:runClientGameTest') 'automatic defaults changed'
+    }
+    Run 'Task7 inherited JVM mode conflicts are refused without changing the parent' {
+        $names=@('JAVA_TOOL_OPTIONS','JDK_JAVA_OPTIONS','_JAVA_OPTIONS','JAVA_OPTS','GRADLE_OPTS')
+        Invoke-V2EnvironmentFixture $names {
+            foreach ($name in $names) { Remove-Item "Env:$name" -ErrorAction SilentlyContinue }
+            $inspectRequest=New-V2Request -Inspect -Scenario grounded-two-lane -EulaAccepted
+            $automaticRequest=New-V2Request -EulaAccepted
+            foreach ($name in $names) {
+                foreach ($option in @('-Dfabric.client.gametest','-Dfabric.client.gametest=','-Dfabric.client.gametest=false','"-Dfabric.client.gametest=false"')) {
+                    [Environment]::SetEnvironmentVariable($name,$option)
+                    Reject { New-V2Request -Inspect -Scenario grounded-two-lane -EulaAccepted } "inspect inherited $name enable accepted"
+                    Assert ([Environment]::GetEnvironmentVariable($name) -ceq $option) 'mode check changed parent option'
+                }
+                foreach ($value in @('false','','TRUE','TrUe','"true"',"'true'")) {
+                    $option="-Dmapart.test.inspect=$value"
+                    [Environment]::SetEnvironmentVariable($name,$option)
+                    $enabled=($value -replace '["'']','') -ieq 'true' -and !($name -in 'JAVA_OPTS','GRADLE_OPTS' -and $value -ceq "'true'")
+                    if ($enabled) {
+                        Reject { New-V2Request -EulaAccepted } 'automatic inherited inspect=true accepted'
+                        New-V2Request -Inspect -Scenario grounded-two-lane -EulaAccepted | Out-Null
+                    } else {
+                        Reject { New-V2Request -Inspect -Scenario grounded-two-lane -EulaAccepted } 'inspect disabling inherited option accepted'
+                        New-V2Request -EulaAccepted | Out-Null
+                    }
+                }
+                foreach ($option in @('-Dmapart.test.inspect','-Dmapart.test.inspect=" true"',"-Dmapart.test.inspect='tr`"ue'",'-Dmapart.test.inspect="tr''ue"')) {
+                    [Environment]::SetEnvironmentVariable($name,$option)
+                    Reject { New-V2Request -Inspect -Scenario grounded-two-lane -EulaAccepted } 'inspect inactive inherited option accepted'
+                    New-V2Request -EulaAccepted | Out-Null
+                }
+                foreach ($case in @(@{Request=$inspectRequest;Options='-Dfabric.client.gametest=false'},@{Request=$automaticRequest;Options='-Dmapart.test.inspect=TRUE'})) {
+                    [Environment]::SetEnvironmentVariable($name,$case.Options)
+                    $refused=Join-Path $testRoot ('mode-refused-'+$name)
+                    Reject { Invoke-V2Supervisor -RequireGame -Request $case.Request -EvidenceRoot $refused -WorkingDirectory $repo } 'real supervisor inherited conflict accepted'
+                    Assert (!(Test-Path -LiteralPath $refused)) 'inherited conflict reached filesystem work'
+                }
+                foreach ($option in @('-Doperator.diagnostic=kept','-DMapart.test.inspect=true -DFabric.client.gametest=false')) {
+                    [Environment]::SetEnvironmentVariable($name,$option)
+                    New-V2Request -Inspect -Scenario grounded-two-lane -EulaAccepted | Out-Null
+                    New-V2Request -EulaAccepted | Out-Null
+                }
+                Remove-Item "Env:$name" -ErrorAction SilentlyContinue
+            }
+            $env:JAVA_TOOL_OPTIONS='-Doperator.diagnostic=kept'
+            $environment=Resolve-V2GameEnvironment ([pscustomobject]@{Home='C:/unused-jdk'}) (New-V2Request -Inspect -Scenario grounded-two-lane -EulaAccepted)
+            Assert ($environment.JAVA_TOOL_OPTIONS -ceq $env:JAVA_TOOL_OPTIONS -and $environment.JAVA_TOOL_OPTIONS -notmatch 'gametest|headless|mapart.test.scenario|mapart.test.repeat') 'inspect appended automatic JVM settings'
+            Reject { Resolve-V2GameEnvironment ([pscustomobject]@{Home='C:/unused-jdk'}) (New-V2Request -Inspect -Scenario grounded-two-lane -EulaAccepted) controlled } 'inspect controlled support resolved'
+        }
+    }
+    Run 'Task7 fixture registers the gated ordinary initializer beside five providers and nine mixins' {
+        $fixture=Join-Path $repo 'v2/fabric/src/gametest'
+        $metadata=Get-Content (Join-Path $fixture 'resources/fabric.mod.json') -Raw | ConvertFrom-Json
+        Assert ((@($metadata.entrypoints.client) -join ',') -ceq 'com.mapartrunner.fabric.scenario.ScenarioClientInitializer') 'ordinary initializer missing/duplicated'
+        Assert (@($metadata.entrypoints.'fabric-client-gametest').Count -eq 5) 'automatic provider count changed'
+        $mixins=Get-Content (Join-Path $fixture 'resources/mapart-test.mixins.json') -Raw | ConvertFrom-Json
+        Assert (@($mixins.client).Count -eq 9 -and $mixins.client -contains 'InspectExitMixin') 'accepted mixin configuration changed'
+    }
+    Run 'Task7 real inspect constructor shares its launch root with the existing archiver' {
+        $request=New-V2Request -Inspect -Scenario grounded-two-lane -EulaAccepted
+        $root=Join-Path $testRoot 'inspect-constructor'
+        $capture=@{}; $sentinel='Task7 before worker construction'; $caught=$null
+        $originalInfo=${function:New-V2ProcessInfo}; $originalJdk=${function:Find-V2Jdk}; $originalArchive=${function:Save-V2Artifacts}
+        try {
+            Set-Item Function:Find-V2Jdk -Value { [pscustomobject]@{Home='C:/unused-jdk'} }
+            Set-Item Function:Save-V2Artifacts -Value { param($Evidence,$Game,$ScenarioRoot,$Before,$Owner) $capture.ArchiveGame=$Game }
+            Set-Item Function:New-V2ProcessInfo -Value {
+                param($Executable,$WorkingDirectory,$Command,$Environment)
+                $capture.Game=$game; $capture.Command=$Command; $capture.Environment=$Environment
+                $capture.Request=Get-Content (Join-Path $evidence 'request.json') -Raw | ConvertFrom-Json
+                & $Archive $evidence $before
+                throw $sentinel
+            }
+            try { Invoke-V2Supervisor -RequireGame -Request $request -EvidenceRoot $root -WorkingDirectory $repo | Out-Null }
+            catch { $caught=$_.Exception.Message }
+        } finally {
+            Set-Item Function:New-V2ProcessInfo -Value $originalInfo; Set-Item Function:Find-V2Jdk -Value $originalJdk; Set-Item Function:Save-V2Artifacts -Value $originalArchive
+        }
+        Assert ($caught -ceq $sentinel) "inspect failed before constructor sentinel: $caught"
+        $expected=Join-Path $repo 'v2/fabric/build/run/inspect'
+        Assert ($capture.Game -ceq $expected -and $capture.ArchiveGame -ceq $expected) 'inspect launch/archive roots differ'
+        Assert ($capture.Command -match ':fabric:runInspect' -and $capture.Command -notmatch 'runClientGameTest|mapartTestEula|mapart.test.scenario|mapart.test.repeat') 'inspect worker selected automatic route'
+        Assert ($capture.Request.Request.Mode -ceq 'inspect' -and $capture.Request.StartupDeadlineMilliseconds -eq 600000) 'inspect request/startup identity changed'
+        $capture | ConvertTo-Json -Depth 12 | Set-Content (Join-Path $testRoot 'inspect-constructor-proof.json')
+        $refused=Join-Path $testRoot 'inspect-support-refused'
+        Reject { Invoke-V2Supervisor -RequireGame -Request $request -InternalSupportCase controlled -EvidenceRoot $refused -WorkingDirectory $repo } 'controlled inspect supervisor accepted'
+        Assert (!(Test-Path -LiteralPath $refused)) 'refused support created filesystem state'
+    }
     Run 'vanished owned PID tolerates stale enumeration without hiding other inventory failures' {
         $originalUpdate=${function:Update-V2Processes}; $capture=@{Process=$null}; $proof=@{}
         try {

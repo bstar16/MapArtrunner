@@ -35,6 +35,14 @@ loom {
         property 'mapart.test.scenario', providers.gradleProperty('mapart.test.scenario').getOrElse('all')
         property 'mapart.test.repeat', providers.gradleProperty('mapart.test.repeat').getOrElse('2')
     }
+    runs {
+        inspect {
+            client()
+            source sourceSets.gametest
+            runDir 'build/run/inspect'
+            property 'mapart.test.inspect', 'true'
+        }
+    }
 }
 
 sourceSets.test.resources.srcDir rootProject.file('test-fixtures')
