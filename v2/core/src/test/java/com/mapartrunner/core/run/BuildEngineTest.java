@@ -17,6 +17,120 @@ import static com.mapartrunner.core.run.RunLifecycle.*;
 import static org.junit.jupiter.api.Assertions.*;
 
 class BuildEngineTest {
+    @Test void verifyRepairsWholePlanOutsideLastStripeAndStillRequiresFullObservedScan() {
+        var h = shiftHarness(target(7, 0, 0), target(90, 11, 8));
+        h.observations = h.scan(STONE); h.step();
+        h.observations = List.of(); h.at(new PlayerObservation(11.5, 1, 7.5, 0)); h.step();
+        h.at(new PlayerObservation(11.5, 1, 7.5, 90)); h.ready();
+        h.at(new PlayerObservation(.5, 1, 7.5, 90)); h.observations = h.scan(STONE); h.step();
+        assertEquals(Activity.VERIFY, h.engine.snapshot().lifecycle().activity().orElseThrow());
+        h.available.put(7, PlacementAvailability.READY);
+        h.observations = List.of(observation(h, 7, h.nextTick, AIR, Evidence.OBSERVED));
+        assertEquals(7, h.step().placement().orElseThrow().targetId());
+        h.observations = List.of(observation(h, 7, h.nextTick, STONE, Evidence.OBSERVED));
+        assertRunning(h.step());
+        h.observations = h.scan(STONE);
+        assertEquals(Outcome.SUCCESS, h.step().snapshot().lifecycle().outcome().orElseThrow());
+    }
+
+    @Test void exactOuterEntrySupportDoesNotAdmitUnrelatedNeighbors() {
+        var h = new Harness(plan(12, 10, target(1, 0, 5), target(2, 1, 5), target(3, 0, 6)));
+        h.support = support(h.plan, STONE, Evidence.OBSERVED);
+        h.available.replaceAll((id, value) -> PlacementAvailability.READY);
+        h.at(new PlayerObservation(.5, 1, 5.25, -90));
+        assertEquals(1, h.step().placement().orElseThrow().targetId());
+        var held = h.step();
+        assertTrue(held.placement().isEmpty());
+        assertEquals(Stage.ENTER_POSITION, held.snapshot().laneEntry().orElseThrow().stage());
+        assertEquals(List.of(1, 2, 3), held.snapshot().unfinishedTargetIds());
+        h.at(new PlayerObservation(.5, 1, 2.5, -90));
+        assertEquals(Stage.ENTER_YAW, h.step().snapshot().laneEntry().orElseThrow().stage());
+        assertTrue(h.step().placement().isEmpty());
+        h.step(); assertTrue(h.step().placement().isEmpty());
+
+        var correction = new Harness(plan(12, 10, target(1, 1, 5), target(2, 0, 5), target(3, 2, 5)));
+        correction.support = support(correction.plan, STONE, Evidence.OBSERVED);
+        correction.available.replaceAll((id, value) -> PlacementAvailability.READY);
+        correction.at(new PlayerObservation(1.5, 1, 5.25, -90));
+        assertEquals(1, correction.step().placement().orElseThrow().targetId());
+        assertEquals(2, correction.step().placement().orElseThrow().targetId()); // Exact backward-next floor, still outside C.
+        assertTrue(correction.step().placement().isEmpty());
+        assertTrue(correction.engine.snapshot().unfinishedTargetIds().contains(3));
+        assertFalse(correction.engine.snapshot().pendingTargetIds().contains(3));
+
+        var jitter = new Harness(plan(12, 10, target(1, 0, 5), target(2, 1, 5)));
+        jitter.support = support(jitter.plan, STONE, Evidence.OBSERVED); jitter.step();
+        assertEquals(Stage.ENTER_YAW, jitter.engine.snapshot().laneEntry().orElseThrow().stage());
+        jitter.at(new PlayerObservation(.5, 1, 5.25, -90)); jitter.available.put(1, PlacementAvailability.READY);
+        var reenter = jitter.step();
+        assertEquals(Stage.ENTER_POSITION, reenter.snapshot().laneEntry().orElseThrow().stage());
+        assertEquals(1, reenter.placement().orElseThrow().targetId()); // ENTER_YAW input cannot hide post-advance support geometry.
+    }
+
+    @Test void postAdvanceEndpointShiftAndNextEntryUseTheirOwnGeometry() {
+        var h = new Harness(plan(12, 10, target(1, 11, 8), target(2, 10, 0), target(3, 10, 9)));
+        h.support = support(h.plan, STONE, Evidence.OBSERVED); h.ready();
+        h.at(new PlayerObservation(11.5, 1, 2.5, -90)); h.available.put(1, PlacementAvailability.READY);
+        var endpoint = h.step();
+        assertEquals(ForwardTraversal.Substage.ENDPOINT, endpoint.snapshot().traversal().orElseThrow().substage());
+        assertEquals(1, endpoint.placement().orElseThrow().targetId());
+        h.step(); h.step(); h.available.put(2, PlacementAvailability.READY);
+        var shift = h.step();
+        assertEquals(ForwardTraversal.Substage.SHIFT, shift.snapshot().traversal().orElseThrow().substage());
+        assertTrue(shift.placement().isEmpty());
+        assertTrue(shift.snapshot().unfinishedTargetIds().contains(2));
+        h.at(new PlayerObservation(11.5, 1, 2.5, 0)); h.ready();
+        h.at(new PlayerObservation(11.5, 1, 7.5, 0)); h.available.put(3, PlacementAvailability.READY);
+        var next = h.step();
+        assertEquals(ForwardTraversal.Substage.NEXT_ENTRY, next.snapshot().traversal().orElseThrow().substage());
+        assertEquals(3, next.placement().orElseThrow().targetId());
+    }
+
+    @Test void westStripeRejectsBothOutsideSidesAndKeepsInsideOrdering() {
+        var h = shiftHarness(target(1, 4, 5), target(2, 4, 4), target(3, 5, 9), target(4, 4, 0));
+        h.at(new PlayerObservation(11.5, 1, 7.5, 0)); h.step();
+        h.at(new PlayerObservation(11.5, 1, 7.5, 90)); h.ready();
+        h.at(new PlayerObservation(4.5, 1, 7.5, 90));
+        h.available.replaceAll((id, value) -> PlacementAvailability.READY);
+        assertEquals(1, h.step().placement().orElseThrow().targetId());
+        assertEquals(3, h.step().placement().orElseThrow().targetId());
+        var refused = h.step(); assertTrue(refused.placement().isEmpty());
+        assertTrue(refused.snapshot().unfinishedTargetIds().containsAll(List.of(2, 4)));
+        assertFalse(refused.snapshot().pendingTargetIds().contains(2));
+        assertFalse(refused.snapshot().pendingTargetIds().contains(4));
+    }
+
+    @ParameterizedTest @ValueSource(ints = {0, 1, 2})
+    void configuredStripeRefusesReachableReadyTargetsWithoutLosingThem(int halfWidth) {
+        int stride = 2 * halfWidth + 1;
+        var h = new Harness(plan(12, stride * 2, target(1, 4, stride - 1),
+                target(2, 4, stride), target(3, 5, stride * 2 - 1)),
+                new Settings(halfWidth, stride, true, 0));
+        h.support = support(h.plan, STONE, Evidence.OBSERVED);
+        h.at(new PlayerObservation(.5, 1, halfWidth + .5, -90)); h.ready();
+        h.at(new PlayerObservation(4.5, 1, halfWidth + .5, -90));
+        h.available.replaceAll((id, value) -> PlacementAvailability.READY);
+        assertEquals(1, h.step().placement().orElseThrow().targetId());
+        h.observations = List.of(observation(h, 1, h.nextTick, STONE, Evidence.OBSERVED));
+        var refused = h.step();
+        assertTrue(refused.placement().isEmpty());
+        assertEquals(List.of(2, 3), refused.snapshot().unfinishedTargetIds());
+        assertTrue(refused.snapshot().pendingTargetIds().isEmpty());
+        assertEquals(3, refused.snapshot().laneEntry().orElseThrow().lane().expectedFloor().targetsByPosition().size());
+        h.observations = List.of();
+        h.at(new PlayerObservation(11.5, 1, halfWidth + .5, -90)); h.step(); h.ready();
+        h.at(new PlayerObservation(11.5, 1, halfWidth + .5, 0)); h.ready();
+        h.at(new PlayerObservation(11.5, 1, halfWidth + stride + .5, 0)); h.step();
+        h.at(new PlayerObservation(11.5, 1, halfWidth + stride + .5, 90)); h.ready();
+        h.at(new PlayerObservation(4.5, 1, halfWidth + stride + .5, 90));
+        var issued = new HashSet<Integer>();
+        for (int k = 0; k < 2; k++) {
+            var placed = h.step().placement().orElseThrow(); issued.add(placed.targetId());
+            h.observations = List.of(observation(h, placed.targetId(), h.nextTick, STONE, Evidence.OBSERVED));
+        }
+        assertEquals(Set.of(2, 3), issued);
+    }
+
     @Test void supportedStationaryWalkFailsAt40() {
         var h = new Harness(plan(12, 5, target(7, 1, 2), target(99, 10, 4)));
         h.support = support(h.plan, STONE, Evidence.OBSERVED); h.ready();
@@ -294,14 +408,18 @@ class BuildEngineTest {
         var h = shiftHarness(target(7, 0, 2), target(90, 11, 3), target(2, 11, 8), target(1, 0, 8));
         h.available.replaceAll((id, value) -> PlacementAvailability.READY);
         assertEquals(90, h.step().placement().orElseThrow().targetId());
-        assertEquals(7, h.step().placement().orElseThrow().targetId());
         assertEquals(2, h.step().placement().orElseThrow().targetId());
         assertTrue(h.step().placement().isEmpty()); // Remote work outside the rectangle stays ineligible.
+        assertTrue(h.engine.snapshot().unfinishedTargetIds().containsAll(List.of(7, 1)));
+        assertFalse(h.engine.snapshot().pendingTargetIds().contains(7));
 
         var ordered = shiftHarness(target(1, 10, 3), target(90, 11, 3), target(91, 11, 2),
                 target(92, 11, 1), target(2, 0, 2), target(3, 11, 8));
         ordered.available.replaceAll((id, value) -> PlacementAvailability.READY);
-        for (int id : List.of(90, 1, 91, 92, 2, 3)) assertEquals(id, ordered.step().placement().orElseThrow().targetId());
+        for (int id : List.of(90, 1, 91, 92, 3)) assertEquals(id, ordered.step().placement().orElseThrow().targetId());
+        assertTrue(ordered.step().placement().isEmpty());
+        assertTrue(ordered.engine.snapshot().unfinishedTargetIds().contains(2));
+        assertFalse(ordered.engine.snapshot().pendingTargetIds().contains(2));
         var tied = shiftHarness(target(90, 10, 8), target(1, 10, 7));
         tied.available.replaceAll((id, value) -> PlacementAvailability.READY);
         assertEquals(1, tied.step().placement().orElseThrow().targetId());
@@ -959,7 +1077,7 @@ class BuildEngineTest {
     static final class Harness {
         final BuildEngine engine = new BuildEngine();
         final BuildPlan plan;
-        final Settings settings = Settings.defaults();
+        final Settings settings;
         final Context context;
         long nextTick;
         Optional<PlayerObservation> player = Optional.of(new PlayerObservation(.5, 1, 2.5, -90));
@@ -968,7 +1086,11 @@ class BuildEngineTest {
         List<PlacementEffectResult> results = List.of();
         final Map<Integer, PlacementAvailability> available = new HashMap<>();
         Harness(BuildPlan plan) {
+            this(plan, Settings.defaults());
+        }
+        Harness(BuildPlan plan, Settings settings) {
             this.plan = plan;
+            this.settings = settings;
             context = new Context(UUID.randomUUID(), "connection", "world", "minecraft:overworld",
                     plan.fingerprint(), new GridPos(0, 65, 0), settings.fingerprint());
             for (Target t : plan.targets()) available.put(t.id(), PlacementAvailability.NO_USABLE_ITEM);

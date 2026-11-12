@@ -2796,6 +2796,10 @@ final class ScenarioRunner implements AutoCloseable {
         if(baseline()) {
             require(!firstSuccess || paused,"First success never reached the required actual SHIFT pause");
             verifyTraversal(id,retained,resumed,stage);
+            require(retained.binding()!=null && retained.binding().context().equals(current.sample.status().engine().lifecycle().context().orElseThrow()),
+                    "Placement stripe proof lost the bound native observation context");
+            writeNew(roots,stage.resolve("placement-stripe.txt"),"definition="+definition.definitionHash()+"\n"
+                    +placementStripeProof(plan,settings,retained.binding().context(),stable.server,checkpoints,samples));
             if(supportCase==SupportCase.ORDINARY) verifyOrdinarySupport(id,samples,stage);
             else {
                 require(host.computeOnClient(c -> PredictionFaults.resetSnapshot().support().orElseThrow().state())
@@ -3612,6 +3616,130 @@ final class ScenarioRunner implements AutoCloseable {
                 "Invalid/reused accepted feedback identity: "+effect);
     }
 
+    /** Adjacent construction calls supply TEST A -> A.server blocks -> TEST B, independently of paired pose-only reads. */
+    private static String placementStripeProof(BuildPlan plan,BuildEngine.Settings settings,Context context,Side initial,
+                                               List<Live> checkpoints,List<ScenarioObserver.Sample> callbacks) {
+        int width=plan.dimensions().width(), depth=plan.dimensions().depth(), half=settings.halfWidth();
+        require(context.planFingerprint().equals(plan.fingerprint()) && context.settingsFingerprint().equals(settings.fingerprint()),
+                "Stripe oracle request differs from its bound plan/settings");
+        int center=Math.min(half,depth-1), firstMin=Math.max(0,center-half), firstMax=Math.min(depth-1,center+half);
+        int nextCenter=Math.min(center+settings.stride(),depth-1-half);
+        require(nextCenter>center && plan.targets().size()==width*depth,"Stripe oracle requires the bound dense two-lane fixture");
+        var stone=new BuildPlan.BlockSpec("minecraft:stone",Map.of());
+        require(plan.targets().stream().allMatch(t -> t.block().equals(stone)),"Stripe oracle requires the actual imported stone plan");
+        var origin=context.origin();
+        var start=targetBlocks(plan,origin,initial);
+        var remote=plan.targets().stream().filter(t -> t.relativePos().z()>firstMax
+                && !turnCell(t.relativePos(),width,center,nextCenter)).toList();
+        require(!remote.isEmpty(),"Stripe oracle has no remote second-stripe targets");
+        for(var target:remote) require(start.get(target.relativePos()).equals(Blocks.AIR.getDefaultState().toString()),
+                "Remote stripe was not initially air: "+target.id());
+        int brackets=0, positive=-1;
+        var proof=new StringBuilder("run="+context.runId()+"; canonicalZ="+firstMin+".."+firstMax
+                +"; turn=x"+Math.max(0,width-2)+".."+(width-1)+",z"+Math.max(0,center-1)+".."+Math.min(depth-1,nextCenter+1)
+                +"; remoteIds="+remote.stream().map(BuildPlan.Target::id).toList()+"\n");
+        for(int k=1;k<checkpoints.size();k++) {
+            var a=checkpoints.get(k-1); var b=checkpoints.get(k);
+            if(!firstEast(a.sample) || !firstEast(b.sample) || !stripeInterior(a.sample.pose().x()-origin.x(),a.sample.pose().z()-origin.z(),center)
+                    || !stripeInterior(b.sample.pose().x()-origin.x(),b.sample.pose().z()-origin.z(),center)) continue;
+            require(a.server!=null,"Missing independent stripe server read");
+            if(!stripeInterior(coordinate(a.server,"x")-origin.x(),coordinate(a.server,"z")-origin.z(),center)) continue;
+            if(a.sample.tick()==b.sample.tick()) continue; // Existing waits need not advance a callback; they earn no bracket.
+            require(a.sample.phase().equals("TEST") && b.sample.phase().equals("TEST") && a.sample.tick()<b.sample.tick(),
+                    "Interior stripe bracket lacks ordered actual TEST endpoints");
+            requireStripeContext(a.sample,context,a.sample.worldIdentity()); requireStripeContext(b.sample,context,a.sample.worldIdentity());
+            require(a.nativeIdentities.equals(b.nativeIdentities),"Interior stripe bracket changed native identities");
+            require(a.client.age>=0 && a.client.time>=0 && a.server.age>=0 && a.server.time>=0
+                    && a.client.age==a.sample.pose().age() && a.client.time==a.sample.pose().worldTime()
+                    && b.client.age==b.sample.pose().age() && b.client.time==b.sample.pose().worldTime()
+                    && b.client.age>=a.client.age && b.client.time>=a.client.time
+                    && a.server.age<=b.server.age && a.server.time<=b.server.time && a.server.serverTick<=b.server.serverTick
+                    && a.server.serverTick>=0 && a.server.state.get("dimension").getAsString().equals(context.dimension()),
+                    "Interior stripe server pose/clocks do not fit the adjacent causal bracket");
+            // Tick numbers are client callbacks; client/server physics clocks remain distinct domains.
+            for(long tick=a.sample.tick()+1;tick<=b.sample.tick();tick++) {
+                long frame=tick;
+                require(callbacks.stream().filter(s -> s.tick()==frame && s.phase().equals("START")).count()==1,"Missing/duplicate intervening stripe START");
+                if(tick<b.sample.tick()) require(callbacks.stream().filter(s -> s.tick()==frame && s.phase().equals("END")).count()==1,"Missing/duplicate intervening stripe END");
+            }
+            for(var sample:callbacks) if(sample.tick()>a.sample.tick() && sample.tick()<=b.sample.tick()) {
+                requireStripeContext(sample,context,a.sample.worldIdentity());
+                require(firstEast(sample),"Interior stripe bracket crossed a traversal stage");
+            }
+            var blocks=targetBlocks(plan,origin,a.server);
+            for(var target:remote) require(blocks.get(target.relativePos()).equals(Blocks.AIR.getDefaultState().toString()),
+                    "First EAST built remote second-stripe target "+target.id()+" at "+target.relativePos()+"; bracket="+(k-1)+".."+k);
+            int crossSection=-1;
+            for(int x=0;x<Math.floor(Math.min(a.sample.pose().x(),coordinate(a.server,"x"))-origin.x());x++) {
+                int column=x;
+                var section=plan.targets().stream().filter(t -> t.relativePos().x()==column && t.relativePos().z()>=firstMin && t.relativePos().z()<=firstMax).toList();
+                if(section.size()!=firstMax-firstMin+1 || section.stream().noneMatch(t -> start.get(t.relativePos()).equals(Blocks.AIR.getDefaultState().toString()))) continue;
+                boolean complete=true;
+                for(var target:section) {
+                    var observations=a.sample.observations().stream().filter(o -> o.targetId()==target.id()).toList();
+                    complete &= blocks.get(target.relativePos()).equals(Blocks.STONE.getDefaultState().toString()) && observations.size()==1
+                            && observations.getFirst().runId().equals(context.runId()) && observations.getFirst().tick()==a.sample.tick()
+                            && observations.getFirst().evidence()==Evidence.OBSERVED && observations.getFirst().observedState().equals(Optional.of(target.block()));
+                }
+                if(complete) { crossSection=x; positive=x; break; }
+            }
+            brackets++;
+            proof.append("adjacent=").append(k-1).append("..").append(k).append("; A.TEST=").append(PhysicsClocks.of(a))
+                    .append("; A.serverPose=").append(coordinate(a.server,"x")).append(',').append(coordinate(a.server,"z"))
+                    .append("; B.TEST=").append(PhysicsClocks.of(b)).append("; remoteAir=PASS; observedPassedCrossSection=").append(crossSection).append('\n');
+        }
+        require(brackets>0 && positive>=0,"Missing coherent mid-first-EAST bracket with genuine client OBSERVED/server cross-section progress");
+        return proof.append("qualifyingBrackets=").append(brackets).append("; positiveCrossSection=").append(positive)
+                .append("; bounded world geometry only; eight paired movement observations remain separate\n").toString();
+    }
+
+    private static boolean turnCell(GridPos p,int width,int center,int nextCenter) {
+        return p.x()>=Math.max(0,width-2) && p.x()<width && p.z()>=Math.max(0,center-1) && p.z()<=nextCenter+1;
+    }
+
+    private static boolean stripeInterior(double x,double z,int center) {
+        return Double.isFinite(x) && Double.isFinite(z) && x>=5.5 && x<=8.5 && z>=center+.25 && z<=center+.75;
+    }
+
+    private static boolean firstEast(ScenarioObserver.Sample sample) {
+        var engine=sample.status().engine(); var traversal=engine.traversal().orElse(null);
+        return sample.pose()!=null && engine.lifecycle().phase()==Phase.RUNNING && engine.lifecycle().activity().orElse(null)==Activity.BUILD
+                && traversal!=null && traversal.pass()==ForwardTraversal.Pass.FORWARD && traversal.laneIndex()==0
+                && traversal.substage()==ForwardTraversal.Substage.LANE && traversal.entry().stage()==Stage.WALK
+                && traversal.entry().lane().direction()==com.mapartrunner.core.traversal.LanePlanner.Direction.EAST;
+    }
+
+    private static void requireStripeContext(ScenarioObserver.Sample sample,Context context,int world) {
+        requireRun(sample,context.runId());
+        require(!sample.paused() && sample.worldIdentity()==world && sample.status().engine().lifecycle().context().filter(context::equals).isPresent(),
+                "Interior stripe bracket changed context/world/pause state");
+    }
+
+    /** Strict projection of existing loaded FULL target evidence, never an absent-cell-is-air assumption. */
+    private static Map<GridPos,String> targetBlocks(BuildPlan plan,GridPos origin,Side side) {
+        var expected=new HashMap<String,GridPos>();
+        for(var target:plan.targets()) {
+            var p=target.relativePos(); var at=new BlockPos(Math.addExact(origin.x(),p.x()),Math.addExact(origin.y(),p.y()),Math.addExact(origin.z(),p.z()));
+            require(expected.put(at.toShortString(),p)==null,"Duplicate translated target");
+        }
+        var result=new HashMap<GridPos,String>(); var seen=new HashSet<String>();
+        require(side!=null && side.state.has("blocks"),"Missing independent server block evidence");
+        for(var encoded:side.state.getAsJsonArray("blocks")) {
+            String row=encoded.getAsString(); int separator=row.indexOf('=');
+            require(separator>0 && seen.add(row.substring(0,separator)),"Malformed/duplicate block evidence");
+            var target=expected.get(row.substring(0,separator));
+            if(target==null) continue;
+            String suffix=";loaded=true;blockEntity=false";
+            require(row.endsWith(suffix),"Unknown/unloaded/block-entity target evidence: "+row);
+            String state=row.substring(separator+1,row.length()-suffix.length());
+            require(state.equals(Blocks.AIR.getDefaultState().toString()) || state.equals(Blocks.STONE.getDefaultState().toString()),
+                    "Unexpected full target state: "+row);
+            require(result.put(target,state)==null,"Duplicate target block evidence");
+        }
+        require(result.size()==plan.targets().size(),"Missing/foreign translated target block evidence");
+        return Map.copyOf(result);
+    }
+
     private static void verifySupportGuards() {
         require(SupportCase.parse(null)==SupportCase.ORDINARY && SupportCase.parse("ordinary")==SupportCase.ORDINARY
                 && SupportCase.parse("controlled")==SupportCase.CONTROLLED,"Closed support selector routing");
@@ -3621,6 +3749,7 @@ final class ScenarioRunner implements AutoCloseable {
         var targets=new ArrayList<BuildPlan.Target>();
         for(int k=0;k<120;k++) targets.add(new BuildPlan.Target(k,new GridPos(k%12,0,k/12),stone));
         var plan=new BuildPlan("support-selfcheck",new BuildPlan.GridSize(12,1,10),targets);
+        verifyStripeGuards(plan);
         var run=new Context(UUID.randomUUID(),"synthetic","synthetic","minecraft:overworld",plan.fingerprint(),new GridPos(0,65,0),"synthetic");
         var off=Collections.nCopies(9,false); var on=new ArrayList<>(off); on.set(0,true);
         int chosen=SingleLaneFixture.targetId(plan,new GridPos(11,0,5));
@@ -3763,6 +3892,112 @@ final class ScenarioRunner implements AutoCloseable {
             require(findSupportWitness(run.runId(),plan,run.origin(),identity,authority,invalid).isEmpty(),"Controlled missing-action/non-later observation accepted");
         PredictionFaults.verifySupportGuards(plan,held);
         System.out.println("ScenarioRunner support-case same-helper synthetic guards passed; native coverage remains separate");
+    }
+
+    private static void verifyStripeGuards(BuildPlan plan) {
+        var settings=BuildEngine.Settings.defaults();
+        var run=new Context(UUID.randomUUID(),"synthetic","synthetic","minecraft:overworld",plan.fingerprint(),new GridPos(17,65,-29),settings.fingerprint());
+        var built=new HashSet<GridPos>();
+        for(int x=0;x<=4;x++) for(int z=0;z<=4;z++) built.add(new GridPos(x,0,z));
+        var a=stripeLive(plan,run,10,6.5,built); var b=stripeLive(plan,run,12,7.5,built);
+        var initial=stripeLive(plan,run,1,.5,Set.of(new GridPos(0,0,2))).server;
+        var callbacks=List.of(stripePhase(stripeLive(plan,run,11,7,built).sample,"START"),
+                stripePhase(stripeLive(plan,run,11,7,built).sample,"END"),stripePhase(b.sample,"START"));
+        require(placementStripeProof(plan,settings,run,initial,List.of(a,b),callbacks).contains("qualifyingBrackets=1"),"Synthetic valid stripe bracket");
+        var transition=new HashSet<>(built); transition.add(new GridPos(11,0,5));
+        placementStripeProof(plan,settings,run,initial,List.of(stripeLive(plan,run,10,6.5,transition),b),callbacks);
+        var beyondTurn=new HashSet<>(built); beyondTurn.add(new GridPos(11,0,9));
+        rejected("second stripe beyond turn Z bound",() -> placementStripeProof(plan,settings,run,initial,List.of(stripeLive(plan,run,10,6.5,beyondTurn),b),callbacks));
+        var bad=new HashSet<>(built);
+        for(int x=0;x<=4;x++) for(int z=5;z<=6;z++) bad.add(new GridPos(x,0,z)); // Old seven-plus-three geometry.
+        var old=stripeLive(plan,run,10,6.5,bad);
+        var eventual=stripeLive(plan,run,30,.5,plan.targets().stream().map(BuildPlan.Target::relativePos).collect(java.util.stream.Collectors.toSet()));
+        requireCurrentScan(run.runId(),30,plan.targets(),eventual.sample.observations());
+        require(targetBlocks(plan,run.origin(),eventual.server).values().stream().allMatch(Blocks.STONE.getDefaultState().toString()::equals),
+                "Synthetic eventual final120 remains independently complete");
+        rejected("old seven-wide EAST despite eventual final120",() -> placementStripeProof(plan,settings,run,initial,List.of(old,b),callbacks));
+        var later=stripeLive(plan,run,14,8,built); var multiple=new ArrayList<>(callbacks);
+        multiple.add(stripePhase(stripeLive(plan,run,13,7.75,built).sample,"START"));
+        multiple.add(stripePhase(stripeLive(plan,run,13,7.75,built).sample,"END")); multiple.add(stripePhase(later.sample,"START"));
+        rejected("bad second qualifying interval cannot be cherry-picked",() -> placementStripeProof(plan,settings,run,initial,
+                List.of(a,stripeLive(plan,run,12,7.5,bad),later),multiple));
+        for(int variant=0;variant<7;variant++) {
+            var state=a.server.state.deepCopy(); var blocks=state.getAsJsonArray("blocks");
+            String row=blocks.get(0).getAsString();
+            switch(variant) {
+                case 0 -> blocks.remove(0);
+                case 1 -> blocks.add(blocks.get(0));
+                case 2 -> blocks.set(0,new JsonPrimitive(row.replace("loaded=true","loaded=false")));
+                case 3 -> blocks.set(0,new JsonPrimitive(row.replace("blockEntity=false","blockEntity=true")));
+                case 4 -> blocks.set(0,new JsonPrimitive(row.replace("minecraft:stone","minecraft:gold_block")));
+                case 5 -> blocks.set(0,new JsonPrimitive("999, 65, 999"+row.substring(row.indexOf('='))));
+                case 6 -> blocks.set(0,new JsonPrimitive(row.replace("Block{minecraft:stone}","UNKNOWN")));
+            }
+            var server=new Side(state,a.server.age,a.server.time,a.server.serverTick,List.of());
+            var invalid=new Live(a.sample,a.client,server,a.fault,a.pending,a.nativeSequence,a.nativeIdentities);
+            rejected("missing/duplicate/unloaded/entity/wrong/foreign/unknown target",() -> placementStripeProof(plan,settings,run,initial,List.of(invalid,b),callbacks));
+        }
+        rejected("no genuine construction beyond seed",() -> placementStripeProof(plan,settings,run,initial,
+                List.of(stripeLive(plan,run,10,6.5,Set.of(new GridPos(0,0,2))),b),callbacks));
+        rejected("missing callback continuity",() -> placementStripeProof(plan,settings,run,initial,List.of(a,b),List.of()));
+        var duplicateCallbacks=new ArrayList<>(callbacks); duplicateCallbacks.add(callbacks.getFirst());
+        rejected("duplicate callback continuity",() -> placementStripeProof(plan,settings,run,initial,List.of(a,b),duplicateCallbacks));
+        var changed=new ArrayList<>(callbacks);
+        changed.set(0,supportSample(plan,run,11,23.5,-26.5,0,Collections.nCopies(9,false),List.of(),Set.of(),List.of(),"START"));
+        rejected("intervening SHIFT changes the bracket",() -> placementStripeProof(plan,settings,run,initial,List.of(a,b),changed));
+        var foreign=new Context(run.runId(),"foreign",run.worldId(),run.dimension(),run.planFingerprint(),run.origin(),run.settingsFingerprint());
+        rejected("foreign endpoint context",() -> placementStripeProof(plan,settings,run,initial,List.of(a,stripeLive(plan,foreign,12,7.5,built)),callbacks));
+        rejected("missing interior window",() -> placementStripeProof(plan,settings,run,initial,List.of(stripeLive(plan,run,10,10.5,built),b),callbacks));
+        rejected("reversed callback clocks",() -> placementStripeProof(plan,settings,run,initial,List.of(b,a),callbacks));
+        var reversedServer=new Side(a.server.state,13,13,13,List.of());
+        var futureServer=new Live(a.sample,a.client,reversedServer,a.fault,a.pending,a.nativeSequence,a.nativeIdentities);
+        rejected("reversed independent server clocks",() -> placementStripeProof(plan,settings,run,initial,List.of(futureServer,b),callbacks));
+        var wrongWorld=a.server.state.deepCopy(); wrongWorld.addProperty("dimension","minecraft:the_nether");
+        var foreignServer=new Live(a.sample,a.client,new Side(wrongWorld,10,10,10,List.of()),a.fault,a.pending,a.nativeSequence,a.nativeIdentities);
+        rejected("foreign server dimension",() -> placementStripeProof(plan,settings,run,initial,List.of(foreignServer,b),callbacks));
+        for(var substage:List.of(ForwardTraversal.Substage.ENDPOINT,ForwardTraversal.Substage.SHIFT,ForwardTraversal.Substage.LANE)) {
+            var original=a.sample.status().engine(); var traversal=original.traversal().orElseThrow();
+            var lane=traversal.entry().lane();
+            if(substage==ForwardTraversal.Substage.LANE) lane=new com.mapartrunner.core.traversal.LanePlanner.Lane(lane.id(),
+                    com.mapartrunner.core.traversal.LanePlanner.Direction.WEST,lane.end(),lane.start(),lane.corridor(),lane.expectedFloor());
+            var entry=new com.mapartrunner.core.movement.MovementPolicy.LaneEntry(lane,Stage.WALK,0,0,0,0,0,Set.of(),false);
+            var changedTraversal=new ForwardTraversal.Snapshot(0,substage,entry,0,Optional.empty(),ForwardTraversal.Pass.FORWARD,0);
+            var engine=new BuildEngine.Snapshot(original.lifecycle(),original.eligibleTicks(),0,Optional.of(changedTraversal),List.of(),Set.of(),Optional.empty(),List.of());
+            var sample=new ScenarioObserver.Sample(10,"TEST",71,true,a.sample.pose(),a.sample.keys(),false,
+                    new FabricBuildAdapter.Status(engine,BuildEngine.ControlOwner.NATIVE,Optional.empty()),a.sample.observations());
+            var invalid=new Live(sample,a.client,a.server,a.fault,a.pending,a.nativeSequence,a.nativeIdentities);
+            rejected("endpoint/SHIFT/WEST is not a first EAST bracket",() -> placementStripeProof(plan,settings,run,initial,List.of(invalid,b),callbacks));
+        }
+        var scan=new ArrayList<>(a.sample.observations());
+        scan.replaceAll(o -> new PlacementObservation(o.runId(),o.targetId(),OptionalLong.empty(),o.tick(),Evidence.PREDICTED,o.observedState()));
+        var sample=new ScenarioObserver.Sample(a.sample.tick(),"TEST",a.sample.worldIdentity(),true,a.sample.pose(),a.sample.keys(),false,a.sample.status(),scan);
+        var predicted=new Live(sample,a.client,a.server,a.fault,a.pending,a.nativeSequence,a.nativeIdentities);
+        rejected("predicted cross-section is not positive evidence",() -> placementStripeProof(plan,settings,run,initial,List.of(predicted,b),callbacks));
+        System.out.println("ScenarioRunner placement stripe same-helper synthetic guards passed; native geometry remains unrun");
+    }
+
+    private static ScenarioObserver.Sample stripePhase(ScenarioObserver.Sample sample,String phase) {
+        return new ScenarioObserver.Sample(sample.tick(),phase,sample.worldIdentity(),sample.originalWorld(),sample.pose(),sample.keys(),sample.paused(),sample.status(),sample.observations());
+    }
+
+    private static Live stripeLive(BuildPlan plan,Context run,long frame,double x,Set<GridPos> built) {
+        var lane=new com.mapartrunner.core.traversal.LanePlanner().plan(plan,2,5).getFirst();
+        var entry=new com.mapartrunner.core.movement.MovementPolicy.LaneEntry(lane,Stage.WALK,0,0,0,0,0,Set.of(),false);
+        var traversal=new ForwardTraversal.Snapshot(0,ForwardTraversal.Substage.LANE,entry,0,Optional.empty(),ForwardTraversal.Pass.FORWARD,0);
+        var engine=new BuildEngine.Snapshot(new com.mapartrunner.core.run.RunLifecycle.Snapshot(Phase.RUNNING,Optional.of(run),Optional.of(Activity.BUILD),Optional.empty()),
+                frame,0,Optional.of(traversal),List.of(),Set.of(),Optional.empty(),List.of());
+        var origin=run.origin(); var state=new JsonObject(); var blocks=new JsonArray();
+        state.addProperty("dimension",run.dimension()); state.addProperty("x",x+origin.x()); state.addProperty("z",2.5+origin.z());
+        for(var target:plan.targets()) {
+            var p=target.relativePos(); var at=new BlockPos(origin.x()+p.x(),origin.y()+p.y(),origin.z()+p.z());
+            blocks.add(at.toShortString()+"="+(built.contains(p)?Blocks.STONE:Blocks.AIR).getDefaultState()+";loaded=true;blockEntity=false");
+        }
+        state.add("blocks",blocks); var side=new Side(state,(int)frame,frame,(int)frame,List.of());
+        var pose=new ScenarioObserver.Pose(x+origin.x(),origin.y()+1,origin.z()+2.5,Vec3d.ZERO,Vec3d.ZERO,(int)frame,frame,-90,-90,-90,false,false,1,7,64);
+        var scan=plan.targets().stream().map(t -> new PlacementObservation(run.runId(),t.id(),OptionalLong.empty(),frame,Evidence.OBSERVED,
+                Optional.of(built.contains(t.relativePos())?t.block():new BuildPlan.BlockSpec("minecraft:air",Map.of())))).toList();
+        var sample=new ScenarioObserver.Sample(frame,"TEST",71,true,pose,Collections.nCopies(9,false),false,new FabricBuildAdapter.Status(engine,BuildEngine.ControlOwner.NATIVE,Optional.empty()),scan);
+        return new Live(sample,side,side,null,List.of(),0,"synthetic");
     }
 
     private static List<PlacementObservation> supportScan(BuildPlan plan,UUID run,long frame) {
