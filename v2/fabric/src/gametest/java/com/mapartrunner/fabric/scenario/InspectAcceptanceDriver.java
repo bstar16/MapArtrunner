@@ -73,6 +73,7 @@ final class InspectAcceptanceDriver {
     private static final Command[] DISPLACED = {Command.RUN, Command.RESET, Command.RUN, Command.RESET, Command.RUN};
     private static final Command[] RESET_ARCHIVE = {Command.RESET, Command.RUN, Command.RESET, Command.RUN, Command.RESET, Command.RUN, Command.RESET, Command.RUN};
     private static final Command[] FOREIGN = {Command.RESET, Command.RUN, Command.RERUN};
+    private static final Command[] WORK_EXPIRY = {Command.RESET, Command.RUN, Command.RESET};
     private enum Stage { WAIT_STARTUP, NEXT_COMMAND, MOVING, OPEN_CHAT, WAIT_HANDOFF, WAIT_COMPLETION, IDLE, IDLE_FINISH_PENDING, FOREIGN, STOPPED }
 
     // This driver alone owns its sequence and synthetic key. No Runner/Host state is changed here.
@@ -92,7 +93,7 @@ final class InspectAcceptanceDriver {
     private PublishedCompletion retained, pending;
     private UUID session;
     private boolean advancing, failed, stopRequested;
-    private boolean selected, displaced, resetArchive, foreignCase, moved, middleLast, carryInputDeadline;
+    private boolean selected, displaced, resetArchive, foreignCase, workExpiry, moved, middleLast, carryInputDeadline;
     private int resetArchiveLast = -1;
     private int movementCallbacks;
     private Object heldForward;
@@ -100,6 +101,11 @@ final class InspectAcceptanceDriver {
     private Idle idle;
     private ForeignClaims foreignClaims;
     private Foreign foreign;
+    private ExpiryClaims expiryClaims;
+    private Expiry expiry;
+    // Keep RUN2's immutable result/proof after RESET3 replaces LAST. Only transient input/ack state retires.
+    private PublishedCompletion expiryResult;
+    private ExpiryObservation expiryProof;
     private boolean stopping;
     private Throwable driverFailure;
 
@@ -126,6 +132,10 @@ final class InspectAcceptanceDriver {
             public boolean replay(MinecraftClient current,UUID operation,long deadline) { return commands.acknowledgeForeignReplayMeasurement(current,operation,deadline); }
             public boolean seal(MinecraftClient current,ForeignProofAck ack) { return commands.acknowledgeForeignFinalProof(current,ack); }
         };
+        expiryClaims=new ExpiryClaims() {
+            public ExpiryObservation observe() { return commands.observeExpiryAcceptance(); }
+            public boolean acknowledge(MinecraftClient current,ExpiryBusyAck ack) { return commands.acknowledgeExpiryBusyProof(current,ack); }
+        };
     }
 
     /** Only this fixed policy has a simulated boundary in unit tests; it grants no native acceptance. */
@@ -151,6 +161,11 @@ final class InspectAcceptanceDriver {
         this(observations,input,clock,enabled,log); this.foreignClaims=foreignClaims;
     }
 
+    InspectAcceptanceDriver(Supplier<InspectObservation> observations,ChatBoundary input,LongSupplier clock,
+                            BooleanSupplier enabled,Consumer<String> log,ExpiryClaims expiryClaims) {
+        this(observations,input,clock,enabled,log); this.expiryClaims=expiryClaims;
+    }
+
     static boolean enabled() {
         return enabled(System.getProperty("mapart.test.inspect"), System.getProperty("mapart.test.inspect.acceptance"),
                 System.getProperty("fabric.client.gametest"));
@@ -161,7 +176,8 @@ final class InspectAcceptanceDriver {
 
     void tick(MinecraftClient current) {
         if (advancing) return;
-        if (!enabled.getAsBoolean() && heldForward == null && idle == null && foreign==null && !failed) return;
+        if (stopping && workExpiry) return;
+        if (!enabled.getAsBoolean() && heldForward == null && idle == null && foreign==null && !workExpiry && !failed) return;
         boolean validEntry = false;
         advancing = true;
         try {
@@ -169,10 +185,11 @@ final class InspectAcceptanceDriver {
             require(enabled.getAsBoolean(), "Acceptance gate disabled during driver activity");
             if (!selected) {
                 var value = System.getProperty("mapart.test.inspect.acceptance.case", "baseline");
-                require(Set.of("baseline","displaced","reset-archive","foreign-world").contains(value), "Unknown acceptance case: " + value);
-                displaced = value.equals("displaced"); resetArchive = value.equals("reset-archive"); foreignCase=value.equals("foreign-world"); selected = true;
+                require(Set.of("baseline","displaced","reset-archive","foreign-world","work-expiry").contains(value), "Unknown acceptance case: " + value);
+                displaced = value.equals("displaced"); resetArchive = value.equals("reset-archive"); foreignCase=value.equals("foreign-world"); workExpiry=value.equals("work-expiry"); selected = true;
             }
             if(resetArchive) require("reset-archive".equals(System.getProperty("mapart.test.inspect.acceptance.case")),"Reset-archive acceptance case changed");
+            if(workExpiry) require("work-expiry".equals(System.getProperty("mapart.test.inspect.acceptance.case")),"Expiry acceptance case changed");
             if (stage == Stage.STOPPED) { requestStop(current); return; }
             var observed = observations.get();
             if(foreignCase) {
@@ -202,6 +219,16 @@ final class InspectAcceptanceDriver {
             }
             input.requireBinding();
             require(observed.ready(), "Inspect session unavailable");
+            if(workExpiry && index==1 && (stage==Stage.WAIT_HANDOFF || stage==Stage.WAIT_COMPLETION)) {
+                if(expiry==null && input.screen()==null && observed.busy()) {
+                    inputDeadline(); // RUN2 still owes its ordinary natural handoff before the long WORK wait.
+                    requireUnchanged(observed);
+                    require(expiryClaims!=null && retained!=null && retained.ordinal()==1 && retained.command()==Command.RESET,"Expiry requires RESET1/owner boundary");
+                    expiry=new Expiry(); stage=Stage.WAIT_COMPLETION;
+                    marker("EXPIRY_WAIT original RUN2 handoff complete; no input allowance for WORK");
+                }
+                if(expiry!=null) { expiry.tick(current,observed); return; }
+            }
             switch (stage) {
                 case NEXT_COMMAND -> beginInput(observed);
                 case MOVING -> advanceMovement(observed);
@@ -260,6 +287,7 @@ final class InspectAcceptanceDriver {
     private void beginInput(InspectObservation observed) {
         requireUnchanged(observed); require(!observed.busy(), "Unexpected busy before input");
         require(input.screen() == null, "Unexpected input screen");
+        if(workExpiry && index>=2) require(expiryResult!=null && expiryResultMatches(expiryResult),"Expiry failed RUN2 result/proof not retained");
         if (displaced && index == 2 && !moved) { beginMovement(); return; }
         if (!carryInputDeadline) inputStarted = clock.getAsLong();
         carryInputDeadline = false;
@@ -319,7 +347,12 @@ final class InspectAcceptanceDriver {
         if (advancing) return;
         boolean validEntry = false;
         advancing = true;
-        try { input.requireClient(current); validEntry = true; stopping=true; if(foreign!=null) foreign.dispose(); releaseForward(); }
+        try {
+            input.requireClient(current); validEntry = true; stopping=true;
+            if(foreign!=null) foreign.dispose();
+            if(workExpiry) { if(expiry!=null) expiry.dispose(); stage=Stage.STOPPED; releaseKey(); }
+            releaseForward();
+        }
         catch (RuntimeException | Error failure) { fail(failure, validEntry); }
         finally { advancing = false; }
     }
@@ -348,7 +381,10 @@ final class InspectAcceptanceDriver {
                 && completion.evidenceComplete() && completion.cleanupSettled() && "RELEASED".equals(completion.cleanupStatus()),
                 "Invalid completion identity/evidence/cleanup");
         boolean expected;
-        if (resetArchive && (index == 0 || index == 4)) {
+        if (workExpiry) {
+            expected = index==1 ? expiryResultMatches(completion)
+                    : "PASS".equals(completion.verdict()) && completion.runId().isEmpty() && completion.failure().isEmpty();
+        } else if (resetArchive && (index == 0 || index == 4)) {
             expected = "FAIL".equals(completion.verdict()) && completion.runId().isEmpty()
                     && completion.failure().filter(f -> "com.mapartrunner.fabric.scenario.ScenarioRunner$SimulatedInspectResetFailure".equals(f.className())
                     && (index == 0 ? "SIMULATED_INSPECT_RESET_AFTER_RESTORE_BEFORE_READINESS"
@@ -367,8 +403,22 @@ final class InspectAcceptanceDriver {
         return completion;
     }
 
+    private boolean expiryResultMatches(PublishedCompletion completion) {
+        return expiryProof!=null && expiryProof.stage().equals("SEALED_BEFORE_END") && expiryProof.acknowledgement()!=null
+                && Objects.equals(completion.sessionId(),expiryProof.sessionId())
+                && Objects.equals(completion.operationId(),expiryProof.operationId())
+                && completion.runId().filter(expiryProof.runId()::equals).isPresent()
+                && "FAIL".equals(completion.verdict()) && completion.failure().filter(InspectAcceptanceDriver::expiryTimeout).isPresent();
+    }
+
     private void acceptSettled(InspectObservation observed, PublishedCompletion completion) {
         if (completion == null || observed.busy()) return;
+        if(workExpiry && index==1) {
+            expiryResult=completion;
+            marker("EXPIRY_RETAINED failed RUN2 operation="+completion.operationId()+" run="+completion.runId().orElseThrow()
+                    +" evidence="+completion.evidenceDirectory()+" summary="+completion.summaryPath()+" proof=work-expiry-proof.json; retained phase/CHAT audits required");
+            expiry.dispose(); expiry=null;
+        }
         session = completion.sessionId(); retained = completion;
         operations.add(completion.operationId()); directories.add(completion.evidenceDirectory()); summaries.add(completion.summaryPath());
         completion.runId().ifPresent(runs::add);
@@ -463,6 +513,7 @@ final class InspectAcceptanceDriver {
         if (failed) { if(driverFailure!=null && driverFailure!=failure) driverFailure.addSuppressed(failure); return; }
         driverFailure=failure;
         failed = true;
+        if(expiry!=null) expiry.dispose();
         if(foreign!=null) try { foreign.dispose(); }
         catch(RuntimeException | Error secondary) { if(secondary!=failure) failure.addSuppressed(secondary); }
         if (validEntry) try { releaseKey(); } catch (RuntimeException | Error release) { failure.addSuppressed(release); }
@@ -488,7 +539,7 @@ final class InspectAcceptanceDriver {
                 + mutations()[index].name().toLowerCase(Locale.ROOT) + " grounded-two-lane";
     }
 
-    private Command[] mutations() { return foreignCase ? FOREIGN : resetArchive ? RESET_ARCHIVE : displaced ? DISPLACED : MUTATIONS; }
+    private Command[] mutations() { return workExpiry ? WORK_EXPIRY : foreignCase ? FOREIGN : resetArchive ? RESET_ARCHIVE : displaced ? DISPLACED : MUTATIONS; }
     private boolean isLast() { return index == mutations().length || displaced && index == 3 && !middleLast
             || resetArchive && (index == 1 || index == 4 || index == 5) && resetArchiveLast != index; }
 
@@ -529,6 +580,136 @@ final class InspectAcceptanceDriver {
         default void retireForeignRead(ForeignRead request) { request.retired.set(true); }
         default JsonObject foreignMetadata() { throw new IllegalStateException("No foreign native metadata boundary"); }
         default void flushForeign() { System.out.flush(); require(!System.out.checkError(),"Foreign stdout flush/check failed"); }
+    }
+
+    /** Detached owner facts only: this policy cannot create/cancel scopes or release native ownership. */
+    interface ExpiryClaims {
+        ExpiryObservation observe();
+        boolean acknowledge(MinecraftClient current,ExpiryBusyAck ack);
+    }
+
+    private static boolean expiryTimeout(FailureObservation failure) {
+        return failure!=null && "com.mapartrunner.fabric.scenario.ScenarioHost$ScopeTimeoutException".equals(failure.className())
+                && "Inspect scope absolute deadline expired".equals(failure.message());
+    }
+
+    // RUN2 alone owns this finite input role. WORK wait has no input origin; BUSY_REQUIRED creates one.
+    // Send/ack stages latch before callbacks. Failure/stop clear only local debt/ack; owners retain cleanup.
+    private final class Expiry {
+        private enum Step { WAIT_BUSY, OPEN, HANDOFF, ACK, RESULT, DISPOSED }
+        private static final String BUSY_CHAT="/maparttest rerun grounded-two-lane";
+        private Step step=Step.WAIT_BUSY;
+        private ExpiryObservation original,request;
+        private ExpiryBusyAck ack;
+        private Object screen;
+        private long chatOrigin;
+        private boolean entered;
+
+        private ExpiryObservation validate() {
+            require(!stopping && !stopRequested && step!=Step.DISPOSED && enabled.getAsBoolean()
+                    && "work-expiry".equals(System.getProperty("mapart.test.inspect.acceptance.case")),"Expiry gate/stopping changed");
+            input.requireBinding();
+            var observed=observations.get();
+            require(observed.ready() && !observed.restartRequired(),"Expiry Commands unavailable");
+            if(step!=Step.RESULT) { requireUnchanged(observed); require(observed.busy(),"Expiry original RUN2 no longer busy"); }
+            var now=expiryClaims.observe();
+            if(now==null) { require(original==null && step==Step.WAIT_BUSY,"Expiry projection lost"); return null; }
+            require(now.ordinal()==2 && Objects.equals(session,now.sessionId()) && now.operationId()!=null && !operations.contains(now.operationId())
+                    && now.runId()!=null && !runs.contains(now.runId())
+                    && now.outerCutoffNanos()-now.workDeadlineNanos()==10_000_000_000L,"Expiry original identity/cutoff invalid");
+            require(Set.of("ARMED","HELD","EXPIRED","BEFORE_REPLAY_READ","REPLAY_QUEUED","REPLAY_REJECTED",
+                    "AFTER_REPLAY_READ","POST_REPLAY_MEASURED","CLEANUP_PENDING","BUSY_REQUIRED","SEALED_BEFORE_END").contains(now.stage()),"Expiry incomplete/replay-failed/unknown stage");
+            if(original==null) {
+                original=now;
+                marker("EXPIRY_ORIGINAL operation="+now.operationId()+" run="+now.runId()+" workDeadlineNanos="+now.workDeadlineNanos()+" outerCutoffNanos="+now.outerCutoffNanos());
+            }
+            require(Objects.equals(now.sessionId(),original.sessionId()) && Objects.equals(now.operationId(),original.operationId())
+                    && Objects.equals(now.runId(),original.runId()) && now.workDeadlineNanos()==original.workDeadlineNanos()
+                    && now.outerCutoffNanos()==original.outerCutoffNanos(),"Expiry original identity/deadline changed");
+            if(step!=Step.RESULT) require(clock.getAsLong()-original.outerCutoffNanos()<0,"Expiry original outer cutoff expired");
+            if(request!=null || now.stage().equals("BUSY_REQUIRED") || now.stage().equals("SEALED_BEFORE_END")) {
+                require(now.wrapperEntries()==2 && now.actionEntries()==0 && now.replayCount()==1 && now.replayRejected()
+                        && now.distinctReplayFailure() && expiryTimeout(now.primary()) && expiryTimeout(now.replay()) && now.boundaryRetired()
+                        && now.requestOrdinal()==1 && now.cleanupDeadlineNanos()-now.outerCutoffNanos()<=0
+                        && now.cleanupDeadlineNanos()-now.workDeadlineNanos()>0,"Expiry replay/cleanup proof invalid");
+                if(request!=null) require(now.cleanupDeadlineNanos()==request.cleanupDeadlineNanos()
+                        && Objects.equals(now.primary(),request.primary()) && Objects.equals(now.replay(),request.replay()),"Expiry busy request changed");
+                require(now.busyRefusals()>=0 && now.busyRefusals()<=1,"Expiry busy refusal count invalid");
+                if(step==Step.RESULT) {
+                    require(Objects.equals(ack,now.acknowledgement()) && now.busyRefusals()==1
+                            && Set.of("BUSY_REQUIRED","SEALED_BEFORE_END").contains(now.stage()),"Expiry acknowledged proof changed");
+                    require(expiryProof==null || expiryProof.equals(now),"Expiry sealed proof changed");
+                } else {
+                    require(now.stage().equals("BUSY_REQUIRED") && now.acknowledgement()==null,"Expiry busy request already sealed/acknowledged");
+                    long time=clock.getAsLong();
+                    require(time-original.workDeadlineNanos()>=0 && time-now.cleanupDeadlineNanos()<0,"Expiry original cleanup deadline invalid/expired");
+                    require(entered || now.busyRefusals()==0,"Expiry refusal before busy Enter");
+                }
+            } else require(step==Step.WAIT_BUSY && now.requestOrdinal()==0 && now.busyRefusals()==0 && now.acknowledgement()==null,
+                    "Expiry premature request/refusal/ack");
+            return now;
+        }
+
+        private ExpiryObservation inputCheck() {
+            var now=validate();
+            require(now!=null && request!=null && clock.getAsLong()-chatOrigin<INPUT_NANOS,"Expiry busy input deadline expired (original 30000ms)");
+            return now;
+        }
+
+        void tick(MinecraftClient current,InspectObservation observed) {
+            var now=validate();
+            switch(step) {
+                case WAIT_BUSY -> {
+                    require(input.screen()==null,"Unexpected expiry WORK screen");
+                    if(now==null || !now.stage().equals("BUSY_REQUIRED")) return;
+                    require(heldKey==-1 && heldForward==null,"Expiry busy input requires no synthetic debt");
+                    request=now; chatOrigin=clock.getAsLong();
+                    inputCheck(); input.requireNeutral();
+                    step=Step.OPEN;
+                    marker("EXPIRY_BUSY_REQUEST denied RERUN role text="+BUSY_CHAT+" request=1 cleanupDeadlineNanos="+request.cleanupDeadlineNanos());
+                    inputCheck(); pairedKey(input.chatKey(),null);
+                }
+                case OPEN -> {
+                    inputCheck(); screen=input.screen();
+                    if(screen==null) return;
+                    input.requireChat(screen,"");
+                    step=Step.HANDOFF; // Whole send is single-use, including a character/Enter that applies then throws.
+                    for(int i=0;i<BUSY_CHAT.length();i++) {
+                        inputCheck(); input.requireChat(screen,BUSY_CHAT.substring(0,i)); input.character(BUSY_CHAT.charAt(i));
+                    }
+                    inputCheck(); input.requireChat(screen,BUSY_CHAT);
+                    entered=true; pairedKey(ENTER,screen);
+                    marker("EXPIRY_BUSY_ENTER denied RERUN delivered; awaiting natural handoff");
+                }
+                case HANDOFF -> {
+                    now=inputCheck();
+                    if(input.screen()!=null) { input.requireChat(screen,BUSY_CHAT); return; }
+                    input.requireNeutral();
+                    if(now.busyRefusals()==0) return; // Never retype to repair an unrecorded refusal.
+                    ack=new ExpiryBusyAck(request.operationId(),request.requestOrdinal(),request.cleanupDeadlineNanos());
+                    step=Step.ACK;
+                    marker("EXPIRY_BUSY_HANDOFF one refusal observed; retained CHAT audit required");
+                }
+                case ACK -> {
+                    now=inputCheck();
+                    require(input.screen()==null && now.busyRefusals()==1,"Expiry ack requires closed chat/one refusal");
+                    input.requireNeutral();
+                    // False retries only this exact frozen value on a later callback. Exceptions retire it in fail().
+                    if(expiryClaims.acknowledge(current,ack)) {
+                        step=Step.RESULT;
+                        marker("EXPIRY_BUSY_ACK operation="+ack.operationId()+" request="+ack.requestOrdinal()+" cleanupDeadlineNanos="+ack.cleanupDeadlineNanos());
+                    }
+                }
+                case RESULT -> {
+                    require(input.screen()==null,"Unexpected completion screen");
+                    if(now.stage().equals("SEALED_BEFORE_END")) expiryProof=now;
+                    acceptSettled(observed,nextCompletion(observed));
+                }
+                default -> throw new IllegalStateException("Expiry input retired");
+            }
+        }
+
+        void dispose() { step=Step.DISPOSED; ack=null; screen=null; }
     }
 
     interface ForeignClaims {
