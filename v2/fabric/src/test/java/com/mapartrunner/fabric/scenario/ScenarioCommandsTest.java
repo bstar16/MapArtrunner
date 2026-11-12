@@ -229,6 +229,51 @@ class ScenarioCommandsTest {
         assertEquals(2, fieldInt(f.runner, "inspectOrdinal"));
     }
 
+    @Test void nativeCancellationAndStoppingReturnWhileRealBeginPublicationStillHoldsPhaseLock() throws Exception {
+        for (boolean stopping : List.of(false, true)) {
+            var entered = new CountDownLatch(1); var release = new CountDownLatch(1);
+            var returned = new CountDownLatch(1); var holder = new Fixture[1];
+            var launch = launch();
+            var receipts = new ScenarioLaunchReceipt(launch.getFileName().toString().substring(7), launch.toString(), path -> {
+                if (!path.getFileName().toString().equals("inspect-op-1.begin.json")) return;
+                assertTrue(assertDoesNotThrow(() -> (java.util.concurrent.locks.ReentrantLock)
+                        field(InspectScenarioHost.class, "lock").get(holder[0].nativeHost)).isHeldByCurrentThread());
+                entered.countDown(); assertDoesNotThrow(() -> assertTrue(release.await(10, TimeUnit.SECONDS)));
+            }, false);
+            var f = fixture(receipts, null); holder[0] = f;
+            var callbackFailure = new AtomicReference<Throwable>(); var expected = new AtomicReference<Throwable>();
+            var original = new IllegalStateException("native cancellation original");
+            var callback = new Thread(() -> {
+                f.nativeThread.set(true);
+                try {
+                    if (stopping) f.nativeHost.onStopping(null);
+                    f.commands.cancel(original); // Same synchronous owner call as the initializer lifecycle callbacks.
+                    @SuppressWarnings("unchecked") var cause = (AtomicReference<Throwable>) field(InspectScenarioHost.class, "originalFailure").get(f.nativeHost);
+                    expected.set(cause.get());
+                } catch (Throwable failure) { callbackFailure.set(failure); }
+                finally { f.nativeThread.remove(); returned.countDown(); }
+            }, "inspect-native-cancel-test");
+            f.commands.enqueue(Command.RUN, message -> { });
+            var worker = new Thread(f.queue.remove(), "inspect-command-publication-test");
+            try {
+                worker.start(); assertTrue(entered.await(2, TimeUnit.SECONDS)); callback.start();
+                assertTrue(returned.await(2, TimeUnit.SECONDS), "Native callback blocked behind receipt publication");
+                assertEquals(1, release.getCount(), "Callback must return before the phase lock is released");
+                assertNull(callbackFailure.get()); assertNotNull(expected.get());
+                if (!stopping) assertSame(original, expected.get());
+                assertFalse(f.commands.isReady());
+            } finally {
+                release.countDown(); worker.join(5000); callback.join(5000);
+                assertFalse(worker.isAlive()); assertFalse(callback.isAlive());
+            }
+            assertSame(expected.get(), f.runner.lastInspectCompletion().orElseThrow().failure());
+            assertTrue(f.neutralScopes.isEmpty()); assertEquals(0, f.nativeEffects.get());
+            assertTrue(f.commands.lastDescription().contains("last: none"));
+            assertEquals(0, f.commands.enqueue(Command.RESET, message -> { }));
+            assertEquals(1, fieldInt(f.runner, "inspectOrdinal"));
+        }
+    }
+
     @Test void initializationReturnsImmediatelyAndCannotManufactureReadyOnFactoryFailure() throws Exception {
         var queue = new ArrayDeque<Runnable>(); var commands = new ScenarioCommands(queue::add, nativeHost());
         var stops = new AtomicInteger();
@@ -249,8 +294,10 @@ class ScenarioCommandsTest {
     private Fixture fixture(ScenarioLaunchReceipt receipts, Consumer<FinalOutcome> observe, Consumer<Operation> header,
                             boolean failRelease) throws Exception {
         var outcomes = new ArrayList<FinalOutcome>(); var neutral = new ArrayList<Scope>();
-        var nativeHost = new InspectScenarioHost(() -> 1L, () -> false, () -> false,
-                action -> fail("No native client action in lifecycle fixture"), action -> fail("No native server action in lifecycle fixture"),
+        var nativeThread = ThreadLocal.withInitial(() -> false); var nativeEffects = new AtomicInteger();
+        var nativeHost = new InspectScenarioHost(() -> 1L, nativeThread::get, () -> false,
+                action -> { nativeEffects.incrementAndGet(); fail("No native client action in lifecycle fixture"); },
+                action -> { nativeEffects.incrementAndGet(); fail("No native server action in lifecycle fixture"); },
                 outcome -> { outcomes.add(outcome); if (observe != null) observe.accept(outcome); }, receipts, Instant::now);
         // Only native chat observation is substituted. All scope/evidence/admission/settlement owners are real.
         var host = (Inspect) Proxy.newProxyInstance(Inspect.class.getClassLoader(), new Class<?>[]{Inspect.class}, (proxy, method, arguments) -> {
@@ -273,7 +320,7 @@ class ScenarioCommandsTest {
         if (receipts != null) ownedTrees.add(evidence.resolve("two-lane-" + runner.inspectSessionId()));
         var queue = new ArrayDeque<Runnable>(); var commands = new ScenarioCommands(queue::add, host);
         set(commands, "runner", runner); set(commands, "ready", true);
-        return new Fixture(commands, runner, queue, outcomes, neutral);
+        return new Fixture(commands, runner, queue, outcomes, neutral, nativeHost, nativeThread, nativeEffects);
     }
 
     private Path launch() throws Exception {
@@ -317,5 +364,6 @@ class ScenarioCommandsTest {
         } catch (ReflectiveOperationException failure) { throw new AssertionError(failure); }
     }
     private record Fixture(ScenarioCommands commands, ScenarioRunner runner, ArrayDeque<Runnable> queue,
-                           List<FinalOutcome> outcomes, List<Scope> neutralScopes) { }
+                           List<FinalOutcome> outcomes, List<Scope> neutralScopes, InspectScenarioHost nativeHost,
+                           ThreadLocal<Boolean> nativeThread, AtomicInteger nativeEffects) { }
 }

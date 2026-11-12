@@ -33,6 +33,54 @@ import static org.junit.jupiter.api.Assertions.*;
 class ScenarioHostTest {
     @TempDir Path temporary;
 
+    @Test void directCancellationReturnsBeforeRealBeginPublicationReleasesLockAndRetainsFirstCause() throws Exception {
+        var source = Path.of(ScenarioHost.class.getProtectionDomain().getCodeSource().getLocation().toURI()).toRealPath();
+        var module = source.getParent().getParent().getParent().getParent();
+        var evidence = Files.createDirectories(module.resolve("build/scenario-results"));
+        var launchId = UUID.randomUUID(); var session = UUID.randomUUID(); var id = UUID.randomUUID();
+        var launch = Files.createDirectory(evidence.resolve("launch-" + launchId));
+        var owned = Files.createDirectory(evidence.resolve("two-lane-" + session));
+        var directory = Files.createDirectories(owned.resolve("inspect-operations/op-1-" + id));
+        var operation = new Operation(session, 1, id, Command.RUN, directory);
+        var entered = new CountDownLatch(1); var release = new CountDownLatch(1); var returned = new CountDownLatch(1);
+        var nativeThread = ThreadLocal.withInitial(() -> false); var effects = new AtomicInteger();
+        var callbackFailure = new AtomicReference<Throwable>(); var original = new IllegalStateException("first cancellation");
+        var receipts = new ScenarioLaunchReceipt(launchId.toString(), launch.toString(), path -> {
+            entered.countDown(); assertDoesNotThrow(() -> assertTrue(release.await(10, TimeUnit.SECONDS)));
+        }, false);
+        var host = new InspectScenarioHost(() -> 1L, nativeThread::get, () -> false,
+                action -> effects.incrementAndGet(), action -> effects.incrementAndGet(), null, receipts, java.time.Instant::now);
+        var worker = Executors.newSingleThreadExecutor();
+        var callback = new Thread(() -> {
+            nativeThread.set(true);
+            try { host.cancelSession(original); host.cancelSession(new IllegalStateException("later cancellation")); }
+            catch (Throwable failure) { callbackFailure.set(failure); }
+            finally { nativeThread.remove(); returned.countDown(); }
+        }, "inspect-direct-native-cancel-test");
+        try {
+            var admission = worker.submit(() -> host.beginWork(operation));
+            try {
+                assertTrue(entered.await(2, TimeUnit.SECONDS)); callback.start();
+                assertTrue(returned.await(2, TimeUnit.SECONDS), "Direct cancellation blocked on phase filesystem IO");
+                assertEquals(1, release.getCount()); assertNull(callbackFailure.get());
+            } finally { release.countDown(); callback.join(5000); assertFalse(callback.isAlive()); }
+            var work = admission.get(2, TimeUnit.SECONDS);
+            assertEquals(600_000_000_001L, work.deadlineNanos());
+            assertSame(original, assertThrows(IllegalStateException.class, () -> host.inScope(work,
+                    () -> host.runOnClient(client -> effects.incrementAndGet()))));
+            assertEquals(0, effects.get());
+            assertThrows(IllegalStateException.class, () -> host.beginWork(new Operation(session, 2, UUID.randomUUID(), Command.RUN, directory)));
+        } finally {
+            release.countDown(); worker.shutdownNow(); assertTrue(worker.awaitTermination(5, TimeUnit.SECONDS));
+            for (var root : List.of(owned, launch)) {
+                assertEquals(evidence, root.getParent()); assertEquals(root, root.toRealPath());
+                try (var paths = Files.walk(root)) {
+                    for (var path : paths.sorted(java.util.Comparator.reverseOrder()).toList()) Files.delete(path);
+                }
+            }
+        }
+    }
+
     @Test void inspectQueuedExpiredAndCancelledActionsHaveZeroEffects() throws Exception {
         try (var h = new DispatchHarness()) {
             var op = operation(1);

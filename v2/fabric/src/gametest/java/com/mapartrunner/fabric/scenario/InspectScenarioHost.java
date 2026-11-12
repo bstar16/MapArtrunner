@@ -56,6 +56,8 @@ final class InspectScenarioHost implements Inspect {
     private final ThreadLocal<Scope> bound = new ThreadLocal<>();
     private final Set<Operation> issued = Collections.newSetFromMap(new IdentityHashMap<>());
     private final AtomicReference<Throwable> originalFailure = new AtomicReference<>();
+    // Session cancellation survives issue() clearing the per-operation cause after a contended BEGIN publication.
+    private final AtomicReference<Throwable> cancellationFailure = new AtomicReference<>();
     private final AtomicBoolean stopNotified = new AtomicBoolean();
     private Scope current;
     private enum Lineage { STARTUP, WORK, FAILED_ADMISSION }
@@ -194,8 +196,11 @@ final class InspectScenarioHost implements Inspect {
         } finally { lock.unlock(); }
     }
     @Override public void cancelSession(Throwable primary) {
-        retain(primary); cancelled = true;
-        lock.lock(); try { changed.signalAll(); } finally { lock.unlock(); }
+        var cause = primary == null ? new IllegalStateException("Inspect session cancelled") : primary;
+        cancellationFailure.compareAndSet(null, cause);
+        retain(cause); cancelled = true;
+        // Native callbacks never wait for phase filesystem IO; worker condition waits already poll within 50ms.
+        if (lock.tryLock()) try { changed.signalAll(); } finally { lock.unlock(); }
     }
     private void retain(Throwable failure) { if (failure != null) originalFailure.compareAndSet(null, failure); }
 
@@ -207,7 +212,8 @@ final class InspectScenarioHost implements Inspect {
         check(clientThread.getAsBoolean(), "Stopping callback is not on client thread");
         check(client == null || nativeClient == client, "Foreign client stopping callback");
         if (!stopNotified.compareAndSet(false, true)) return;
-        stopped = true; cancelled = true; retain(new IllegalStateException("Inspect client is stopping"));
+        cancelSession(new IllegalStateException("Inspect client is stopping"));
+        stopped = true;
         // Never wait on the native thread. Contention refuses effects; bounded waits also poll stopped.
         if (!lock.tryLock()) { stopDecisionSettled = true; return; }
         Scope claim;
@@ -257,6 +263,7 @@ final class InspectScenarioHost implements Inspect {
     private void rejectNativeWait() { check(!clientThread.getAsBoolean() && !serverThread.getAsBoolean(), "Blocking transport called on native thread"); }
     private void throwOriginal() {
         var failure = originalFailure.get();
+        if (failure == null) failure = cancellationFailure.get();
         if (failure instanceof Error error) throw error;
         if (failure instanceof RuntimeException runtime) throw runtime;
         throw new IllegalStateException("Inspect session cancelled/stopped", failure);
