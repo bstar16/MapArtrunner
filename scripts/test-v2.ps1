@@ -879,19 +879,20 @@ function Invoke-V2Supervisor {
                 if ($stdoutFile) { $stdoutFile.Flush($true) }; if ($stderrFile) { $stderrFile.Flush($true) }
                 $result.CleanupStatus='settled'
             } catch { $result.CleanupError=$_.Exception.ToString(); if ($result.ExitCode -eq 0) { $result.ExitCode=125 } }
+            # Pipeline cancellation resumes only finally; retain evidence before releasing owned handles.
+            $result.NativeGameExitCodes=@($records | Where-Object IsGame | Select-Object -ExpandProperty ExitCode)
+            if ($RequireGame -and (!$result.NativeGameExitCodes.Count -or @($result.NativeGameExitCodes | Where-Object { $null -eq $_ }).Count)) {
+                $result.SupervisorError += ' Native game process exit was not observed.'
+                if ($result.ExitCode -eq 0) { $result.ExitCode=125 }
+            }
+            if ($result.ExitCode -eq 0 -and @($result.NativeGameExitCodes | Where-Object { $_ -ne 0 }).Count) { $result.ExitCode=125; $result.SupervisorError += ' Native game failed despite worker0.' }
+            try { & $Archive $evidence $before; $result.ArchiveStatus='retained' }
+            catch { $result.ArchiveStatus='failed'; $result.ArchiveError=$_.Exception.ToString(); if ($result.ExitCode -eq 0) { $result.ExitCode=125 } }
+            $result | ConvertTo-Json -Depth 12 | Set-Content (Join-Path $evidence 'outcome.json')
+            "exitCode=$($result.ExitCode); workerExitCode=$($result.WorkerExitCode); timedOut=$($result.TimedOut); cleanup=$($result.CleanupStatus); archive=$($result.ArchiveStatus)" | Set-Content (Join-Path $evidence 'exit-code.txt')
+            # Clear only after durable outcome/evidence and verified cleanup; unresolved ownership blocks rerun.
+            if ($result.CleanupStatus -eq 'settled' -and $result.ArchiveStatus -eq 'retained') { $lock.SetLength(0); $lock.Flush($true) }
         }
-        $result.NativeGameExitCodes=@($records | Where-Object IsGame | Select-Object -ExpandProperty ExitCode)
-        if ($RequireGame -and (!$result.NativeGameExitCodes.Count -or @($result.NativeGameExitCodes | Where-Object { $null -eq $_ }).Count)) {
-            $result.SupervisorError += ' Native game process exit was not observed.'
-            if ($result.ExitCode -eq 0) { $result.ExitCode=125 }
-        }
-        if ($result.ExitCode -eq 0 -and @($result.NativeGameExitCodes | Where-Object { $_ -ne 0 }).Count) { $result.ExitCode=125; $result.SupervisorError += ' Native game failed despite worker0.' }
-        try { & $Archive $evidence $before; $result.ArchiveStatus='retained' }
-        catch { $result.ArchiveStatus='failed'; $result.ArchiveError=$_.Exception.ToString(); if ($result.ExitCode -eq 0) { $result.ExitCode=125 } }
-        $result | ConvertTo-Json -Depth 12 | Set-Content (Join-Path $evidence 'outcome.json')
-        "exitCode=$($result.ExitCode); workerExitCode=$($result.WorkerExitCode); timedOut=$($result.TimedOut); cleanup=$($result.CleanupStatus); archive=$($result.ArchiveStatus)" | Set-Content (Join-Path $evidence 'exit-code.txt')
-        # Clear only after durable outcome/evidence and verified cleanup; unresolved ownership blocks rerun.
-        if ($result.CleanupStatus -eq 'settled' -and $result.ArchiveStatus -eq 'retained') { $lock.SetLength(0); $lock.Flush($true) }
         return $result
     } finally {
         if ($job) { $job.Dispose() }

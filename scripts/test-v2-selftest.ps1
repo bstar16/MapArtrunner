@@ -607,6 +607,97 @@ $text=$receipt | ConvertTo-Json -Compress
         if ($Outcome.CleanupStatus -ne 'settled') { throw 'HOLD: startup regression ownership unresolved; no more launches.' }
         Assert ($Outcome.ArchiveStatus -eq 'retained') 'startup evidence archive failed'
     }
+    Run 'Task7b stopped pipeline retains actual READY, held exits and archive before clearing ownership' {
+        foreach ($case in 'ready','before-ready','archive-failure') {
+            $caseRoot=Join-Path $testRoot ('stopped-'+$case)
+            $observation=[hashtable]::Synchronized(@{})
+            $pipeline=[Management.Automation.PowerShell]::Create()
+            $invocation=$null; $stopping=$null
+            try {
+                $worker=$(if($case -ceq 'before-ready') { { Start-Sleep -Seconds 30 } }
+                    else { New-V2ReceiptWorker '$receipt=@{schema="mapartrunner-inspect-ready-v1";launchId=$receipt.launchId;pid=$receipt.pid;startedUtc=$receipt.startedUtc;scenario="grounded-two-lane";mode="inspect";sessionId=[guid]::NewGuid().ToString("D");event="INSPECT_WORLD_BOUND_COMMANDS_READY"}' 30000 })
+                [void]$pipeline.AddScript({
+                    param($Source,$Owner,$Root,$WorkerText,$Case,$Observation)
+                    $ErrorActionPreference='Stop'
+                    . $Source
+                    $originalOperations=${function:Update-V2InspectOperations}
+                    $originalProcesses=${function:Update-V2Processes}
+                    function Update-V2InspectOperations {
+                        param($State,$Result,$WorkingDirectory,$Clock,[switch]$RequireGame,[hashtable]$InternalInspectTest=@{})
+                        & $originalOperations @PSBoundParameters
+                        if (!$Observation.ContainsKey('Snapshot')) {
+                            $Observation.Snapshot=$Result | ConvertTo-Json -Depth 12 -Compress
+                            $Observation.HeldPid=$State.Held.Record.Pid
+                            $Observation.HeldStartedUtc=$State.Held.Record.StartedUtc
+                            $Observation.HeldLive=!$State.Held.Process.HasExited
+                            $Observation.Ready=$true
+                        }
+                    }
+                    function Update-V2Processes {
+                        param($Job,$Records,$Handles,[switch]$Fast)
+                        & $originalProcesses @PSBoundParameters
+                        if ($Case -ceq 'before-ready' -and !$Fast -and !$Observation.ContainsKey('Snapshot')) {
+                            $Observation.Snapshot=$result | ConvertTo-Json -Depth 12 -Compress
+                            $Observation.OwnedPids=@($Job.Pids())
+                            $Observation.Ready=$true
+                        }
+                    }
+                    $game=Join-Path $Root 'dummy-game'
+                    New-Item -ItemType Directory -Path (Join-Path $game 'logs') -Force | Out-Null
+                    Set-Content -LiteralPath (Join-Path $game 'logs/latest.log') 'owned dummy archive'
+                    $archive={
+                        param($Evidence,$Before)
+                        Save-V2Artifacts -Evidence $Evidence -Game $game -ScenarioRoot $Root -Before $Before -Owner $Owner
+                        if ($Case -ceq 'archive-failure') { throw 'Task7b deliberate archive failure' }
+                    }
+                    Invoke-V2Supervisor -Worker ([scriptblock]::Create($WorkerText)) -Request ([pscustomobject]@{Mode='inspect';Scenario='grounded-two-lane'}) -EvidenceRoot $Root -WorkingDirectory $Owner -TimeoutMilliseconds 20000 -StartupMilliseconds 10000 -Archive $archive
+                }.ToString()).AddArgument((Join-Path $repo 'scripts/test-v2.ps1')).AddArgument($repo).AddArgument($caseRoot).AddArgument($worker.ToString()).AddArgument($case).AddArgument($observation)
+                $invocation=$pipeline.BeginInvoke()
+                $wait=[Diagnostics.Stopwatch]::StartNew()
+                while (!$observation.Ready -and !$invocation.IsCompleted -and $wait.ElapsedMilliseconds -lt 10000) { Start-Sleep -Milliseconds 20 }
+                if (!$observation.Ready -and $invocation.IsCompleted) { [void]$pipeline.EndInvoke($invocation) }
+                Assert $observation.Ready "stopped $case never reached actual supervisor observation"
+                $accepted=$observation.Snapshot | ConvertFrom-Json
+                $observation.Snapshot | Set-Content (Join-Path $caseRoot 'observed-before-stop.json')
+                if ($case -ceq 'before-ready') {
+                    Assert ($null -eq $accepted.StartReceipt -and $null -eq $accepted.StartIdentity -and $null -eq $accepted.StartupAcceptedElapsedMilliseconds -and $observation.OwnedPids -contains $accepted.WorkerPid) 'pre-READY stop lacked actual owned worker or invented acceptance'
+                } else {
+                    Assert ($accepted.ReceiptStatus -ceq 'Accepted' -and $accepted.StartReceipt.event -ceq 'INSPECT_WORLD_BOUND_COMMANDS_READY' -and $null -ne $accepted.StartupAcceptedElapsedMilliseconds -and $observation.HeldLive -and $observation.HeldPid -eq $accepted.StartIdentity.Pid -and [DateTimeOffset]$observation.HeldStartedUtc -eq [DateTimeOffset]$accepted.StartIdentity.StartedUtc) 'stop was not after actual consumer acceptance of the same live held identity'
+                }
+                $stopClock=[Diagnostics.Stopwatch]::StartNew()
+                $stopping=$pipeline.BeginStop($null,$null)
+                Assert ($stopping.AsyncWaitHandle.WaitOne(15000)) 'HOLD: stopped pipeline exceeded original cleanup bound plus host allowance'
+                $pipeline.EndStop($stopping)
+                $stopped=$false
+                try { [void]$pipeline.EndInvoke($invocation) }
+                catch [Management.Automation.MethodInvocationException] {
+                    if ($_.Exception.InnerException -isnot [Management.Automation.PipelineStoppedException]) { throw }
+                    $stopped=$true
+                }
+                Assert ($stopped -and $pipeline.InvocationStateInfo.State -eq 'Stopped') 'pipeline was not actually stopped'
+                Assert (@($pipeline.Streams.Error | Where-Object { $_.Exception -isnot [Management.Automation.PipelineStoppedException] }).Count -eq 0) "unexpected stopped-pipeline error: $($pipeline.Streams.Error -join '; ')"
+                $outcomePath=Join-Path $accepted.Evidence 'outcome.json'
+                $proof=@{Case=$case;PipelineState=[string]$pipeline.InvocationStateInfo.State;PipelineStoppedException=$stopped;StopElapsedMilliseconds=$stopClock.ElapsedMilliseconds;OutcomePresent=(Test-Path -LiteralPath $outcomePath);LockBytes=(Get-Item -LiteralPath (Join-Path $caseRoot 'supervisor.lock')).Length;Observation=$accepted}
+                $proof | ConvertTo-Json -Depth 14 | Set-Content (Join-Path $caseRoot 'stop-proof.json')
+                Assert $proof.OutcomePresent "stopped $case lost durable outcome after actual pipeline cancellation"
+                $outcome=Get-Content -LiteralPath $outcomePath -Raw | ConvertFrom-Json
+                Assert ($outcome.CleanupStatus -ceq 'settled' -and $null -ne $outcome.WorkerExitCode -and @($outcome.Processes).Count -gt 0 -and @($outcome.Processes | Where-Object {$null -eq $_.ExitCode}).Count -eq 0) 'stopped pipeline lost actual held exits/settlement'
+                Assert (@($outcome.Processes | Where-Object {$_.Pid -eq $outcome.WorkerPid -and $_.ExitCode -eq $outcome.WorkerExitCode}).Count -eq 1) 'raw worker exit differs from original held process'
+                Assert ($outcome.ExitCode -ne 0 -and $outcome.TerminationRequested -and !$outcome.TimedOut) 'interruption became success or renewed deadline timeout'
+                Assert ((Test-Path -LiteralPath (Join-Path $accepted.Evidence 'exit-code.txt')) -and (Get-Content -LiteralPath (Join-Path $accepted.Evidence 'logs/latest.log') -Raw).Trim() -ceq 'owned dummy archive') 'stopped pipeline lost exit summary/archive bytes'
+                Assert ($outcome.LaunchId -ceq $accepted.LaunchId -and $outcome.StartupAcceptedElapsedMilliseconds -eq $accepted.StartupAcceptedElapsedMilliseconds -and ($outcome.StartIdentity | ConvertTo-Json -Compress) -ceq ($accepted.StartIdentity | ConvertTo-Json -Compress) -and ($outcome.StartReceipt | ConvertTo-Json -Compress) -ceq ($accepted.StartReceipt | ConvertTo-Json -Compress)) 'cancellation changed accepted receipt/identity/original clock'
+                if ($case -ceq 'archive-failure') {
+                    Assert ($outcome.ArchiveStatus -ceq 'failed' -and $outcome.ArchiveError -like '*Task7b deliberate archive failure*' -and $proof.LockBytes -gt 0) 'cancelled archive failure lost failure/retained ownership'
+                    Reject { Invoke-V2Supervisor -Worker { exit 0 } -EvidenceRoot $caseRoot -WorkingDirectory $repo } 'cancelled archive failure allowed rerun'
+                } else { Assert ($outcome.ArchiveStatus -ceq 'retained' -and $proof.LockBytes -eq 0) 'cancelled settled archive did not clear ownership' }
+            } finally {
+                if ($invocation -and !$invocation.IsCompleted) { $pipeline.Stop() }
+                if ($stopping) { $stopping.AsyncWaitHandle.Dispose() }
+                if ($invocation) { $invocation.AsyncWaitHandle.Dispose() }
+                $pipeline.Dispose()
+            }
+        }
+    }
     Run 'inspect READY establishes one session only after the same owned receipt checks' {
         $request=[pscustomobject]@{Mode='inspect';Scenario='grounded-two-lane'}
         $originalUpdate=${function:Update-V2Processes}; $proof=@{Checked=$false;Latched=$false;Samples=0;Session=$null;Elapsed=$null}
