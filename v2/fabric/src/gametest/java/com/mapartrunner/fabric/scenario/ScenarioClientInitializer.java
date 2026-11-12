@@ -16,6 +16,7 @@ public final class ScenarioClientInitializer implements ClientModInitializer {
     private static final AtomicBoolean installed = new AtomicBoolean();
     private static MinecraftClient inspectClient;
     private static volatile ScenarioCommands inspectCommands;
+    private static InspectAcceptanceDriver inspectAcceptance;
 
     public static boolean deferStop(MinecraftClient client) {
         var owner = inspectCommands;
@@ -37,6 +38,8 @@ public final class ScenarioClientInitializer implements ClientModInitializer {
         ClientCommandRegistrationCallback.EVENT.register((dispatcher, access) -> commands.register(dispatcher));
         ClientTickEvents.END_CLIENT_TICK.register(current -> {
             host.onTick(); commands.checkWorld(current);
+            var acceptance = inspectAcceptance;
+            if (acceptance != null) acceptance.tick(current);
             if (commands.releaseNativeStop()) current.scheduleStop();
         });
         ClientWorldEvents.AFTER_CLIENT_WORLD_CHANGE.register((current, world) -> commands.checkWorld(current));
@@ -52,6 +55,7 @@ public final class ScenarioClientInitializer implements ClientModInitializer {
             // Fabric entrypoints run before Minecraft assigns its client thread.
             var watch = ScenarioObserver.install(client);
             commands.initialize(watch, ScenarioLaunchReceipt.fromEnvironment(), () -> current.execute(current::scheduleStop));
+            if (InspectAcceptanceDriver.enabled()) inspectAcceptance = new InspectAcceptanceDriver(client, commands);
         });
     }
 }
