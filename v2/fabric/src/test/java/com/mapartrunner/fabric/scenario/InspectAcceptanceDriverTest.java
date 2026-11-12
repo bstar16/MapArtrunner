@@ -10,6 +10,9 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.*;
 import java.util.concurrent.atomic.AtomicLong;
+import java.time.Instant;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 
 import static com.mapartrunner.fabric.scenario.ScenarioCommands.*;
 import static com.mapartrunner.fabric.scenario.ScenarioHost.Command;
@@ -17,6 +20,140 @@ import static org.junit.jupiter.api.Assertions.*;
 
 /** Simulated input/clock policy checks. These do not establish native keyboard or gameplay acceptance. */
 class InspectAcceptanceDriverTest {
+    @Test void settledFailureBWaitsWithoutChatInputOrStop() {
+        displaced(f -> {
+            f.beginForward(); f.input.x = 0.5; f.tick(); f.sendCompletion(3);
+            int effects = f.input.events.size();
+            f.tick(3);
+            assertEquals(effects, f.input.events.size(), "Settled B must idle before LAST or RESET input");
+            assertEquals(3, f.input.commands.size()); assertEquals(0, f.input.stops);
+        });
+    }
+
+    @Test void idleRequiresBothStrictBoundsAndFollowingObservationCallbackWithoutPerTickSnapshots() {
+        for (boolean timeFirst : List.of(false,true)) displaced(f -> {
+            f.beginFailedIdle(); int events = f.input.events.size(), logs = f.logs.size();
+            if (timeFirst) f.now.set(600_000_000_001L);
+            f.input.reenter = () -> f.driver.tick(null); f.input.reenterNeutral = true;
+            f.tick(6000);
+            assertEquals(1,f.idleReads); assertEquals(logs,f.logs.size()); assertEquals(events,f.input.events.size());
+            if (timeFirst) {
+                f.tick(); assertEquals(1,f.idleReads); // callback6001 qualifies, reentrant calls do not count.
+            } else {
+                f.tick(); // 6001 callbacks alone cannot qualify.
+                f.now.set(600_000_000_000L); f.tick(); // exactly600000ms cannot qualify.
+                assertEquals(1,f.idleReads); assertEquals(logs,f.logs.size());
+                f.now.incrementAndGet(); f.tick();
+            }
+            assertEquals(1,f.idleReads); assertEquals(events,f.input.events.size());
+            f.tick(); assertEquals(2,f.idleReads); assertEquals(events,f.input.events.size());
+            var end = f.idleMarkers().getLast();
+            assertEquals(timeFirst ? 6001 : 6003,end.get("qualifyingCallbacks").getAsInt());
+            assertEquals(timeFirst ? 6002 : 6004,end.get("observationCallbacks").getAsInt());
+            f.tick(); assertTrue(f.input.events.size() > events); assertEquals(0,f.input.stops);
+        });
+    }
+
+    @Test void twoIdleMarkersKeepFixedIdentityIndependentOriginsAndFreshNextInputDeadline() {
+        displaced(f -> {
+            f.beginFailedIdle(); f.finishIdle();
+            f.send(); f.tick(); f.sendCompletion(4);
+            f.retainedObserver = boundObservation();
+            f.now.addAndGet(123_000_000L); f.sendCompletion(5);
+            assertEquals(3,f.idleReads); assertEquals(6,f.input.commands.size());
+            f.finishIdle();
+            assertEquals(4,f.idleReads);
+            var markers = f.idleMarkers(); assertEquals(4,markers.size());
+            for (int pair=0;pair<2;pair++) {
+                var begin = markers.get(pair*2); var end = markers.get(pair*2+1);
+                assertEquals("BEGIN",begin.get("event").getAsString()); assertEquals("END",end.get("event").getAsString());
+                for (String field : List.of("schema","kind","mode","acceptanceCase","nativePid","nativeStartedUtc","launchId",
+                        "sessionId","operationId","ordinal","command","verdict","runId","originNanos","originUtc",
+                        "beforeSamples","beforeWitnesses","beforeBound")) assertEquals(begin.get(field),end.get(field),field);
+                assertEquals("mapartrunner.inspect.idle.v1",begin.get("schema").getAsString());
+                assertEquals("inspect",begin.get("mode").getAsString()); assertEquals("displaced",begin.get("acceptanceCase").getAsString());
+                assertEquals(pair==0?"failed":"terminal",begin.get("kind").getAsString());
+                assertEquals(pair==0?3:5,begin.get("ordinal").getAsInt()); assertEquals("RUN",begin.get("command").getAsString());
+                assertEquals(pair==0?"FAIL":"PASS",begin.get("verdict").getAsString());
+                assertEquals(f.session.toString(),begin.get("sessionId").getAsString());
+                assertEquals(f.operations[pair==0?2:4].toString(),begin.get("operationId").getAsString());
+                assertEquals(42,begin.get("nativePid").getAsLong());
+                assertEquals("2026-11-12T00:00:00Z",begin.get("nativeStartedUtc").getAsString());
+                assertEquals("00000000-0000-0000-0000-000000000001",begin.get("launchId").getAsString());
+                assertEquals(pair==0,begin.get("runId").isJsonNull());
+                assertEquals(600_000_000_001L,end.get("elapsedNanos").getAsLong());
+                assertEquals(end.get("endNanos").getAsLong()-begin.get("originNanos").getAsLong(),end.get("elapsedNanos").getAsLong());
+                assertEquals(6001,end.get("qualifyingCallbacks").getAsInt()); assertEquals(6002,end.get("observationCallbacks").getAsInt());
+                assertTrue(end.get("retainedEqual").getAsBoolean());
+                assertEquals(pair!=0,begin.get("beforeBound").getAsBoolean());
+                assertEquals(begin.get("beforeSamples"),end.get("afterSamples"));
+                assertEquals(begin.get("beforeWitnesses"),end.get("afterWitnesses"));
+                assertFalse(Instant.parse(end.get("endUtc").getAsString()).isBefore(Instant.parse(begin.get("originUtc").getAsString())));
+            }
+            assertTrue(markers.get(2).get("originNanos").getAsLong()>markers.get(1).get("endNanos").getAsLong());
+            assertNotEquals(markers.get(0).get("originUtc"),markers.get(2).get("originUtc"));
+            f.tick(); f.now.addAndGet(29_000_000_000L); f.openChat(); f.tick(); f.tick();
+            assertEquals(1,f.input.stops); assertTrue(f.logs.stream().noneMatch(s -> s.contains("DRIVER_FAIL")));
+            assertTrue(f.logs.stream().allMatch(s -> s.length()<=4096));
+        });
+    }
+
+    @Test void idleLossOrChangedRetainedValueFailsWithoutSuccessorInputOrEndMarker() {
+        for (String lost : List.of("case","busy","last","ready","restart","gate","world","focus","screen","neutral","guard","snapshot","clock"))
+            displaced(f -> {
+                f.beginFailedIdle(); int effects = f.input.events.size();
+                switch (lost) {
+                    case "case" -> System.setProperty("mapart.test.inspect.acceptance.case","baseline");
+                    case "busy" -> f.observation = new InspectObservation(true,true,false,f.observation.last());
+                    case "last" -> f.observation = idle(f.changed(f.completion(3),"session"));
+                    case "ready" -> f.observation = new InspectObservation(false,false,false,f.observation.last());
+                    case "restart" -> f.observation = new InspectObservation(true,false,true,f.observation.last());
+                    case "gate" -> f.enabled=false;
+                    case "world","focus" -> f.input.refusal=lost;
+                    case "screen" -> f.input.screen=new Object();
+                    case "neutral" -> f.input.neutral=false;
+                    case "guard" -> f.guardFailure=lost;
+                    case "snapshot" -> f.retainedObserver=boundObservation();
+                    case "clock" -> f.now.set(-1);
+                }
+                if (lost.equals("snapshot")) f.finishIdle(); else f.tick();
+                f.assertFailed("DRIVER_FAIL"); assertEquals(effects,f.input.events.size());
+                assertEquals(3,f.input.commands.size()); assertEquals(1,f.idleMarkers().size());
+            });
+    }
+
+    @Test void idleRevalidatesOnFinalReadAndTerminalRequiresEveryRetainedHistory() {
+        displaced(f -> {
+            f.beginFailedIdle(); f.now.set(600_000_000_001L); f.tick(6001);
+            f.guardFailure="final guard"; f.tick(); f.assertFailed("final guard");
+            assertEquals(1,f.idleReads); assertEquals(1,f.idleMarkers().size());
+        });
+        for (String missing : List.of("samples","witnesses","binding")) displaced(f -> {
+            f.beginFailedIdle(); f.finishIdle(); f.send(); f.tick(); f.sendCompletion(4);
+            f.retainedObserver=boundObservation(missing); f.sendCompletion(5);
+            f.assertFailed("Terminal idle requires"); assertEquals(2,f.idleMarkers().size());
+        });
+    }
+
+    @Test void publicationBeforeWorkerSettlementDoesNotStartIdleAndBoundaryReadRechecksAuthority() {
+        displaced(f -> {
+            f.beginForward(); f.input.x=0.5; f.tick(); f.send();
+            f.observation=new InspectObservation(true,true,false,Optional.of(f.completion(3))); f.tick(4);
+            assertEquals(0,f.idleReads); assertTrue(f.idleMarkers().isEmpty());
+            f.observation=idle(f.completion(3)); f.boundaryFailure="boundary authority lost";
+            f.tick(); f.assertFailed("boundary authority lost"); assertTrue(f.idleMarkers().isEmpty());
+        });
+    }
+
+    @Test void idleGateLossOnRejectedEntryDefersStopUntilAValidCallback() {
+        displaced(f -> {
+            f.beginFailedIdle(); int effects=f.input.events.size();
+            f.enabled=false; f.input.entryRefusal="rejected idle entry"; f.tick();
+            assertEquals(0,f.input.stops); assertEquals(effects,f.input.events.size());
+            f.input.entryRefusal=null; f.tick(); f.assertFailed("rejected idle entry");
+            assertEquals(effects,f.input.events.size()); assertEquals(1,f.idleMarkers().size());
+        });
+    }
     @Test void activeUnknownCaseFailsBeforeAnyInputButInactiveSelectionIsInert() {
         var previous = System.getProperty("mapart.test.inspect.acceptance.case");
         try {
@@ -45,8 +182,8 @@ class InspectAcceptanceDriverTest {
     @Test void displacedProgramRequiresExactFailureBThenLastExplicitResetAndSuccess() {
         displaced(f -> {
             f.beginForward(); f.input.x = 0.5; f.tick(); assertFalse(f.input.pressed);
-            f.sendCompletion(3); f.send(); f.tick();
-            f.sendCompletion(4); f.sendCompletion(5); f.send(); f.tick();
+            f.sendCompletion(3); f.finishIdle(); f.send(); f.tick();
+            f.sendCompletion(4); f.retainedObserver=boundObservation(); f.sendCompletion(5); f.finishIdle(); f.send(); f.tick();
             assertEquals(List.of("/maparttest run grounded-two-lane", "/maparttest reset grounded-two-lane",
                     "/maparttest run grounded-two-lane", "/maparttest last", "/maparttest reset grounded-two-lane",
                     "/maparttest run grounded-two-lane", "/maparttest last"), f.input.commands);
@@ -235,6 +372,7 @@ class InspectAcceptanceDriverTest {
         assertEquals(0, f.input.stops, "Enter delivery alone cannot finish LAST");
         f.tick(); assertEquals(1, f.input.stops); f.tick(10); assertEquals(1, f.input.stops);
         assertEquals(12, f.input.events.size() / 2);
+        assertTrue(f.idleMarkers().isEmpty()); assertEquals(0,f.idleReads);
         assertEquals(1, f.logs.stream().filter(s -> s.contains("SEQUENCE_COMPLETE")).count());
         assertTrue(f.logs.stream().anyMatch(s -> s.contains("LAST submitted")));
         assertTrue(f.logs.stream().noneMatch(s -> s.contains("response proved") || s.contains("normal-close PASS")));
@@ -371,14 +509,21 @@ class InspectAcceptanceDriverTest {
         final List<String> logs = new ArrayList<>(); final UUID session = UUID.randomUUID();
         final UUID[] operations = new UUID[5], runs = new UUID[5];
         InspectObservation observation = idle(null); boolean enabled = true, displaced; String guardFailure;
+        String boundaryFailure; int idleReads;
+        ScenarioRunner.InspectIdleObservation retainedObserver = new ScenarioRunner.InspectIdleObservation(new ScenarioObserver.Watch().retained());
         final InspectAcceptanceDriver driver = new InspectAcceptanceDriver(() -> observation, input, now::get, () -> enabled, logs::add,
-                expected -> { if (guardFailure != null) throw new IllegalStateException(guardFailure); assertEquals(observation.last().orElseThrow(), expected); assertFalse(observation.busy()); });
-        Fixture() { Arrays.setAll(operations, i -> UUID.randomUUID()); Arrays.setAll(runs, i -> UUID.randomUUID()); }
+                expected -> { if (guardFailure != null) throw new IllegalStateException(guardFailure); assertEquals(observation.last().orElseThrow(), expected); assertFalse(observation.busy()); },
+                expected -> { idleReads++; if (boundaryFailure!=null) throw new IllegalStateException(boundaryFailure); return retainedObserver; });
+        Fixture() { Arrays.setAll(operations, i -> UUID.randomUUID()); Arrays.setAll(runs, i -> UUID.randomUUID()); input.now=now; }
         void tick() { driver.tick(null); } void tick(int count) { for (int i = 0; i < count; i++) tick(); }
         void openChat() { input.screen = input.chat; input.draft = ""; }
         void send() { tick(); if (input.screen == null) openChat(); tick(); }
         void sendCompletion(int ordinal) { send(); observation = idle(completion(ordinal)); tick(); }
         void beginForward() { sendCompletion(1); sendCompletion(2); assertFalse(input.pressed); tick(); }
+        void beginFailedIdle() { beginForward(); input.x=0.5; tick(); sendCompletion(3); assertEquals(1,idleReads); }
+        void finishIdle() { now.addAndGet(600_000_000_001L); tick(6002); }
+        List<JsonObject> idleMarkers() { return logs.stream().filter(s -> s.startsWith("INSPECT_ACCEPTANCE_IDLE "))
+                .map(s -> JsonParser.parseString(s.substring("INSPECT_ACCEPTANCE_IDLE ".length())).getAsJsonObject()).toList(); }
         void assertFailed(String reason) {
             assertEquals(1, input.stops, logs.toString());
             assertEquals(1, logs.stream().filter(s -> s.contains("DRIVER_FAIL")).count(), logs.toString());
@@ -443,5 +588,31 @@ class InspectAcceptanceDriverTest {
             requireCapturedClient(); assertSame(forward, binding); if (clearFails) throw new IllegalStateException("clear unavailable");
             pressed = false; events.add("captured-false");
         }
+        boolean neutral=true,reenterNeutral; AtomicLong now;
+        public void requireNeutral() {
+            requireBinding(); if (screen!=null) throw new IllegalStateException("idle screen");
+            if (!neutral || pressed) throw new IllegalStateException("idle neutral");
+            if (reenterNeutral && reenter!=null) reenter.run();
+        }
+        public Instant utc() { return Instant.parse("2026-11-12T01:00:00Z").plusNanos(now.get()); }
+        public InspectAcceptanceDriver.IdleIdentity idleIdentity() { return new InspectAcceptanceDriver.IdleIdentity(42,
+                Instant.parse("2026-11-12T00:00:00Z"),UUID.fromString("00000000-0000-0000-0000-000000000001")); }
+    }
+
+    private static ScenarioRunner.InspectIdleObservation boundObservation() {
+        return boundObservation("");
+    }
+    private static ScenarioRunner.InspectIdleObservation boundObservation(String missing) {
+        var context = new com.mapartrunner.core.run.RunLifecycle.Context(UUID.randomUUID(),"connection","world","minecraft:overworld",
+                "plan",new com.mapartrunner.core.model.BuildPlan.GridPos(0,65,0),"settings");
+        var player=UUID.randomUUID();
+        var binding = new ScenarioObserver.Binding(UUID.randomUUID(),context,
+                new ScenarioObserver.ClientBinding(new Object(),new Object(),new Object(),new Object(),player,context.dimension(),true,true,true),
+                new ScenarioObserver.ServerBinding(new Object(),new Object(),new Object(),player,context.dimension(),true,true),null,null);
+        var sample = new ScenarioObserver.Sample(1,"END",12,true,null,List.of(),false,null,List.of());
+        var witness = new ScenarioObserver.ServerWitness(new ScenarioObserver.EndPublication(binding,sample,4.5),1,
+                new ScenarioObserver.ServerReading(binding.server(),0,66,0,4.5,1,1,1));
+        return new ScenarioRunner.InspectIdleObservation(new ScenarioObserver.Watch.Retained(missing.equals("samples")?List.of():List.of(sample),null,
+                missing.equals("binding")?null:binding,missing.equals("witnesses")?List.of():List.of(witness)));
     }
 }

@@ -28,6 +28,122 @@ class ScenarioInspectLifecycleTest {
     }
     @TempDir Path directory;
 
+    @Test void opaqueIdleValueComparesWholeHistoryBindingAndFirstFailureDespiteEqualCounts() {
+        var context=witnessContext(); var watch=pairedWatch(context,witnessSamples(context),null,null);
+        var retained=watch.retained(); var before=new ScenarioRunner.InspectIdleObservation(retained);
+        assertEquals(before,new ScenarioRunner.InspectIdleObservation(watch.retained()));
+        var samples=new java.util.ArrayList<>(retained.samples());
+        samples.set(0,laterEnd(context,99));
+        var witnesses=new java.util.ArrayList<>(retained.witnesses()); var first=witnesses.getFirst();
+        witnesses.set(0,new ScenarioObserver.ServerWitness(first.publication(),first.callback(),
+                reading(retained.binding().server(),first.publication().sample(),4.5,999)));
+        for(var changed:List.of(
+                new ScenarioObserver.Watch.Retained(samples,null,retained.binding(),retained.witnesses()),
+                new ScenarioObserver.Watch.Retained(retained.samples(),null,retained.binding(),witnesses),
+                new ScenarioObserver.Watch.Retained(retained.samples(),null,witnessBinding(context,null,null),retained.witnesses()),
+                new ScenarioObserver.Watch.Retained(retained.samples(),new AssertionError("new first failure"),retained.binding(),retained.witnesses()))) {
+            var after=new ScenarioRunner.InspectIdleObservation(changed);
+            assertEquals(before.samples(),after.samples()); assertEquals(before.witnesses(),after.witnesses());
+            assertEquals(before.bound(),after.bound()); assertNotEquals(before,after);
+        }
+        var a=new MutableFailure(); var b=new MutableFailure(); b.setStackTrace(a.getStackTrace());
+        assertNotEquals(new ScenarioRunner.InspectIdleObservation(new ScenarioObserver.Watch.Retained(List.of(),a,null,List.of())),
+                new ScenarioRunner.InspectIdleObservation(new ScenarioObserver.Watch.Retained(List.of(),b,null,List.of())),"First-failure identity matters");
+    }
+
+    @Test void opaqueIdleValueFreezesThrowableRenderingIncludingLaterMessageCauseStackAndSuppressedChanges() throws Exception {
+        for(String changed:List.of("message","cause","stack","suppressed")) {
+            var watch=new ScenarioObserver.Watch(); var failure=new MutableFailure(); field("failure").set(watch,failure);
+            var before=new ScenarioRunner.InspectIdleObservation(watch.retained());
+            assertEquals(before,new ScenarioRunner.InspectIdleObservation(watch.retained()));
+            switch(changed) {
+                case "message" -> failure.message="mutated diagnostic";
+                case "cause" -> failure.initCause(new AssertionError("late cause"));
+                case "stack" -> failure.setStackTrace(new StackTraceElement[]{new StackTraceElement("changed.Owner","later","Owner.java",42)});
+                case "suppressed" -> failure.addSuppressed(new AssertionError("late suppressed diagnostic"));
+            }
+            assertSame(failure,watch.retained().failure());
+            assertNotEquals(before,new ScenarioRunner.InspectIdleObservation(watch.retained()),changed);
+        }
+    }
+
+    private static final class MutableFailure extends RuntimeException {
+        String message="original diagnostic";
+        @Override public String getMessage() { return message; }
+        @Override public boolean equals(Object other) { return other instanceof MutableFailure; }
+        @Override public int hashCode() { return 1; }
+    }
+
+    @Test void realFrozenWatchRetainsOpaqueValueAndClosedEvidenceAcrossBothIdleHistoriesAndLateClaims() throws Exception {
+        for(boolean failed:List.of(false,true)) {
+            var context=witnessContext(); var watch=pairedWatch(context,witnessSamples(context),null,null);
+            var retained=watch.retained(); watch.append(retained.binding(),laterEnd(context,12),retained.binding().client(),4.5);
+            var inFlight=watch.beginServerRead(); assertNotNull(inFlight);
+            if(failed) field("failure").set(watch,new AssertionError("original retained observer failure"));
+            watch.freeze(); var before=new ScenarioRunner.InspectIdleObservation(watch.retained());
+            var host=new InspectTransport(); var runner=new ScenarioRunner(host,watch,roots()); var completion=settledPrior(runner,host);
+            var hashes=closedFileHashes(completion.evidenceDirectory()); int effects=host.effects;
+            for(int callback=0;callback<6002;callback++) {
+                watch.record(null,"START"); watch.record(null,"END"); watch.recordServer(null);
+                watch.append(retained.binding(),laterEnd(context,13),retained.binding().client(),4.5);
+                watch.commitServer(inFlight,reading(retained.binding().server(),inFlight.publications().getFirst().sample(),4.5,999));
+                watch.failRead(inFlight,new AssertionError("late read must not replace retained failure"));
+            }
+            assertEquals(before,new ScenarioRunner.InspectIdleObservation(watch.retained()));
+            assertTrue(before.samples()>0 && before.witnesses()>0 && before.bound());
+            assertEquals(hashes,closedFileHashes(completion.evidenceDirectory())); assertEquals(effects,host.effects);
+        }
+    }
+
+    @Test void retainedIdleValueCannotAuthorizeANewNativeReadOrReopenExpiredScope() throws Exception {
+        var time=new java.util.concurrent.atomic.AtomicLong(1);
+        var dispatches=new java.util.concurrent.atomic.AtomicInteger();
+        var host=new InspectScenarioHost(time::get,() -> false,() -> false,a -> dispatches.incrementAndGet(),a -> dispatches.incrementAndGet(),null);
+        var op=new Operation(UUID.randomUUID(),1,UUID.randomUUID(),Command.RUN,directory);
+        var scope=host.beginWork(op); var context=witnessContext(); var watch=pairedWatch(context,witnessSamples(context),host,scope);
+        watch.freeze(); var oldValue=new ScenarioRunner.InspectIdleObservation(watch.retained());
+        time.set(scope.deadlineNanos()+1);
+        assertFalse(host.observationScopeValid(scope));
+        assertThrows(ScopeTimeoutException.class,() -> host.inScope(scope,() -> host.waitTick()));
+        assertEquals(0,dispatches.get()); assertEquals(oldValue,new ScenarioRunner.InspectIdleObservation(watch.retained()));
+        var runner=new ScenarioRunner(new InspectTransport(),watch,roots());
+        assertThrows(AssertionError.class,() -> runner.observeInspectIdle(null,null));
+        assertEquals(oldValue,new ScenarioRunner.InspectIdleObservation(watch.retained()));
+        assertTrue(runner.lastInspectCompletion().isEmpty());
+    }
+
+    @Test void commandsBoundaryObservationRechecksPublicationAndNativeAuthorityWithoutAllocatingWork() throws Exception {
+        // Real owners, no created world: even a fresh equal publication must reach and fail the native guard.
+        var host=new InspectTransport(); var runner=runner(host); var completion=settledPrior(runner,host);
+        var commands=new ScenarioCommands(action -> fail("Boundary read must not schedule work"),host);
+        for(String name:List.of("runner","ready","last")) {
+            var field=ScenarioCommands.class.getDeclaredField(name); field.setAccessible(true);
+            field.set(commands,name.equals("runner")?runner:name.equals("ready")?true:completion);
+        }
+        var properties=List.of("mapart.test.inspect","mapart.test.inspect.acceptance","mapart.test.inspect.acceptance.case","fabric.client.gametest");
+        var previous=new java.util.HashMap<String,String>(); properties.forEach(key -> previous.put(key,System.getProperty(key)));
+        int ordinal=runnerField("inspectOrdinal").getInt(runner), effects=host.effects;
+        var hashes=closedFileHashes(completion.evidenceDirectory());
+        try {
+            System.setProperty(properties.get(0),"true"); System.setProperty(properties.get(1),"true");
+            System.setProperty(properties.get(2),"displaced"); System.clearProperty(properties.get(3));
+            var expected=commands.observeInspect().last().orElseThrow();
+            assertEquals(expected,commands.observeInspect().last().orElseThrow());
+            assertNotSame(expected,commands.observeInspect().last().orElseThrow());
+            for(int read=0;read<2;read++) assertEquals("Inspect command session/world unavailable",
+                    assertThrows(AssertionError.class,() -> commands.observeAcceptanceIdle(null,expected)).getMessage());
+            var queued=ScenarioCommands.class.getDeclaredField("queued"); queued.setAccessible(true); queued.setBoolean(commands,true);
+            assertThrows(IllegalStateException.class,() -> commands.observeAcceptanceIdle(null,expected)); queued.setBoolean(commands,false);
+            assertThrows(IllegalStateException.class,() -> commands.observeAcceptanceIdle(null,null));
+            System.setProperty(properties.get(3),"false");
+            assertThrows(IllegalStateException.class,() -> commands.observeAcceptanceIdle(null,expected));
+        } finally {
+            previous.forEach((key,value) -> { if(value==null) System.clearProperty(key); else System.setProperty(key,value); });
+        }
+        assertEquals(ordinal,runnerField("inspectOrdinal").getInt(runner)); assertEquals(effects,host.effects);
+        assertTrue(runnerField("inspectOperation").get(runner)==null); assertEquals(hashes,closedFileHashes(completion.evidenceDirectory()));
+    }
+
     @Test void simulatedCadenceRetainsBothEntryEndsBeforeLaneInOnePhysicalRead() {
         var context=witnessContext(); var watch=new ScenarioObserver.Watch();
         var binding=witnessBinding(context,null,null); watch.bind(binding);

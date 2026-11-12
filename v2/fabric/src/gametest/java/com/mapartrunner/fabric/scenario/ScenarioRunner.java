@@ -331,6 +331,34 @@ final class ScenarioRunner implements AutoCloseable {
     Optional<InspectCompletion> lastInspectCompletion() { return Optional.ofNullable(inspectLast); }
     UUID inspectSessionId() { require(inspectMode,"Not an inspect session"); return invocation; }
 
+    /** Opaque retained value, never a native binding/scope capability. No Runner cache owns a second history. */
+    static final class InspectIdleObservation {
+        private final ScenarioObserver.Watch.Retained retained;
+        private final String failureRendering;
+        InspectIdleObservation(ScenarioObserver.Watch.Retained retained) {
+            this.retained=Objects.requireNonNull(retained);
+            failureRendering=retained.failure()==null?null:trace(retained.failure());
+        }
+        int samples() { return retained.samples().size(); }
+        int witnesses() { return retained.witnesses().size(); }
+        boolean bound() { return retained.binding()!=null; }
+        @Override public boolean equals(Object other) {
+            return other instanceof InspectIdleObservation value && retained.equals(value.retained)
+                    && retained.failure()==value.retained.failure()
+                    && Objects.equals(failureRendering,value.failureRendering);
+        }
+        @Override public int hashCode() { return Objects.hash(retained,failureRendering); }
+    }
+
+    /** Called under Commands' settled-publication monitor on the native client, without Host dispatch. */
+    InspectIdleObservation observeInspectIdle(MinecraftClient client,InspectCompletion expected) {
+        requireInspectCommandWorld(client);
+        require(inspectOperation==null && expected!=null && expected.equals(inspectLast)
+                        && expected.evidenceComplete() && expected.cleanupSettled() && "RELEASED".equals(expected.cleanupStatus()),
+                "Idle observation requires the exact settled complete last operation");
+        return new InspectIdleObservation(watch.retained());
+    }
+
     /** Native command pre-admission guard only: no ordinal, readiness/pose check, scope, transport or effect. */
     void requireInspectCommandWorld(MinecraftClient client) {
         require(inspectMode && !closed && worldCreated && inspectAdmissionFailure==null && inspectStartupFailure==null && inspectUnresolvedCleanupFailure==null,

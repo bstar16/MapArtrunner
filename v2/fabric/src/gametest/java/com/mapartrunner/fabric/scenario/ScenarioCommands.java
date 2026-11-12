@@ -183,6 +183,14 @@ final class ScenarioCommands {
         runner.requireInspectCommandWorld(client);
     }
 
+    /** Boundary observation only; every call independently checks current publication/native authority. */
+    synchronized ScenarioRunner.InspectIdleObservation observeAcceptanceIdle(MinecraftClient client, PublishedCompletion expected) {
+        requireAcceptanceIdle(client,expected);
+        if (!"displaced".equals(System.getProperty("mapart.test.inspect.acceptance.case")))
+            throw new IllegalStateException("Idle observation requires displaced acceptance");
+        return runner.observeInspectIdle(client,last);
+    }
+
     /** Native intent only: no scope, IO, wait, interrupt or replacement worker. */
     synchronized boolean requestStop() {
         if (releaseNativeStop()) return false;

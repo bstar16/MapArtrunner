@@ -13,6 +13,8 @@ import net.minecraft.client.util.InputUtil;
 
 import java.util.*;
 import java.util.function.*;
+import java.time.Instant;
+import com.google.gson.JsonObject;
 
 import static com.mapartrunner.fabric.scenario.ScenarioCommands.*;
 import static com.mapartrunner.fabric.scenario.ScenarioHost.Command;
@@ -20,10 +22,11 @@ import static com.mapartrunner.fabric.scenario.ScenarioHost.Command;
 /** Fixed fixture-driven game-code input; neither physical keyboard input nor normal-close proof. */
 final class InspectAcceptanceDriver {
     private static final long INPUT_NANOS = 30_000_000_000L;
+    private static final long IDLE_NANOS = 600_000_000_000L;
     private static final int ENTER = 257;
     private static final Command[] MUTATIONS = {Command.RUN, Command.RESET, Command.RUN, Command.RERUN, Command.RERUN};
     private static final Command[] DISPLACED = {Command.RUN, Command.RESET, Command.RUN, Command.RESET, Command.RUN};
-    private enum Stage { WAIT_STARTUP, NEXT_COMMAND, MOVING, OPEN_CHAT, WAIT_HANDOFF, WAIT_COMPLETION, STOPPED }
+    private enum Stage { WAIT_STARTUP, NEXT_COMMAND, MOVING, OPEN_CHAT, WAIT_HANDOFF, WAIT_COMPLETION, IDLE, IDLE_FINISH_PENDING, STOPPED }
 
     // This driver alone owns its sequence and synthetic key. No Runner/Host state is changed here.
     private final Supplier<InspectObservation> observations;
@@ -32,6 +35,7 @@ final class InspectAcceptanceDriver {
     private final BooleanSupplier enabled;
     private final Consumer<String> log;
     private final Consumer<PublishedCompletion> idleGuard;
+    private final Function<PublishedCompletion, ScenarioRunner.InspectIdleObservation> idleObservation;
     private final Set<UUID> operations = new HashSet<>(), runs = new LinkedHashSet<>();
     private final Set<String> directories = new HashSet<>(), summaries = new HashSet<>();
     private Stage stage = Stage.WAIT_STARTUP;
@@ -45,10 +49,25 @@ final class InspectAcceptanceDriver {
     private int movementCallbacks;
     private Object heldForward;
     private Pose movementStart;
+    private Idle idle;
+
+    // Only Driver owns this interval. Origins never renew; its before value is cleared after the final comparison.
+    private static final class Idle {
+        final String kind;
+        final long originNanos;
+        final Instant originUtc;
+        final IdleIdentity identity;
+        final ScenarioRunner.InspectIdleObservation before;
+        int callbacks, qualifyingCallbacks;
+        Idle(String kind,long originNanos,Instant originUtc,IdleIdentity identity,ScenarioRunner.InspectIdleObservation before) {
+            this.kind=kind; this.originNanos=originNanos; this.originUtc=originUtc; this.identity=identity; this.before=before;
+        }
+    }
 
     InspectAcceptanceDriver(MinecraftClient client, ScenarioCommands commands) {
         this(commands::observeInspect, new NativeChat(client), System::nanoTime, InspectAcceptanceDriver::enabled,
-                message -> System.out.println(message), completion -> commands.requireAcceptanceIdle(client, completion));
+                message -> System.out.println(message), completion -> commands.requireAcceptanceIdle(client, completion),
+                completion -> commands.observeAcceptanceIdle(client, completion));
     }
 
     /** Only this fixed policy has a simulated boundary in unit tests; it grants no native acceptance. */
@@ -59,8 +78,14 @@ final class InspectAcceptanceDriver {
 
     InspectAcceptanceDriver(Supplier<InspectObservation> observations, ChatBoundary input, LongSupplier clock,
                             BooleanSupplier enabled, Consumer<String> log, Consumer<PublishedCompletion> idleGuard) {
+        this(observations,input,clock,enabled,log,idleGuard,completion -> { throw new IllegalStateException("No idle observation boundary"); });
+    }
+
+    InspectAcceptanceDriver(Supplier<InspectObservation> observations, ChatBoundary input, LongSupplier clock,
+                            BooleanSupplier enabled, Consumer<String> log, Consumer<PublishedCompletion> idleGuard,
+                            Function<PublishedCompletion,ScenarioRunner.InspectIdleObservation> idleObservation) {
         this.observations = observations; this.input = input; this.clock = clock; this.enabled = enabled; this.log = log;
-        this.idleGuard = idleGuard;
+        this.idleGuard = idleGuard; this.idleObservation = idleObservation;
     }
 
     static boolean enabled() {
@@ -73,12 +98,12 @@ final class InspectAcceptanceDriver {
 
     void tick(MinecraftClient current) {
         if (advancing) return;
-        if (!enabled.getAsBoolean() && heldForward == null) return;
+        if (!enabled.getAsBoolean() && heldForward == null && idle == null && !failed) return;
         boolean validEntry = false;
         advancing = true;
         try {
             input.requireClient(current); validEntry = true;
-            require(enabled.getAsBoolean(), "Acceptance gate disabled while forward held");
+            require(enabled.getAsBoolean(), "Acceptance gate disabled during driver activity");
             if (!selected) {
                 var value = System.getProperty("mapart.test.inspect.acceptance.case", "baseline");
                 require(value.equals("baseline") || value.equals("displaced"), "Unknown acceptance case: " + value);
@@ -100,6 +125,7 @@ final class InspectAcceptanceDriver {
             switch (stage) {
                 case NEXT_COMMAND -> beginInput(observed);
                 case MOVING -> advanceMovement(observed);
+                case IDLE, IDLE_FINISH_PENDING -> advanceIdle(observed);
                 case OPEN_CHAT -> {
                     inputDeadline(); requireUnchanged(observed);
                     require(!observed.busy(), "Unexpected admission before Enter");
@@ -263,6 +289,66 @@ final class InspectAcceptanceDriver {
                 + " evidence=" + completion.evidenceDirectory() + " summary=" + completion.summaryPath());
         // Retain the exact result through every successor; only this sequence's transient input state clears.
         index++; chat = null; pending = null; stage = Stage.NEXT_COMMAND;
+        if (displaced && (index == 3 || index == 5)) beginIdle(observed);
+    }
+
+    private void requireIdle(InspectObservation observed) {
+        require("displaced".equals(System.getProperty("mapart.test.inspect.acceptance.case")), "Idle acceptance case changed");
+        requireUnchanged(observed); require(!observed.busy(), "Unexpected admission during idle");
+        require(heldKey == -1 && heldForward == null, "Idle requires no synthetic input debt");
+        idleGuard.accept(retained); input.requireBinding(); input.requireNeutral();
+    }
+
+    private void beginIdle(InspectObservation observed) {
+        requireIdle(observed);
+        var before = idleObservation.apply(retained);
+        require(index != 5 || before.samples() > 0 && before.witnesses() > 0 && before.bound(),
+                "Terminal idle requires retained samples, witnesses and binding");
+        idle = new Idle(index == 3 ? "failed" : "terminal",clock.getAsLong(),input.utc(),input.idleIdentity(),before);
+        stage = Stage.IDLE; idleMarker("BEGIN",0,null);
+    }
+
+    private void advanceIdle(InspectObservation observed) {
+        requireIdle(observed);
+        long now = clock.getAsLong(), elapsed = now - idle.originNanos;
+        require(elapsed >= 0, "Idle monotonic clock regressed");
+        idle.callbacks++;
+        if (stage == Stage.IDLE) {
+            if (elapsed > IDLE_NANOS && idle.callbacks > 6000) {
+                idle.qualifyingCallbacks = idle.callbacks;
+                // Driver END precedes Watch END: observe only on the following actual callback.
+                stage = Stage.IDLE_FINISH_PENDING;
+            }
+            return;
+        }
+        require(elapsed > IDLE_NANOS, "Idle monotonic interval regressed before observation");
+        var after = idleObservation.apply(retained);
+        require(idle.before.equals(after), "Retained observer changed during idle");
+        idleMarker("END",now,after);
+        idle = null; stage = Stage.NEXT_COMMAND; // Input gets its ordinary origin on a later callback.
+    }
+
+    private void idleMarker(String event,long endNanos,ScenarioRunner.InspectIdleObservation after) {
+        var json = new JsonObject();
+        json.addProperty("schema","mapartrunner.inspect.idle.v1"); json.addProperty("event",event);
+        json.addProperty("kind",idle.kind); json.addProperty("mode","inspect"); json.addProperty("acceptanceCase","displaced");
+        json.addProperty("nativePid",idle.identity.nativePid()); json.addProperty("nativeStartedUtc",idle.identity.nativeStartedUtc().toString());
+        json.addProperty("launchId",idle.identity.launchId().toString()); json.addProperty("sessionId",retained.sessionId().toString());
+        json.addProperty("operationId",retained.operationId().toString()); json.addProperty("ordinal",retained.ordinal());
+        json.addProperty("command",retained.command().name()); json.addProperty("verdict",retained.verdict());
+        json.addProperty("runId",retained.runId().map(UUID::toString).orElse(null));
+        json.addProperty("originNanos",idle.originNanos); json.addProperty("originUtc",idle.originUtc.toString());
+        json.addProperty("beforeSamples",idle.before.samples()); json.addProperty("beforeWitnesses",idle.before.witnesses());
+        json.addProperty("beforeBound",idle.before.bound());
+        if (after != null) {
+            json.addProperty("endNanos",endNanos); json.addProperty("endUtc",input.utc().toString());
+            json.addProperty("elapsedNanos",endNanos-idle.originNanos);
+            json.addProperty("qualifyingCallbacks",idle.qualifyingCallbacks); json.addProperty("observationCallbacks",idle.callbacks);
+            json.addProperty("afterSamples",after.samples()); json.addProperty("afterWitnesses",after.witnesses());
+            json.addProperty("afterBound",after.bound()); json.addProperty("retainedEqual",true);
+        }
+        var line = "INSPECT_ACCEPTANCE_IDLE " + json;
+        require(line.length() <= 4096,"Idle marker exceeds log cap"); log.accept(line);
     }
 
     private void pairedKey(int code, Object expectedScreen) {
@@ -290,6 +376,7 @@ final class InspectAcceptanceDriver {
         failed = true;
         if (validEntry) try { releaseKey(); } catch (RuntimeException | Error release) { failure.addSuppressed(release); }
         marker("DRIVER_FAIL " + failure.getClass().getName() + ": " + failure.getMessage());
+        idle = null;
         stage = Stage.STOPPED;
     }
 
@@ -337,9 +424,13 @@ final class InspectAcceptanceDriver {
         boolean forwardPressed(Object binding);
         void forward(Object binding, boolean press);
         void clearForward(Object binding);
+        void requireNeutral();
+        Instant utc();
+        IdleIdentity idleIdentity();
     }
 
     record Pose(double x, double z) { }
+    record IdleIdentity(long nativePid,Instant nativeStartedUtc,UUID launchId) { }
 
     static void requireForwardKeys(KeyBinding binding, KeyBinding[] allKeys, List<KeyBinding> controls,
                                    BuildEngine.ControlOwner owner) {
@@ -426,6 +517,18 @@ final class InspectAcceptanceDriver {
         }
         @Override public void clearForward(Object binding) {
             requireClient(client); ((KeyBinding) binding).setPressed(false);
+        }
+        @Override public void requireNeutral() {
+            requireBinding(); require(client.currentScreen == null,"Unexpected idle screen");
+            var o = client.options;
+            require(List.of(o.forwardKey,o.backKey,o.leftKey,o.rightKey,o.jumpKey,o.sneakKey,o.sprintKey,o.useKey,o.attackKey)
+                    .stream().noneMatch(KeyBinding::isPressed) && MapArtClient.status().controlOwner() == BuildEngine.ControlOwner.NONE,
+                    "Idle requires neutral keys/control owner");
+        }
+        @Override public Instant utc() { return Instant.now(); }
+        @Override public IdleIdentity idleIdentity() {
+            var process = ProcessHandle.current();
+            return new IdleIdentity(process.pid(),process.info().startInstant().orElseThrow(),UUID.fromString(System.getenv("MAPART_TEST_LAUNCH_ID")));
         }
     }
 
