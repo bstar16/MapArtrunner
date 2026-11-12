@@ -28,6 +28,373 @@ class ScenarioInspectLifecycleTest {
     }
     @TempDir Path directory;
 
+    @Test void denseNativeEvidenceMustNotDependOnSparseHeldWorkerSelection() throws Exception {
+        var context=witnessContext();
+        var dense=witnessSamples(context);
+        var retained=pairedWatch(context,dense,null,null).retained();
+        var proof=ScenarioRunner.evaluateTraversal(context.runId(),retained,null);
+        assertEquals(List.of(2L,3L,4L,5L,6L,7L,10L,11L),proof.ordered().stream().map(w -> w.publication().sample().tick()).toList());
+        // Same sparse held worker selection as the behavioral RED against the old production verifier.
+        var sparse=retained.witnesses().stream().filter(w -> Set.of(1L,5L).contains(w.publication().sample().tick())).toList();
+        assertRejected(retained,sparse,retained.samples());
+        assertRejected(retained,List.of(),retained.samples());
+    }
+
+    private static RunLifecycle.Context witnessContext() {
+        return new RunLifecycle.Context(UUID.randomUUID(),"paired-connection","paired-world","minecraft:overworld",
+                "paired-plan",new BuildPlan.GridPos(0,65,0),"paired-settings");
+    }
+
+    private static List<ScenarioObserver.Sample> witnessSamples(RunLifecycle.Context context) {
+        var ends=new java.util.ArrayList<ScenarioObserver.Sample>();
+        var lane=com.mapartrunner.core.run.ForwardTraversal.Substage.LANE;
+        var endpoint=com.mapartrunner.core.run.ForwardTraversal.Substage.ENDPOINT;
+        var shift=com.mapartrunner.core.run.ForwardTraversal.Substage.SHIFT;
+        var entry=com.mapartrunner.core.run.ForwardTraversal.Substage.NEXT_ENTRY;
+        ends.add(witnessSample(context,1,lane,0,"EAST",.5,2.5,false,0,0));
+        ends.add(witnessSample(context,2,lane,0,"EAST",.5,2.5,true,0,0));
+        ends.add(witnessSample(context,3,lane,0,"EAST",6,2.5,true,0,0));
+        ends.add(witnessSample(context,4,endpoint,0,"EAST",11.5,2.5,false,0,1));
+        ends.add(witnessSample(context,5,shift,0,"SOUTH",11.5,2.5,true,0,2));
+        ends.add(witnessSample(context,6,shift,0,"SOUTH",11.5,3,true,0,3));
+        ends.add(witnessSample(context,7,entry,1,"WEST",11.5,7.5,false,0,4));
+        ends.add(witnessSample(context,8,entry,1,"WEST",11.5,7.5,false,1,5));
+        ends.add(witnessSample(context,9,lane,1,"WEST",11.5,7.5,false,0,0));
+        ends.add(witnessSample(context,10,lane,1,"WEST",11.5,7.5,true,0,0));
+        ends.add(witnessSample(context,11,lane,1,"WEST",5,7.5,true,0,0));
+        var result=new java.util.ArrayList<ScenarioObserver.Sample>();
+        ScenarioObserver.Sample previous=ends.getFirst();
+        for(var end:ends) {
+            var e=previous.status().engine();
+            var before=new BuildEngine.Snapshot(e.lifecycle(),end.tick()-1,0,e.traversal(),List.of(),Set.of(),Optional.empty(),List.of());
+            result.add(new ScenarioObserver.Sample(end.tick(),"START",12,true,previous.pose(),previous.keys(),false,
+                    new com.mapartrunner.fabric.runtime.FabricBuildAdapter.Status(before,previous.status().controlOwner(),Optional.empty()),List.of()));
+            result.add(end); previous=end;
+        }
+        return result;
+    }
+
+    private static ScenarioObserver.Sample witnessSample(RunLifecycle.Context context,long frame,
+            com.mapartrunner.core.run.ForwardTraversal.Substage substage,int index,String direction,double x,double z,
+            boolean forward,int aligned,int transition) {
+        var d=com.mapartrunner.core.traversal.LanePlanner.Direction.valueOf(direction);
+        var corridor=new com.mapartrunner.core.traversal.LanePlanner.Corridor(0,11,0,9);
+        var floor=new com.mapartrunner.core.traversal.LanePlanner.ExpectedFloor(java.util.Map.of());
+        var start=new BuildPlan.GridPos(direction.equals("WEST")?11:direction.equals("SOUTH")?11:0,0,direction.equals("EAST")?2:direction.equals("SOUTH")?2:7);
+        var finish=new BuildPlan.GridPos(direction.equals("WEST")?0:11,0,direction.equals("EAST")?2:7);
+        var lane=new com.mapartrunner.core.traversal.LanePlanner.Lane(index,d,start,finish,corridor,floor);
+        var stage=substage==com.mapartrunner.core.run.ForwardTraversal.Substage.LANE
+                || substage==com.mapartrunner.core.run.ForwardTraversal.Substage.SHIFT
+                ?com.mapartrunner.core.movement.MovementPolicy.Stage.WALK:com.mapartrunner.core.movement.MovementPolicy.Stage.ENTER_YAW;
+        var entry=new com.mapartrunner.core.movement.MovementPolicy.LaneEntry(lane,stage,aligned,aligned,aligned,0,0,Set.of(),false);
+        var traversal=new com.mapartrunner.core.run.ForwardTraversal.Snapshot(index,substage,entry,transition,Optional.empty(),
+                com.mapartrunner.core.run.ForwardTraversal.Pass.FORWARD,0);
+        var lifecycle=new RunLifecycle.Snapshot(RunLifecycle.Phase.RUNNING,Optional.of(context),
+                Optional.of(substage==com.mapartrunner.core.run.ForwardTraversal.Substage.SHIFT?RunLifecycle.Activity.SHIFT:RunLifecycle.Activity.BUILD),Optional.empty());
+        var engine=new BuildEngine.Snapshot(lifecycle,frame,0,Optional.of(traversal),List.of(),Set.of(),Optional.empty(),List.of());
+        var pose=new ScenarioObserver.Pose(x,66,z,net.minecraft.util.math.Vec3d.ZERO,net.minecraft.util.math.Vec3d.ZERO,
+                (int)frame,frame,(float)d.yawDegrees(),(float)d.yawDegrees(),(float)d.yawDegrees(),false,false,1,64,64);
+        return new ScenarioObserver.Sample(frame,"END",12,true,pose,List.of(forward,false,false,false,false,false,false,false,false),false,
+                new com.mapartrunner.fabric.runtime.FabricBuildAdapter.Status(engine,BuildEngine.ControlOwner.NATIVE,Optional.empty()),List.of());
+    }
+
+    private static ScenarioRunner.Live witnessLive(ScenarioObserver.Sample sample) {
+        var state=new com.google.gson.JsonObject(); state.addProperty("x",sample.pose().x()); state.addProperty("z",sample.pose().z());
+        var side=new ScenarioRunner.Side(state,(int)sample.tick(),sample.tick(),(int)sample.tick(),List.of());
+        return new ScenarioRunner.Live(sample,side,side,null,List.of(),0,"");
+    }
+
+    private static ScenarioObserver.Binding witnessBinding(RunLifecycle.Context context,Inspect host,Scope scope) {
+        var player=UUID.randomUUID();
+        return new ScenarioObserver.Binding(UUID.randomUUID(),context,
+                new ScenarioObserver.ClientBinding(new Object(),new Object(),new Object(),new Object(),player,context.dimension(),true),
+                new ScenarioObserver.ServerBinding(new Object(),new Object(),new Object(),player,context.dimension(),true,true),host,scope);
+    }
+
+    private static ScenarioObserver.Watch pairedWatch(RunLifecycle.Context context,List<ScenarioObserver.Sample> samples,Inspect host,Scope scope) {
+        var watch=new ScenarioObserver.Watch(); var binding=witnessBinding(context,host,scope); watch.bind(binding);
+        for(var sample:samples) {
+            watch.append(binding,sample,binding.client(),4.5);
+            if(sample.phase().equals("END")) {
+                var read=watch.beginServerRead();
+                assertNotNull(read);
+                watch.commitServer(read,reading(binding.server(),sample,4.5,(int)sample.tick()+100));
+            }
+        }
+        assertNull(watch.retained().failure());
+        return watch;
+    }
+
+    private static ScenarioObserver.ServerReading reading(ScenarioObserver.ServerBinding binding,ScenarioObserver.Sample sample,double reach,int tick) {
+        return new ScenarioObserver.ServerReading(binding,sample.pose().x(),sample.pose().y(),sample.pose().z(),reach,
+                (int)sample.tick()+20,sample.tick()+200,tick);
+    }
+
+    private static void assertRejected(ScenarioObserver.Watch.Retained original,List<ScenarioObserver.ServerWitness> witnesses,
+                                       List<ScenarioObserver.Sample> samples) {
+        var changed=new ScenarioObserver.Watch.Retained(samples,original.failure(),original.binding(),witnesses);
+        assertThrows(AssertionError.class,() -> ScenarioRunner.evaluateTraversal(original.binding().context().runId(),changed,null));
+    }
+
+    private static List<ScenarioObserver.ServerWitness> changeWitness(ScenarioObserver.Watch.Retained retained,long frame,
+            UnaryOperator<ScenarioObserver.ServerWitness> change) {
+        return retained.witnesses().stream().map(w -> w.publication().sample().tick()==frame?change.apply(w):w).toList();
+    }
+
+    @Test void evaluatorRequiresIndependentServerEndpointAndCannotSubstituteShiftGeometry() {
+        var context=witnessContext(); var r=pairedWatch(context,witnessSamples(context),null,null).retained();
+        assertRejected(r,r.witnesses().stream().filter(w -> w.publication().sample().tick()!=4).toList(),r.samples());
+        for(double x:List.of(10.7,11.249,11.751)) {
+            var wrong=changeWitness(r,4,w -> new ScenarioObserver.ServerWitness(w.publication(),w.callback(),
+                    new ScenarioObserver.ServerReading(w.reading().binding(),x,66,2.5,4.5,24,204,w.reading().serverTick())));
+            assertRejected(r,wrong,r.samples());
+        }
+        var wrongZ=r.witnesses().stream().map(w -> w.publication().sample().tick()==7 || w.publication().sample().tick()==8?
+                new ScenarioObserver.ServerWitness(w.publication(),w.callback(),
+                    new ScenarioObserver.ServerReading(w.reading().binding(),11.5,66,7.249,4.5,27,207,w.reading().serverTick())):w).toList();
+        assertRejected(r,wrongZ,r.samples());
+    }
+
+    @Test void evaluatorRejectsWrongBindingRunContextAndReorderedClocks() {
+        var context=witnessContext(); var r=pairedWatch(context,witnessSamples(context),null,null).retained();
+        var foreign=witnessBinding(context,null,null);
+        var forged=changeWitness(r,4,w -> new ScenarioObserver.ServerWitness(
+                new ScenarioObserver.EndPublication(foreign,w.publication().sample(),4.5),w.callback(),w.reading()));
+        assertRejected(r,forged,r.samples());
+        var wrongPlayer=new ScenarioObserver.ServerBinding(r.binding().server().server(),r.binding().server().world(),new Object(),
+                r.binding().server().playerId(),context.dimension(),true,true);
+        assertRejected(r,changeWitness(r,4,w -> new ScenarioObserver.ServerWitness(w.publication(),w.callback(),
+                reading(wrongPlayer,w.publication().sample(),4.5,w.reading().serverTick()))),r.samples());
+        assertThrows(AssertionError.class,() -> ScenarioRunner.evaluateTraversal(UUID.randomUUID(),r,null));
+        var samples=new java.util.ArrayList<>(r.samples());
+        var original=samples.get(7);
+        var changed=witnessSample(witnessContext(),4,com.mapartrunner.core.run.ForwardTraversal.Substage.ENDPOINT,0,"EAST",11.5,2.5,false,0,1);
+        samples.set(7,changed);
+        assertRejected(r,r.witnesses(),samples);
+        for(int kind=0;kind<3;kind++) {
+            final int clock=kind;
+            var bad=changeWitness(r,4,w -> {
+                var previous=r.witnesses().get(2);
+                return new ScenarioObserver.ServerWitness(clock==0?previous.publication():w.publication(),
+                        clock==1?previous.callback():w.callback(),clock==2?
+                        reading(w.reading().binding(),w.publication().sample(),4.5,previous.reading().serverTick()):w.reading());
+            });
+            assertRejected(r,bad,r.samples());
+        }
+        var reversed=new java.util.ArrayList<>(r.witnesses()); java.util.Collections.swap(reversed,3,4);
+        assertRejected(r,reversed,r.samples());
+        var duplicate=new java.util.ArrayList<>(r.samples()); duplicate.add(8,original);
+        assertRejected(r,r.witnesses(),duplicate);
+    }
+
+    @Test void evaluatorRequiresNativeForwardEachReachAndControllerWestInputs() {
+        var context=witnessContext(); var dense=witnessSamples(context); var r=pairedWatch(context,dense,null,null).retained();
+        // Per-side actual reach is independently checked at and below the displacement boundary.
+        for(boolean east:List.of(false,true)) for(boolean client:List.of(false,true)) for(double excess:List.of(0.,.1)) {
+            double reach=(east?5.5:6.5)+excess;
+            var bad=r.witnesses().stream().map(w -> {
+                if(w.publication().sample().tick()!=(east?2:10) && w.publication().sample().tick()!=(east?3:11)) return w;
+                return new ScenarioObserver.ServerWitness(client?new ScenarioObserver.EndPublication(r.binding(),w.publication().sample(),reach):w.publication(),
+                        w.callback(),client?w.reading():reading(w.reading().binding(),w.publication().sample(),reach,w.reading().serverTick()));
+            }).toList();
+            assertRejected(r,bad,r.samples());
+        }
+        var held=dense.stream().map(s -> {
+            if(!s.phase().equals("END") || s.tick()!=2 && s.tick()!=3) return s;
+            return new ScenarioObserver.Sample(s.tick(),s.phase(),s.worldIdentity(),s.originalWorld(),s.pose(),
+                    List.of(false,false,false,false,false,false,false,false,false),s.paused(),s.status(),s.observations());
+        }).toList();
+        var heldR=pairedWatch(context,held,null,null).retained(); assertRejected(heldR,heldR.witnesses(),heldR.samples());
+        for(long frame:List.of(8L,9L)) {
+            var missing=r.samples().stream().filter(s -> s.tick()!=frame).toList();
+            var points=r.witnesses().stream().filter(w -> w.publication().sample().tick()!=frame).toList();
+            assertRejected(r,points,missing);
+        }
+        var reverseInputs=new java.util.ArrayList<>(r.samples());
+        java.util.Collections.swap(reverseInputs,15,17); assertRejected(r,r.witnesses(),reverseInputs);
+        var resumed=witnessLive(r.samples().get(9));
+        assertDoesNotThrow(() -> ScenarioRunner.evaluateTraversal(context.runId(),r,resumed));
+        var late=witnessLive(r.samples().get(11));
+        assertThrows(AssertionError.class,() -> ScenarioRunner.evaluateTraversal(context.runId(),r,late));
+        var serverAhead=witnessLive(r.samples().get(11));
+        var clientOnlyProgress=new ScenarioRunner.Live(resumed.sample(),resumed.client(),serverAhead.server(),null,List.of(),0,"");
+        assertThrows(AssertionError.class,() -> ScenarioRunner.evaluateTraversal(context.runId(),r,clientOnlyProgress));
+    }
+
+    @Test void watchFreezeLinearizesAgainstInflightReadsAndMoreThan6000LateCallbacks() throws Exception {
+        var context=witnessContext(); var watch=pairedWatch(context,witnessSamples(context),null,null);
+        var started=new java.util.concurrent.CountDownLatch(1); var finish=new java.util.concurrent.CountDownLatch(1);
+        var inFlight=new java.util.concurrent.atomic.AtomicReference<ScenarioObserver.ServerRead>();
+        var error=new java.util.concurrent.atomic.AtomicReference<Throwable>();
+        var server=new Thread(() -> {
+            try {
+                var read=watch.beginServerRead(); inFlight.set(read); started.countDown();
+                if(!finish.await(2,java.util.concurrent.TimeUnit.SECONDS)) throw new AssertionError("Freeze test did not release server read");
+                watch.commitServer(read,reading(read.publication().binding().server(),read.publication().sample(),4.5,999));
+                watch.failRead(read,new AssertionError("late read must not mutate failure"));
+            } catch(Throwable failure) { error.set(failure); }
+        },"simulated-server-read");
+        server.start();
+        ScenarioObserver.Watch.Retained archived;
+        try {
+            assertTrue(started.await(2,java.util.concurrent.TimeUnit.SECONDS)); assertNotNull(inFlight.get());
+            watch.freeze(); archived=watch.retained();
+        } finally { finish.countDown(); server.join(2000); }
+        assertFalse(server.isAlive()); assertNull(error.get());
+        var read=inFlight.get();
+        for(int n=0;n<6002;n++) {
+            assertNull(watch.beginServerRead()); watch.recordServer(null);
+            watch.append(archived.binding(),read.publication().sample(),archived.binding().client(),4.5);
+        }
+        assertEquals(archived,watch.retained());
+        watch.clear();
+        var fresh=witnessBinding(witnessContext(),null,null); watch.bind(fresh);
+        var freshEnd=witnessSamples(fresh.context()).get(7); watch.append(fresh,freshEnd,fresh.client(),4.5);
+        watch.commitServer(read,reading(archived.binding().server(),read.publication().sample(),4.5,1000));
+        assertTrue(watch.retained().witnesses().isEmpty()); assertSame(fresh,watch.retained().binding());
+        var freshRead=watch.beginServerRead(); assertEquals(1,freshRead.callback());
+        watch.commitServer(freshRead,reading(fresh.server(),freshEnd,4.5,101));
+        assertEquals(1,watch.retained().witnesses().size());
+        assertEquals(11,archived.witnesses().size());
+        assertThrows(UnsupportedOperationException.class,() -> archived.witnesses().clear());
+    }
+
+    @Test void pairedResumeRequiresServerReadAfterIndependentServerAnchor() {
+        var context=witnessContext(); var r=pairedWatch(context,witnessSamples(context),null,null).retained();
+        var resume=witnessLive(r.samples().get(9));
+        for(int serverTick:List.of(106,107)) {
+            var independent=new ScenarioRunner.Side(resume.server().state(),25,205,serverTick,List.of());
+            var anchor=new ScenarioRunner.Live(resume.sample(),resume.client(),independent,null,List.of(),0,"");
+            // Client frame6 and server z3 exceed resume frame5/z2.5, but the server read precedes/equal anchor.
+            assertThrows(AssertionError.class,() -> ScenarioRunner.evaluateTraversal(context.runId(),r,anchor));
+        }
+    }
+
+    @Test void automaticObserverCloseDisarmsPairedReadsWithoutClearingRetainedBinding() {
+        var context=witnessContext(); var watch=pairedWatch(context,witnessSamples(context),null,null);
+        var read=watch.beginServerRead(); watch.closeWorld(); var archived=watch.retained();
+        assertNotNull(archived.binding());
+        watch.commitServer(read,reading(archived.binding().server(),read.publication().sample(),4.5,999));
+        assertNull(watch.beginServerRead()); assertEquals(archived,watch.retained());
+    }
+
+    @Test void changedPublicationDiscardsInflightReadAndServerCapLatchesFirstCause() {
+        var context=witnessContext(); var watch=new ScenarioObserver.Watch(); var binding=witnessBinding(context,null,null); watch.bind(binding);
+        var samples=witnessSamples(context); var endpoint=samples.get(7); var shift=samples.get(9);
+        watch.append(binding,endpoint,binding.client(),4.5); var old=watch.beginServerRead();
+        watch.append(binding,shift,binding.client(),4.5);
+        watch.commitServer(old,reading(binding.server(),endpoint,4.5,101));
+        watch.failRead(old,new AssertionError("discard replaced publication error"));
+        assertTrue(watch.retained().witnesses().isEmpty()); assertNull(watch.retained().failure());
+        for(int n=0;n<6000;n++) {
+            var read=watch.beginServerRead();
+            assertSame(shift,read.publication().sample());
+            watch.commitServer(read,reading(binding.server(),shift,4.5,n+200));
+        }
+        var extra=watch.beginServerRead(); watch.commitServer(extra,reading(binding.server(),shift,4.5,6200));
+        assertEquals(6000,watch.retained().witnesses().size());
+        var failure=watch.retained().failure(); assertInstanceOf(AssertionError.class,failure);
+        watch.failRead(extra,new IllegalStateException("second cause")); assertSame(failure,watch.retained().failure());
+        watch.freeze(); var retained=watch.retained();
+        for(int n=0;n<6002;n++) watch.recordServer(null);
+        assertEquals(retained,watch.retained());
+    }
+
+    @Test void watchRejectsClientAndServerIdentityLossAndNeverPublishesStartOrTest() {
+        for(String side:List.of("client-world","client-player","handler","connection","client-uuid","client-dimension","client-thread",
+                "server","server-world","server-player","server-uuid","server-dimension","server-thread","member")) {
+            var context=witnessContext(); var watch=new ScenarioObserver.Watch(); var b=witnessBinding(context,null,null); watch.bind(b);
+            var sample=witnessSamples(context).get(7); var c=b.client(); var s=b.server();
+            watch.append(b,new ScenarioObserver.Sample(sample.tick(),"START",12,true,sample.pose(),sample.keys(),false,sample.status(),List.of()),c,4.5);
+            assertNull(watch.beginServerRead());
+            watch.append(b,new ScenarioObserver.Sample(sample.tick(),"TEST",12,true,sample.pose(),sample.keys(),false,sample.status(),List.of()),c,4.5);
+            assertNull(watch.beginServerRead());
+            var client=new ScenarioObserver.ClientBinding(side.equals("client-world")?new Object():c.world(),side.equals("client-player")?new Object():c.player(),
+                    side.equals("handler")?new Object():c.handler(),side.equals("connection")?new Object():c.connection(),
+                    side.equals("client-uuid")?UUID.randomUUID():c.playerId(),side.equals("client-dimension")?"foreign":c.dimension(),!side.equals("client-thread"));
+            watch.append(b,sample,client,4.5);
+            if(side.startsWith("server") || side.equals("member")) {
+                var read=watch.beginServerRead(); assertNotNull(read);
+                var server=new ScenarioObserver.ServerBinding(side.equals("server")?new Object():s.server(),side.equals("server-world")?new Object():s.world(),
+                        side.equals("server-player")?new Object():s.player(),side.equals("server-uuid")?UUID.randomUUID():s.playerId(),
+                        side.equals("server-dimension")?"foreign":s.dimension(),!side.equals("server-thread"),!side.equals("member"));
+                watch.commitServer(read,reading(server,sample,4.5,101));
+            }
+            assertNotNull(watch.retained().failure(),side); assertTrue(watch.retained().witnesses().isEmpty(),side);
+        }
+    }
+
+    @Test void watchRejectsEveryChangedRunContextFieldAndOldGenerationPublication() {
+        var context=witnessContext();
+        var alternatives=List.of(
+                new RunLifecycle.Context(UUID.randomUUID(),context.connectionId(),context.worldId(),context.dimension(),context.planFingerprint(),context.origin(),context.settingsFingerprint()),
+                new RunLifecycle.Context(context.runId(),"foreign",context.worldId(),context.dimension(),context.planFingerprint(),context.origin(),context.settingsFingerprint()),
+                new RunLifecycle.Context(context.runId(),context.connectionId(),"foreign",context.dimension(),context.planFingerprint(),context.origin(),context.settingsFingerprint()),
+                new RunLifecycle.Context(context.runId(),context.connectionId(),context.worldId(),"foreign",context.planFingerprint(),context.origin(),context.settingsFingerprint()),
+                new RunLifecycle.Context(context.runId(),context.connectionId(),context.worldId(),context.dimension(),"foreign",context.origin(),context.settingsFingerprint()),
+                new RunLifecycle.Context(context.runId(),context.connectionId(),context.worldId(),context.dimension(),context.planFingerprint(),new BuildPlan.GridPos(1,65,0),context.settingsFingerprint()),
+                new RunLifecycle.Context(context.runId(),context.connectionId(),context.worldId(),context.dimension(),context.planFingerprint(),context.origin(),"foreign"));
+        for(var foreign:alternatives) {
+            var watch=new ScenarioObserver.Watch(); var binding=witnessBinding(context,null,null); watch.bind(binding);
+            var sample=witnessSamples(foreign).get(7); watch.append(binding,sample,binding.client(),4.5);
+            assertNotNull(watch.retained().failure()); assertNull(watch.beginServerRead());
+        }
+        var watch=new ScenarioObserver.Watch(); var old=witnessBinding(context,null,null); watch.bind(old); watch.freeze(); watch.clear();
+        var fresh=witnessBinding(context,null,null); watch.bind(fresh); var retained=watch.retained();
+        watch.append(old,witnessSamples(context).get(7),old.client(),4.5);
+        assertEquals(retained,watch.retained()); assertNotEquals(old.generation(),fresh.generation());
+    }
+
+    @Test void realHostObservationCheckDoesNotWaitForHostLock() throws Exception {
+        var host=new InspectScenarioHost(() -> 1L,() -> false,() -> false,a -> fail("No queue"),a -> fail("No queue"),null);
+        var op=new Operation(UUID.randomUUID(),1,UUID.randomUUID(),Command.RUN,directory); var work=host.beginWork(op);
+        var field=InspectScenarioHost.class.getDeclaredField("lock"); field.setAccessible(true);
+        var lock=(java.util.concurrent.locks.ReentrantLock)field.get(host);
+        var checked=new java.util.concurrent.CountDownLatch(1); var accepted=new java.util.concurrent.atomic.AtomicBoolean();
+        var reader=new Thread(() -> { accepted.set(host.observationScopeValid(work)); checked.countDown(); },"scope-observer");
+        lock.lock();
+        try { reader.start(); assertTrue(checked.await(1,java.util.concurrent.TimeUnit.SECONDS)); assertTrue(accepted.get()); }
+        finally { lock.unlock(); reader.join(2000); }
+        assertFalse(reader.isAlive());
+    }
+
+    @Test void realHostObservationScopeRejectsExpiryCancellationReplacementAndLookalikes() {
+        for(String invalidation:List.of("expiry","cancel","replacement","stopping")) {
+            var now=new java.util.concurrent.atomic.AtomicLong(1);
+            var nativeThread=ThreadLocal.withInitial(() -> false);
+            var host=new InspectScenarioHost(now::get,nativeThread::get,() -> false,a -> fail("No client dispatch"),a -> fail("No server dispatch"),null);
+            var operation=new Operation(UUID.randomUUID(),1,UUID.randomUUID(),Command.RUN,directory);
+            var work=host.beginWork(operation);
+            assertSame(work,host.inScope(work,() -> host.requireScope(operation,Kind.WORK)));
+            assertTrue(host.observationScopeValid(work));
+            assertFalse(host.observationScopeValid(new Scope(operation,Kind.WORK,work.deadlineNanos())));
+            assertFalse(host.observationScopeValid(null));
+            var context=witnessContext(); var watch=pairedWatch(context,witnessSamples(context),host,work);
+            var legitimate=watch.retained().binding();
+            var lookalike=new ScenarioObserver.Binding(UUID.randomUUID(),context,legitimate.client(),legitimate.server(),host,
+                    new Scope(operation,Kind.WORK,work.deadlineNanos()));
+            assertThrows(IllegalStateException.class,() -> new ScenarioObserver.Watch().bind(lookalike));
+            var read=watch.beginServerRead();
+            switch(invalidation) {
+                case "expiry" -> now.set(work.deadlineNanos());
+                case "cancel" -> host.cancelSession(new IllegalStateException("cancelled"));
+                case "replacement" -> {
+                    var cleanup=host.beginCleanup(work,null);
+                    assertFalse(host.observationScopeValid(cleanup));
+                    host.settleCleanup(cleanup,new FinalOutcome(operation,Verdict.SUCCESS,CleanupStatus.SETTLED));
+                    var next=new Operation(operation.sessionId(),2,UUID.randomUUID(),Command.RUN,directory);
+                    assertTrue(host.observationScopeValid(host.beginWork(next)));
+                }
+                case "stopping" -> { nativeThread.set(true); try { host.onStopping(null); } finally { nativeThread.remove(); } }
+            }
+            var retained=watch.retained();
+            assertFalse(host.observationScopeValid(work)); assertNull(watch.beginServerRead());
+            watch.commitServer(read,reading(retained.binding().server(),read.publication().sample(),4.5,999));
+            watch.append(retained.binding(),read.publication().sample(),retained.binding().client(),4.5);
+            assertEquals(retained,watch.retained());
+        }
+    }
+
     @Test void commandAuthorityRefusalHasNoOrdinalEvidenceOrTransportEffects() throws Exception {
         var host=new InspectTransport(); var runner=runner(host);
         var session=runner.inspectSessionId();

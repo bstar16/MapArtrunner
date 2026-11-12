@@ -100,11 +100,7 @@ final class ScenarioRunner implements AutoCloseable {
     private record Checkpoint(Side client, Side server, FabricBuildAdapter.Status status) { }
     private record Prior(FabricBuildAdapter.Status status, List<ScenarioObserver.Sample> samples,
                          PredictionFaults.Snapshot fault, PredictionFaults.StateSnapshot stateFault,
-                         TraversalCapture.Sealed traversal) {
-        Prior(FabricBuildAdapter.Status status,List<ScenarioObserver.Sample> samples,PredictionFaults.Snapshot fault,PredictionFaults.StateSnapshot stateFault) {
-            this(status,samples,fault,stateFault,null);
-        }
-    }
+                         TraversalCapture.Sealed traversal, ScenarioObserver.Watch.Retained observer) { }
     private final String supportSelector=System.getenv("MAPART_TWO_LANE_SUPPORT_CASE");
     private final SupportCase supportCase=SupportCase.parse(supportSelector);
     private final ScenarioHost host;
@@ -422,12 +418,13 @@ final class ScenarioRunner implements AutoCloseable {
         }
     }
 
-    private void requireInspectWork(Command first, Command second) {
-        if(!inspectMode) return;
+    private Scope requireInspectWork(Command first, Command second) {
+        if(!inspectMode) return null;
         require(inspectAdmissionFailure==null && inspectStartupFailure==null && inspectUnresolvedCleanupFailure==null
                 && inspectOperation!=null && !inspectFinalizing,"Inspect work is unavailable");
-        ((Inspect)host).requireScope(inspectOperation,Kind.WORK);
+        var scope=((Inspect)host).requireScope(inspectOperation,Kind.WORK);
         require(inspectOperation.command()==first || inspectOperation.command()==second,"Wrong inspect work command");
+        return scope;
     }
 
     InspectCompletion finishInspectOperation(Operation operation, Scope cleanup, Throwable primary) {
@@ -929,8 +926,10 @@ final class ScenarioRunner implements AutoCloseable {
             requireReleased(c);
             // Copy before clear/arm: both owners retain diagnostics across stop.
             if(!baseline() && capture!=null && sealed==null) sealed=watch.sealTraversal();
-            return new Prior(MapArtClient.status(), baseline()?(inspectMode?watch.retained().samples():watch.copy()):List.of(),
-                    PredictionFaults.snapshot(), PredictionFaults.stateSnapshot(),sealed);
+            var retained=baseline()?watch.retained():null;
+            if(baseline() && !inspectMode) watch.copy(); // Preserve automatic failure propagation before archive.
+            return new Prior(MapArtClient.status(), baseline()?retained.samples():List.of(),
+                    PredictionFaults.snapshot(), PredictionFaults.stateSnapshot(),sealed,retained);
         });
         var stage = artifacts.resolve("reset-" + (++resetOrdinal));
         archiveThenRestore(() -> {
@@ -973,7 +972,7 @@ final class ScenarioRunner implements AutoCloseable {
     }
 
     private UUID start(ScenarioDefinition definition, boolean counted) {
-        requireInspectWork(Command.RUN,Command.RERUN);
+        var observationScope=requireInspectWork(Command.RUN,Command.RERUN);
         preflight(definition);
         require(baseline() || compactArchiveFailure==null,"Start refuses an earlier failed compact archive");
         require(ready && admitted != null && definition.definitionHash().equals(admitted.definitionHash()),
@@ -982,6 +981,10 @@ final class ScenarioRunner implements AutoCloseable {
                 "Repeat bound exceeded or dirty prelude was not first");
         if (counted) countedStarts++;
         ready = false; // Consume before facade reentry; failure cannot reuse readiness.
+        var serverBinding=baseline()?host.computeOnServer(s -> {
+            requireServer(s);
+            return ScenarioObserver.serverBinding(s,serverWorld,serverPlayer);
+        }):null;
         UUID started=host.computeOnClient(c -> {
             requireClient(c); requireReleased(c);
             var now = readClient(c, true);
@@ -999,7 +1002,8 @@ final class ScenarioRunner implements AutoCloseable {
             require(bound.runId().equals(fresh) && bound.planFingerprint().equals(plan.fingerprint())
                     && bound.origin().equals(origin) && bound.settingsFingerprint().equals(settings.fingerprint())
                     && bound.dimension().equals("minecraft:overworld"), "Facade bound another start request");
-            if(baseline()) watch.arm(c, plan);
+            if(baseline()) watch.arm(c, plan,new ScenarioObserver.Binding(UUID.randomUUID(),bound,
+                    ScenarioObserver.clientBinding(c),serverBinding,inspectMode?(Inspect)host:null,observationScope));
             else {
                 try { capture=new TraversalCapture(outputs.root(),fresh,captureLimits,admitted.removalIds(plan),outputs); }
                 catch(IOException error) { throw new UncheckedIOException(error); }
@@ -1126,7 +1130,7 @@ final class ScenarioRunner implements AutoCloseable {
             writeNew(roots,artifacts.resolve("dirty-release-"+tick+".txt"),next.toString());
             released=next;
         }
-        var priorArchive=host.computeOnClient(c -> new Prior(MapArtClient.status(),watch.copy(),PredictionFaults.snapshot(),PredictionFaults.stateSnapshot()));
+        var priorArchive=host.computeOnClient(c -> new Prior(MapArtClient.status(),watch.copy(),PredictionFaults.snapshot(),PredictionFaults.stateSnapshot(),null,watch.retained()));
         archive(artifacts.resolve("dirty-failed-before-drain"),priorArchive);
         var beforeDrain=live();
         writeNew(roots,artifacts.resolve("held-response-before-reset.txt"),beforeDrain.toString());
@@ -1703,6 +1707,7 @@ final class ScenarioRunner implements AutoCloseable {
                         if(inspectMode) { requireClient(c); return watch.retained().samples(); }
                         return watch.copy();
                     }).stream().map(ScenarioObserver.Sample::line)::iterator));
+            capture(error,() -> writeNew(roots,artifacts.resolve("failure-server-witnesses.txt"),pairedEvidence(watch.retained())));
         }
         // Capture errors are present here; later try-with-resources close errors remain in the outer log.
         capture(error,() -> writeNew(roots,artifacts.resolve("failure-after-capture.txt"),trace(error)));
@@ -2493,8 +2498,10 @@ final class ScenarioRunner implements AutoCloseable {
             }
         }
         var terminal=baseline()?current.sample.status().engine():host.computeOnClient(c->{ requireClient(c); return MapArtClient.status().engine(); });
-        List<ScenarioObserver.Sample> samples=baseline()?host.computeOnClient(c -> watch.copy()):List.of();
+        var retained=baseline()?host.computeOnClient(c -> watch.retained()):null;
+        List<ScenarioObserver.Sample> samples=baseline()?retained.samples():List.of();
         if(baseline()) writeLinesNew(stage.resolve("observer-before-assertions.txt"),samples.stream().map(ScenarioObserver.Sample::line)::iterator);
+        if(baseline()) writeNew(roots,stage.resolve("server-witnesses-before-assertions.txt"),pairedEvidence(retained));
         require(terminal.lifecycle().phase()==Phase.TERMINAL && terminal.lifecycle().outcome().orElse(null)==Outcome.SUCCESS,
                 "Counted run did not reach SUCCESS within "+budget+" real ticks"+(baseline()?": "+terminal:"; compact prefix retained"));
         require(terminal.diagnostic().orElseThrow().reason()==BuildEngine.Reason.VERIFIED
@@ -2503,7 +2510,7 @@ final class ScenarioRunner implements AutoCloseable {
                 "SUCCESS lacks exact VERIFIED/ALL_CONFIRMED export"+(baseline()?": "+terminal:"; compact prefix retained"));
         if(baseline()) {
             require(!firstSuccess || paused,"First success never reached the required actual SHIFT pause");
-            verifyTraversal(id,checkpoints,samples,clientReach,serverReach,resumed,stage);
+            verifyTraversal(id,retained,resumed,stage);
             if(supportCase==SupportCase.ORDINARY) verifyOrdinarySupport(id,samples,stage);
             else {
                 require(host.computeOnClient(c -> PredictionFaults.resetSnapshot().support().orElseThrow().state())
@@ -2804,48 +2811,86 @@ final class ScenarioRunner implements AutoCloseable {
     private static boolean atEntry(double x, double z, double wantedX, double wantedZ) {
         return x>=wantedX-.25 && x<=wantedX+.25 && z>=wantedZ-.25 && z<=wantedZ+.25;
     }
-    private static boolean atEntry(Live sample, double x, double z) {
-        return atEntry(coordinate(sample.client,"x"),coordinate(sample.client,"z"),x,z)
-                && atEntry(coordinate(sample.server,"x"),coordinate(sample.server,"z"),x,z);
-    }
 
     private static void ordered(int... indices) {
         int prior=-1;
         for (int index:indices) { require(index>prior,"Missing/unordered native traversal witnesses: "+Arrays.toString(indices)); prior=index; }
     }
 
-    private void verifyTraversal(UUID id, List<Live> points, List<ScenarioObserver.Sample> samples,
-                                 double clientReach, double serverReach, Live resumed, Path stage) {
+    private void verifyTraversal(UUID id, ScenarioObserver.Watch.Retained retained, Live resumed, Path stage) {
+        var proof=evaluateTraversal(id,retained,resumed);
+        writeNew(roots,stage.resolve("traversal-proof.txt"),proof.toString()
+                +"\ninputProof=controller ENTER_YAW actual capture condition <=1.5 degrees on two adjacent eligible callbacks; raw START/END rotations remain phase-labelled, not capture-boundary readings\n");
+    }
+
+    private static String pairedEvidence(ScenarioObserver.Watch.Retained retained) {
+        return "pair=actual client END publication precedes independent server END read; clocks are distinct, no acknowledgement implied"
+                +"\nbinding="+retained.binding()+"\nfirstFailure="+retained.failure()+"\n"
+                +String.join("\n",retained.witnesses().stream().map(Object::toString).toList())+"\n";
+    }
+
+    record TraversalProof(List<ScenarioObserver.ServerWitness> ordered, WestInput firstWestInput, WestInput secondWestInput) {
+        TraversalProof { ordered=List.copyOf(ordered); }
+    }
+
+    /** Pure oracle used by ordinary and automatic baseline; simulated unit pairs confer no native acceptance. */
+    static TraversalProof evaluateTraversal(UUID id, ScenarioObserver.Watch.Retained retained, Live resumed) {
+        var binding=retained.binding();
+        require(binding!=null && binding.context().runId().equals(id) && retained.failure()==null,
+                "Missing/failed paired native observation binding: "+retained.failure());
+        var nativeEnds=Collections.newSetFromMap(new IdentityHashMap<ScenarioObserver.Sample,Boolean>());
+        for(var sample:retained.samples()) {
+            requireRun(sample,id);
+            require(sample.status().engine().lifecycle().context().orElseThrow().equals(binding.context()),"Changed full native context");
+            if(sample.phase().equals("END")) nativeEnds.add(sample);
+        }
+        var points=retained.witnesses();
         int east=-1,eastTravel=-1,endpoint=-1,shift=-1,south=-1,westEntry=-1,west=-1,westTravel=-1;
+        long frame=-1,callback=-1,serverTick=-1;
         for (int k=0;k<points.size();k++) {
-            var point=points.get(k); var sample=point.sample; requireRun(sample,id);
+            var point=points.get(k); var publication=point.publication(); var sample=publication.sample();
+            require(publication.binding()==binding && nativeEnds.contains(sample) && sample.phase().equals("END")
+                    && binding.server().matches(point.reading().binding()),"Foreign publication/generation/native binding");
+            require(sample.tick()>=frame && point.callback()>callback && point.reading().serverTick()>serverTick,
+                    "Duplicate/reordered native frame/server callback/tick");
+            frame=sample.tick(); callback=point.callback(); serverTick=point.reading().serverTick();
+            require(Double.isFinite(publication.reach()) && publication.reach()>0
+                    && Double.isFinite(point.reading().reach()) && point.reading().reach()>0,"Invalid actual native reach");
             var traversal=sample.status().engine().traversal().orElse(null);
             if (traversal==null) continue;
             boolean walking=traversal.substage()==ForwardTraversal.Substage.LANE && traversal.entry().stage()==Stage.WALK
                     && sample.status().engine().lifecycle().activity().orElse(null)==Activity.BUILD && nativeForward(sample);
             if (walking && traversal.laneIndex()==0 && traversal.entry().lane().direction().name().equals("EAST")) {
                 if (east<0) east=k;
-                if (beyondReach(points.get(east),point,clientReach,serverReach,1)) eastTravel=k;
+                if (pairedBeyondReach(points.get(east),point,1)) eastTravel=k;
             }
-            if (eastTravel>=0 && endpoint<0 && traversal.substage()==ForwardTraversal.Substage.ENDPOINT && atEntry(point,11.5,2.5)) endpoint=k;
+            if (eastTravel>=0 && endpoint<0 && traversal.substage()==ForwardTraversal.Substage.ENDPOINT && pairedEntry(point,11.5,2.5)) endpoint=k;
             if (endpoint>=0 && traversal.substage()==ForwardTraversal.Substage.SHIFT
                     && traversal.entry().lane().direction().name().equals("SOUTH")) {
                 if (shift<0) shift=k;
                 if (nativeForward(sample) && Math.abs(MathHelper.wrapDegrees(sample.pose().yaw()))<=1.5
                         && Math.abs(MathHelper.wrapDegrees(sample.pose().headYaw()))<=1.5 && Math.abs(MathHelper.wrapDegrees(sample.pose().bodyYaw()))<=1.5
-                        && moved(points.get(shift),point,"z",.25,1)) south=k;
+                        && pairedMoved(points.get(shift),point,.25)) south=k;
             }
-            if (south>=0 && westEntry<0 && traversal.substage()==ForwardTraversal.Substage.NEXT_ENTRY && atEntry(point,11.5,7.5)) westEntry=k;
+            if (south>=0 && westEntry<0 && traversal.substage()==ForwardTraversal.Substage.NEXT_ENTRY && pairedEntry(point,11.5,7.5)) westEntry=k;
             if (westEntry>=0 && walking && traversal.laneIndex()==1 && traversal.entry().lane().direction().name().equals("WEST")) {
                 if (west<0) west=k;
-                if (beyondReach(points.get(west),point,clientReach,serverReach,-1)) westTravel=k;
+                if (pairedBeyondReach(points.get(west),point,-1)) westTravel=k;
             }
         }
         ordered(east,eastTravel,endpoint,shift,south,westEntry,west,westTravel);
+        var chain=List.of(points.get(east),points.get(eastTravel),points.get(endpoint),points.get(shift),points.get(south),
+                points.get(westEntry),points.get(west),points.get(westTravel));
+        long selectedFrame=-1,selectedCallback=-1,selectedTick=-1;
+        for(var point:chain) {
+            require(point.publication().sample().tick()>selectedFrame && point.callback()>selectedCallback
+                    && point.reading().serverTick()>selectedTick,"Traversal chain reused native frame/server observation");
+            selectedFrame=point.publication().sample().tick(); selectedCallback=point.callback(); selectedTick=point.reading().serverTick();
+        }
         var inputs=new ArrayList<WestInput>();
         ScenarioObserver.Sample start=null;
         long previousEnd=-1;
-        for (var sample:samples) {
+        for (var sample:retained.samples()) {
             requireRun(sample,id);
             if (sample.phase().equals("START")) { start=sample; continue; }
             if (!sample.phase().equals("END")) continue;
@@ -2873,23 +2918,31 @@ final class ScenarioRunner implements AutoCloseable {
         }
         WestInput first=null,second=null;
         for (int k=1;k<inputs.size();k++) if (westInputs(inputs.get(k-1),inputs.get(k))) { first=inputs.get(k-1); second=inputs.get(k); break; }
-        require(first!=null && second!=null && points.get(westEntry).sample.tick()<=first.frame
-                        && second.frame<=points.get(west).sample.tick(),"Missing ordered full-entry/two distinct controller-certified WEST input callbacks: "+inputs);
-        if (resumed!=null) require(points.stream().anyMatch(p -> p.sample.tick()>resumed.sample.tick()
-                && substage(p.sample,ForwardTraversal.Substage.SHIFT) && nativeForward(p.sample) && moved(resumed,p,"z",0,1)),
-                "No actual SOUTH progress after manual resume");
-        writeNew(roots,stage.resolve("traversal-proof.txt"),"orderedCheckpointIndices="+List.of(east,eastTravel,endpoint,shift,south,westEntry,west,westTravel)
-                +"; clientReach="+clientReach+"; serverReach="+serverReach+"; WEST input decisions="+first+", "+second
-                +"; inputProof=controller ENTER_YAW actual capture condition <=1.5 degrees on two adjacent eligible callbacks; raw START/END rotations remain phase-labelled, not capture-boundary readings\n"
-                +"eastStart="+points.get(east)+"\neastEnd="+points.get(eastTravel)+"\nendpoint="+points.get(endpoint)
-                +"\nshiftStart="+points.get(shift)+"\nsouth="+points.get(south)+"\nwestEntry="+points.get(westEntry)
-                +"\nwestStart="+points.get(west)+"\nwestEnd="+points.get(westTravel));
+        require(first!=null && second!=null && points.get(westEntry).publication().sample().tick()<=first.frame
+                        && second.frame<=points.get(west).publication().sample().tick(),"Missing ordered full-entry/two distinct controller-certified WEST input callbacks: "+inputs);
+        if (resumed!=null) require(points.stream().anyMatch(p -> p.publication().sample().tick()>resumed.sample.tick()
+                && p.reading().serverTick()>resumed.server.serverTick
+                && substage(p.publication().sample(),ForwardTraversal.Substage.SHIFT) && nativeForward(p.publication().sample())
+                && distance(coordinate(resumed.client,"z"),p.publication().sample().pose().z(),0,1)
+                && distance(coordinate(resumed.server,"z"),p.reading().z(),0,1)),
+                "No actual independent SOUTH progress after manual resume");
+        return new TraversalProof(chain,first,second);
     }
 
-    private static boolean beyondReach(Live first, Live last, double clientReach, double serverReach, int sign) {
-        return distance(coordinate(first.client,"x"),coordinate(last.client,"x"),clientReach,sign)
-                && distance(coordinate(first.server,"x"),coordinate(last.server,"x"),serverReach,sign);
+    private static boolean pairedEntry(ScenarioObserver.ServerWitness point,double x,double z) {
+        var client=point.publication().sample().pose(); var server=point.reading();
+        return atEntry(client.x(),client.z(),x,z) && atEntry(server.x(),server.z(),x,z);
     }
+    private static boolean pairedBeyondReach(ScenarioObserver.ServerWitness first,ScenarioObserver.ServerWitness last,int sign) {
+        return distance(first.publication().sample().pose().x(),last.publication().sample().pose().x(),
+                Math.max(first.publication().reach(),last.publication().reach()),sign)
+                && distance(first.reading().x(),last.reading().x(),Math.max(first.reading().reach(),last.reading().reach()),sign);
+    }
+    private static boolean pairedMoved(ScenarioObserver.ServerWitness first,ScenarioObserver.ServerWitness last,double amount) {
+        return distance(first.publication().sample().pose().z(),last.publication().sample().pose().z(),amount,1)
+                && distance(first.reading().z(),last.reading().z(),amount,1);
+    }
+
     private record WestInput(long frame,long eligible,int priorAligned,int aligned,boolean walk,boolean fullPosition,boolean west) { }
     private static boolean westInputs(WestInput first, WestInput second) {
         return first.frame+1==second.frame && first.eligible+1==second.eligible && first.priorAligned==0 && first.aligned==1
@@ -3519,6 +3572,7 @@ final class ScenarioRunner implements AutoCloseable {
         writeNew(roots, stage.resolve("prior-result.txt"), String.valueOf(previous));
         writeNew(roots, stage.resolve("prior-status-transitions.txt"), prior.status.toString());
         writeLinesNew(stage.resolve("prior-observer.txt"),prior.samples.stream().map(ScenarioObserver.Sample::line)::iterator);
+        if(prior.observer!=null) writeNew(roots,stage.resolve("prior-server-witnesses.txt"),pairedEvidence(prior.observer));
         writeNew(roots, stage.resolve("prior-fault.txt"), prior.fault + "\n" + prior.stateFault);
         writeNew(roots, stage.resolve("prior-mismatches.txt"), previous==null ? "no previous result" : previous.mismatches.toString());
         if(inspectMode && inspectLast!=null) {

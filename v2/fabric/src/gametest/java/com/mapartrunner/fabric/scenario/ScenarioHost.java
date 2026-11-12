@@ -93,6 +93,8 @@ interface ScenarioHost {
          * Finalization also compares the returned handle by identity with its supplied cleanup scope.
          */
         Scope requireScope(Operation expected, Kind expectedKind);
+        /** Read-only native observation check; no dispatch/binding permission and never takes Host.lock. */
+        default boolean observationScopeValid(Scope scope) { return false; }
         void inScope(Scope scope, Runnable action);
         <V> V inScope(Scope scope, Supplier<V> action);
     }

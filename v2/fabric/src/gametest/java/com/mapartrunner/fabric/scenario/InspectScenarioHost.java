@@ -59,7 +59,7 @@ final class InspectScenarioHost implements Inspect {
     // Session cancellation survives issue() clearing the per-operation cause after a contended BEGIN publication.
     private final AtomicReference<Throwable> cancellationFailure = new AtomicReference<>();
     private final AtomicBoolean stopNotified = new AtomicBoolean();
-    private Scope current;
+    private volatile Scope current;
     private enum Lineage { STARTUP, WORK, FAILED_ADMISSION }
     private Lineage lineage;
     private UUID session;
@@ -244,6 +244,11 @@ final class InspectScenarioHost implements Inspect {
             if (!clientThread.getAsBoolean() && !serverThread.getAsBoolean()) waitForStopping(scope);
             valid(scope); check(scope.operation() == operation && scope.kind() == kind, "Wrong bound operation/kind"); return scope;
         } finally { lock.unlock(); }
+    }
+    @Override public boolean observationScopeValid(Scope scope) {
+        return scope != null && scope == current && scope.kind() == Kind.WORK
+                && !cancelled && !stopped && !stopNotified.get()
+                && clock.getAsLong() - scope.deadlineNanos() < 0;
     }
     @Override public void inScope(Scope scope, Runnable action) { inScope(scope, () -> { action.run(); return null; }); }
     @Override public <V> V inScope(Scope scope, Supplier<V> action) {
