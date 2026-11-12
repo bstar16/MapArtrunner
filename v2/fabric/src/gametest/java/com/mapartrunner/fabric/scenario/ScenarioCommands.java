@@ -8,6 +8,7 @@ import net.minecraft.text.Text;
 import java.util.Objects;
 import java.util.concurrent.Executor;
 import java.util.function.Consumer;
+import java.util.function.LongSupplier;
 
 import static com.mapartrunner.fabric.scenario.ScenarioHost.*;
 import static net.fabricmc.fabric.api.client.command.v2.ClientCommandManager.literal;
@@ -22,6 +23,11 @@ final class ScenarioCommands {
     private Throwable terminal;
     private Operation active;
     private ScenarioRunner.InspectCompletion last;
+    private final LongSupplier clock = System::nanoTime;
+    // First intent closes admission permanently; worker settlement or the fixed cutoff releases native stop.
+    private enum Exit { OPEN, REQUESTED, RELEASE_NATIVE }
+    private Exit exit = Exit.OPEN;
+    private long exitDeadline;
 
     ScenarioCommands(Executor worker, Inspect host) {
         this.worker = Objects.requireNonNull(worker);
@@ -51,6 +57,7 @@ final class ScenarioCommands {
         }
         worker.execute(() -> {
             try {
+                synchronized (this) { if (exit != Exit.OPEN) return; }
                 var created = ScenarioRunner.inspect(host, watch);
                 synchronized (this) { runner = created; }
                 created.initializeInspectWorld(() -> receipts.inspect(created.inspectSessionId().toString()));
@@ -59,8 +66,9 @@ final class ScenarioCommands {
                 terminate(failure);
                 System.err.println("Inspect startup failed; ordinary client stop requested");
                 failure.printStackTrace(System.err);
+                synchronized (this) { exit = Exit.RELEASE_NATIVE; }
                 stop.run();
-            } finally { synchronized (this) { queued = false; } }
+            } finally { workerFinished(); }
         });
     }
 
@@ -89,7 +97,7 @@ final class ScenarioCommands {
     }
 
     private String refusal() {
-        if (terminal != null || cancelled) return "Inspect session unavailable; restart required";
+        if (exit != Exit.OPEN || terminal != null || cancelled) return "Inspect session unavailable; restart required";
         if (queued) return "Inspect is busy through cleanup; use /maparttest last";
         if (!ready) return "Inspect startup is not ready";
         return null;
@@ -97,7 +105,7 @@ final class ScenarioCommands {
 
     private void execute(Command command, Consumer<String> reply) {
         try {
-            synchronized (this) { if (cancelled || terminal != null) return; }
+            synchronized (this) { if (exit != Exit.OPEN || cancelled || terminal != null) return; }
             var operation = runner.beginInspectOperation(command);
             synchronized (this) { active = operation; }
             final Scope work;
@@ -123,7 +131,7 @@ final class ScenarioCommands {
             feedback(reply, "Inspect session unavailable; restart required: " + failure.getMessage());
         } finally {
             // A terminal failure still clears scheduling state, never the terminal admission latch or retained last.
-            synchronized (this) { queued = false; }
+            workerFinished();
         }
     }
 
@@ -146,7 +154,81 @@ final class ScenarioCommands {
                 + "; last: " + (last == null ? "none" : describe(last));
     }
 
-    synchronized boolean isReady() { return ready && !cancelled && terminal == null; }
+    synchronized boolean isReady() { return exit == Exit.OPEN && ready && !cancelled && terminal == null; }
+
+    /** Native intent only: no scope, IO, wait, interrupt or replacement worker. */
+    synchronized boolean requestStop() {
+        if (releaseNativeStop()) return false;
+        if (exit == Exit.REQUESTED) return true;
+        boolean damagedAdmission = runner != null && runner.inspectAdmissionFailure().isPresent()
+                && runner.failedInspectAdmission().isPresent();
+        if (cancelled || terminal != null && !damagedAdmission || !queued && !ready && !damagedAdmission) return false;
+        exit = Exit.REQUESTED;
+        exitDeadline = clock.getAsLong() + 10_000_000_000L;
+        if (queued) {
+            // STARTUP/WORK unwind into their original cleanup; CLEANUP retains only its remaining permission.
+            cancel(new IllegalStateException("Inspect application exit requested"));
+        } else {
+            queued = true;
+            try { worker.execute(this::closeForExit); }
+            catch (RuntimeException | Error failure) { terminate(failure); workerFinished(); }
+        }
+        return exit == Exit.REQUESTED;
+    }
+
+    synchronized boolean releaseNativeStop() {
+        if (exit == Exit.REQUESTED && clock.getAsLong() - exitDeadline >= 0) exit = Exit.RELEASE_NATIVE;
+        return exit == Exit.RELEASE_NATIVE;
+    }
+
+    private synchronized void workerFinished() {
+        queued = false;
+        if (exit == Exit.REQUESTED) exit = Exit.RELEASE_NATIVE;
+    }
+
+    private void closeForExit() {
+        boolean damagedCloseAttempted = false;
+        try {
+            synchronized (this) { if (releaseNativeStop() || cancelled) return; }
+            // Retained N1 capability is independent of mutation readiness/terminal state; Runner guards effects.
+            if (runner.inspectAdmissionFailure().isPresent() && runner.failedInspectAdmission().isPresent()) {
+                damagedCloseAttempted = true;
+                runner.close(); return;
+            }
+            var operation = runner.beginInspectOperation(Command.CLOSE);
+            synchronized (this) { active = operation; }
+            final Scope work;
+            if (releaseNativeStop()) return;
+            try { work = host.beginWork(operation); }
+            catch (RuntimeException | Error failure) { runner.failInspectAdmission(operation, failure); throw failure; }
+            if (releaseNativeStop()) return;
+            var cleanup = host.beginCleanup(work, null);
+            var completion = host.inScope(cleanup, () -> {
+                if (releaseNativeStop()) throw new ScopeTimeoutException();
+                Throwable primary = null;
+                try { runner.close(); } catch (RuntimeException | Error failure) { primary = failure; }
+                if (releaseNativeStop()) throw new ScopeTimeoutException();
+                return runner.finishInspectOperation(operation, cleanup, primary);
+            });
+            synchronized (this) {
+                if (active != operation || !completion.cleanupSettled() || completion.command() != Command.CLOSE
+                        || !completion.sessionId().equals(operation.sessionId())
+                        || !completion.operationId().equals(operation.operationId()) || completion.ordinal() != operation.ordinal())
+                    throw new IllegalStateException("Foreign/stale or unsettled inspect CLOSE completion");
+                // Expected native DISCONNECT cancels publication. Consume the settled CLOSE, retaining prior last.
+                active = null;
+            }
+        } catch (RuntimeException | Error failure) {
+            terminate(failure);
+            // CLOSE allocation/BEGIN failure has the same retained N1 authority, never a successor ordinal.
+            if (!damagedCloseAttempted && !releaseNativeStop() && runner.inspectAdmissionFailure().isPresent()
+                    && runner.failedInspectAdmission().isPresent()) {
+                try { runner.close(); }
+                catch (RuntimeException | Error cleanup) { if (cleanup != failure) failure.addSuppressed(cleanup); }
+            }
+        }
+        finally { workerFinished(); }
+    }
 
     void checkWorld(MinecraftClient client) {
         ScenarioRunner owned;

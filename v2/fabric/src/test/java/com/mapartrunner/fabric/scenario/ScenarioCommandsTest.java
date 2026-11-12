@@ -72,9 +72,13 @@ class ScenarioCommandsTest {
             for (var value : List.of("false", "1", "yes", "")) {
                 System.setProperty("mapart.test.inspect", value);
                 assertDoesNotThrow(() -> new ScenarioClientInitializer().onInitializeClient());
+                assertFalse(ScenarioClientInitializer.deferStop(null));
             }
             System.clearProperty("mapart.test.inspect");
             assertDoesNotThrow(() -> new ScenarioClientInitializer().onInitializeClient());
+            assertFalse(ScenarioClientInitializer.deferStop(null));
+            System.setProperty("mapart.test.inspect", "true");
+            assertFalse(ScenarioClientInitializer.deferStop(null), "Absent installed owner is inert");
         } finally {
             if (previous == null) System.clearProperty("mapart.test.inspect"); else System.setProperty("mapart.test.inspect", previous);
         }
@@ -175,8 +179,9 @@ class ScenarioCommandsTest {
             if (boundary.equals("post-link")) assertTrue(Files.readString(launch.resolve("inspect-op-2.begin.json")).contains("WORK"));
             var begin = launch.resolve("inspect-op-2.begin.json");
             byte[] retainedBegin = Files.exists(begin) ? Files.readAllBytes(begin) : null;
-            // Exercise the existing Runner capability only: native pre-stop integration belongs to the follow-up slice.
-            f.runner.close();
+            assertTrue(f.commands.requestStop(), "N1 survives terminal mutation admission");
+            assertTrue(f.commands.requestStop()); assertEquals(1, f.queue.size());
+            f.queue.remove().run(); assertTrue(f.commands.releaseNativeStop()); assertFalse(f.commands.requestStop());
             assertTrue(field(ScenarioRunner.class, "closed").getBoolean(f.runner));
             assertEquals(2, fieldInt(f.runner, "inspectOrdinal")); assertSame(prior, f.runner.lastInspectCompletion().orElseThrow());
             assertFalse(Files.exists(launch.resolve("inspect-op-2.cleanup.json"))); assertFalse(Files.exists(launch.resolve("inspect-op-2.end.json")));
@@ -193,6 +198,7 @@ class ScenarioCommandsTest {
         assertEquals(0, f.commands.enqueue(Command.RESET, message -> { }));
         assertEquals(1, fieldInt(f.runner, "inspectOrdinal")); assertTrue(f.queue.isEmpty());
         assertThrows(AssertionError.class, f.runner::close); assertEquals(1, fieldInt(f.runner, "inspectOrdinal"));
+        assertFalse(f.commands.requestStop()); assertTrue(f.queue.isEmpty());
     }
 
     @Test void unresolvedRunnerReleaseCannotPromoteLastOrReserveSuccessorAfterEnd() throws Exception {
@@ -230,7 +236,7 @@ class ScenarioCommandsTest {
     }
 
     @Test void nativeCancellationAndStoppingReturnWhileRealBeginPublicationStillHoldsPhaseLock() throws Exception {
-        for (boolean stopping : List.of(false, true)) {
+        for (var boundary : List.of("cancel", "stopping", "application-exit")) {
             var entered = new CountDownLatch(1); var release = new CountDownLatch(1);
             var returned = new CountDownLatch(1); var holder = new Fixture[1];
             var launch = launch();
@@ -246,8 +252,9 @@ class ScenarioCommandsTest {
             var callback = new Thread(() -> {
                 f.nativeThread.set(true);
                 try {
-                    if (stopping) f.nativeHost.onStopping(null);
-                    f.commands.cancel(original); // Same synchronous owner call as the initializer lifecycle callbacks.
+                    if (boundary.equals("stopping")) f.nativeHost.onStopping(null);
+                    if (boundary.equals("application-exit")) assertTrue(f.commands.requestStop());
+                    else f.commands.cancel(original); // Same synchronous owner call as the initializer lifecycle callbacks.
                     @SuppressWarnings("unchecked") var cause = (AtomicReference<Throwable>) field(InspectScenarioHost.class, "originalFailure").get(f.nativeHost);
                     expected.set(cause.get());
                 } catch (Throwable failure) { callbackFailure.set(failure); }
@@ -260,7 +267,8 @@ class ScenarioCommandsTest {
                 assertTrue(returned.await(2, TimeUnit.SECONDS), "Native callback blocked behind receipt publication");
                 assertEquals(1, release.getCount(), "Callback must return before the phase lock is released");
                 assertNull(callbackFailure.get()); assertNotNull(expected.get());
-                if (!stopping) assertSame(original, expected.get());
+                if (boundary.equals("cancel")) assertSame(original, expected.get());
+                if (boundary.equals("application-exit")) assertEquals("Inspect application exit requested", expected.get().getMessage());
                 assertFalse(f.commands.isReady());
             } finally {
                 release.countDown(); worker.join(5000); callback.join(5000);
@@ -280,9 +288,192 @@ class ScenarioCommandsTest {
         commands.initialize(new ScenarioObserver.Watch(), new ScenarioLaunchReceipt(null, null), stops::incrementAndGet);
         assertEquals(1, queue.size()); assertFalse(commands.isReady()); assertEquals(0, stops.get());
         // Unit launcher has no inspect game root: real factory refuses before any native world action.
-        queue.remove().run(); assertEquals(1, stops.get()); assertFalse(commands.isReady());
+        var diagnostic = new java.io.ByteArrayOutputStream(); var previous = System.err;
+        try {
+            System.setErr(new java.io.PrintStream(diagnostic)); queue.remove().run();
+        } finally { System.setErr(previous); }
+        assertTrue(diagnostic.toString(java.nio.charset.StandardCharsets.UTF_8)
+                .contains("Inspect startup failed; ordinary client stop requested"));
+        assertTrue(diagnostic.toString(java.nio.charset.StandardCharsets.UTF_8).contains("Cannot establish loaded-module authority"));
+        assertEquals(1, stops.get()); assertFalse(commands.isReady());
+        assertFalse(commands.requestStop(), "Failure's native stop must pass through without recursive CLOSE");
         assertEquals(0, commands.enqueue(Command.RUN, message -> { }));
         assertThrows(IllegalStateException.class, () -> commands.initialize(new ScenarioObserver.Watch(), null, () -> { }));
+    }
+
+    @Test void firstExitClosesAdmissionAndRepeatedRequestsNeverRenewOrQueueAnotherClose() throws Exception {
+        var f = fixture(null, null); var now = new AtomicLong(1);
+        set(f.commands, "clock", (LongSupplier) now::get);
+        assertTrue(f.commands.requestStop()); assertEquals(1, f.queue.size());
+        assertEquals(0, f.commands.enqueue(Command.RUN, message -> { }));
+        now.set(9_000_000_001L); assertTrue(f.commands.requestStop()); assertEquals(1, f.queue.size());
+        now.set(10_000_000_001L); assertTrue(f.commands.releaseNativeStop());
+        assertFalse(f.commands.requestStop()); f.queue.remove().run();
+        assertEquals(0, fieldInt(f.runner, "inspectOrdinal"), "Cutoff cannot allocate late CLOSE permission");
+        assertTrue(f.outcomes.isEmpty()); assertEquals(0, f.nativeEffects.get());
+    }
+
+    @Test void cutoffDuringCloseAllocationRetainsIncompleteTruthWithoutIssuingLateWork() throws Exception {
+        var now = new AtomicLong(1);
+        var f = fixture(null, null, operation -> {
+            if (operation.command() == Command.CLOSE) now.set(10_000_000_001L);
+        }); set(f.commands, "clock", (LongSupplier) now::get);
+        f.commands.enqueue(Command.RUN, message -> { }); f.queue.remove().run();
+        var prior = f.runner.lastInspectCompletion().orElseThrow();
+        assertTrue(f.commands.requestStop()); f.queue.remove().run();
+        var pending = (Operation) field(ScenarioRunner.class, "inspectOperation").get(f.runner);
+        assertEquals(Command.CLOSE, pending.command()); assertEquals(2, pending.ordinal());
+        var header = pending.evidenceDirectory().resolve("operation.json"); var bytes = Files.readAllBytes(header);
+        assertFalse(Files.exists(pending.evidenceDirectory().resolve("completion.json")));
+        assertNull(field(InspectScenarioHost.class, "current").get(f.nativeHost));
+        assertSame(prior, f.runner.lastInspectCompletion().orElseThrow()); assertEquals(1, f.outcomes.size());
+        assertTrue(f.commands.releaseNativeStop()); assertFalse(f.commands.requestStop()); assertTrue(f.queue.isEmpty());
+        assertArrayEquals(bytes, Files.readAllBytes(header)); assertEquals(0, f.nativeEffects.get());
+    }
+
+    @Test void idleExitUsesActualCloseScopeAndSettlesWhileDisconnectRetainsPublishedLast() throws Exception {
+        var holder = new Fixture[1];
+        var f = fixture(null, outcome -> {
+            if (outcome.operation().command() == Command.CLOSE) {
+                assertTrue(holder[0].commands.requestStop(), "Reentrant native intent stays deferred through END");
+                holder[0].commands.cancel(new IllegalStateException("Inspect connection disconnected; restart required"));
+            }
+        }); holder[0] = f;
+        f.commands.enqueue(Command.RUN, message -> { }); f.queue.remove().run();
+        var prior = f.runner.lastInspectCompletion().orElseThrow();
+        assertTrue(f.commands.requestStop()); f.queue.remove().run();
+        var close = f.runner.lastInspectCompletion().orElseThrow();
+        assertEquals(Command.CLOSE, close.command()); assertTrue(close.cleanupSettled()); assertEquals("PASS", close.verdict());
+        assertTrue(Files.exists(close.summaryPath())); assertTrue(field(ScenarioRunner.class, "closed").getBoolean(f.runner));
+        assertEquals(2, f.outcomes.size()); assertTrue(f.commands.lastDescription().contains(prior.operationId().toString()));
+        assertFalse(f.commands.lastDescription().contains(close.operationId().toString()));
+        assertTrue(f.commands.releaseNativeStop()); assertFalse(f.commands.requestStop()); assertTrue(f.queue.isEmpty());
+    }
+
+    @Test void exitCancelsQueuedWorkWithoutReservingSuccessorClose() throws Exception {
+        var f = fixture(null, null); f.commands.enqueue(Command.RUN, message -> { });
+        assertTrue(f.commands.requestStop()); assertEquals(1, f.queue.size());
+        f.queue.remove().run(); assertTrue(f.commands.releaseNativeStop());
+        assertEquals(0, fieldInt(f.runner, "inspectOrdinal")); assertTrue(f.outcomes.isEmpty());
+        assertEquals(0, f.commands.enqueue(Command.RUN, message -> { }));
+    }
+
+    @Test void pendingWorkExitUnwindsItsOriginalCleanupAndRetainsPriorLastAndCause() throws Exception {
+        var holder = new Fixture[1]; var stopInWork = new AtomicBoolean();
+        var f = fixture(null, null, operation -> { }, false, scope -> {
+            if (stopInWork.get()) {
+                assertTrue(holder[0].commands.requestStop());
+                assertTrue(holder[0].commands.requestStop());
+            }
+        }); holder[0] = f;
+        f.commands.enqueue(Command.RUN, message -> { }); f.queue.remove().run();
+        var prior = f.runner.lastInspectCompletion().orElseThrow(); stopInWork.set(true);
+        f.commands.enqueue(Command.RESET, message -> { }); f.queue.remove().run();
+        var cancelled = f.runner.lastInspectCompletion().orElseThrow();
+        assertEquals(Command.RESET, cancelled.command()); assertTrue(cancelled.cleanupSettled());
+        assertEquals("Inspect application exit requested", cancelled.failure().getMessage());
+        assertTrue(f.commands.lastDescription().contains(prior.operationId().toString()));
+        assertSame(prior, field(ScenarioCommands.class, "last").get(f.commands));
+        assertTrue(f.commands.releaseNativeStop()); assertEquals(2, fieldInt(f.runner, "inspectOrdinal"));
+        assertEquals(2, f.outcomes.size()); assertTrue(f.queue.isEmpty()); assertEquals(0, f.nativeEffects.get());
+    }
+
+    @Test void exitDuringIssuedCleanupRetainsOriginalFailureAndDoesNotStartAnotherClose() throws Exception {
+        var holder = new Fixture[1]; var original = new AtomicReference<Throwable>();
+        var f = fixture(null, outcome -> {
+            if (outcome.operation().ordinal() != 2) return;
+            var current = assertDoesNotThrow(() -> (Scope) field(InspectScenarioHost.class, "current").get(holder[0].nativeHost));
+            assertEquals(Kind.CLEANUP, current.kind());
+            @SuppressWarnings("unchecked") var cause = assertDoesNotThrow(() -> (AtomicReference<Throwable>)
+                    field(InspectScenarioHost.class, "originalFailure").get(holder[0].nativeHost));
+            original.set(cause.get());
+            assertTrue(holder[0].commands.requestStop()); assertSame(original.get(), cause.get());
+        }); holder[0] = f;
+        f.commands.enqueue(Command.RUN, message -> { }); f.queue.remove().run();
+        var prior = f.runner.lastInspectCompletion().orElseThrow();
+        f.commands.enqueue(Command.RESET, message -> { }); f.queue.remove().run();
+        assertSame(original.get(), f.runner.lastInspectCompletion().orElseThrow().failure());
+        assertTrue(f.commands.lastDescription().contains(prior.operationId().toString()));
+        assertEquals(2, fieldInt(f.runner, "inspectOrdinal")); assertTrue(f.queue.isEmpty());
+        assertTrue(f.commands.releaseNativeStop()); assertEquals(0, f.nativeEffects.get());
+    }
+
+    @Test void pendingStartupExitUsesOriginalStartupCleanupWithoutN1OrOrdinaryLast() throws Exception {
+        var f = fixture(null, null);
+        invoke(f.runner, "reserveInspectStartup", new Class<?>[]{});
+        set(f.commands, "ready", false); set(f.commands, "queued", true);
+        Runnable startup = () -> {
+            assertTrue(f.commands.requestStop()); f.nativeHost.waitTick();
+        };
+        var failure = assertThrows(IllegalStateException.class, () -> invoke(f.runner, "initializeInspectStartup",
+                new Class<?>[]{Runnable.class}, startup));
+        invoke(f.commands, "workerFinished", new Class<?>[]{});
+        assertEquals("Inspect application exit requested", failure.getMessage());
+        assertTrue(f.runner.inspectAdmissionFailure().isEmpty()); assertTrue(f.runner.failedInspectAdmission().isEmpty());
+        assertNull(field(InspectScenarioHost.class, "current").get(f.nativeHost));
+        assertTrue(f.runner.lastInspectCompletion().isEmpty()); assertTrue(f.outcomes.isEmpty());
+        assertEquals(0, fieldInt(f.runner, "inspectOrdinal")); assertTrue(f.commands.releaseNativeStop());
+        assertFalse(f.commands.requestStop()); assertTrue(f.queue.isEmpty()); assertEquals(0, f.nativeEffects.get());
+    }
+
+    @Test void damagedCloseAdmissionUsesN1OnceWithoutRepairingItsPhaseStream() throws Exception {
+        var f = fixture(null, null, operation -> {
+            if (operation.command() == Command.CLOSE)
+                assertDoesNotThrow(() -> Files.writeString(operation.evidenceDirectory().resolve("operation.json"), "collision"));
+        });
+        f.commands.enqueue(Command.RUN, message -> { }); f.queue.remove().run();
+        var prior = f.runner.lastInspectCompletion().orElseThrow();
+        assertTrue(f.commands.requestStop()); f.queue.remove().run();
+        assertTrue(f.runner.inspectAdmissionFailure().isPresent()); assertEquals(2, fieldInt(f.runner, "inspectOrdinal"));
+        assertTrue(field(ScenarioRunner.class, "closed").getBoolean(f.runner));
+        assertTrue(field(InspectScenarioHost.class, "shutdownIssued").getBoolean(f.nativeHost));
+        assertSame(prior, f.runner.lastInspectCompletion().orElseThrow()); assertEquals(1, f.outcomes.size());
+        assertTrue(f.commands.releaseNativeStop()); assertFalse(f.commands.requestStop()); assertTrue(f.queue.isEmpty());
+    }
+
+    @Test void pendingNativeActionIsRefusedAfterExitCancellationAndNativeStopping() throws Exception {
+        var holder = new Fixture[1]; var nativeQueue = new LinkedBlockingQueue<Runnable>(); var effects = new AtomicInteger();
+        var f = fixture(null, null, operation -> { }, false,
+                scope -> holder[0].nativeHost.runOnClient(client -> effects.incrementAndGet()), nativeQueue::add);
+        holder[0] = f;
+        f.commands.enqueue(Command.RUN, message -> { }); var worker = new Thread(f.queue.remove(), "inspect-late-action-test");
+        try {
+            worker.start(); var late = nativeQueue.poll(2, TimeUnit.SECONDS); assertNotNull(late);
+            assertTrue(f.commands.requestStop());
+            worker.join(5000); assertFalse(worker.isAlive()); assertTrue(f.commands.releaseNativeStop());
+            f.nativeThread.set(true);
+            try { f.nativeHost.onStopping(null); late.run(); }
+            finally { f.nativeThread.remove(); }
+            assertEquals(0, effects.get()); assertEquals(1, fieldInt(f.runner, "inspectOrdinal"));
+            assertEquals("Inspect application exit requested", f.runner.lastInspectCompletion().orElseThrow().failure().getMessage());
+            assertFalse(f.commands.requestStop()); assertTrue(f.queue.isEmpty());
+        } finally {
+            f.commands.cancel(new IllegalStateException("test finally")); worker.join(5000); assertFalse(worker.isAlive());
+        }
+    }
+
+    @Test void retainedN1CannotRenewIssuedExpiredOrSettledCleanup() throws Exception {
+        for (var state : List.of("issued", "expired", "settled", "stopped")) {
+            var f = fixture(null, null, operation -> {
+                assertDoesNotThrow(() -> Files.writeString(operation.evidenceDirectory().resolve("operation.json"), "collision"));
+            });
+            f.commands.enqueue(Command.RUN, message -> { }); f.queue.remove().run();
+            var failed = f.runner.failedInspectAdmission().orElseThrow();
+            var now = new AtomicLong(1); set(f.nativeHost, "clock", (LongSupplier) now::get);
+            var cleanup = f.nativeHost.beginShutdownCleanup(failed, f.runner.inspectAdmissionFailure().orElseThrow());
+            if (state.equals("expired")) now.set(cleanup.deadlineNanos());
+            if (state.equals("settled")) f.nativeHost.inScope(cleanup, () -> f.nativeHost.settleCleanup(cleanup,
+                    new FinalOutcome(failed, Verdict.FAILURE, CleanupStatus.SETTLED)));
+            if (state.equals("stopped")) {
+                f.nativeThread.set(true); try { f.nativeHost.onStopping(null); } finally { f.nativeThread.remove(); }
+            }
+            var current = field(InspectScenarioHost.class, "current").get(f.nativeHost);
+            assertTrue(f.commands.requestStop()); f.queue.remove().run();
+            assertSame(current, field(InspectScenarioHost.class, "current").get(f.nativeHost));
+            assertEquals(1, fieldInt(f.runner, "inspectOrdinal")); assertTrue(f.outcomes.isEmpty());
+            assertTrue(f.commands.releaseNativeStop()); assertFalse(f.commands.requestStop());
+            assertEquals(0, f.nativeEffects.get()); assertTrue(f.queue.isEmpty());
+        }
     }
 
     private Fixture fixture(ScenarioLaunchReceipt receipts, Consumer<FinalOutcome> observe) throws Exception {
@@ -293,16 +484,27 @@ class ScenarioCommandsTest {
     }
     private Fixture fixture(ScenarioLaunchReceipt receipts, Consumer<FinalOutcome> observe, Consumer<Operation> header,
                             boolean failRelease) throws Exception {
+        return fixture(receipts, observe, header, failRelease, scope -> { });
+    }
+    private Fixture fixture(ScenarioLaunchReceipt receipts, Consumer<FinalOutcome> observe, Consumer<Operation> header,
+                            boolean failRelease, Consumer<Scope> onNeutral) throws Exception {
+        return fixture(receipts, observe, header, failRelease, onNeutral,
+                action -> fail("No native client action in lifecycle fixture"));
+    }
+    private Fixture fixture(ScenarioLaunchReceipt receipts, Consumer<FinalOutcome> observe, Consumer<Operation> header,
+                            boolean failRelease, Consumer<Scope> onNeutral, Consumer<Runnable> clientQueue) throws Exception {
         var outcomes = new ArrayList<FinalOutcome>(); var neutral = new ArrayList<Scope>();
         var nativeThread = ThreadLocal.withInitial(() -> false); var nativeEffects = new AtomicInteger();
         var nativeHost = new InspectScenarioHost(() -> 1L, nativeThread::get, () -> false,
-                action -> { nativeEffects.incrementAndGet(); fail("No native client action in lifecycle fixture"); },
+                action -> { nativeEffects.incrementAndGet(); clientQueue.accept(action); },
                 action -> { nativeEffects.incrementAndGet(); fail("No native server action in lifecycle fixture"); },
                 outcome -> { outcomes.add(outcome); if (observe != null) observe.accept(outcome); }, receipts, Instant::now);
         // Only native chat observation is substituted. All scope/evidence/admission/settlement owners are real.
         var host = (Inspect) Proxy.newProxyInstance(Inspect.class.getClassLoader(), new Class<?>[]{Inspect.class}, (proxy, method, arguments) -> {
             if (method.getName().equals("awaitNeutralChat")) {
-                var op = ((Scope) field(InspectScenarioHost.class, "current").get(nativeHost)).operation();
+                var current = (Scope) field(InspectScenarioHost.class, "current").get(nativeHost);
+                onNeutral.accept(current);
+                var op = current.operation();
                 neutral.add(nativeHost.requireScope(op, Kind.WORK)); return null;
             }
             try { return method.invoke(nativeHost, arguments); }

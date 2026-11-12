@@ -14,6 +14,14 @@ import java.util.concurrent.atomic.AtomicBoolean;
 /** Ordinary inspect bootstrap. Deliberately unregistered until the launcher/metadata slice. */
 public final class ScenarioClientInitializer implements ClientModInitializer {
     private static final AtomicBoolean installed = new AtomicBoolean();
+    private static MinecraftClient inspectClient;
+    private static volatile ScenarioCommands inspectCommands;
+
+    public static boolean deferStop(MinecraftClient client) {
+        var owner = inspectCommands;
+        return Boolean.getBoolean("mapart.test.inspect") && owner != null && client != null && client == inspectClient
+                && client.isOnThread() && client.isRunning() && owner.requestStop();
+    }
 
     @Override public void onInitializeClient() {
         if (!Boolean.getBoolean("mapart.test.inspect")) return;
@@ -24,9 +32,14 @@ public final class ScenarioClientInitializer implements ClientModInitializer {
             var thread = new Thread(action, "mapart-inspect-worker"); thread.setDaemon(true); return thread;
         });
         var commands = new ScenarioCommands(worker, host);
+        inspectClient = client;
+        inspectCommands = commands;
         var watch = ScenarioObserver.install(client);
         ClientCommandRegistrationCallback.EVENT.register((dispatcher, access) -> commands.register(dispatcher));
-        ClientTickEvents.END_CLIENT_TICK.register(current -> { host.onTick(); commands.checkWorld(current); });
+        ClientTickEvents.END_CLIENT_TICK.register(current -> {
+            host.onTick(); commands.checkWorld(current);
+            if (commands.releaseNativeStop()) current.scheduleStop();
+        });
         ClientWorldEvents.AFTER_CLIENT_WORLD_CHANGE.register((current, world) -> commands.checkWorld(current));
         ClientPlayConnectionEvents.DISCONNECT.register((handler, current) ->
                 commands.cancel(new IllegalStateException("Inspect connection disconnected; restart required")));
