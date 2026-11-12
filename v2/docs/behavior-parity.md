@@ -124,7 +124,7 @@ All six cases are **CORRECT â€” pending**, source-verified assessment findi
 | Feature | Status / decision | Reference |
 |---|---|---|
 | Experimental Elytra flight/sweep, new flight/staircasing | **DEFERRED â€” owner decision:** grounded-first design. Keep v1 source/tests available; no flight changes or production promise in initial v2. This does not defer manual air place, torch grid or timer. | [design scope](../../docs/superpowers/specs/2026-10-28-v2-reliability-design.md#goals-and-limits), [flight controller](../../src/main/java/com/example/mapart/plan/sweep/flight/ElytraFlightController.java), [flight tests](../../src/test/java/com/example/mapart/plan/sweep/flight/ElytraFlightControllerTest.java), [older sweep](../../src/main/java/com/example/mapart/plan/sweep/SingleLaneSweepDebugRunner.java) |
-| Executable Minecraft 1.12.2 port and loader/runtime choice | **DEFERRED â€” owner decision:** later adapter target, after reliable 1.21.11 and tested boundaries. | [design port decision](../../docs/superpowers/specs/2026-10-28-v2-reliability-design.md#later-1122-port) |
+| Executable Minecraft 1.12.2 port and loader/runtime choice | **DEFERRED â€” owner decision:** No executable port work or loader/runtime choice in v2. Stop after verified v2 completion; a later port requires separate explicit owner authorization. | [design port decision](../../docs/superpowers/specs/2026-10-28-v2-reliability-design.md#later-1122-port) |
 
 No other helper/alias/settings omission is approved. Features not yet implemented remain pending preservation requirements. Unregistered internal classes/test helpers are reference material, not new public commands; do not remove v1 implementations under this task.
 

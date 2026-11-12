@@ -9,6 +9,7 @@ These rules apply to the separate `v2/` implementation and shared infrastructure
 - Use two production modules, `core` and `fabric`, with packages `com.mapartrunner.core` and `com.mapartrunner.fabric`. No general plugin framework or event bus. Artifact: `mapartrunner-v2`; public namespace: `/mapart`; mod ID: `mapart`.
 - V1 and v2 must use separate game directories and must never load together. Development game directories belong under `v2/fabric/build/run/`; retained automated evidence belongs under `v2/fabric/build/scenario-results/`.
 - Preserve working behavior, helpers, settings, aliases, keybindings and overlays before replacing v1. Omissions need an explicit owner decision recorded in the parity contract. Experimental flight/staircasing and the executable 1.12.2 port are deferred. Do not choose the legacy loader/runtime, downgrade Java, or promise shared compiled binaries now.
+- Stop after the approved v2 scope is complete and verified. Do not begin the Minecraft 1.12.2 port unless the owner explicitly authorizes it as separate work.
 
 ## Ownership and dependency boundaries
 
