@@ -68,7 +68,167 @@ public final class PredictionFaults {
     private static final List<IncomingState> incomingStates=new ArrayList<>();
     private static ImportEvent importEvent;
 
+    // Client-thread owner: capture identity only during the existing adapter callback. No registry/authority API.
+    private static FabricBuildAdapter enteringAdapter, supportAdapter;
+    private static ExpiryHold expiry;
+
     private PredictionFaults() { }
+
+    /** Reference-bearing facts are private to the finite owner, never exported as observations. */
+    record ExpiryFrame(Object adapter,Object client,Object server,String save,ScenarioObserver.ClientBinding binding,
+                       RunLifecycle.Snapshot lifecycle,BuildEngine.ControlOwner owner,List<Boolean> keys,
+                       SupportPose pose,boolean suspended,long nanos) {
+        ExpiryFrame { keys=List.copyOf(keys); }
+        boolean sameNative(ExpiryFrame other) {
+            return adapter==other.adapter && client==other.client && server==other.server && save.equals(other.save)
+                    && binding.matches(other.binding);
+        }
+        boolean neutralNative() { return lifecycle.phase()==Phase.RUNNING && owner==BuildEngine.ControlOwner.NATIVE && allReleased(keys); }
+    }
+    record ExpiryIdentity(UUID arm,RunLifecycle.Context context,long workDeadlineNanos,int adapterIdentity) { }
+    record ExpiryObservation(long nanos,RunLifecycle.Snapshot lifecycle,BuildEngine.ControlOwner owner,List<Boolean> keys,
+                             SupportPose pose,boolean sameNative,boolean suspended) {
+        ExpiryObservation { keys=List.copyOf(keys); }
+    }
+    record ExpirySnapshot(ExpiryIdentity identity,boolean disposed,Optional<String> invalidity,long samples,
+                          ExpiryObservation first,ExpiryObservation latest) { }
+
+    /** Only suppression lifetime lives here: old fault expiry/clear and Host wrapper retirement cannot release it. */
+    static final class ExpiryHold {
+        private ExpiryFrame nativeFrame;
+        private final ExpiryIdentity identity;
+        private ExpiryObservation first,latest;
+        private long samples;
+        private String invalidity;
+        ExpiryHold(ExpiryFrame frame,long deadline) {
+            if(!frame.neutralNative() || frame.suspended() || !frame.binding().matches(frame.binding())
+                    || frame.adapter()==null || frame.client()==null || frame.server()==null || deadline<=frame.nanos())
+                throw new IllegalStateException("Refused expiry native neutral running frame/deadline");
+            identity=new ExpiryIdentity(UUID.randomUUID(),frame.lifecycle().context().orElseThrow(),deadline,System.identityHashCode(frame.adapter()));
+            nativeFrame=frame;
+            observe(frame,true);
+        }
+        ExpiryIdentity identity() { return identity; }
+        boolean retainsNativeReferences() { return nativeFrame!=null; }
+        private void invalid(String reason) { if(invalidity==null) invalidity=reason; }
+        private void observe(ExpiryFrame frame,boolean same) {
+            latest=new ExpiryObservation(frame.nanos(),frame.lifecycle(),frame.owner(),frame.keys(),frame.pose(),same,frame.suspended());
+            if(first==null) first=latest;
+            if(samples<Long.MAX_VALUE) samples++;
+        }
+        boolean defer(ExpiryFrame frame,boolean enabled) {
+            var owned=nativeFrame;
+            if(owned==null || frame.adapter()!=owned.adapter()) return false;
+            boolean same=owned.sameNative(frame);
+            observe(frame,same);
+            if(!enabled) invalid("Acceptance gate disabled");
+            else if(frame.nanos()>=identity.workDeadlineNanos()) invalid("Original WORK expired");
+            if(!frame.lifecycle().context().filter(identity.context()::equals).isPresent()) {
+                invalid("Adapter run replaced");
+                nativeFrame=null; // Adapter start requires the old run inactive: never suppress the successor.
+                return false;
+            }
+            if(frame.lifecycle().phase()==Phase.TERMINAL && frame.owner()==BuildEngine.ControlOwner.NONE && allReleased(frame.keys())) {
+                nativeFrame=null; // Actual terminal release precedes disposal of all captured native references.
+                return false;
+            }
+            if(!same || frame.suspended() || frame.lifecycle().phase()!=Phase.RUNNING) {
+                invalid("Native binding or suspension changed");
+                return false; // Preserve adapter checkLive/pause/terminate; never hide lifecycle guards at HEAD.
+            }
+            if(!frame.neutralNative()) invalid("Native ownership or neutral keys lost");
+            return true; // Expiry/flag disable/invalidity NEVER permits old capture/core/effects to resume.
+        }
+        boolean retire(ExpiryIdentity issued,ExpiryFrame frame) {
+            if(issued!=identity) throw new IllegalStateException("Refused foreign expiry retirement");
+            if(nativeFrame==null) return false;
+            if(frame.adapter()!=nativeFrame.adapter() || !frame.lifecycle().context().filter(identity.context()::equals).isPresent()
+                    || frame.lifecycle().phase()!=Phase.TERMINAL || frame.owner()!=BuildEngine.ControlOwner.NONE || !allReleased(frame.keys()))
+                throw new IllegalStateException("Expiry retirement requires actual owned terminal release");
+            observe(frame,nativeFrame.sameNative(frame));
+            nativeFrame=null;
+            return true;
+        }
+        ExpirySnapshot snapshot() { return new ExpirySnapshot(identity,nativeFrame==null,Optional.ofNullable(invalidity),samples,first,latest); }
+    }
+
+    static boolean expiryEnabled(String inspect,String acceptance,String automatic,String selected) {
+        return Boolean.parseBoolean(inspect) && Boolean.parseBoolean(acceptance) && automatic==null && "work-expiry".equals(selected);
+    }
+    private static boolean expiryEnabled() {
+        return expiryEnabled(System.getProperty("mapart.test.inspect"),System.getProperty("mapart.test.inspect.acceptance"),
+                System.getProperty("fabric.client.gametest"),System.getProperty("mapart.test.inspect.acceptance.case"));
+    }
+    private static ExpiryFrame expiryFrame(MinecraftClient client,FabricBuildAdapter adapter) {
+        var handler=client.getNetworkHandler(); var world=client.world; var player=client.player; var server=client.getServer();
+        var binding=new ScenarioObserver.ClientBinding(world,player,handler,handler==null?null:handler.getConnection(),
+                player==null?null:player.getUuid(),world==null?"":world.getRegistryKey().getValue().toString(),client.isOnThread(),
+                handler!=null && handler.getConnection().isOpen(),handler!=null && handler.getWorld()==world && player!=null && player.getEntityWorld()==world);
+        var status=adapter.status();
+        return new ExpiryFrame(adapter,client,server,server==null?"":server.getSavePath(WorldSavePath.ROOT).toAbsolutePath().normalize().toString(),
+                binding,status.engine().lifecycle(),status.controlOwner(),keys(client),player==null || world==null?null:SupportPose.of(pose(client)),
+                client.isPaused() || client.currentScreen!=null,System.nanoTime());
+    }
+    /** Existing mixin HEAD only; other native/Host/Watch callbacks remain independently scheduled. */
+    public static boolean deferAdapterTick(FabricBuildAdapter adapter) {
+        enteringAdapter=null;
+        if(expiry!=null && expiry.retainsNativeReferences() && expiry.nativeFrame.adapter()==adapter) {
+            var client=MinecraftClient.getInstance(); requireThread(client);
+            if(expiry.defer(expiryFrame(client,adapter),expiryEnabled())) return true;
+        }
+        if(scope!=null && scope.mode()==Mode.SUPPORT_AVAILABILITY) {
+            requireThread(scope.client());
+            enteringAdapter=adapter;
+        }
+        return false;
+    }
+    public static void afterAdapterTick(FabricBuildAdapter adapter) {
+        if(enteringAdapter==adapter) enteringAdapter=null;
+        if(expiry!=null && expiry.retainsNativeReferences() && expiry.nativeFrame.adapter()==adapter) {
+            var client=MinecraftClient.getInstance(); requireThread(client);
+            expiry.defer(expiryFrame(client,adapter),expiryEnabled()); // Observe tick-detected cleanup; no second adapter tick.
+        }
+    }
+    /** B must authenticate its actual Runner operation/original WORK before this client-thread handoff. */
+    static ExpiryIdentity latchExpiryHold(MinecraftClient client,MinecraftServer server,Path save,UUID runId,
+            ScenarioObserver.Sample heldEnd,long originalWorkDeadlineNanos) {
+        requireThread(client);
+        if(supportAdapter==null || scope==null || scope.mode()!=Mode.SUPPORT_AVAILABILITY)
+            throw new IllegalStateException("Refused expiry missing active support adapter");
+        var adapter=supportAdapter;
+        if(!adapter.status().equals(MapArtClient.status())) throw new IllegalStateException("Refused foreign adapter status");
+        var next=prepareExpiryHold(expiry,expiryFrame(client,adapter),originalWorkDeadlineNanos,support,heldEnd,
+                scope.support().watch().copy(),MapArtClient.status(),pose(client),keys(client),expiryEnabled());
+        // Existing release authenticates the retained END, SOUTH support/READY evidence and every native identity.
+        // It has no key/lease mutation or callback; consume it and publish suppression in this single client callback.
+        releaseSupportAvailability(client,server,save,runId,heldEnd);
+        expiry=next;
+        supportAdapter=null;
+        return next.identity();
+    }
+    static ExpiryHold prepareExpiryHold(ExpiryHold prior,ExpiryFrame frame,long deadline,SupportAvailabilitySnapshot gate,
+            ScenarioObserver.Sample held,List<ScenarioObserver.Sample> retained,FabricBuildAdapter.Status status,Pose pose,List<Boolean> keys,boolean enabled) {
+        var run=frame.lifecycle().context().orElseThrow();
+        if(!enabled || prior!=null && (prior.retainsNativeReferences() || prior.identity().context().runId().equals(run.runId()))
+                || !frame.lifecycle().equals(status.engine().lifecycle()) || frame.owner()!=status.controlOwner()
+                || !frame.keys().equals(keys) || !Objects.equals(frame.pose(),SupportPose.of(pose))
+                || !supportHold(gate,held,retained,status,pose,keys))
+            throw new IllegalStateException("Refused expiry gate/duplicate/nonretained native support hold");
+        return new ExpiryHold(frame,deadline);
+    }
+
+    static ExpirySnapshot observeExpiryHold(MinecraftClient client,ExpiryIdentity issued) {
+        requireThread(client);
+        if(expiry==null || issued!=expiry.identity()) throw new IllegalStateException("Refused foreign expiry observation");
+        if(expiry.retainsNativeReferences()) expiry.defer(expiryFrame(client,(FabricBuildAdapter)expiry.nativeFrame.adapter()),expiryEnabled());
+        return expiry.snapshot();
+    }
+    static boolean retireExpiryHold(MinecraftClient client,ExpiryIdentity issued) {
+        requireThread(client);
+        if(expiry==null || issued!=expiry.identity()) throw new IllegalStateException("Refused foreign expiry retirement");
+        if(!expiry.retainsNativeReferences()) return false;
+        return expiry.retire(issued,expiryFrame(client,(FabricBuildAdapter)expiry.nativeFrame.adapter()));
+    }
 
     record Response(UUID runId, String save, int serverIdentity, int worldIdentity, int handlerIdentity,
                     int connectionIdentity, int sequence, int playerAge, long eligibleTick) { }
@@ -168,6 +328,7 @@ public final class PredictionFaults {
         if(mode==Mode.SUPPORT_AVAILABILITY) {
             targetId=armed.identity().targetId(); fingerprint=plan.fingerprint();
         }
+        supportAdapter=null; // A new support fault must earn its adapter identity again inside capture.
         var next=new Scope(client,ownedServer,client.world,client.player,client.world.getRegistryKey().getValue().toString(),
                 handler,handler.getConnection(),runId,save,client.player.age,mode,fingerprint,targetId,live);
         responses.clear();
@@ -233,6 +394,7 @@ public final class PredictionFaults {
         check(client);
         requireSupportBarrier(support,run.runId());
         try {
+            if(enteringAdapter!=null && enteringAdapter.status().equals(MapArtClient.status())) supportAdapter=enteringAdapter;
             var result=filterSupportMap(original,plan,owned.targetId());
             if(support.captures()>=WINDOW*10) throw new IllegalStateException("Support capture event bound exceeded");
             var capture=new SupportCapture(run,owned.targetId(),original.get(owned.targetId()),result.get(owned.targetId()),
@@ -295,13 +457,19 @@ public final class PredictionFaults {
         requireSupportArguments(client,owned.support().plan(),MapArtClient.status().engine().lifecycle().context().orElseThrow(),
                 owned.support().settings(),owned);
         var samples=owned.support().watch().copy();
-        if(!supportHold(support,heldEnd,samples,MapArtClient.status(),pose(client),keys(client)))
-            throw new IllegalStateException("Refused premature/stale/nonretained support release");
+        var released=releaseSupportEvidence(support,heldEnd,samples,MapArtClient.status(),pose(client),keys(client));
         check(client);
         requireSupportBarrier(support,runId);
-        support=finishSupport(support,SupportState.RELEASED,Optional.of(heldEnd.line()));
+        support=released;
+        supportAdapter=null;
         scope=null; // Publish consumed immutable evidence before dropping the sole live native/Watch owner.
         return support;
+    }
+
+    static SupportAvailabilitySnapshot releaseSupportEvidence(SupportAvailabilitySnapshot gate,ScenarioObserver.Sample held,
+            List<ScenarioObserver.Sample> samples,FabricBuildAdapter.Status status,Pose pose,List<Boolean> keys) {
+        if(!supportHold(gate,held,samples,status,pose,keys)) throw new IllegalStateException("Refused premature/stale/nonretained support release");
+        return finishSupport(gate,SupportState.RELEASED,Optional.of(held.line()));
     }
 
     static Optional<ScenarioObserver.Sample> supportHold(MinecraftClient client,UUID runId) {
@@ -380,6 +548,7 @@ public final class PredictionFaults {
             failure=retireSupportFailure(gate,failure);
         } else if(gate.state()==SupportState.ARMED) support=finishSupport(gate,SupportState.CANCELLED,gate.heldEnd());
         scope=null;
+        supportAdapter=null; enteringAdapter=null;
     }
 
     private static void requireSupportClose(SupportAvailabilitySnapshot gate,SupportArmIdentity issued,UUID requested,
@@ -700,6 +869,7 @@ public final class PredictionFaults {
         }
         if(support!=null && support.state()==SupportState.FAILED && !support.cleanupAcknowledged())
             throw new IllegalStateException(support.firstCause().orElseThrow());
+        supportAdapter=null; enteringAdapter=null; // Independent expiry suppression deliberately survives this old-fault clear.
         scope=null; // Invalidate before disposing native owners; immutable response evidence survives cleanup.
         stateStage=StateStage.INACTIVE;
     }
@@ -756,6 +926,7 @@ public final class PredictionFaults {
     }
 
     private static void fail(String detail) {
+        supportAdapter=null; enteringAdapter=null; // Failed old faults retain only detached evidence, never the independent expiry owner.
         if(scope!=null && scope.mode()==Mode.SUPPORT_AVAILABILITY) {
             support=failedSupport(support,detail,failure==null); // First cause/barrier precede disposal on EVERY shared failure route.
             if(failure==null) failure=support.firstCause().orElseThrow();
