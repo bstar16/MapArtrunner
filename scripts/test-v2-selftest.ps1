@@ -821,6 +821,217 @@ Write-Output ('TRANSPORT='+(@{support=$env:MAPART_TWO_LANE_SUPPORT_CASE;launchId
         Assert ($request.Request.ChildEnvironment.MAPART_TEST_LAUNCH_ID -ceq $success.LaunchId -and $request.Request.ChildEnvironment.MAPART_TEST_LAUNCH_DIR -ceq $success.Evidence) 'final child challenge absent from request'
         Assert ($overall.LaunchId -cne $success.LaunchId) 'launch challenge reused'
     }
+    Run 'inspect phase reader enforces exact clocks schema identity paths and original age' {
+        Assert ([bool](Get-Command Read-V2InspectOperationReceipt -ErrorAction SilentlyContinue)) 'inspect phase reader is missing'
+        $originalUpdate=${function:Update-V2Processes}; $proof=@{Done=$false}
+        try {
+            Set-Item Function:Update-V2Processes -Value {
+                param($Job,$Records,$Handles,[switch]$Fast)
+                & $originalUpdate $Job $Records $Handles -Fast:$Fast
+                if ($Fast -or $proof.Done -or !$result.StartReceipt) { return }
+                $proof.Done=$true; $held=$Handles | Where-Object { $_.Record.Pid -eq $process.Id } | Select-Object -First 1
+                $session=$result.StartReceipt.sessionId; $id=[guid]::NewGuid().ToString('D')
+                $directory=Join-Path $repo "v2/fabric/build/scenario-results/two-lane-$session/inspect-operations/op-1-$id"
+                New-Item -ItemType Directory -Path $directory -Force | Out-Null
+                $time=[DateTimeOffset]::UtcNow; $time=[DateTimeOffset]::new($time.Ticks-($time.Ticks%10000),[TimeSpan]::Zero)
+                $data=[ordered]@{schema='mapartrunner-inspect-operation-v1';launchId=$launchId;pid=$process.Id;startedUtc=$result.StartReceipt.startedUtc
+                    mode='inspect';sessionId=$session;ordinal=1;operationId=$id;command='RUN';phase='WORK';phaseStartedUtc=$time.ToString('o')
+                    phaseDeadlineUtc=$time.AddMilliseconds(600000).ToString('o');evidenceDir=$directory;verdict=$null;cleanupStatus=$null}
+                $file=Join-Path $evidence 'inspect-op-1.begin.json'
+                $arguments=@{Evidence=$evidence;WorkingDirectory=$repo;StartReceipt=$result.StartReceipt;StartIdentity=$result.StartIdentity
+                    Held=$held;Ordinal=1;Phase='begin';Previous=$null;PreviousSettledUtc=$null;InternalInspectTest=@{NowUtc=$time}}
+                function Check-Phase($Candidate) {
+                    [IO.File]::WriteAllText($file,($Candidate|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
+                    Read-V2InspectOperationReceipt @arguments
+                }
+                Assert ((Check-Phase $data).Status -ceq 'Accepted') 'legitimate future BEGIN deadline rejected'
+                foreach($change in @(
+                    { $candidate.phaseStartedUtc=$time.AddMilliseconds(1).ToString('o') },
+                    { $candidate.phaseDeadlineUtc=$time.AddMilliseconds(600001).ToString('o') },
+                    { $candidate.sessionId=[guid]::NewGuid().ToString('D') },
+                    { $candidate.evidenceDir=$evidence }, { $candidate.ordinal=2 }, { $candidate.ordinal=1.5 },
+                    { $candidate.operationId='1-1-1-1-1' }, { $candidate.pid=$PID }, { $candidate.phase='CLEANUP' },
+                    { $candidate.verdict='SUCCESS' }, { $candidate.cleanupStatus='SETTLED' }, { $candidate.extra=1 },
+                    { $candidate.Remove('verdict') }, { $candidate.ordinal='1' }, { $candidate.pid='1' },
+                    { $candidate.schema='wrong' }, { $candidate.mode='automatic' }, { $candidate.command='STARTUP' },
+                    { $candidate.phaseDeadlineUtc=$null }, { $candidate.phaseStartedUtc=$null },
+                    { $candidate.phaseStartedUtc=([DateTimeOffset]::Parse($data.startedUtc)).AddMilliseconds(-1).ToString('o') }
+                )) {
+                    $candidate=@{}+$data; & $change
+                    Assert ((Check-Phase $candidate).Status -ceq 'Rejected') 'malformed/future/mismatched BEGIN accepted'
+                }
+                foreach($raw in @('{','[]','{}',(' '*4097), (($data|ConvertTo-Json -Compress) -replace '\{"','{"schema":"duplicate","'))) {
+                    [IO.File]::WriteAllText($file,$raw,[Text.UTF8Encoding]::new($false))
+                    Assert ((Read-V2InspectOperationReceipt @arguments).Status -ceq 'Rejected') 'malformed/duplicate/oversize JSON accepted'
+                }
+                [IO.File]::WriteAllBytes($file,[byte[]]@(0xff,0xfe))
+                Assert ((Read-V2InspectOperationReceipt @arguments).Status -ceq 'Rejected') 'invalid UTF8 phase accepted'
+                $oldHeld=$held.Record.StartedUtc; $oldIdentity=$result.StartIdentity.StartedUtc
+                try {
+                    $held.Record.StartedUtc=([DateTimeOffset]::Parse($oldHeld)).AddMilliseconds(5).UtcDateTime.ToString('o')
+                    $result.StartIdentity.StartedUtc=$held.Record.StartedUtc
+                    $candidate=@{}+$data; $candidate.phaseDeadlineUtc=$time.AddMilliseconds(600001).ToString('o')
+                    Assert ((Check-Phase $candidate).Status -ceq 'Rejected') 'identity10ms tolerance extended deadline'
+                } finally {$held.Record.StartedUtc=$oldHeld;$result.StartIdentity.StartedUtc=$oldIdentity}
+                $begin=(Check-Phase $data).Receipt
+                $arguments.Phase='cleanup'; $arguments.Previous=$begin; $file=Join-Path $evidence 'inspect-op-1.cleanup.json'
+                $middle=@{}+$data; $middle.phase='CLEANUP'; $middle.verdict='TIMEOUT'; $middle.phaseDeadlineUtc=$time.AddMilliseconds(10000).ToString('o')
+                $checked=Check-Phase $middle
+                Assert ($checked.Status -ceq 'Accepted') "legal cleanup rejected: $($checked.Reason)"
+                $candidate=@{}+$middle; $candidate.phaseDeadlineUtc=$time.AddMilliseconds(10001).ToString('o')
+                Assert ((Check-Phase $candidate).Status -ceq 'Rejected') 'cleanup own cap +1ms accepted'
+                $arguments.InternalInspectTest.NowUtc=$time.AddMilliseconds(600001)
+                $candidate=@{}+$middle; $candidate.phaseStartedUtc=$time.AddMilliseconds(600001).ToString('o'); $candidate.phaseDeadlineUtc=$time.AddMilliseconds(610001).ToString('o')
+                Assert ((Check-Phase $candidate).Status -ceq 'Rejected') 'cleanup original work cap +1ms accepted'
+                $arguments.InternalInspectTest.NowUtc=$time
+                $cleanup=(Check-Phase $middle).Receipt
+                $arguments.Phase='end'; $arguments.Previous=$cleanup; $file=Join-Path $evidence 'inspect-op-1.end.json'
+                $end=@{}+$middle; $end.phase='SETTLED'; $end.cleanupStatus='SETTLED'; $end.phaseDeadlineUtc=$null
+                $checked=Check-Phase $end
+                Assert ($checked.Status -ceq 'Accepted') "valid END rejected: $($checked.Reason)"
+                $candidate=@{}+$end; $candidate.phaseDeadlineUtc=$time.ToString('o')
+                Assert ((Check-Phase $candidate).Status -ceq 'Rejected') 'nonnull END deadline accepted'
+                $candidate=@{}+$end; $candidate.phaseStartedUtc=$time.AddMilliseconds(-1).ToString('o')
+                Assert ((Check-Phase $candidate).Status -ceq 'Rejected') 'END occurrence moved backwards'
+                $arguments.Ordinal=2; $file=Join-Path $evidence 'inspect-op-2.end.json'
+                Assert ((Check-Phase $end).Status -ceq 'Rejected') 'late old END settled newer ordinal'
+                Remove-Item -LiteralPath $file; $arguments.Ordinal=1
+                $arguments.Phase='begin'; $arguments.Previous=$null; $file=Join-Path $evidence 'inspect-op-1.begin.json'
+                $candidate=@{}+$data; $candidate.command='CLOSE'; $candidate.phaseDeadlineUtc=$time.AddMilliseconds(10000).ToString('o')
+                $close=(Check-Phase $candidate)
+                Assert ($close.Status -ceq 'Accepted') 'CLOSE shared ceiling rejected'
+                $candidate.phaseDeadlineUtc=$time.AddMilliseconds(10001).ToString('o')
+                Assert ((Check-Phase $candidate).Status -ceq 'Rejected') 'CLOSE cap +1ms accepted'
+                $arguments.Phase='cleanup'; $arguments.Previous=$close.Receipt; $arguments.InternalInspectTest.NowUtc=$time.AddMilliseconds(5000)
+                $file=Join-Path $evidence 'inspect-op-1.cleanup.json'
+                $candidate=@{}+$middle; $candidate.command='CLOSE'; $candidate.phaseStartedUtc=$time.AddMilliseconds(5000).ToString('o'); $candidate.phaseDeadlineUtc=$time.AddMilliseconds(10001).ToString('o')
+                Assert ((Check-Phase $candidate).Status -ceq 'Rejected') 'CLOSE CLEANUP renewed shared ceiling'
+                foreach($name in 'begin','cleanup','end') { Remove-Item -LiteralPath (Join-Path $evidence "inspect-op-1.$name.json") }
+            }
+            $worker=New-V2ReceiptWorker '$receipt=@{schema="mapartrunner-inspect-ready-v1";launchId=$receipt.launchId;pid=$receipt.pid;startedUtc=$receipt.startedUtc;scenario="grounded-two-lane";mode="inspect";sessionId=[guid]::NewGuid().ToString("D");event="INSPECT_WORLD_BOUND_COMMANDS_READY"}' 3000
+            $outcome=Invoke-V2Supervisor -Worker $worker -Request ([pscustomobject]@{Mode='inspect';Scenario='grounded-two-lane'}) -EvidenceRoot $testRoot -WorkingDirectory $repo -TimeoutMilliseconds 6000 -StartupMilliseconds 3000
+        } finally { Set-Item Function:Update-V2Processes -Value $originalUpdate }
+        Assert-V2Settled $outcome
+        Assert ($proof.Done -and $outcome.ExitCode -eq 0) 'phase parser dummy failed'
+    }
+    Run 'inspect ordered polling idle timeout cleanup exit and escalation share the owned backend' {
+        Reject { Invoke-V2Supervisor -RequireGame -InternalInspectTest @{} -Worker {exit 0} } 'real inspect clock override accepted'
+        # Policy-only reproduction of Windows exit-code visibility before its wait handle is signaled.
+        $exiting=[pscustomobject]@{HasExited=$true;ExitCode=7;ExitTime=[DateTime]::UtcNow}
+        $exiting | Add-Member ScriptMethod WaitForExit { param($Milliseconds) return $false }
+        $exitRecord=[pscustomobject]@{ExitCode=$null;ExitedUtc=$null;ObservedExitUtc=$null}
+        $exitHandles=@([pscustomobject]@{Process=$exiting;Record=$exitRecord})
+        Update-V2ProcessExits $exitHandles
+        Assert ($null -eq $exitRecord.ExitCode) 'automatic wait-based exit policy changed'
+        Update-V2ProcessExits $exitHandles -IncludeExiting
+        Assert ($exitRecord.ExitCode -eq 7 -and $exitRecord.ExitedUtc) 'inspect observed exit code was lost before wait signal'
+        $phaseProofs=[Collections.Generic.List[object]]::new()
+        foreach($case in 'idle','all-at-once-aged','aged-begin','timeout-settled','missing-cleanup','stuck-cleanup','close-stuck','unresolved','rewrite','exit-final','exit-late-phase','worker7','missing-ordinal','ready-dies-before-anchor') {
+            $originalUpdate=${function:Update-V2Processes}; $originalReader=${function:Read-V2StartReceipt}
+            $proof=@{Case=$case;Stage=0;Session=[guid]::NewGuid().ToString('D');Id=[guid]::NewGuid().ToString('D')}
+            try {
+                Set-Item Function:Update-V2Processes -Value {
+                    param($Job,$Records,$Handles,[switch]$Fast)
+                    & $originalUpdate $Job $Records $Handles -Fast:$Fast
+                    if ($Fast) { return }
+                    $time=[DateTimeOffset]::UtcNow
+                    $held=$Handles | Where-Object { $_.Record.Pid -eq $process.Id } | Select-Object -First 1
+                    $done=Join-Path $evidence 'fixture-done'
+                    if (!$result.StartReceipt) {
+                        $ready=@{schema='mapartrunner-inspect-ready-v1';launchId=$launchId;pid=$process.Id;startedUtc=$held.Record.StartedUtc
+                            scenario='grounded-two-lane';mode='inspect';sessionId=$proof.Session;event='INSPECT_WORLD_BOUND_COMMANDS_READY'}
+                        [IO.File]::WriteAllText((Join-Path $evidence 'test-start.json'),($ready|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
+                        return
+                    }
+                    if (!$proof.ContainsKey('ReadyUtc')) { $proof.ReadyUtc=$time }
+                    $age=($time-$proof.ReadyUtc).TotalMilliseconds
+                    function Publish-Phase([string]$Suffix,$Occurrence,$Deadline,[string]$Verdict,[string]$Cleanup,[int]$Ordinal=1) {
+                        $directory=Join-Path $repo "v2/fabric/build/scenario-results/two-lane-$($proof.Session)/inspect-operations/op-$Ordinal-$($proof.Id)"
+                        New-Item -ItemType Directory -Path $directory -Force | Out-Null
+                        $phaseName=@{begin='WORK';cleanup='CLEANUP';end='SETTLED'}[$Suffix]
+                        $data=@{schema='mapartrunner-inspect-operation-v1';launchId=$launchId;pid=$process.Id;startedUtc=$result.StartReceipt.startedUtc
+                            mode='inspect';sessionId=$proof.Session;ordinal=$Ordinal;operationId=$proof.Id;command=$(if($proof.Case -ceq 'close-stuck'){'CLOSE'}else{'RUN'});phase=$phaseName
+                            phaseStartedUtc=$Occurrence.ToString('o');phaseDeadlineUtc=$(if($null -ne $Deadline){$Deadline.ToString('o')}else{$null})
+                            evidenceDir=$directory;verdict=$(if($Verdict){$Verdict}else{$null});cleanupStatus=$(if($Cleanup){$Cleanup}else{$null})}
+                        $path=Join-Path $evidence "inspect-op-$Ordinal.$Suffix.json"
+                        Assert (!(Test-Path -LiteralPath $path)) 'fixture attempted phase replacement'
+                        [IO.File]::WriteAllText($path,($data|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
+                    }
+                    if ($proof.Case -ceq 'idle') { if($age -ge 1600){Set-Content $done 'done'}; return }
+                    if ($proof.Case -cin 'all-at-once-aged','aged-begin') {
+                        if ($age -ge 1600 -and !$proof.Stage) {
+                            $start=$proof.ReadyUtc
+                            Publish-Phase begin $start $start.AddMilliseconds(400) '' ''
+                            if ($proof.Case -ceq 'all-at-once-aged') {
+                                Publish-Phase cleanup $start.AddMilliseconds(30) $start.AddMilliseconds(1000) 'SUCCESS' ''
+                                Publish-Phase end $start.AddMilliseconds(50) $null 'FAILURE' 'SETTLED'
+                                Set-Content $done 'done'
+                            }
+                            $proof.Stage=1
+                        } elseif($proof.Stage) {
+                            $proof.AfterPublicationSamples++
+                        }; return
+                    }
+                    if ($proof.Case -cin 'exit-final','exit-late-phase') {
+                        if ($age -ge 300) {Set-Content $done 'done'}
+                        if ($held.Process.HasExited -and !$proof.Stage) {
+                            $start=$proof.ReadyUtc
+                            Publish-Phase begin $start $start.AddMilliseconds(400) '' ''
+                            Publish-Phase cleanup $start.AddMilliseconds(20) $start.AddMilliseconds(1000) 'SUCCESS' ''
+                            Publish-Phase end $(if($proof.Case -ceq 'exit-late-phase'){$time}else{$start.AddMilliseconds(30)}) $null 'SUCCESS' 'SETTLED'
+                            $proof.Stage=1
+                        }; return
+                    }
+                    if (!$proof.Stage) {
+                        $proof.Start=$time; $proof.Stage=1
+                        if ($proof.Case -ceq 'missing-ordinal') { Publish-Phase begin $time $time.AddMilliseconds(400) '' '' 2 }
+                        else { Publish-Phase begin $time $time.AddMilliseconds($(if($proof.Case -ceq 'close-stuck'){1000}else{400})) '' '' }
+                        if ($proof.Case -ceq 'worker7') { Set-Content $done 'done' }
+                    }
+                    if ($proof.Case -ceq 'rewrite' -and $inspectState.Active) {
+                        Add-Content -LiteralPath (Join-Path $evidence 'inspect-op-1.begin.json') ' '; return
+                    }
+                    if ($proof.Case -ceq 'missing-ordinal') {if($age -ge 1600){Set-Content $done 'done'};return}
+                    if ($proof.Case -cin 'missing-cleanup','close-stuck','worker7') { return }
+                    $workAge=($time-$proof.Start).TotalMilliseconds
+                    if ($proof.Stage -eq 1 -and $workAge -ge 400) {
+                        Publish-Phase cleanup $time $proof.Start.AddMilliseconds(1400) 'TIMEOUT' ''
+                        $proof.Stage=2
+                    } elseif ($proof.Stage -eq 2 -and $proof.Case -cne 'stuck-cleanup') {
+                        Publish-Phase end $time $null 'TIMEOUT' $(if($proof.Case -ceq 'unresolved'){'UNRESOLVED'}else{'SETTLED'})
+                        $proof.Stage=3; if($proof.Case -cne 'unresolved'){Set-Content $done 'done'}
+                    }
+                }
+                $exit=$(if($case -ceq 'worker7'){7}else{0})
+                $worker=[scriptblock]::Create('$fixtureClock=[Diagnostics.Stopwatch]::StartNew(); while(!(Test-Path (Join-Path $env:MAPART_TEST_LAUNCH_DIR "fixture-done"))) { if($fixtureClock.ElapsedMilliseconds -gt 8000){exit 99}; Start-Sleep -Milliseconds 10 }; exit '+$exit)
+                if ($case -ceq 'ready-dies-before-anchor') {
+                    Set-Item Function:Read-V2StartReceipt -Value {
+                        param($Evidence,$LaunchId,$Request,$Handles,$OwnedPids,$WorkerPid,$JavaExecutable,[switch]$RequireGame)
+                        $checked=& $originalReader @PSBoundParameters
+                        if ($checked.Status -ceq 'Accepted') {
+                            Set-Content -LiteralPath (Join-Path $Evidence 'fixture-done') 'done'
+                            $held=$Handles | Where-Object {$_.Record.Pid -eq $WorkerPid} | Select-Object -First 1
+                            Assert ($held.Process.WaitForExit(3000)) 'live READY race fixture did not exit'
+                        }
+                        $checked
+                    }
+                }
+                $outcome=Invoke-V2Supervisor -Worker $worker -Request ([pscustomobject]@{Mode='inspect';Scenario='grounded-two-lane'}) -EvidenceRoot $testRoot -WorkingDirectory $repo -TimeoutMilliseconds 100 -StartupMilliseconds 3000 -InternalInspectTest @{WorkMilliseconds=400;CleanupMilliseconds=1000}
+            } finally { Set-Item Function:Update-V2Processes -Value $originalUpdate; Set-Item Function:Read-V2StartReceipt -Value $originalReader }
+            Assert-V2Settled $outcome
+            $expected=$(if($case -cin 'aged-begin','missing-cleanup','stuck-cleanup','close-stuck'){124}elseif($case -cin 'unresolved','rewrite','exit-late-phase','ready-dies-before-anchor'){125}elseif($case -ceq 'worker7'){7}else{0})
+            Assert ($outcome.ExitCode -eq $expected) "inspect $case public exit mismatch: $($outcome.ExitCode) $($outcome.SupervisorError) $($outcome.InspectEscalation)"
+            Assert (@($outcome.Processes|Where-Object {$null -eq $_.ExitCode}).Count -eq 0) "inspect $case raw exit missing"
+            Assert ((Get-Item -LiteralPath (Join-Path $testRoot 'supervisor.lock')).Length -eq 0) "inspect $case settled lock retained"
+            if($case -cin 'aged-begin','missing-cleanup','stuck-cleanup','close-stuck','unresolved','rewrite') {Assert ($outcome.TerminationRequested -and $outcome.InspectIncomplete -and $outcome.WorkerExitCode -eq 125) "inspect $case did not use owned Stop/raw125"}
+            if($case -cin 'all-at-once-aged','timeout-settled','exit-final') {Assert ($outcome.InspectOperations.Count -eq 1 -and !$outcome.TimedOut -and !$outcome.InspectIncomplete) "inspect $case settlement lost"}
+            if($case -ceq 'missing-ordinal') {Assert ($outcome.InspectOperations.Count -eq 0 -and !$outcome.TimedOut) 'consumer skipped failed/missing ordinal'}
+            if($case -ceq 'aged-begin') {Assert (!$proof.AfterPublicationSamples -and $outcome.TimedOut) 'delayed BEGIN received a new allowance'}
+            if($case -ceq 'ready-dies-before-anchor') {Assert (!$outcome.StartReceipt -and !$outcome.StartIdentity -and $null -eq $outcome.StartupAcceptedElapsedMilliseconds) 'first READY was latched after original process death'}
+            $phaseProofs.Add(@{Case=$case;Outcome=$outcome;Fixture=$proof})
+        }
+        $phaseProofs|ConvertTo-Json -Depth 14|Set-Content (Join-Path $testRoot 'inspect-phase-proofs.json')
+    }
     Run 'observed native failure precedence has deterministic simultaneous ordering' {
         $failures=@(
             [pscustomobject]@{Pid=400;IsGame=$true;ExitCode=9;ExitedUtc='2026-01-01T00:00:02Z';ObservedExitUtc='2026-01-01T00:00:03Z';StartedUtc='2026-01-01T00:00:00Z'},

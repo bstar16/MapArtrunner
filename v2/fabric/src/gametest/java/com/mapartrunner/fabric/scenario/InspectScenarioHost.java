@@ -27,6 +27,7 @@ import java.awt.image.BufferedImage;
 import javax.imageio.ImageIO;
 import javax.imageio.stream.MemoryCacheImageOutputStream;
 import java.nio.file.*;
+import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicReference;
@@ -46,6 +47,10 @@ final class InspectScenarioHost implements Inspect {
     private final BooleanSupplier clientThread, serverThread;
     private final Consumer<Runnable> clientQueue, serverQueue;
     private final Consumer<FinalOutcome> publish;
+    private final ScenarioLaunchReceipt receipts;
+    private final Supplier<Instant> utc;
+    // Created before BEGIN publication; retained through cleanup/END, replaced only by the next admitted operation.
+    private Instant phaseStarted, workDeadline, phaseDeadline;
     private final ReentrantLock lock = new ReentrantLock();
     private final Condition changed = lock.newCondition();
     private final ThreadLocal<Scope> bound = new ThreadLocal<>();
@@ -68,6 +73,8 @@ final class InspectScenarioHost implements Inspect {
     private volatile MinecraftServer server;
     private volatile Path save;
 
+    InspectScenarioHost(MinecraftClient client) { this(client, null); }
+
     InspectScenarioHost(MinecraftClient client, Consumer<FinalOutcome> publish) {
         this.client = Objects.requireNonNull(client);
         clock = System::nanoTime; clientThread = client::isOnThread;
@@ -77,14 +84,20 @@ final class InspectScenarioHost implements Inspect {
             var owned = server;
             check(owned != null, "Owned server is unavailable"); owned.execute(action);
         };
-        this.publish = Objects.requireNonNull(publish);
+        this.publish = publish; receipts = ScenarioLaunchReceipt.fromEnvironment(); utc = Instant::now;
     }
 
     /** Native queues/clock only: tests exercise the same issuing/dispatch/settlement policies. */
     InspectScenarioHost(LongSupplier clock, BooleanSupplier clientThread, BooleanSupplier serverThread,
                         Consumer<Runnable> clientQueue, Consumer<Runnable> serverQueue, Consumer<FinalOutcome> publish) {
+        this(clock, clientThread, serverThread, clientQueue, serverQueue, publish, null, Instant::now);
+    }
+    InspectScenarioHost(LongSupplier clock, BooleanSupplier clientThread, BooleanSupplier serverThread,
+                        Consumer<Runnable> clientQueue, Consumer<Runnable> serverQueue, Consumer<FinalOutcome> publish,
+                        ScenarioLaunchReceipt receipts, Supplier<Instant> utc) {
         client = null; this.clock = clock; this.clientThread = clientThread; this.serverThread = serverThread;
         this.clientQueue = clientQueue; this.serverQueue = serverQueue; this.publish = publish;
+        this.receipts = receipts; this.utc = utc;
     }
 
     @Override public Scope beginStartup(Operation operation) {
@@ -105,10 +118,16 @@ final class InspectScenarioHost implements Inspect {
         check(!cancelled && !stopped && current == null, "Inspect admission is unavailable/busy");
         check(!issued.contains(operation) && operation.ordinal() > lastOrdinal, "Operation already issued/stale");
         check(session == null || session.equals(operation.sessionId()), "Foreign session");
+        long deadline = clock.getAsLong() + budget;
+        if (kind == Kind.WORK && receipts != null) {
+            phaseStarted = utc.get(); workDeadline = phaseDeadline = phaseStarted.plusNanos(budget);
+            try { receipts.operation(operation, "WORK", phaseStarted, phaseDeadline, null, null); }
+            catch (RuntimeException | Error failure) { cancelSession(failure); throw failure; }
+        }
         session = operation.sessionId(); lastOrdinal = operation.ordinal(); issued.add(operation);
         originalFailure.set(null); settlementAttempted=false;
         lineage=kind==Kind.STARTUP?Lineage.STARTUP:Lineage.WORK;
-        return current = new Scope(operation, kind, clock.getAsLong() + budget);
+        return current = new Scope(operation, kind, deadline);
     }
     @Override public Scope beginCleanup(Scope work, Throwable primary) {
         rejectNativeWait(); lock.lock();
@@ -120,6 +139,17 @@ final class InspectScenarioHost implements Inspect {
             if (work.operation().command()==Command.CLOSE) deadline=work.deadlineNanos();
             else if (now - work.deadlineNanos() >= 0) deadline = work.deadlineNanos() + CLEANUP_NANOS;
             current = new Scope(work.operation(), Kind.CLEANUP, deadline);
+            if (lineage == Lineage.WORK && receipts != null) {
+                Instant nowUtc = utc.get();
+                check(!nowUtc.isBefore(phaseStarted), "Phase UTC moved backwards");
+                phaseStarted = nowUtc;
+                // Project the retained monotonic deadline; never grant an extra interval after publication.
+                phaseDeadline = nowUtc.plusNanos(deadline - now);
+                Instant cap = work.operation().command()==Command.CLOSE ? workDeadline : workDeadline.plusMillis(10000);
+                if (phaseDeadline.isAfter(cap)) phaseDeadline = cap;
+                receipts.operation(work.operation(), "CLEANUP", phaseStarted, phaseDeadline,
+                        primary instanceof ScopeTimeoutException ? Verdict.TIMEOUT : primary == null ? Verdict.SUCCESS : Verdict.FAILURE, null);
+            }
             changed.signalAll(); return current;
         } finally { lock.unlock(); }
     }
@@ -150,7 +180,13 @@ final class InspectScenarioHost implements Inspect {
             check(!settlementAttempted, "Settlement already attempted"); settling = true; settlementAttempted=true;
             try {
                 // STARTUP and exceptional failed admission never had an ordinary phase stream to complete.
-                if(lineage==Lineage.WORK) publish.accept(outcome);
+                if(lineage==Lineage.WORK) {
+                    if (receipts != null) {
+                        Instant now = utc.get(); check(!now.isBefore(phaseStarted), "Phase UTC moved backwards");
+                        receipts.operation(outcome.operation(), "SETTLED", now, null, outcome.verdict(), outcome.cleanup());
+                    }
+                    if (publish != null) publish.accept(outcome);
+                }
                 valid(scope); // A visible late END cannot turn an expired cleanup into local settlement.
                 if (outcome.cleanup() == CleanupStatus.UNRESOLVED) { cancelled = true; unresolved=true; }
                 current = null; changed.signalAll();
