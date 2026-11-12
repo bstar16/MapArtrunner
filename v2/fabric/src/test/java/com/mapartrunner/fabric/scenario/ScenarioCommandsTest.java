@@ -22,35 +22,8 @@ class ScenarioCommandsTest {
         net.minecraft.SharedConstants.createGameVersion(); net.minecraft.Bootstrap.initialize();
     }
     @TempDir Path directory;
-    final List<Path> ownedTrees = new ArrayList<>();
-    Path ownedInspectRoot;
-    Object ownedInspectKey;
-    java.nio.file.attribute.FileTime ownedInspectCreation;
-
-    @AfterEach void removeOnlyFreshFixtureEvidence() throws Exception {
-        try {
-            var evidence = loadedModule().resolve("build/scenario-results");
-            for (var root : ownedTrees) if (Files.exists(root)) {
-                assertEquals(evidence, root.getParent()); assertEquals(root, root.toRealPath());
-                try (var files = Files.walk(root)) {
-                    for (var file : files.sorted(Comparator.reverseOrder()).toList()) Files.delete(file);
-                }
-            }
-        } finally {
-            if (ownedInspectRoot != null) {
-                assertEquals(loadedModule().resolve("build/run/inspect"), ownedInspectRoot);
-                assertEquals(ownedInspectRoot, ownedInspectRoot.toRealPath());
-                var attributes = Files.readAttributes(ownedInspectRoot,
-                        java.nio.file.attribute.BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
-                assertTrue(attributes.isDirectory()); assertFalse(attributes.isSymbolicLink()); assertFalse(attributes.isOther());
-                if (ownedInspectKey != null) assertEquals(ownedInspectKey, attributes.fileKey());
-                assertEquals(ownedInspectCreation, attributes.creationTime());
-                try (var files = Files.list(ownedInspectRoot)) { assertEquals(0, files.count(), "Preserve unexpected fixture-root files"); }
-                // Nonrecursive deletion refuses to remove any files that appeared in this empty fixture root.
-                Files.delete(ownedInspectRoot);
-            }
-        }
-    }
+    // JUnit owns cleanup of these temporary trees; the native game root is never a fixture cleanup target.
+    Path receiptModule;
 
     @Test void grammarHasExactlyFourLiteralBranches() {
         var commands = new ScenarioCommands(new ArrayDeque<Runnable>()::add, nativeHost());
@@ -64,6 +37,37 @@ class ScenarioCommandsTest {
             assertTrue(node.getChild("grounded-two-lane").getChildren().isEmpty());
         }
         assertNotNull(root.getChild("last").getCommand()); assertTrue(root.getChild("last").getChildren().isEmpty());
+    }
+
+    @Test void receiptFixturePublishesOnlyWithinTemporaryRootsAndPreservesNativeRoot() throws Exception {
+        var nativeGame = loadedModule().resolve("build/run/inspect");
+        var before = Files.exists(nativeGame, LinkOption.NOFOLLOW_LINKS) ? Files.readAttributes(nativeGame,
+                java.nio.file.attribute.BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS) : null;
+        var launch = launch(); var launchId = launch.getFileName().toString().substring(7);
+        var receipts = new ScenarioLaunchReceipt(launchId, launch.toString(), null, launch.getParent());
+        var f = fixture(receipts, null);
+        var roots = (ScenarioRunner.Roots) field(ScenarioRunner.class, "roots").get(f.runner);
+        assertTrue(roots.game().startsWith(directory.toRealPath())); assertTrue(roots.evidence().startsWith(directory.toRealPath()));
+        assertFalse(roots.game().startsWith(nativeGame)); assertFalse(roots.evidence().startsWith(loadedModule()));
+        f.commands.enqueue(Command.RUN, message -> { }); f.queue.remove().run();
+        var operation = f.outcomes.getFirst().operation();
+        assertTrue(operation.evidenceDirectory().startsWith(roots.evidence())); assertEquals(roots.evidence(), launch.getParent());
+        assertTrue(Files.isRegularFile(launch.resolve("inspect-op-1.begin.json")));
+        assertTrue(Files.isRegularFile(launch.resolve("inspect-op-1.cleanup.json")));
+        assertTrue(Files.isRegularFile(launch.resolve("inspect-op-1.end.json")));
+        var now = Instant.now();
+        assertThrows(AssertionError.class, () -> new ScenarioLaunchReceipt(launchId, launch.toString(), null, false)
+                .operation(operation, "WORK", now, now.plusMillis(600000), null, null), "Existing portable constructor retains native authority");
+        var foreign = new Operation(operation.sessionId(), 1, operation.operationId(), Command.RUN, launch);
+        assertThrows(AssertionError.class, () -> receipts.operation(foreign, "WORK", now, now.plusMillis(600000), null, null));
+        assertThrows(AssertionError.class, () -> new ScenarioLaunchReceipt(launchId, launch.toString(), null,
+                roots.evidence().resolve(".")).operation(operation, "WORK", now, now.plusMillis(600000), null, null));
+        assertEquals(before != null, Files.exists(nativeGame, LinkOption.NOFOLLOW_LINKS));
+        if (before != null) {
+            var after = Files.readAttributes(nativeGame, java.nio.file.attribute.BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+            assertEquals(before.fileKey(), after.fileKey()); assertEquals(before.creationTime(), after.creationTime());
+            assertEquals(before.lastModifiedTime(), after.lastModifiedTime());
+        }
     }
 
     @Test void inactivePropertyIsInertAndUsesStandardBooleanSemantics() {
@@ -149,7 +153,7 @@ class ScenarioCommandsTest {
             var launch = launch();
             var receipts = new ScenarioLaunchReceipt(launch.getFileName().toString().substring(7), launch.toString(),
                     path -> { if (boundary.equals("post-link") && path.getFileName().toString().equals("inspect-op-2.begin.json"))
-                        throw new IllegalStateException("after native hard link"); }, false);
+                        throw new IllegalStateException("after native hard link"); }, launch.getParent());
             Consumer<Operation> header = operation -> {
                 if (boundary.equals("header") && operation.ordinal() == 2)
                     assertDoesNotThrow(() -> Files.writeString(operation.evidenceDirectory().resolve("operation.json"), "collision"));
@@ -245,7 +249,7 @@ class ScenarioCommandsTest {
                 assertTrue(assertDoesNotThrow(() -> (java.util.concurrent.locks.ReentrantLock)
                         field(InspectScenarioHost.class, "lock").get(holder[0].nativeHost)).isHeldByCurrentThread());
                 entered.countDown(); assertDoesNotThrow(() -> assertTrue(release.await(10, TimeUnit.SECONDS)));
-            }, false);
+            }, launch.getParent());
             var f = fixture(receipts, null); holder[0] = f;
             var callbackFailure = new AtomicReference<Throwable>(); var expected = new AtomicReference<Throwable>();
             var original = new IllegalStateException("native cancellation original");
@@ -283,18 +287,28 @@ class ScenarioCommandsTest {
     }
 
     @Test void initializationReturnsImmediatelyAndCannotManufactureReadyOnFactoryFailure() throws Exception {
-        var queue = new ArrayDeque<Runnable>(); var commands = new ScenarioCommands(queue::add, nativeHost());
-        var stops = new AtomicInteger();
+        var queue = new ArrayDeque<Runnable>(); var nativeEffects = new AtomicInteger();
+        var host = new InspectScenarioHost(() -> 1L, () -> false, () -> false,
+                action -> nativeEffects.incrementAndGet(), action -> nativeEffects.incrementAndGet(), outcome -> fail("No startup outcome"));
+        var commands = new ScenarioCommands(queue::add, host); var stops = new AtomicInteger();
         commands.initialize(new ScenarioObserver.Watch(), new ScenarioLaunchReceipt(null, null), stops::incrementAndGet);
         assertEquals(1, queue.size()); assertFalse(commands.isReady()); assertEquals(0, stops.get());
-        // Unit launcher has no inspect game root: real factory refuses before any native world action.
+        // The real factory reads native root metadata, then refuses the unit launcher's unmanaged binding.
         var diagnostic = new java.io.ByteArrayOutputStream(); var previous = System.err;
         try {
             System.setErr(new java.io.PrintStream(diagnostic)); queue.remove().run();
         } finally { System.setErr(previous); }
-        assertTrue(diagnostic.toString(java.nio.charset.StandardCharsets.UTF_8)
-                .contains("Inspect startup failed; ordinary client stop requested"));
-        assertTrue(diagnostic.toString(java.nio.charset.StandardCharsets.UTF_8).contains("Cannot establish loaded-module authority"));
+        var failure = (Throwable) field(ScenarioCommands.class, "terminal").get(commands);
+        var nativeGame = loadedModule().resolve("build/run/inspect");
+        assertTrue(failure instanceof IllegalStateException && "Cannot establish loaded-module authority".equals(failure.getMessage())
+                        && failure.getCause() instanceof NoSuchFileException missing && nativeGame.equals(Path.of(missing.getFile()))
+                || failure instanceof AssertionError && "Unmanaged/redirected game root".equals(failure.getMessage()),
+                () -> "Unexpected startup failure: " + failure);
+        var text = diagnostic.toString(java.nio.charset.StandardCharsets.UTF_8);
+        assertTrue(text.contains("Inspect startup failed; ordinary client stop requested"));
+        assertTrue(text.contains(failure.toString()), "Retain the actual authority refusal diagnostic");
+        assertNull(field(ScenarioCommands.class, "runner").get(commands));
+        assertEquals(0, nativeEffects.get()); assertTrue(queue.isEmpty());
         assertEquals(1, stops.get()); assertFalse(commands.isReady());
         assertFalse(commands.requestStop(), "Failure's native stop must pass through without recursive CLOSE");
         assertEquals(0, commands.enqueue(Command.RUN, message -> { }));
@@ -510,40 +524,24 @@ class ScenarioCommandsTest {
             try { return method.invoke(nativeHost, arguments); }
             catch (InvocationTargetException failure) { throw failure.getCause(); }
         });
-        var module = receipts == null ? Files.createTempDirectory(directory, "module-") : loadedModule();
-        var build = receipts == null ? Files.createDirectory(module.resolve("build")) : module.resolve("build");
-        var game = receipts == null ? Files.createDirectories(build.resolve("run/inspect")) : emptyInspectRoot();
+        var module = receipts == null ? Files.createTempDirectory(directory, "module-") : receiptModule;
+        var build = Files.createDirectories(module.resolve("build"));
+        var game = Files.createDirectories(build.resolve("run/inspect"));
         var evidence = build.resolve("scenario-results");
         var roots = new ScenarioRunner.Roots(module, game, build, evidence, game.resolve("saves"));
         var watch = new ScenarioObserver.Watch();
         var runner = failRelease ? new ScenarioRunner(host, watch, roots,
                 () -> { throw new IllegalStateException("owned release unavailable"); }, watch::freeze)
                 : new ScenarioRunner(host, watch, roots, header);
-        if (receipts != null) ownedTrees.add(evidence.resolve("two-lane-" + runner.inspectSessionId()));
         var queue = new ArrayDeque<Runnable>(); var commands = new ScenarioCommands(queue::add, host);
         set(commands, "runner", runner); set(commands, "ready", true);
         return new Fixture(commands, runner, queue, outcomes, neutral, nativeHost, nativeThread, nativeEffects);
     }
 
     private Path launch() throws Exception {
-        var root = Files.createDirectories(loadedModule().resolve("build/scenario-results"));
-        var launch = Files.createDirectory(root.resolve("launch-" + UUID.randomUUID())); ownedTrees.add(launch); return launch;
-    }
-    private Path emptyInspectRoot() throws Exception {
-        var module = loadedModule(); var build = module.resolve("build"); var run = build.resolve("run");
-        assertTrue(module.endsWith(Path.of("v2", "fabric"))); assertTrue(Files.isRegularFile(module.resolve("build.gradle")));
-        for (var ancestor : List.of(module, build, run)) {
-            assertTrue(Files.isDirectory(ancestor, LinkOption.NOFOLLOW_LINKS)); assertEquals(ancestor, ancestor.toRealPath());
-        }
-        var game = run.resolve("inspect");
-        if (!Files.exists(game, LinkOption.NOFOLLOW_LINKS)) {
-            Files.createDirectory(game); ownedInspectRoot = game;
-            var attributes = Files.readAttributes(game, java.nio.file.attribute.BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
-            ownedInspectKey = attributes.fileKey(); ownedInspectCreation = attributes.creationTime();
-        }
-        assertTrue(Files.isDirectory(game, LinkOption.NOFOLLOW_LINKS)); assertEquals(game, game.toRealPath());
-        try (var files = Files.list(game)) { assertEquals(0, files.count(), "Never adopt a nonempty inspect game root"); }
-        return game;
+        if (receiptModule == null) receiptModule = Files.createTempDirectory(directory, "receipt-module-");
+        var root = Files.createDirectories(receiptModule.resolve("build/scenario-results"));
+        return Files.createDirectory(root.resolve("launch-" + UUID.randomUUID()));
     }
     private static Path loadedModule() throws Exception {
         var source = Path.of(ScenarioRunner.class.getProtectionDomain().getCodeSource().getLocation().toURI()).toRealPath();

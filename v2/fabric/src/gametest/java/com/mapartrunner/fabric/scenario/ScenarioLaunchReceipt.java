@@ -24,6 +24,7 @@ final class ScenarioLaunchReceipt {
     private boolean published;
     private final Consumer<Path> afterLink;
     private final boolean requireWindowsBackend;
+    private final Path fixtureEvidenceRoot;
 
     ScenarioLaunchReceipt(String launchId, String directory) {
         this(launchId, directory, null);
@@ -36,10 +37,21 @@ final class ScenarioLaunchReceipt {
 
     /** Portable filesystem policy fixture only; all native/environment constructors enforce Windows/NTFS. */
     ScenarioLaunchReceipt(String launchId, String directory, Consumer<Path> afterLink, boolean requireWindowsBackend) {
+        this(launchId, directory, afterLink, requireWindowsBackend, null);
+    }
+
+    /** Explicit filesystem-policy fixture only; native/environment constructors retain loaded-module authority. */
+    ScenarioLaunchReceipt(String launchId, String directory, Consumer<Path> afterLink, Path fixtureEvidenceRoot) {
+        this(launchId, directory, afterLink, false, java.util.Objects.requireNonNull(fixtureEvidenceRoot));
+    }
+
+    private ScenarioLaunchReceipt(String launchId, String directory, Consumer<Path> afterLink,
+                                  boolean requireWindowsBackend, Path fixtureEvidenceRoot) {
         this.launchId = launchId;
         this.directory = directory;
         this.afterLink = afterLink;
         this.requireWindowsBackend = requireWindowsBackend;
+        this.fixtureEvidenceRoot = fixtureEvidenceRoot;
     }
 
     synchronized void operation(Operation operation, String phase, Instant started, Instant deadline,
@@ -122,12 +134,7 @@ final class ScenarioLaunchReceipt {
 
     private void publish(JsonObject receipt, String filename, Operation operation) {
         try {
-            var source = Path.of(ScenarioLaunchReceipt.class.getProtectionDomain().getCodeSource().getLocation().toURI()).toAbsolutePath().normalize();
-            require(Files.isDirectory(source) && source.endsWith(Path.of("build", "classes", "java", "gametest"))
-                    && source.equals(source.toRealPath()), "Unsupported/redirected loaded test module");
-            var module = source.getParent().getParent().getParent().getParent();
-            require(module.endsWith(Path.of("v2", "fabric")) && Files.isRegularFile(module.resolve("build.gradle")), "Wrong test module root");
-            var root = module.resolve("build/scenario-results");
+            var root = evidenceRoot();
             require(root.equals(root.toRealPath()), "Redirected scenario-results root");
             if (operation != null) {
                 Path expected = root.resolve("two-lane-" + operation.sessionId()).resolve("inspect-operations")
@@ -170,6 +177,20 @@ final class ScenarioLaunchReceipt {
             }
         } catch (IOException error) { throw new UncheckedIOException("Cannot publish owned startup", error); }
         catch (java.net.URISyntaxException error) { throw new IllegalStateException("Cannot identify loaded test module", error); }
+    }
+
+    private Path evidenceRoot() throws IOException, java.net.URISyntaxException {
+        if (fixtureEvidenceRoot != null) {
+            require(fixtureEvidenceRoot.isAbsolute() && fixtureEvidenceRoot.equals(fixtureEvidenceRoot.normalize())
+                    && Files.isDirectory(fixtureEvidenceRoot, LinkOption.NOFOLLOW_LINKS), "Wrong fixture evidence root");
+            return fixtureEvidenceRoot;
+        }
+        var source = Path.of(ScenarioLaunchReceipt.class.getProtectionDomain().getCodeSource().getLocation().toURI()).toAbsolutePath().normalize();
+        require(Files.isDirectory(source) && source.endsWith(Path.of("build", "classes", "java", "gametest"))
+                && source.equals(source.toRealPath()), "Unsupported/redirected loaded test module");
+        var module = source.getParent().getParent().getParent().getParent();
+        require(module.endsWith(Path.of("v2", "fabric")) && Files.isRegularFile(module.resolve("build.gradle")), "Wrong test module root");
+        return module.resolve("build/scenario-results");
     }
 
     private static void require(boolean condition, String message) { if (!condition) throw new AssertionError(message); }
