@@ -56,8 +56,20 @@ class ScenarioCommandsTest {
         assertTrue(Files.isRegularFile(launch.resolve("inspect-op-1.cleanup.json")));
         assertTrue(Files.isRegularFile(launch.resolve("inspect-op-1.end.json")));
         var now = Instant.now();
-        assertThrows(AssertionError.class, () -> new ScenarioLaunchReceipt(launchId, launch.toString(), null, false)
-                .operation(operation, "WORK", now, now.plusMillis(600000), null, null), "Existing portable constructor retains native authority");
+        var nativeEvidence = loadedModule().resolve("build/scenario-results");
+        var defaultReceipts = new ScenarioLaunchReceipt(launchId, launch.toString(), null, false);
+        // Default authority resolves its native evidence parent before checking this foreign operation.
+        if (Files.exists(nativeEvidence, LinkOption.NOFOLLOW_LINKS)) {
+            var refusal = assertThrows(AssertionError.class,
+                    () -> defaultReceipts.operation(operation, "WORK", now, now.plusMillis(600000), null, null));
+            assertEquals("Wrong/redirected operation evidence", refusal.getMessage());
+        } else {
+            var refusal = assertThrows(java.io.UncheckedIOException.class,
+                    () -> defaultReceipts.operation(operation, "WORK", now, now.plusMillis(600000), null, null));
+            assertEquals("Cannot publish owned startup", refusal.getMessage());
+            var missing = assertInstanceOf(NoSuchFileException.class, refusal.getCause());
+            assertEquals(nativeEvidence, Path.of(missing.getFile()));
+        }
         var foreign = new Operation(operation.sessionId(), 1, operation.operationId(), Command.RUN, launch);
         assertThrows(AssertionError.class, () -> receipts.operation(foreign, "WORK", now, now.plusMillis(600000), null, null));
         assertThrows(AssertionError.class, () -> new ScenarioLaunchReceipt(launchId, launch.toString(), null,
