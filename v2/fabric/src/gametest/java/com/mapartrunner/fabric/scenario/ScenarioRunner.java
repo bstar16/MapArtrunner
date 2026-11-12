@@ -70,6 +70,8 @@ import java.awt.image.BufferedImage;
 import javax.imageio.ImageIO;
 import javax.imageio.stream.MemoryCacheImageOutputStream;
 import java.util.concurrent.CompletableFuture;
+import java.util.function.Consumer;
+import java.util.function.Function;
 
 import static com.mapartrunner.fabric.scenario.ScenarioHost.*;
 
@@ -94,7 +96,7 @@ final class ScenarioRunner implements AutoCloseable {
     record InspectCompletion(UUID sessionId, UUID operationId, int ordinal, Command command, Optional<UUID> runId,
                              String verdict, Throwable failure, Path evidenceDirectory, boolean evidenceComplete,
                              String cleanupStatus, boolean cleanupSettled, Path summaryPath) { }
-    private record Side(JsonObject state, int age, long time, int serverTick, List<String> problems) { }
+    record Side(JsonObject state, int age, long time, int serverTick, List<String> problems) { }
     private record Checkpoint(Side client, Side server, FabricBuildAdapter.Status status) { }
     private record Prior(FabricBuildAdapter.Status status, List<ScenarioObserver.Sample> samples,
                          PredictionFaults.Snapshot fault, PredictionFaults.StateSnapshot stateFault,
@@ -1037,7 +1039,7 @@ final class ScenarioRunner implements AutoCloseable {
         require(before.equals(PredictionFaults.resetSnapshot()) && status.equals(MapArtClient.status()),"Support argument refusal mutated owner/core");
     }
 
-    private record Live(ScenarioObserver.Sample sample, Side client, Side server,
+    record Live(ScenarioObserver.Sample sample, Side client, Side server,
                         PredictionFaults.Snapshot fault, List<String> pending, int nativeSequence,
                         String nativeIdentities) { }
 
@@ -1324,19 +1326,25 @@ final class ScenarioRunner implements AutoCloseable {
     }
 
     private Live live() {
-        var local=host.computeOnClient(c -> {
-            requireClient(c); enforceActionScope();
-            var pending=(PendingPredictionView)((ClientWorldPendingUpdateAccessor)c.world).mapart$getPendingUpdateManager();
-            var positions=new ArrayList<String>();
-            for (var cell:admitted.worldCells().keySet()) {
-                var at=new BlockPos(cell.x(),cell.y(),cell.z());
-                if (pending.mapart$hasPendingPrediction(at)) positions.add(at.toShortString()+"="+c.world.getBlockState(at));
-            }
-            return new Live(watch.sample(c,"TEST"),readClient(c,false),null,PredictionFaults.snapshot(),List.copyOf(positions),
-                    ((ClientWorldPendingUpdateAccessor)c.world).mapart$getPendingUpdateManager().getSequence(),
-                    "player="+System.identityHashCode(c.player)+"; world="+System.identityHashCode(c.world)
-                            +"; handler="+System.identityHashCode(c.getNetworkHandler())+"; connection="+System.identityHashCode(connection));
-        });
+        return withServer(host.computeOnClient(this::clientLive));
+    }
+
+    private Live clientLive(MinecraftClient c) {
+        requireClient(c); enforceActionScope();
+        var pending=(PendingPredictionView)((ClientWorldPendingUpdateAccessor)c.world).mapart$getPendingUpdateManager();
+        var positions=new ArrayList<String>();
+        for (var cell:admitted.worldCells().keySet()) {
+            var at=new BlockPos(cell.x(),cell.y(),cell.z());
+            if (pending.mapart$hasPendingPrediction(at)) positions.add(at.toShortString()+"="+c.world.getBlockState(at));
+        }
+        return new Live(watch.sample(c,"TEST"),readClient(c,false),null,PredictionFaults.snapshot(),List.copyOf(positions),
+                ((ClientWorldPendingUpdateAccessor)c.world).mapart$getPendingUpdateManager().getSequence(),
+                "player="+System.identityHashCode(c.player)+"; world="+System.identityHashCode(c.world)
+                        +"; handler="+System.identityHashCode(c.getNetworkHandler())+"; connection="+System.identityHashCode(connection));
+    }
+
+    private Live withServer(Live local) {
+        // Await the server only after the client callback returns; retain its exact client pose/tick.
         var remote=host.computeOnServer(s -> { requireServer(s); return readPlayer(serverPlayer,false,s.getTicks()); });
         return new Live(local.sample,local.client,remote,local.fault,local.pending,local.nativeSequence,local.nativeIdentities);
     }
@@ -2694,9 +2702,10 @@ final class ScenarioRunner implements AutoCloseable {
 
     private Live pauseShift(UUID id, Live before, Path stage, List<Live> checkpoints) {
         require(substage(before.sample,ForwardTraversal.Substage.SHIFT) && nativeForward(before.sample),"Pause checkpoint is not moving SHIFT");
-        host.runOnClient(c -> { requireClient(c); MapArtClient.pause(); requireReleased(c); });
-        Live paused=live(); requirePaused(before,paused,id);
-        writeNew(roots,stage.resolve("pause-before.txt"),"before="+before+"\nimmediate="+paused);
+        var pause=pauseOnClient(host,this::clientLive,c -> { requireClient(c); MapArtClient.pause(); requireReleased(c); },id);
+        Live immediateBefore=withServer(pause.before);
+        Live paused=withServer(pause.after);
+        writeNew(roots,stage.resolve("pause-before.txt"),"before="+immediateBefore+"\nimmediate="+paused);
         Live prior=paused;
         for (int tick=0;tick<20;tick++) {
             host.waitTick();
@@ -2707,19 +2716,48 @@ final class ScenarioRunner implements AutoCloseable {
             prior=next;
         }
         Live last=live(); requirePaused(paused,last,id);
-        host.runOnClient(c -> {
+        var resume=resumeOnClient(host,this::clientLive,c -> {
             requireClient(c); requireReleased(c);
             require(MapArtClient.status().engine().lifecycle().phase()==Phase.PAUSED,"Not PAUSED immediately before manual resume");
             MapArtClient.resume();
-        });
-        Live resumed=live(); requireRun(resumed.sample,id);
-        require(retainedProgress(paused.sample.status().engine(),resumed.sample.status().engine())
-                && resumed.sample.status().engine().lifecycle().phase()==Phase.RUNNING,"Manual resume renewed traversal or clocks");
-        writeNew(roots,stage.resolve("manual-resume.txt"),"lastPaused="+last+"\nresumed="+resumed);
+        },paused,id);
+        Live resumeBefore=withServer(resume.before);
+        Live resumed=withServer(resume.after);
+        writeNew(roots,stage.resolve("manual-resume.txt"),"lastPaused="+last+"\nimmediateBefore="+resumeBefore+"\nresumed="+resumed);
         return resumed;
     }
 
-    private static boolean retainedProgress(BuildEngine.Snapshot before, BuildEngine.Snapshot after) {
+    record ClientTransition(Live before, Live after) { }
+
+    // Inspect ticks may run between dispatches; capture/action/exact assertions must share one client callback.
+    static ClientTransition pauseOnClient(ScenarioHost host, Function<MinecraftClient,Live> capture,
+                                         Consumer<MinecraftClient> pause, UUID id) {
+        return host.computeOnClient(c -> {
+            var before=capture.apply(c);
+            requireRun(before.sample,id);
+            require(substage(before.sample,ForwardTraversal.Substage.SHIFT) && nativeForward(before.sample),"Pause checkpoint is not moving SHIFT");
+            pause.accept(c);
+            var after=capture.apply(c);
+            requirePaused(before,after,id);
+            return new ClientTransition(before,after);
+        });
+    }
+
+    static ClientTransition resumeOnClient(ScenarioHost host, Function<MinecraftClient,Live> capture,
+                                          Consumer<MinecraftClient> resume, Live paused, UUID id) {
+        return host.computeOnClient(c -> {
+            var before=capture.apply(c);
+            requirePaused(paused,before,id);
+            resume.accept(c);
+            var after=capture.apply(c);
+            requireRun(after.sample,id);
+            require(retainedProgress(paused.sample.status().engine(),after.sample.status().engine())
+                    && after.sample.status().engine().lifecycle().phase()==Phase.RUNNING,"Manual resume renewed traversal or clocks");
+            return new ClientTransition(before,after);
+        });
+    }
+
+    static boolean retainedProgress(BuildEngine.Snapshot before, BuildEngine.Snapshot after) {
         // Observation routing precedes the PAUSED return; pending/unfinished/feedback may legitimately change.
         return before.lifecycle().context().equals(after.lifecycle().context())
                 && before.lifecycle().activity().equals(after.lifecycle().activity())
