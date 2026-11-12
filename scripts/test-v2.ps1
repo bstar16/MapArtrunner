@@ -951,12 +951,22 @@ function Invoke-V2Supervisor {
                 # Keep records/handles until every owned member has exited, even when the root already exited.
                 Update-V2Processes $job $records $handles -Fast
                 Set-V2ObservedFailure $result $records
-                # Normal shutdown may outlive the worker briefly; drain shares both existing fixed budgets.
+                # Healthy native exit may precede wrapper exit. Leave the final1000ms of this same
+                # cleanup clock for force/held metadata/streams; that reserve cannot guarantee settlement.
+                $healthyInspectDrain=$inspectMode -and $inspectEnded -and $inspectState.Held.Process.HasExited -and
+                    !$result.PrimaryFailure -and !$result.TimedOut -and !$result.SupervisorError -and !$result.InspectEscalation -and !$result.InspectIncomplete
+                $normalDrainMilliseconds=$(if($healthyInspectDrain){9000}else{1000})
                 while (($null -ne $result.WorkerExitCode -or $inspectEnded) -and !$result.TimedOut -and !$result.SupervisorError -and
-                    !($inspectMode -and $result.InspectEscalation) -and @($job.Pids()).Count -and $cleanupClock.ElapsedMilliseconds -lt 1000 -and ($inspectMode -or $clock.ElapsedMilliseconds -lt $deadlineMilliseconds)) {
+                    !($inspectMode -and $result.InspectEscalation) -and (!$healthyInspectDrain -or !$result.PrimaryFailure) -and
+                    @($job.Pids()).Count -and $cleanupClock.ElapsedMilliseconds -lt $normalDrainMilliseconds -and ($inspectMode -or $clock.ElapsedMilliseconds -lt $deadlineMilliseconds)) {
                     Update-V2Processes $job $records $handles -Fast
                     Set-V2ObservedFailure $result $records
                     if ($inspectState) { Update-V2InspectOperations $inspectState $result $WorkingDirectory $clock -RequireGame:$RequireGame -InternalInspectTest $InternalInspectTest }
+                    if ($healthyInspectDrain) {
+                        # Phase reads can outlive the inventory sample; latch actual failures before force.
+                        Update-V2ProcessExits @($handles) -IncludeExiting
+                        Set-V2ObservedFailure $result $records
+                    }
                     if ($inspectEnded -and $process.WaitForExit(0)) {
                         $result.WorkerExitCode=$process.ExitCode
                         if (!$result.PrimaryFailure -and !$result.InspectEscalation) { $result.ExitCode=$process.ExitCode }
@@ -970,6 +980,9 @@ function Invoke-V2Supervisor {
                         if (!$result.PrimaryFailure -and $result.ExitCode -eq 0) { $result.ExitCode=124 }
                     }
                     elseif ($result.ExitCode -eq 0) { $result.ExitCode=125; $result.SupervisorError='Owned descendants required forced termination after bounded normal drain.' }
+                    elseif ($inspectMode -and $inspectEnded -and !$result.SupervisorError) {
+                        $result.SupervisorError='Owned descendants required forced termination after bounded normal drain.'
+                    }
                     $result.TerminationRequested=$true
                     $job.Stop()
                 }

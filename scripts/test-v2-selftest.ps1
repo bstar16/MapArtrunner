@@ -1408,6 +1408,129 @@ Write-Output ('TRANSPORT='+(@{support=$env:MAPART_TWO_LANE_SUPPORT_CASE;launchId
             }
         }
     }
+    Run 'Task8i distinct native exit drains wrapper inside the original cleanup allowance' {
+        $proofs=[Collections.Generic.List[object]]::new()
+        foreach($case in 'worker0','worker7','worker7-tail','native9','stuck','metadata') {
+            $originalUpdate=${function:Update-V2Processes}; $originalReader=${function:Read-V2StartReceipt}; $originalExits=${function:Update-V2ProcessExits}
+            $caseRoot=Join-Path $testRoot ('wrapper-drain-'+$case)
+            New-Item -ItemType Directory -Path $caseRoot | Out-Null
+            $proof=@{Case=$case;NativePid=0;TailPid=0;CleanupSamples=0;WithheldSamples=0;ArchiveSawLock=$false}
+            # Real child publishes its own identity/ordered CLOSE; parent stays alive after its actual exit.
+            $child=@'
+$ErrorActionPreference='Stop'
+$self=[Diagnostics.Process]::GetCurrentProcess(); $session=[guid]::NewGuid().ToString('D'); $operation=[guid]::NewGuid().ToString('D')
+$ready=@{schema='mapartrunner-inspect-ready-v1';launchId=$env:MAPART_TEST_LAUNCH_ID;pid=$PID;startedUtc=$self.StartTime.ToUniversalTime().ToString('o');scenario='grounded-two-lane';mode='inspect';sessionId=$session;event='INSPECT_WORLD_BOUND_COMMANDS_READY'}
+$ready|ConvertTo-Json -Compress|Set-Content (Join-Path $env:MAPART_TEST_LAUNCH_DIR 'test-start.json')
+$wait=[Diagnostics.Stopwatch]::StartNew()
+while(!(Test-Path (Join-Path $env:MAPART_TEST_LAUNCH_DIR 'child-anchored'))){if($wait.ElapsedMilliseconds -gt 8000){exit 99};Start-Sleep -Milliseconds 10}
+$directory=Join-Path $env:TASK8I_REPO "v2/fabric/build/scenario-results/two-lane-$session/inspect-operations/op-1-$operation"
+New-Item -ItemType Directory -Path $directory|Out-Null
+$start=[DateTimeOffset]::UtcNow; $deadline=$start.AddMilliseconds(10000)
+foreach($phase in 'begin','cleanup','end') {
+    $frame=@{schema='mapartrunner-inspect-operation-v1';launchId=$ready.launchId;pid=$PID;startedUtc=$ready.startedUtc;mode='inspect';sessionId=$session;ordinal=1;operationId=$operation;command='CLOSE';evidenceDir=$directory
+        phase=@{begin='WORK';cleanup='CLEANUP';end='SETTLED'}[$phase];phaseStartedUtc=[DateTimeOffset]::UtcNow.ToString('o');phaseDeadlineUtc=$(if($phase -ceq 'end'){$null}else{$deadline.ToString('o')});verdict=$(if($phase -ceq 'begin'){$null}else{'SUCCESS'});cleanupStatus=$(if($phase -ceq 'end'){'SETTLED'}else{$null})}
+    if($phase -ceq 'begin'){$frame.phaseStartedUtc=$start.ToString('o')}
+    $frame|ConvertTo-Json -Compress|Set-Content (Join-Path $env:MAPART_TEST_LAUNCH_DIR "inspect-op-1.$phase.json")
+}
+while(!(Test-Path (Join-Path $env:MAPART_TEST_LAUNCH_DIR 'close-consumed'))){if($wait.ElapsedMilliseconds -gt 8000){exit 99};Start-Sleep -Milliseconds 10}
+Write-Output 'Task8i native trailing stdout';[Console]::Error.WriteLine('Task8i native trailing stderr')
+if($env:TASK8I_CASE -ceq 'native9'){exit 9};exit 0
+'@
+            $childPath=Join-Path $caseRoot 'native.ps1'; $child|Set-Content $childPath
+            $worker={
+                $info=[Diagnostics.ProcessStartInfo]::new((Join-Path $PSHOME pwsh.exe));$info.UseShellExecute=$false
+                foreach($arg in @('-NoProfile','-File',$env:TASK8I_CHILD)){$info.ArgumentList.Add($arg)}
+                $native=[Diagnostics.Process]::Start($info)
+                Set-Content (Join-Path $env:MAPART_TEST_LAUNCH_DIR 'native-pid.txt') $native.Id
+                $native.WaitForExit();$native.Dispose()
+                if($env:TASK8I_CASE -cin 'stuck','worker7-tail') {
+                    $tail=[Diagnostics.ProcessStartInfo]::new((Join-Path $PSHOME pwsh.exe));$tail.UseShellExecute=$false
+                    foreach($arg in @('-NoProfile','-Command','Start-Sleep -Seconds 30')){$tail.ArgumentList.Add($arg)}
+                    $tailProcess=[Diagnostics.Process]::Start($tail)
+                    Set-Content (Join-Path $env:MAPART_TEST_LAUNCH_DIR 'tail-pid.txt') $tailProcess.Id
+                    $tailProcess.Dispose()
+                }
+                if($env:TASK8I_CASE -cin 'stuck','native9'){Start-Sleep -Seconds 30}
+                Start-Sleep -Milliseconds 2000
+                Write-Output 'Task8i wrapper trailing stdout';[Console]::Error.WriteLine('Task8i wrapper trailing stderr')
+                if($env:TASK8I_CASE -cin 'worker7','worker7-tail'){exit 7};exit 0
+            }
+            try {
+                Set-Item Function:Update-V2Processes -Value {
+                    param($Job,$Records,$Handles,[switch]$Fast)
+                    & $originalUpdate @PSBoundParameters
+                    $pidFile=Join-Path $evidence 'native-pid.txt'
+                    if(Test-Path $pidFile){$proof.NativePid=[int](Get-Content $pidFile -Raw)}
+                    $tailFile=Join-Path $evidence 'tail-pid.txt'
+                    if(Test-Path $tailFile){$proof.TailPid=[int](Get-Content $tailFile -Raw)}
+                    foreach($record in $Records){if($record.Pid -eq $proof.NativePid){$record.IsGame=$true}}
+                    if($result.StartIdentity){Set-Content (Join-Path $evidence 'child-anchored') 'accepted'}
+                    if($result.InspectOperations.Count){Set-Content (Join-Path $evidence 'close-consumed') 'accepted'}
+                    if($cleanupClock){$proof.CleanupSamples++;if(!$result.TerminationRequested){$proof.LastNaturalSampleMilliseconds=$cleanupClock.ElapsedMilliseconds}}
+                }
+                Set-Item Function:Read-V2StartReceipt -Value {
+                    param($Evidence,$LaunchId,$Request,$Handles,$OwnedPids,$WorkerPid,$JavaExecutable,[switch]$RequireGame)
+                    # Test-only anchoring adapts the existing direct-dummy restriction. Real checks stay exact.
+                    if($RequireGame){return (& $originalReader @PSBoundParameters)}
+                    if(!$proof.NativePid){return [pscustomobject]@{Status='Pending';Reason='Awaiting owned dummy child'}}
+                    $native=@($Handles|Where-Object {$_.Record.Pid -eq $proof.NativePid})
+                    if($native.Count -ne 1){return [pscustomobject]@{Status='Pending';Reason='Awaiting owned dummy child'}}
+                    $arguments=@{}+$PSBoundParameters
+                    $shadow=$native[0].Record.PSObject.Copy();$shadow.Ownership='directly started gated worker'
+                    $arguments.Handles=@([pscustomobject]@{Process=$native[0].Process;Record=$shadow});$arguments.WorkerPid=$proof.NativePid
+                    $checked=& $originalReader @arguments
+                    if($checked.Status -ceq 'Accepted') {
+                        $realArguments=@{}+$arguments;$realArguments.RequireGame=$true;$realArguments.JavaExecutable=Join-Path $PSHOME 'not-configured-java.exe'
+                        $realCheck=& $originalReader @realArguments
+                        Assert ($realCheck.Status -ceq 'Rejected' -and $realCheck.Reason -like '*configured JDK native game*') 'dummy anchoring bypassed configured real JDK checks'
+                        $checked.Identity.Ownership=$native[0].Record.Ownership
+                    }
+                    $checked
+                }
+                Set-Item Function:Update-V2ProcessExits -Value {
+                    param($Handles,[switch]$IncludeExiting)
+                    & $originalExits @PSBoundParameters
+                    if($proof.Case -ceq 'metadata') {
+                        foreach($entry in $Handles){if($entry.Record.Pid -eq $proof.NativePid -and $entry.Process.HasExited){$entry.Record.ExitedUtc=$null;$proof.WithheldSamples++}}
+                    }
+                }
+                $archive={param($Evidence,$Before,$Context)
+                    $proof.CleanupFinishedMilliseconds=$cleanupClock.ElapsedMilliseconds
+                    $proof.ArchiveSawLock=$lock.Length -gt 0 -and $Context.Evidence -ceq $Evidence
+                    foreach($name in 'launch.stdout.log','launch.stderr.log'){Assert (Test-Path (Join-Path $Evidence $name)) 'archive preceded output files'}
+                }
+                $outcome=Invoke-V2Supervisor -Worker $worker -Request ([pscustomobject]@{Mode='inspect';Scenario='grounded-two-lane'}) -EvidenceRoot $caseRoot -WorkingDirectory $repo -StartupMilliseconds 6000 -Environment @{TASK8I_CHILD=$childPath;TASK8I_REPO=$repo;TASK8I_CASE=$case} -Archive $archive
+            } finally {Set-Item Function:Update-V2Processes -Value $originalUpdate;Set-Item Function:Read-V2StartReceipt -Value $originalReader;Set-Item Function:Update-V2ProcessExits -Value $originalExits}
+            $native=@($outcome.Processes|Where-Object {$_.Pid -eq $proof.NativePid})
+            $wrapper=@($outcome.Processes|Where-Object {$_.Pid -eq $outcome.WorkerPid})
+            $proof.Outcome=$outcome;$proof.LockBytes=(Get-Item (Join-Path $caseRoot 'supervisor.lock')).Length
+            if($native[0].ExitedUtc -and $wrapper[0].ExitedUtc){$proof.NativeToWorkerMilliseconds=([DateTimeOffset]$wrapper[0].ExitedUtc-[DateTimeOffset]$native[0].ExitedUtc).TotalMilliseconds}
+            $proofs.Add($proof);$proofs|ConvertTo-Json -Depth 14|Set-Content (Join-Path $testRoot 'wrapper-drain-proofs.json')
+            Assert ($native.Count -eq 1 -and $native[0].Pid -ne $outcome.WorkerPid -and $outcome.StartIdentity.Pid -eq $proof.NativePid -and $proof.ArchiveSawLock) 'distinct owned child anchoring/archive lock not exercised'
+            Assert ($outcome.InspectOperations.Count -eq 1 -and $outcome.InspectOperations[0].command -ceq 'CLOSE' -and $outcome.InspectOperations[0].cleanupStatus -ceq 'SETTLED') 'actual ordered CLOSE lost'
+            Assert ($proof.CleanupFinishedMilliseconds -lt 11000 -and $outcome.ArchiveStatus -ceq 'retained') 'cleanup renewed original10000ms bound or lost archive'
+            if($case -cin 'worker0','worker7','worker7-tail','metadata') {
+                Assert ((Get-Content (Join-Path $outcome.Evidence 'launch.stdout.log') -Raw) -like '*Task8i wrapper trailing stdout*' -and (Get-Content (Join-Path $outcome.Evidence 'launch.stderr.log') -Raw) -like '*Task8i wrapper trailing stderr*') 'wrapper trailing output lost'
+            }
+            if($case -ceq 'metadata') {
+                Assert ($proof.WithheldSamples -gt 0 -and $outcome.ExitCode -eq 125 -and $outcome.WorkerExitCode -eq 0 -and $outcome.CleanupStatus -ceq 'unresolved' -and $outcome.CleanupError -like '*exit metadata*' -and $proof.LockBytes -gt 0 -and !$outcome.TerminationRequested -and $proof.CleanupFinishedMilliseconds -ge 10000) 'withheld metadata did not exhaust original remainder and retain ownership'
+                continue
+            }
+            Assert-V2Settled $outcome
+            Assert ($proof.LockBytes -eq 0 -and @($outcome.Processes|Where-Object {$null -eq $_.ExitCode}).Count -eq 0) 'settled cleanup retained lock or lost raw exits'
+            if($case -cin 'stuck','native9','worker7-tail') {
+                Assert ($outcome.TerminationRequested -and $outcome.SupervisorError -like '*forced termination*') 'forced termination lost explanation'
+                if($case -cin 'stuck','worker7-tail'){Assert ($proof.TailPid -gt 0 -and @($outcome.Processes|Where-Object {$_.Pid -eq $proof.TailPid -and $_.ExitCode -eq 125}).Count -eq 1) 'actual owned tail exit125 missing'}
+                if($case -ceq 'stuck') {Assert ($native[0].ExitCode -eq 0 -and $outcome.WorkerExitCode -eq 125 -and $outcome.ExitCode -eq 125 -and !$outcome.PrimaryFailure -and $proof.LastNaturalSampleMilliseconds -ge 8800 -and $proof.CleanupFinishedMilliseconds -ge 9000 -and $proof.CleanupFinishedMilliseconds -lt 10000 -and $outcome.Processes.Count -ge 3) 'healthy stuck wrapper/descendant did not use original9000ms allocation'}
+                elseif($case -ceq 'native9') {Assert ($native[0].ExitCode -eq 9 -and $outcome.WorkerExitCode -eq 125 -and $outcome.ExitCode -eq 9 -and $outcome.PrimaryFailure.Pid -eq $proof.NativePid -and $proof.CleanupFinishedMilliseconds -lt 2000) 'early native failure entered healthy delay or lost first cause'}
+                else {Assert ($native[0].ExitCode -eq 0 -and $outcome.WorkerExitCode -eq 7 -and $outcome.ExitCode -eq 7 -and $outcome.PrimaryFailure.Pid -eq $outcome.WorkerPid -and $outcome.ObservedFailures.Count -eq 1 -and $proof.NativeToWorkerMilliseconds -ge 1800 -and $proof.CleanupFinishedMilliseconds -lt 4000) 'late worker failure did not stop healthy waiting or lost raw first cause'}
+            } else {
+                $code=$(if($case -ceq 'worker7'){7}else{0})
+                Assert ($native[0].ExitCode -eq 0 -and $outcome.WorkerExitCode -eq $code -and $outcome.ExitCode -eq $code -and !$outcome.TerminationRequested -and $proof.NativeToWorkerMilliseconds -ge 1800) "wrapper $case was forced before actual delayed exit: public=$($outcome.ExitCode), worker=$($outcome.WorkerExitCode), delay=$($proof.NativeToWorkerMilliseconds)"
+                if($code){Assert ($outcome.PrimaryFailure.Pid -eq $outcome.WorkerPid -and $outcome.PrimaryFailure.ExitCode -eq 7 -and $outcome.ObservedFailures.Count -eq 1) 'late actual worker7 lost first cause'}
+            }
+        }
+    }
     Run 'Task7b final held settlement reconciles pending metadata within the original cleanup allowance' {
         $proofs=[Collections.Generic.List[object]]::new()
         foreach($case in 'code0','code7','unknown') {
