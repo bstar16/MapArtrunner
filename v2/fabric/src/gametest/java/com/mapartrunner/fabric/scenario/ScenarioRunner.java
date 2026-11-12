@@ -188,6 +188,9 @@ final class ScenarioRunner implements AutoCloseable {
     private final Runnable inspectReleaseEffect;
     private final Runnable inspectFreezeEffect;
     private final InspectEffects inspectEffects = new InspectEffects();
+    // Bounded RUN2 comparison stays in Runner; never export Watch graphs to the native probe.
+    private InspectIdleObservation inspectForeignPrior;
+    private Operation inspectForeignOperation;
     private boolean inspectDoubledEffects;
     // Installed/refreshed only on the client thread at binding/start/arm; stopping never reads server-world state.
     private StopBinding inspectStopBinding;
@@ -511,7 +514,7 @@ final class ScenarioRunner implements AutoCloseable {
     static ResetFault selectResetFault(boolean inspect, String inspectGate, String acceptance, String automatic,
                                        String selection, Command command, int ordinal, int resets, boolean predecessor) {
         if(!inspect || !Boolean.parseBoolean(inspectGate) || !Boolean.parseBoolean(acceptance) || automatic!=null) return null;
-        require(Set.of("baseline","displaced","reset-archive").contains(selection),"Unknown acceptance case: "+selection);
+        require(Set.of("baseline","displaced","reset-archive","foreign-world").contains(selection),"Unknown acceptance case: "+selection);
         if(!selection.equals("reset-archive") || command!=Command.RESET) return null;
         if(ordinal==1 || ordinal==5) {
             require(resets==(ordinal==1?0:2) && predecessor,"Invalid reset fault counter/predecessor");
@@ -720,6 +723,15 @@ final class ScenarioRunner implements AutoCloseable {
             try { verifyResetFault(operation,cleanup,failure); }
             catch(RuntimeException | Error error) { inspectEvidenceIncomplete=true; failure=retain(failure,error); }
         }
+        if(inspectForeignOperation==operation && host instanceof InspectScenarioHost concrete) {
+            try {
+                boolean unchanged=inspectForeignPrior!=null && inspectForeignPrior.equals(new InspectIdleObservation(watch.retained()));
+                require(unchanged,"Foreign refusal discarded retained RUN2 Watch evidence");
+                verifyInspectPriorEvidence();
+                concrete.awaitForeignFinalProof(operation,cleanup,new ScenarioCommands.ForeignFinalFacts(unchanged,true,
+                        failure==null?null:failure.getClass().getName(),failure==null?null:failure.getMessage(),concrete.foreignGuardFacts()));
+            } catch(RuntimeException | Error error) { inspectEvidenceIncomplete=true; failure=retain(failure,error); }
+        }
         // Transport settlement cannot resolve an unverified release/freeze owned by this Runner.
         if(cleanupStatus.equals("FAILED")) inspectUnresolvedCleanupFailure=failure;
         ready=ready && failure==null && operation.command()==Command.RESET;
@@ -764,7 +776,7 @@ final class ScenarioRunner implements AutoCloseable {
                 Optional.ofNullable(inspectRun),failure==null?"PASS":"FAIL",failure,artifacts,complete,cleanupStatus,true,summary);
         inspectLast=completion; inspectLastSummaryHash=summaryHash; inspectOperation=null;
         return completion;
-        } finally { inspectResetDiagnostic=null; }
+        } finally { inspectResetDiagnostic=null; inspectForeignPrior=null; inspectForeignOperation=null; }
     }
 
     private static boolean timeoutFailure(Throwable failure) {
@@ -783,6 +795,7 @@ final class ScenarioRunner implements AutoCloseable {
         }
         Throwable unavailable=null;
         try {
+            host.runOnClient(c -> foreignGuard("CLEANUP_PREFLIGHT",() -> requireClient(c)));
             requireServerCheckpoint();
             return host.computeOnClient(c -> {
                 inspectEffects.attempt(cleanup,() -> { requireClient(c); return inspectObservations(c); },
@@ -824,14 +837,16 @@ final class ScenarioRunner implements AutoCloseable {
     }
 
     private void releaseInspectOnClient(MinecraftClient c,boolean stopping,Scope cleanup) {
-        if(stopping) requireInspectStopClient(c,cleanup); else requireClient(c);
-        require(MapArtClient.status().engine().lifecycle().context().map(context -> runs.contains(context.runId())).orElse(true),
-                "Cleanup refuses another run's controls");
-        MapArtClient.stop(); requireReleased(c);
+        foreignGuard("CLEANUP_RELEASE",() -> {
+            if(stopping) requireInspectStopClient(c,cleanup); else requireClient(c);
+            require(MapArtClient.status().engine().lifecycle().context().map(context -> runs.contains(context.runId())).orElse(true),
+                    "Cleanup refuses another run's controls");
+        });
+        foreignEffect("CLEANUP_STOP"); MapArtClient.stop(); requireReleased(c);
         var arm=stopping?inspectStopBinding.arm:supportArm;
         if(arm!=null) {
             if(stopping) requireInspectStopClient(c,cleanup); else requireClient(c);
-            PredictionFaults.cancelSupportAvailabilityForClose(c,server,save,arm.context().runId(),arm);
+            foreignEffect("CLEANUP_FAULT_CANCEL"); PredictionFaults.cancelSupportAvailabilityForClose(c,server,save,arm.context().runId(),arm);
         }
     }
 
@@ -1131,6 +1146,32 @@ final class ScenarioRunner implements AutoCloseable {
         }
     }
 
+    private void foreignGuard(String site,Runnable guard) {
+        if(host instanceof InspectScenarioHost concrete) concrete.foreignGuard(site,guard); else guard.run();
+    }
+    private void foreignEffect(String site) {
+        if(host instanceof InspectScenarioHost concrete) concrete.foreignEffect(site);
+    }
+    private void armForeignResetStop(ScenarioDefinition definition,Scope work) {
+        if(!inspectMode || !InspectScenarioHost.foreignAcceptanceEnabled() || inspectOperation.command()!=Command.RERUN) return;
+        require(host instanceof InspectScenarioHost && inspectOperation.ordinal()==3 && work!=null
+                && work.operation()==inspectOperation && resetOrdinal==1 && countedStarts==1 && worldCreated && !closed
+                && admitted!=null && definition.definitionHash().equals(admitted.definitionHash())
+                && inspectLast!=null && inspectLast.ordinal()==2 && inspectLast.command()==Command.RUN
+                && inspectLast.sessionId().equals(invocation) && inspectLast.verdict().equals("PASS") && inspectLast.failure()==null
+                && inspectLast.evidenceComplete() && inspectLast.cleanupSettled() && inspectLast.cleanupStatus().equals("RELEASED")
+                && previous!=null && inspectLast.runId().filter(previous.runId()::equals).isPresent()
+                && previous.artifacts().equals(inspectLast.evidenceDirectory()) && priorCountedSuccess==previous
+                && assertedSuccesses.stream().anyMatch(result -> result==previous),"Foreign hold requires retained successful RUN2");
+        require(((Inspect)host).requireScope(inspectOperation,Kind.WORK)==work,"Foreign reset WORK changed");
+        verifyInspectPriorEvidence();
+        var retained=watch.retained();
+        require(retained.binding()!=null && retained.binding().context().runId().equals(previous.runId())
+                && !retained.samples().isEmpty() && !retained.witnesses().isEmpty(),"Foreign hold lacks retained RUN2 native evidence");
+        inspectForeignPrior=new InspectIdleObservation(retained); inspectForeignOperation=inspectOperation;
+        ((InspectScenarioHost)host).armForeignResetStop(inspectOperation);
+    }
+
     void reset(ScenarioDefinition definition) {
         var resetWork=requireInspectWork(Command.RESET,Command.RERUN);
         require(!inspectMode || worldCreated,"Inspect startup must create and bind the owned world before reset");
@@ -1164,9 +1205,10 @@ final class ScenarioRunner implements AutoCloseable {
         ready = false;
         if (!worldCreated) createOwnedWorld();
         preflight(definition);
+        armForeignResetStop(definition,resetWork);
         Prior prior = host.computeOnClient(c -> {
-            requireClient(c);
-            MapArtClient.stop();
+            foreignGuard("RESET_STOP",() -> requireClient(c));
+            foreignEffect("RESET_STOP"); MapArtClient.stop();
             requireReleased(c);
             // Copy before clear/arm: both owners retain diagnostics across stop.
             if(!baseline() && capture!=null && sealed==null) sealed=watch.sealTraversal();
@@ -1200,7 +1242,8 @@ final class ScenarioRunner implements AutoCloseable {
         }, () -> {
             int consumed=release ? releaseForReset(stage,prior) : 0;
             host.runOnClient(c -> {
-                requireClient(c); PredictionFaults.clear(); watch.clear();
+                foreignGuard("RESET_CLEAR",() -> requireClient(c));
+                foreignEffect("RESET_CLEAR"); PredictionFaults.clear(); watch.clear();
                 if(inspectMode) { supportArm=null; bindInspectStop(c); }
             });
             if(!baseline()) {
@@ -1247,11 +1290,11 @@ final class ScenarioRunner implements AutoCloseable {
             return ScenarioObserver.serverBinding(s,serverWorld,serverPlayer);
         }):null;
         UUID started=host.computeOnClient(c -> {
-            requireClient(c); requireReleased(c);
+            foreignGuard("START",() -> { requireClient(c); requireReleased(c); });
             var now = readClient(c, true);
             if(!baseline()) now=withRegion(now,region(c.player,true,"prestart-client"));
             require(now.problems.isEmpty() && now.state.equals(stable.client.state), "Start state changed without physics");
-            UUID fresh = MapArtClient.start(plan, origin, settings);
+            foreignEffect("START"); UUID fresh = MapArtClient.start(plan, origin, settings);
             require(runs.add(fresh), "Facade reused a run UUID");
             bindInspectStop(c);
             if(inspectMode) {
@@ -1595,7 +1638,7 @@ final class ScenarioRunner implements AutoCloseable {
     }
 
     private Live clientLive(MinecraftClient c) {
-        requireClient(c); enforceActionScope();
+        foreignGuard("LIVE_CLIENT",() -> requireClient(c)); enforceActionScope();
         var pending=(PendingPredictionView)((ClientWorldPendingUpdateAccessor)c.world).mapart$getPendingUpdateManager();
         var positions=new ArrayList<String>();
         for (var cell:admitted.worldCells().keySet()) {
@@ -1956,16 +1999,16 @@ final class ScenarioRunner implements AutoCloseable {
                 stable==null ? null : stable.status.engine().lifecycle().context().map(c -> c.runId()).orElse(null)).toString()));
         if (worldCreated && (!inspectMode || !closed)) {
             capture(error,() -> writeNew(roots,artifacts.resolve("failure-support-gate.txt"),
-                    host.computeOnClient(c -> { if(inspectMode) requireClient(c); return PredictionFaults.resetSnapshot().support(); }).toString()));
+                    host.computeOnClient(c -> { if(inspectMode) foreignGuard("CAPTURE_FAULT",() -> requireClient(c)); return PredictionFaults.resetSnapshot().support(); }).toString()));
             capture(error,() -> {
-                host.runOnClient(this::requireClient);
+                host.runOnClient(c -> foreignGuard("CAPTURE_SCREEN_PREFLIGHT",() -> requireClient(c)));
                 takeScreenshot(artifacts,"failure");
             });
             if (failureLiveAvailable(true,admitted,plan,origin,settings))
                 capture(error,() -> writeNew(roots,artifacts.resolve("failure-live.txt"),live().toString()));
             capture(error,() -> writeLinesNew(artifacts.resolve("failure-observer.txt"),
                     host.computeOnClient(c -> {
-                        if(inspectMode) { requireClient(c); return watch.retained().samples(); }
+                        if(inspectMode) { foreignGuard("CAPTURE_WATCH",() -> requireClient(c)); return watch.retained().samples(); }
                         return watch.copy();
                     }).stream().map(ScenarioObserver.Sample::line)::iterator));
             capture(error,() -> writeNew(roots,artifacts.resolve("failure-server-witnesses.txt"),pairedEvidence(watch.retained())));
@@ -4316,11 +4359,12 @@ final class ScenarioRunner implements AutoCloseable {
         preflight(d);
         var data=d.data(); var player=data.getAsJsonObject("player");
         host.runOnServer(s -> {
-            requireServer(s);
+            foreignGuard("RESTORE_SERVER",() -> requireServer(s));
             var level=s.getOverworld();
             var entities=level.getOtherEntities(serverPlayer, regionBox(), e -> true);
             // This fixture never breaks blocks or drops items; no arbitrary entity gets reset ownership.
             require(entities.isEmpty(), "Unowned bounded entities: " + entities);
+            foreignEffect("RESTORE_BLOCKS_PLAYER_INVENTORY");
             for (var cell:data.getAsJsonObject("world").getAsJsonArray("blocks")) {
                 var value=cell.getAsJsonObject(); level.setBlockState(pos(value.getAsJsonObject("position")), block(value.getAsJsonObject("block")));
             }
@@ -4333,7 +4377,8 @@ final class ScenarioRunner implements AutoCloseable {
             p.sendAbilitiesUpdate(); p.getInventory().markDirty(); p.playerScreenHandler.syncState();
         });
         host.runOnClient(c -> {
-            requireClient(c);
+            foreignGuard("RESTORE_CLIENT",() -> requireClient(c));
+            foreignEffect("RESTORE_POSE_INPUT_OPTIONS");
             optionsOwned=true;
             c.options.getAutoJump().setValue(b(player,"autoJump"));
             if(!baseline()) {
@@ -4675,6 +4720,7 @@ final class ScenarioRunner implements AutoCloseable {
 
     private void restoreCallerOptions(MinecraftClient c) {
         if(!optionsOwned) return;
+        foreignEffect("CLOSE_OPTIONS");
         c.options.getAutoJump().setValue(callerAutoJump);
         if(!baseline()) { c.options.getViewDistance().setValue(callerViewDistance); c.options.sendClientSettings(); }
         optionsOwned=false;
@@ -4693,7 +4739,7 @@ final class ScenarioRunner implements AutoCloseable {
             var cleanup=transport.requireScope(inspectOperation,Kind.CLEANUP);
             closeInspectOwned(inspectOperation,cleanup);
         }
-        } finally { inspectResetDiagnostic=null; }
+        } finally { inspectResetDiagnostic=null; inspectForeignPrior=null; inspectForeignOperation=null; }
     }
 
     private void closeInspectOwned(Operation operation, Scope cleanup) {
@@ -4716,11 +4762,14 @@ final class ScenarioRunner implements AutoCloseable {
             if(effects.observationFailure()!=null) failure=retain(failure,effects.observationFailure());
             if(effects.aftermathFailure()!=null) failure=retain(failure,effects.aftermathFailure());
             if(effects.releaseFailure()!=null || effects.freezeFailure()!=null) inspectUnresolvedCleanupFailure=failure;
-            try { host.runOnClient(c -> { requireClient(c); restoreCallerOptions(c); }); }
+            try { host.runOnClient(c -> {
+                foreignGuard("CLOSE_OPTIONS",() -> requireClient(c));
+                restoreCallerOptions(c);
+            }); }
             catch(RuntimeException | Error error) { failure=retain(failure,error); }
             try {
                 requireServerCheckpoint(); host.runOnClient(this::requireClient);
-                ((Inspect)host).closeWorld(this::requireClient); closed=true; normalClose=true;
+                ((Inspect)host).closeWorld(c -> foreignGuard("CLOSE_NATIVE",() -> requireClient(c))); closed=true; normalClose=true;
                 if(inspectAdmissionFailure==null)
                     writeNew(roots,artifacts.resolve("world-closed.txt"),"WORLD CLOSED normally; session="+invocation+"; operation="+operation.operationId());
             } catch(RuntimeException | Error error) { failure=retain(failure,error); }
@@ -4742,7 +4791,7 @@ final class ScenarioRunner implements AutoCloseable {
             if(failure instanceof Error fatal) throw fatal;
             if(failure!=null) throw (RuntimeException)failure;
         }
-        } finally { inspectResetDiagnostic=null; }
+        } finally { inspectResetDiagnostic=null; inspectForeignPrior=null; inspectForeignOperation=null; }
     }
 
     private void closeCompact() {

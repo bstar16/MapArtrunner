@@ -6,6 +6,43 @@ import com.mapartrunner.core.run.BuildEngine;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.option.KeyBinding;
 import net.minecraft.client.gui.screen.ChatScreen;
+import net.minecraft.client.gui.screen.GameMenuScreen;
+import net.minecraft.client.gui.screen.TitleScreen;
+import net.minecraft.client.gui.screen.world.CreateWorldScreen;
+import net.minecraft.client.gui.screen.world.WorldCreator;
+import net.minecraft.client.gui.Element;
+import net.minecraft.client.gui.ParentElement;
+import net.minecraft.client.gui.widget.ButtonWidget;
+import net.minecraft.client.gui.widget.Widget;
+import net.minecraft.client.input.MouseInput;
+import net.minecraft.screen.ScreenTexts;
+import net.minecraft.screen.PlayerScreenHandler;
+import net.minecraft.registry.RegistryKeys;
+import net.minecraft.world.gen.WorldPresets;
+import net.minecraft.util.WorldSavePath;
+import net.minecraft.util.PlayerInput;
+import net.minecraft.util.ErrorReporter;
+import net.minecraft.util.math.BlockPos;
+import net.minecraft.world.World;
+import net.minecraft.world.chunk.WorldChunk;
+import net.minecraft.world.chunk.ChunkStatus;
+import net.minecraft.world.GameMode;
+import net.minecraft.entity.player.PlayerEntity;
+import net.minecraft.entity.EquipmentSlot;
+import net.minecraft.entity.attribute.EntityAttributeModifier;
+import net.minecraft.entity.effect.StatusEffectInstance;
+import net.minecraft.item.ItemStack;
+import net.minecraft.block.BlockState;
+import net.minecraft.storage.NbtWriteView;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.world.ServerWorld;
+import net.minecraft.server.network.ServerPlayerEntity;
+import com.mojang.serialization.Codec;
+import com.mojang.serialization.JsonOps;
+import java.nio.file.Path;
+import java.nio.file.Files;
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import net.minecraft.client.gui.widget.TextFieldWidget;
 import net.minecraft.client.input.CharInput;
 import net.minecraft.client.input.KeyInput;
@@ -15,6 +52,14 @@ import java.util.*;
 import java.util.function.*;
 import java.time.Instant;
 import com.google.gson.JsonObject;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonParser;
+import com.google.gson.JsonNull;
+import net.minecraft.nbt.*;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 
 import static com.mapartrunner.fabric.scenario.ScenarioCommands.*;
 import static com.mapartrunner.fabric.scenario.ScenarioHost.Command;
@@ -27,7 +72,8 @@ final class InspectAcceptanceDriver {
     private static final Command[] MUTATIONS = {Command.RUN, Command.RESET, Command.RUN, Command.RERUN, Command.RERUN};
     private static final Command[] DISPLACED = {Command.RUN, Command.RESET, Command.RUN, Command.RESET, Command.RUN};
     private static final Command[] RESET_ARCHIVE = {Command.RESET, Command.RUN, Command.RESET, Command.RUN, Command.RESET, Command.RUN, Command.RESET, Command.RUN};
-    private enum Stage { WAIT_STARTUP, NEXT_COMMAND, MOVING, OPEN_CHAT, WAIT_HANDOFF, WAIT_COMPLETION, IDLE, IDLE_FINISH_PENDING, STOPPED }
+    private static final Command[] FOREIGN = {Command.RESET, Command.RUN, Command.RERUN};
+    private enum Stage { WAIT_STARTUP, NEXT_COMMAND, MOVING, OPEN_CHAT, WAIT_HANDOFF, WAIT_COMPLETION, IDLE, IDLE_FINISH_PENDING, FOREIGN, STOPPED }
 
     // This driver alone owns its sequence and synthetic key. No Runner/Host state is changed here.
     private final Supplier<InspectObservation> observations;
@@ -46,12 +92,16 @@ final class InspectAcceptanceDriver {
     private PublishedCompletion retained, pending;
     private UUID session;
     private boolean advancing, failed, stopRequested;
-    private boolean selected, displaced, resetArchive, moved, middleLast, carryInputDeadline;
+    private boolean selected, displaced, resetArchive, foreignCase, moved, middleLast, carryInputDeadline;
     private int resetArchiveLast = -1;
     private int movementCallbacks;
     private Object heldForward;
     private Pose movementStart;
     private Idle idle;
+    private ForeignClaims foreignClaims;
+    private Foreign foreign;
+    private boolean stopping;
+    private Throwable driverFailure;
 
     // Only Driver owns this interval. Origins never renew; its before value is cleared after the final comparison.
     private static final class Idle {
@@ -67,9 +117,15 @@ final class InspectAcceptanceDriver {
     }
 
     InspectAcceptanceDriver(MinecraftClient client, ScenarioCommands commands) {
-        this(commands::observeInspect, new NativeChat(client), System::nanoTime, InspectAcceptanceDriver::enabled,
+        this(commands::observeInspect, new NativeChat(client,commands::observeForeignAcceptance), System::nanoTime, InspectAcceptanceDriver::enabled,
                 message -> System.out.println(message), completion -> commands.requireAcceptanceIdle(client, completion),
                 completion -> commands.observeAcceptanceIdle(client, completion));
+        foreignClaims=new ForeignClaims() {
+            public ForeignObservation observe() { return commands.observeForeignAcceptance(); }
+            public boolean release(MinecraftClient current) { return commands.releaseForeignAcceptanceBoundary(current); }
+            public boolean replay(MinecraftClient current,UUID operation,long deadline) { return commands.acknowledgeForeignReplayMeasurement(current,operation,deadline); }
+            public boolean seal(MinecraftClient current,ForeignProofAck ack) { return commands.acknowledgeForeignFinalProof(current,ack); }
+        };
     }
 
     /** Only this fixed policy has a simulated boundary in unit tests; it grants no native acceptance. */
@@ -90,6 +146,11 @@ final class InspectAcceptanceDriver {
         this.idleGuard = idleGuard; this.idleObservation = idleObservation;
     }
 
+    InspectAcceptanceDriver(Supplier<InspectObservation> observations,ChatBoundary input,LongSupplier clock,
+                            BooleanSupplier enabled,Consumer<String> log,ForeignClaims foreignClaims) {
+        this(observations,input,clock,enabled,log); this.foreignClaims=foreignClaims;
+    }
+
     static boolean enabled() {
         return enabled(System.getProperty("mapart.test.inspect"), System.getProperty("mapart.test.inspect.acceptance"),
                 System.getProperty("fabric.client.gametest"));
@@ -100,7 +161,7 @@ final class InspectAcceptanceDriver {
 
     void tick(MinecraftClient current) {
         if (advancing) return;
-        if (!enabled.getAsBoolean() && heldForward == null && idle == null && !failed) return;
+        if (!enabled.getAsBoolean() && heldForward == null && idle == null && foreign==null && !failed) return;
         boolean validEntry = false;
         advancing = true;
         try {
@@ -108,12 +169,28 @@ final class InspectAcceptanceDriver {
             require(enabled.getAsBoolean(), "Acceptance gate disabled during driver activity");
             if (!selected) {
                 var value = System.getProperty("mapart.test.inspect.acceptance.case", "baseline");
-                require(value.equals("baseline") || value.equals("displaced") || value.equals("reset-archive"), "Unknown acceptance case: " + value);
-                displaced = value.equals("displaced"); resetArchive = value.equals("reset-archive"); selected = true;
+                require(Set.of("baseline","displaced","reset-archive","foreign-world").contains(value), "Unknown acceptance case: " + value);
+                displaced = value.equals("displaced"); resetArchive = value.equals("reset-archive"); foreignCase=value.equals("foreign-world"); selected = true;
             }
             if(resetArchive) require("reset-archive".equals(System.getProperty("mapart.test.inspect.acceptance.case")),"Reset-archive acceptance case changed");
             if (stage == Stage.STOPPED) { requestStop(current); return; }
             var observed = observations.get();
+            if(foreignCase) {
+                require("foreign-world".equals(System.getProperty("mapart.test.inspect.acceptance.case")),"Foreign acceptance case changed");
+                if(foreign!=null) { foreign.tick(current,observed); return; }
+                if(index==2 && (stage==Stage.WAIT_HANDOFF || stage==Stage.WAIT_COMPLETION) && foreignClaims!=null) {
+                    var held=foreignClaims.observe();
+                    if(held!=null && held.queueEntered()) {
+                        require(input.screen()==null && held.ordinal()==3 && Objects.equals(session,held.sessionId())
+                                && held.operationId()!=null && !operations.contains(held.operationId())
+                                && Set.of("HELD","CANCELLED_HOLD").contains(held.stage()) && !held.boundaryRetired()
+                                && clock.getAsLong()-held.workDeadlineNanos()<0,"Foreign original RERUN3 boundary invalid");
+                        input.requireBinding(); requireUnchanged(observed);
+                        require(retained!=null && retained.ordinal()==2 && retained.command()==Command.RUN && retained.runId().isPresent(),"Foreign requires retained RUN2");
+                        foreign=new Foreign(held); stage=Stage.FOREIGN; foreign.tick(current,observed); return;
+                    }
+                }
+            }
             require(!observed.restartRequired(), "Inspect session unavailable; restart required");
             if (stage == Stage.WAIT_STARTUP) {
                 if (!observed.ready() || observed.busy()) return; // Original startup owner retains its bound.
@@ -242,7 +319,7 @@ final class InspectAcceptanceDriver {
         if (advancing) return;
         boolean validEntry = false;
         advancing = true;
-        try { input.requireClient(current); validEntry = true; releaseForward(); }
+        try { input.requireClient(current); validEntry = true; stopping=true; if(foreign!=null) foreign.dispose(); releaseForward(); }
         catch (RuntimeException | Error failure) { fail(failure, validEntry); }
         finally { advancing = false; }
     }
@@ -276,7 +353,7 @@ final class InspectAcceptanceDriver {
                     && completion.failure().filter(f -> "com.mapartrunner.fabric.scenario.ScenarioRunner$SimulatedInspectResetFailure".equals(f.className())
                     && (index == 0 ? "SIMULATED_INSPECT_RESET_AFTER_RESTORE_BEFORE_READINESS"
                     : "SIMULATED_INSPECT_ARCHIVE_BEFORE_COMMITTED").equals(f.message())).isPresent();
-        } else if (resetArchive && (index == 1 || index == 5) || !resetArchive && (index == 0 || displaced && index == 2)) {
+        } else if (!foreignCase && (resetArchive && (index == 1 || index == 5) || !resetArchive && (index == 0 || displaced && index == 2))) {
             expected = "FAIL".equals(completion.verdict()) && completion.runId().isEmpty()
                     && completion.failure().filter(f -> "java.lang.AssertionError".equals(f.className())
                     && (resetArchive || index == 0 ? "Run requires this invocation's successful reset" : "Start state changed without physics").equals(f.message())).isPresent();
@@ -383,8 +460,11 @@ final class InspectAcceptanceDriver {
     private void fail(Throwable failure, boolean validEntry) {
         // A rejected current argument retains debt even if captured-client checks would succeed.
         if (validEntry) try { releaseForward(); } catch (RuntimeException | Error release) { if (release != failure) failure.addSuppressed(release); }
-        if (failed) return;
+        if (failed) { if(driverFailure!=null && driverFailure!=failure) driverFailure.addSuppressed(failure); return; }
+        driverFailure=failure;
         failed = true;
+        if(foreign!=null) try { foreign.dispose(); }
+        catch(RuntimeException | Error secondary) { if(secondary!=failure) failure.addSuppressed(secondary); }
         if (validEntry) try { releaseKey(); } catch (RuntimeException | Error release) { failure.addSuppressed(release); }
         marker("DRIVER_FAIL " + failure.getClass().getName() + ": " + failure.getMessage());
         idle = null;
@@ -408,7 +488,7 @@ final class InspectAcceptanceDriver {
                 + mutations()[index].name().toLowerCase(Locale.ROOT) + " grounded-two-lane";
     }
 
-    private Command[] mutations() { return resetArchive ? RESET_ARCHIVE : displaced ? DISPLACED : MUTATIONS; }
+    private Command[] mutations() { return foreignCase ? FOREIGN : resetArchive ? RESET_ARCHIVE : displaced ? DISPLACED : MUTATIONS; }
     private boolean isLast() { return index == mutations().length || displaced && index == 3 && !middleLast
             || resetArchive && (index == 1 || index == 4 || index == 5) && resetArchiveLast != index; }
 
@@ -439,10 +519,393 @@ final class InspectAcceptanceDriver {
         void requireNeutral();
         Instant utc();
         IdleIdentity idleIdentity();
+        default void exitForeign() { throw new IllegalStateException("No foreign native exit boundary"); }
+        default boolean createForeign(Runnable revalidate,UUID session) { throw new IllegalStateException("No foreign native creation boundary"); }
+        default boolean bindForeign() { throw new IllegalStateException("No foreign native binding boundary"); }
+        default boolean settleForeign() { throw new IllegalStateException("No foreign native settling boundary"); }
+        default boolean foreignClockAdvanced(String previous) { throw new IllegalStateException("No foreign native clock boundary"); }
+        default ForeignRead readForeign(long ordinal,long deadline,String previousServer,ForeignObservation expected) { throw new IllegalStateException("No foreign native read boundary"); }
+        default void continueForeignRead(ForeignRead request) { }
+        default void retireForeignRead(ForeignRead request) { request.retired.set(true); }
+        default JsonObject foreignMetadata() { throw new IllegalStateException("No foreign native metadata boundary"); }
+        default void flushForeign() { System.out.flush(); require(!System.out.checkError(),"Foreign stdout flush/check failed"); }
     }
+
+    interface ForeignClaims {
+        ForeignObservation observe();
+        boolean release(MinecraftClient current);
+        boolean replay(MinecraftClient current,UUID operation,long deadline);
+        boolean seal(MinecraftClient current,ForeignProofAck ack);
+    }
+
+    // One program, one outstanding read and one frozen claim; originals clear only after successful consumption.
+    private final class Foreign {
+        private enum Step { EXIT, CREATE, BIND, SETTLE, READ, CHAT_OPEN, CHAT_SEND, CHAT_HANDOFF, RELEASE, REPLAY, REPLAY_ACK, FINAL, SEAL_ACK, AWAIT_END }
+        private final ForeignObservation original;
+        private final ForeignProof proof=new ForeignProof(log,input::flushForeign);
+        private Step step=Step.EXIT;
+        private long readOrdinal,chatOrigin;
+        private int pair,chatIndex;
+        private ForeignRead read;
+        private String baselineClient,baselineServer,previousClient,previousServer;
+        private ForeignObservation frozen;
+        private ForeignProofAck seal;
+        private Object chatScreen;
+        Foreign(ForeignObservation original) { this.original=original; }
+        private ForeignObservation validate(InspectObservation observed) {
+            require(!stopping && !stopRequested && enabled.getAsBoolean() && "foreign-world".equals(System.getProperty("mapart.test.inspect.acceptance.case")),"Foreign gate/stopping changed");
+            var now=foreignClaims.observe();
+            require(now!=null && now.sessionId().equals(original.sessionId()) && now.operationId().equals(original.operationId())
+                    && now.ordinal()==3 && now.queueEntered() && now.workDeadlineNanos()==original.workDeadlineNanos()
+                    && !Set.of("ABANDONED","INCOMPLETE","REPLAY_FAILED").contains(now.stage()),"Foreign request changed/abandoned");
+            requireUnchanged(observed);
+            require(observed.busy() || step==Step.AWAIT_END,"Foreign original operation no longer busy");
+            long deadline=now.requestOrdinal()==0?now.workDeadlineNanos():now.cleanupDeadlineNanos();
+            require(clock.getAsLong()-deadline<0 || step==Step.AWAIT_END,"Foreign original deadline expired");
+            require(now.guards().stream().allMatch(g -> FOREIGN_GUARDS.contains(g.site()) && g.effectCalled()==0
+                    && g.entered()>=0 && g.refused()>=0 && g.passed()>=0 && g.entered()==g.refused()+g.passed()),"Managed effect/unknown guard fact after foreign arming");
+            return now;
+        }
+        private void nativeCheck(InspectObservation observed) { validate(observed); input.requireBinding(); }
+        void tick(MinecraftClient current,InspectObservation observed) {
+            if(step==Step.AWAIT_END) return;
+            var now=validate(observed);
+            switch(step) {
+                case EXIT -> {
+                    require(!now.cancelled() && now.stage().equals("HELD"),"Foreign exit requires entered original held wrapper");
+                    input.requireNeutral(); step=Step.CREATE; input.exitForeign();
+                }
+                case CREATE -> {
+                    require(now.cancelled(),"Native exit did not cancel original WORK");
+                    if(input.createForeign(() -> validate(observations.get()),original.sessionId())) step=Step.BIND;
+                }
+                case BIND -> { if(input.bindForeign()) step=Step.SETTLE; }
+                case SETTLE -> {
+                    nativeCheck(observed);
+                    if(input.settleForeign()) {
+                        var header=input.foreignMetadata(); var identity=input.idleIdentity();
+                        header.addProperty("schema","mapartrunner.inspect.foreign.v1"); header.addProperty("version",1);
+                        header.addProperty("nativePid",identity.nativePid()); header.addProperty("nativeStartedUtc",identity.nativeStartedUtc().toString());
+                        header.addProperty("launchId",identity.launchId().toString()); header.addProperty("sessionId",original.sessionId().toString());
+                        header.addProperty("operationId",original.operationId().toString()); header.addProperty("ordinal",3);
+                        header.addProperty("run2Operation",retained.operationId().toString()); header.addProperty("run2",retained.runId().orElseThrow().toString());
+                        header.addProperty("run2Summary",retained.summaryPath()); header.addProperty("run2Evidence",retained.evidenceDirectory());
+                        header.addProperty("workDeadlineNanos",original.workDeadlineNanos()); header.addProperty("sourceJoin","Root retained immutable source/tree plus launch identity");
+                        var exclusions=new JsonArray(); List.of("clocks.age","clocks.worldTime","clocks.timeOfDay","server.clocks.serverTick","player.hunger.value.foodTickTimer").forEach(exclusions::add);
+                        header.add("exclusions",exclusions); proof.row("HEADER",header); step=Step.READ;
+                    }
+                }
+                case READ -> {
+                    nativeCheck(observed); input.requireNeutral();
+                    if(read==null) {
+                        if(previousClient!=null && !input.foreignClockAdvanced(previousClient)) return;
+                        read=input.readForeign(++readOrdinal,now.requestOrdinal()==0?now.workDeadlineNanos():now.cleanupDeadlineNanos(),previousServer,now); return;
+                    }
+                    input.continueForeignRead(read);
+                    var remote=read.consume(readOrdinal,clock.getAsLong()); if(remote==null) return;
+                    nativeCheck(observations.get()); input.requireNeutral();
+                    var local=read.client;
+                    if(pair==0) {
+                        protectedForeign(local,false); protectedForeign(remote,true); baselineClient=local; baselineServer=remote;
+                    } else {
+                        compareForeign(baselineClient,previousClient,local,false); compareForeign(baselineServer,previousServer,remote,true);
+                    }
+                    var label=PAIR_LABELS.get(pair); proof.pair(label,readOrdinal,local,remote);
+                    previousClient=local; previousServer=remote; input.retireForeignRead(read); read=null; pair++;
+                    if(pair>=2 && pair<=5) step=Step.CHAT_OPEN;
+                    else if(pair==26) { frozen=now; step=Step.RELEASE; }
+                    else if(pair==27) { frozen=now; step=Step.REPLAY_ACK; }
+                    else if(pair==28) {
+                        requireFinal(now);
+                        var finalRows=foreignFacts(now); finalRows.addProperty("finalObservationIdentity",finalIdentity());
+                        proof.row("FINAL_REQUEST",finalRows);
+                        nativeCheck(observations.get()); frozen=now;
+                        seal=proof.seal(now,finalIdentity(),clock.getAsLong()); step=Step.SEAL_ACK;
+                    }
+                }
+                case CHAT_OPEN -> {
+                    nativeCheck(observed); input.requireNeutral(); chatOrigin=clock.getAsLong(); chatScreen=null;
+                    var row=new JsonObject(); row.addProperty("command",foreignCommand()); row.addProperty("beforePair",PAIR_LABELS.get(pair-1));
+                    row.addProperty("expectedFeedbackKind",chatIndex<3?"actual native refusal; Root must verify retained vanilla chat bytes":"actual native LAST RUN2; Root must verify retained vanilla chat bytes");
+                    proof.row("CHAT_REQUESTED",row); step=Step.CHAT_SEND; pairedKey(input.chatKey(),null);
+                }
+                case CHAT_SEND -> {
+                    chatDeadline(); nativeCheck(observed); chatScreen=input.screen(); if(chatScreen==null) return;
+                    input.requireChat(chatScreen,""); step=Step.CHAT_HANDOFF; var command=foreignCommand();
+                    for(int i=0;i<command.length();i++) { chatDeadline(); nativeCheck(observations.get()); input.requireChat(chatScreen,command.substring(0,i)); input.character(command.charAt(i)); }
+                    chatDeadline(); input.requireChat(chatScreen,command);
+                    var row=new JsonObject(); row.addProperty("command",command); row.addProperty("typing","transient complete draft; Enter callback follows"); proof.row("CHAT_ENTER",row);
+                    pairedKey(ENTER,chatScreen);
+                }
+                case CHAT_HANDOFF -> {
+                    chatDeadline(); nativeCheck(observed);
+                    if(input.screen()!=null) { input.requireChat(chatScreen,foreignCommand()); return; }
+                    input.requireNeutral(); var row=new JsonObject(); row.addProperty("command",foreignCommand()); row.addProperty("nextPair","C"+(chatIndex+1));
+                    row.addProperty("feedbackAuthority","independent retained vanilla ChatHud logger; this row is handoff only"); proof.row("CHAT_HANDOFF",row);
+                    chatIndex++; step=Step.READ;
+                }
+                case RELEASE -> {
+                    nativeCheck(observed); input.requireNeutral(); require(samePending(frozen,now,"CANCELLED_HOLD","HELD"),"Foreign release pending request changed");
+                    if(foreignClaims.release(current)) { step=Step.REPLAY; frozen=null; }
+                }
+                case REPLAY -> {
+                    nativeCheck(observed); input.requireNeutral();
+                    if(now.stage().equals("REPLAY_REJECTED")) {
+                        require(now.replayRejected() && now.cancelled() && !now.boundaryRetired(),"No actual original-wrapper refusal");
+                        proof.row("REPLAY_REJECTED",foreignFacts(now)); step=Step.READ;
+                    } else require(Set.of("RELEASE_REQUESTED","REPLAY_QUEUED").contains(now.stage()),"Unexpected original replay stage");
+                }
+                case REPLAY_ACK -> {
+                    nativeCheck(observed); input.requireNeutral(); require(samePending(frozen,now,"REPLAY_REJECTED"),"Foreign P claim changed");
+                    if(foreignClaims.replay(current,original.operationId(),original.workDeadlineNanos())) { step=Step.FINAL; frozen=null; }
+                }
+                case FINAL -> {
+                    nativeCheck(observed); input.requireNeutral();
+                    if(now.stage().equals("FINAL_NATIVE_READ_REQUIRED")) { requireFinal(now); proof.row("FINAL_REQUESTED",foreignFacts(now)); step=Step.READ; }
+                    else require(Set.of("POST_REPLAY_MEASURED","CLEANUP_PENDING").contains(now.stage()),"Unexpected foreign cleanup stage");
+                }
+                case SEAL_ACK -> {
+                    nativeCheck(observed); input.requireNeutral(); require(samePending(frozen,now,"FINAL_NATIVE_READ_REQUIRED"),"Foreign final claim changed");
+                    requireFinal(now);
+                    if(foreignClaims.seal(current,seal)) { dispose(); step=Step.AWAIT_END; }
+                }
+                case AWAIT_END -> { /* Original supervisor owns expected UNRESOLVED END/escalation; no close or further native proof. */ }
+            }
+        }
+        private void chatDeadline() { require(clock.getAsLong()-chatOrigin<INPUT_NANOS,"Foreign original chat input deadline expired"); }
+        private String foreignCommand() { return chatIndex==3?"/maparttest last":"/maparttest "+List.of("reset","run","rerun").get(chatIndex)+" grounded-two-lane"; }
+        private String finalIdentity() { return sha256((previousClient+"\n"+previousServer+"\n").getBytes(StandardCharsets.UTF_8)); }
+        private void requireFinal(ForeignObservation now) {
+            require(now.stage().equals("FINAL_NATIVE_READ_REQUIRED") && now.requestOrdinal()==1 && now.cleanupDeadlineNanos()!=0
+                    && now.boundaryRetired() && now.replayRejected() && now.cancelled() && now.finalFacts()!=null
+                    && now.finalFacts().retainedWatchUnchanged() && now.finalFacts().closedRunEvidenceUnchanged()
+                    && now.finalFacts().primaryClass()!=null && now.finalFacts().primaryMessage()!=null
+                    && now.finalFacts().guards().equals(now.guards()),"Foreign final proof provenance unavailable");
+            require(now.guards().stream().anyMatch(g -> g.site().equals("CLEANUP_PREFLIGHT") && g.entered()>0 && g.refused()==g.entered() && g.passed()==0),"Foreign cleanup refusal not reached");
+        }
+        void dispose() {
+            var outstanding=read; read=null;
+            frozen=null; seal=null; baselineClient=null; baselineServer=null; previousClient=null; previousServer=null;
+            if(outstanding!=null) { outstanding.retired.set(true); input.retireForeignRead(outstanding); }
+        }
+    }
+    private static boolean samePending(ForeignObservation frozen,ForeignObservation current,String... stages) {
+        return Arrays.asList(stages).contains(current.stage()) && frozen.equals(current);
+    }
+    private static JsonObject foreignFacts(ForeignObservation value) {
+        var out=new JsonObject(); out.addProperty("sessionId",value.sessionId().toString()); out.addProperty("operationId",value.operationId().toString());
+        out.addProperty("ordinal",value.ordinal()); out.addProperty("stage",value.stage()); out.addProperty("workDeadlineNanos",value.workDeadlineNanos());
+        out.addProperty("queueEntered",value.queueEntered()); out.addProperty("replayRejected",value.replayRejected()); out.addProperty("cancelled",value.cancelled());
+        out.addProperty("boundaryRetired",value.boundaryRetired()); out.addProperty("requestOrdinal",value.requestOrdinal()); out.addProperty("cleanupDeadlineNanos",value.cleanupDeadlineNanos());
+        var guards=new JsonArray(); for(var g:value.guards()) {
+            var row=new JsonObject(); row.addProperty("site",g.site()); row.addProperty("entered",g.entered()); row.addProperty("refused",g.refused()); row.addProperty("passed",g.passed()); row.addProperty("effectCalled",g.effectCalled()); guards.add(row);
+        } out.add("guards",guards);
+        var unreached=new JsonArray(); FOREIGN_GUARDS.stream().filter(site -> value.guards().stream().noneMatch(g -> g.site().equals(site) && g.entered()>0))
+                .forEach(unreached::add); out.add("unreachedGuardSites",unreached);
+        if(value.finalFacts()!=null) {
+            out.addProperty("retainedWatchUnchanged",value.finalFacts().retainedWatchUnchanged()); out.addProperty("closedRunEvidenceUnchanged",value.finalFacts().closedRunEvidenceUnchanged());
+            out.addProperty("primaryClass",value.finalFacts().primaryClass()); out.addProperty("primaryMessage",value.finalFacts().primaryMessage());
+        }
+        return out;
+    }
+    private static final List<String> FOREIGN_GUARDS=List.of("RESET_STOP","RESET_CLEAR","RESTORE_SERVER","RESTORE_BLOCKS_PLAYER_INVENTORY",
+            "RESTORE_CLIENT","RESTORE_POSE_INPUT_OPTIONS","START","LIVE_CLIENT","CAPTURE_FAULT","CAPTURE_SCREEN_PREFLIGHT","CAPTURE_WATCH",
+            "SCREENSHOT","CLEANUP_PREFLIGHT","CLEANUP_RELEASE","CLEANUP_STOP","CLEANUP_FAULT_CANCEL","CLOSE_OPTIONS","CLOSE_NATIVE","CLOSE_NATIVE_WORLD","CLOSE_NATIVE_CLIENT");
 
     record Pose(double x, double z) { }
     record IdleIdentity(long nativePid,Instant nativeStartedUtc,UUID launchId) { }
+
+    private static JsonElement canonical(JsonElement value) {
+        if(value.isJsonObject()) {
+            var out=new JsonObject();
+            new TreeSet<>(value.getAsJsonObject().keySet()).forEach(k -> out.add(k,canonical(value.getAsJsonObject().get(k))));
+            return out;
+        }
+        if(value.isJsonArray()) {
+            var out=new JsonArray(); value.getAsJsonArray().forEach(v -> out.add(canonical(v))); return out;
+        }
+        return value.deepCopy();
+    }
+    static String canonicalText(JsonElement value) { return canonical(value).toString(); }
+    static String sha256(byte[] value) {
+        try { return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(value)); }
+        catch(NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); }
+    }
+    static JsonObject floating(float value) {
+        require(Float.isFinite(value),"Nonfinite float");
+        var out=new JsonObject(); out.addProperty("type","f32"); out.addProperty("bits",Integer.toUnsignedString(Float.floatToRawIntBits(value),16));
+        out.addProperty("hex",Float.toHexString(value)); return out;
+    }
+    static JsonObject floating(double value) {
+        require(Double.isFinite(value),"Nonfinite double");
+        var out=new JsonObject(); out.addProperty("type","f64"); out.addProperty("bits",Long.toUnsignedString(Double.doubleToRawLongBits(value),16));
+        out.addProperty("hex",Double.toHexString(value)); return out;
+    }
+    /** Tagged recursive NBT: no NbtOps-to-JSON coercion, numeric widening or array/list conflation. */
+    static JsonObject typedNbt(NbtElement element) {
+        require(element!=null,"Missing typed NBT");
+        var out=new JsonObject(); out.addProperty("type",element.getType());
+        JsonElement value;
+        if(element instanceof NbtCompound compound) {
+            var fields=new JsonObject(); new TreeSet<>(compound.getKeys()).forEach(k -> fields.add(k,typedNbt(compound.get(k)))); value=fields;
+        } else if(element instanceof NbtList list) {
+            var items=new JsonArray(); list.forEach(v -> items.add(typedNbt(v))); value=items;
+        } else if(element instanceof NbtByteArray array) {
+            var items=new JsonArray(); for(byte n:array.getByteArray()) items.add(n); value=items;
+        } else if(element instanceof NbtIntArray array) {
+            var items=new JsonArray(); for(int n:array.getIntArray()) items.add(n); value=items;
+        } else if(element instanceof NbtLongArray array) {
+            var items=new JsonArray(); for(long n:array.getLongArray()) items.add(n); value=items;
+        } else if(element instanceof NbtString text) value=new com.google.gson.JsonPrimitive(text.value());
+        else if(element instanceof AbstractNbtNumber number) {
+            value=switch(element.getType()) {
+                case NbtElement.BYTE_TYPE -> new com.google.gson.JsonPrimitive(number.byteValue());
+                case NbtElement.SHORT_TYPE -> new com.google.gson.JsonPrimitive(number.shortValue());
+                case NbtElement.INT_TYPE -> new com.google.gson.JsonPrimitive(number.intValue());
+                case NbtElement.LONG_TYPE -> new com.google.gson.JsonPrimitive(number.longValue());
+                case NbtElement.FLOAT_TYPE -> floating(number.floatValue());
+                case NbtElement.DOUBLE_TYPE -> floating(number.doubleValue());
+                default -> throw new IllegalStateException("Unknown numeric NBT type");
+            };
+        } else if(element.getType()==NbtElement.END_TYPE) value=JsonNull.INSTANCE;
+        else throw new IllegalStateException("Unknown NBT type: "+element.getType());
+        out.add("value",value); return out;
+    }
+
+    /** One finite stdout stream; the seal excludes itself and permanently closes data emission. */
+    static final class ForeignProof {
+        static final String PREFIX="INSPECT_FOREIGN_PROOF ";
+        static final int SIDE_BYTES=262144, CHUNK_BYTES=1536, LINE_BYTES=4096;
+        private final Consumer<String> output;
+        private final Runnable flush;
+        private final MessageDigest digest;
+        private long rows, bytes;
+        private int pairs;
+        private boolean sealed;
+        ForeignProof(Consumer<String> output,Runnable flush) {
+            this.output=output; this.flush=flush;
+            try { digest=MessageDigest.getInstance("SHA-256"); }
+            catch(NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); }
+        }
+        void row(String kind,JsonObject fields) {
+            require(!sealed,"Foreign proof already sealed");
+            var row=fields.deepCopy(); row.addProperty("kind",kind); row.addProperty("row",rows);
+            var text=canonicalText(row); var raw=(text+"\n").getBytes(StandardCharsets.UTF_8);
+            require((PREFIX+text+"\n").getBytes(StandardCharsets.UTF_8).length<=LINE_BYTES,"Foreign proof line overflow");
+            output.accept(PREFIX+text); digest.update(raw); bytes=Math.addExact(bytes,raw.length); rows=Math.addExact(rows,1);
+        }
+        void pair(String label,long request,String client,String server) {
+            require(pairs<28 && PAIR_LABELS.get(pairs).equals(label),"Foreign pair order/count changed");
+            // Validate both sides before any partial pair escapes.
+            var local=client.getBytes(StandardCharsets.UTF_8); var remote=server.getBytes(StandardCharsets.UTF_8);
+            require(local.length>0 && remote.length>0 && local.length<=SIDE_BYTES && remote.length<=SIDE_BYTES,"Foreign snapshot empty/overflow");
+            chunks(label,request,"client",local); chunks(label,request,"server",remote); pairs++;
+        }
+        private void chunks(String label,long request,String side,byte[] raw) {
+            int count=(raw.length+CHUNK_BYTES-1)/CHUNK_BYTES;
+            var sideHash=sha256(raw);
+            for(int chunk=0;chunk<count;chunk++) {
+                var data=new JsonObject(); data.addProperty("pair",label); data.addProperty("request",request); data.addProperty("side",side);
+                data.addProperty("chunk",chunk); data.addProperty("chunks",count); data.addProperty("sideBytes",raw.length);
+                data.addProperty("sideSha256",sideHash);
+                data.addProperty("base64",Base64.getEncoder().encodeToString(Arrays.copyOfRange(raw,chunk*CHUNK_BYTES,Math.min(raw.length,(chunk+1)*CHUNK_BYTES))));
+                row("SNAPSHOT",data);
+            }
+        }
+        ForeignProofAck seal(ForeignObservation request,String identity,long beforeClaimNanos) {
+            require(!sealed && pairs==28,"Foreign seal requires exactly 28 full pairs");
+            sealed=true;
+            var hash=HexFormat.of().formatHex(digest.digest());
+            var seal=new JsonObject(); seal.addProperty("kind","SEAL"); seal.addProperty("rows",rows); seal.addProperty("bytes",bytes);
+            seal.addProperty("sha256",hash); seal.addProperty("operationId",request.operationId().toString());
+            seal.addProperty("requestOrdinal",request.requestOrdinal()); seal.addProperty("cleanupDeadlineNanos",request.cleanupDeadlineNanos());
+            seal.addProperty("beforeClaimNanos",beforeClaimNanos); seal.addProperty("finalObservationIdentity",identity);
+            var labels=new JsonArray(); PAIR_LABELS.forEach(labels::add); seal.add("pairs",labels); seal.addProperty("measurementVerdict","COMPLETE");
+            var text=canonicalText(seal);
+            require((PREFIX+text+"\n").getBytes(StandardCharsets.UTF_8).length<=LINE_BYTES,"Foreign seal overflow");
+            output.accept(PREFIX+text); flush.run();
+            return new ForeignProofAck(request.operationId(),request.requestOrdinal(),rows,bytes,hash,identity);
+        }
+    }
+    static final List<String> PAIR_LABELS;
+    static {
+        var labels=new ArrayList<>(List.of("B0","B1","C1","C2","C3","C4"));
+        for(int i=1;i<=20;i++) labels.add("D"+i); labels.add("P"); labels.add("F"); PAIR_LABELS=List.copyOf(labels);
+    }
+
+    static String protectedForeign(String text,boolean server) {
+        var state=JsonParser.parseString(text).getAsJsonObject();
+        var clocks=state.getAsJsonObject("clocks");
+        require(clocks.keySet().equals(Set.of("age","worldTime","timeOfDay","serverTick")),"Unknown foreign clock schema");
+        clocks.remove("age"); clocks.remove("worldTime"); clocks.remove("timeOfDay");
+        if(server) clocks.remove("serverTick"); else require(clocks.get("serverTick").isJsonNull(),"Client cannot supply server clock credit");
+        var hunger=state.getAsJsonObject("player").getAsJsonObject("hunger");
+        require(hunger.get("type").getAsInt()==NbtElement.COMPOUND_TYPE,"Foreign hunger is not typed compound");
+        var fields=hunger.getAsJsonObject("value"); var timer=fields.getAsJsonObject("foodTickTimer");
+        require(timer!=null && timer.get("type").getAsInt()==NbtElement.INT_TYPE,"Missing typed hunger timer");
+        fields.remove("foodTickTimer"); return canonicalText(state);
+    }
+    static void compareForeign(String baseline,String before,String after,boolean server) {
+        require(protectedForeign(baseline,server).equals(protectedForeign(after,server))
+                && protectedForeign(before,server).equals(protectedForeign(after,server)),"Foreign protected state changed");
+        var a=JsonParser.parseString(before).getAsJsonObject().getAsJsonObject("clocks");
+        var b=JsonParser.parseString(after).getAsJsonObject().getAsJsonObject("clocks");
+        for(var key:server?List.of("age","worldTime","serverTick"):List.of("age","worldTime"))
+            require(b.get(key).getAsLong()>a.get(key).getAsLong(),"Foreign independent clock did not advance: "+key);
+    }
+
+    /** Only detached strings cross the native read boundary; each request is entered and retired once. */
+    static final class ForeignRead {
+        private enum State { QUEUED, RUNNING, CLOCK_PENDING, REQUEUE_READY, CAPTURED }
+        final long ordinal, deadline;
+        final String client,previousServer;
+        final java.util.concurrent.atomic.AtomicReference<String> server=new java.util.concurrent.atomic.AtomicReference<>();
+        final java.util.concurrent.atomic.AtomicReference<FailureObservation> failure=new java.util.concurrent.atomic.AtomicReference<>();
+        final java.util.concurrent.atomic.AtomicBoolean entered=new java.util.concurrent.atomic.AtomicBoolean(),retired=new java.util.concurrent.atomic.AtomicBoolean();
+        private final java.util.concurrent.atomic.AtomicReference<State> state=new java.util.concurrent.atomic.AtomicReference<>(State.QUEUED);
+        private ForeignClock lastClock;
+        ForeignRead(long ordinal,long deadline,String client) { this(ordinal,deadline,client,null); }
+        ForeignRead(long ordinal,long deadline,String client,String previousServer) {
+            this.ordinal=ordinal; this.deadline=deadline; this.client=client; this.previousServer=previousServer;
+        }
+        void probeEntry() { require(!retired.get() && failure.get()==null && state.compareAndSet(State.QUEUED,State.RUNNING),"Late/duplicate foreign server callback"); }
+        boolean admit(ForeignClock clock) {
+            require(!retired.get() && state.get()==State.RUNNING && !entered.get(),"Foreign full capture already admitted");
+            var previous=previousServer==null?null:foreignClock(previousServer);
+            require(clock.age>=0 && clock.time>=0 && clock.tick>=0 && (previous==null || clock.nondecreasing(previous))
+                    && (lastClock==null || clock.nondecreasing(lastClock)),"Foreign server clock regressed/unknown");
+            lastClock=clock;
+            if(previous!=null && !clock.advancing(previous)) {
+                require(state.compareAndSet(State.RUNNING,State.CLOCK_PENDING),"Foreign pending clock result changed"); return false;
+            }
+            enter(); return true;
+        }
+        void enter() {
+            require(!retired.get() && failure.get()==null && entered.compareAndSet(false,true),"Late/duplicate foreign native read");
+            state.compareAndSet(State.QUEUED,State.RUNNING);
+        }
+        boolean requeue() { return !retired.get() && failure.get()==null && state.compareAndSet(State.REQUEUE_READY,State.QUEUED); }
+        void complete(String value) {
+            require(!retired.get() && entered.get() && state.get()==State.RUNNING && server.compareAndSet(null,value),"Late/duplicate foreign native result");
+            require(state.compareAndSet(State.RUNNING,State.CAPTURED),"Foreign full native result changed");
+        }
+        String consume(long expected,long now) {
+            require(ordinal==expected && now-deadline<0 && !retired.get(),"Stale/expired foreign native result");
+            var problem=failure.get(); require(problem==null,"Foreign server read failed: "+problem);
+            if(state.compareAndSet(State.CLOCK_PENDING,State.REQUEUE_READY)) return null;
+            if(state.get()!=State.CAPTURED) return null;
+            var result=server.get(); if(result==null) return null;
+            require(state.get()==State.CAPTURED && entered.get() && retired.compareAndSet(false,true),"Foreign native result already consumed"); return result;
+        }
+    }
+    record ForeignClock(long age,long time,long tick) {
+        boolean nondecreasing(ForeignClock other) { return age>=other.age && time>=other.time && tick>=other.tick; }
+        boolean advancing(ForeignClock other) { return age>other.age && time>other.time && tick>other.tick; }
+    }
+    private static ForeignClock foreignClock(String state) {
+        var clocks=JsonParser.parseString(state).getAsJsonObject().getAsJsonObject("clocks");
+        return new ForeignClock(clocks.get("age").getAsLong(),clocks.get("worldTime").getAsLong(),clocks.get("serverTick").getAsLong());
+    }
 
     static void requireForwardKeys(KeyBinding binding, KeyBinding[] allKeys, List<KeyBinding> controls,
                                    BuildEngine.ControlOwner owner) {
@@ -456,9 +919,11 @@ final class InspectAcceptanceDriver {
 
     private static final class NativeChat implements ChatBoundary {
         private final MinecraftClient client;
+        private final Supplier<ForeignObservation> foreignObservation;
         private Object world, server, player, handler, connection, window;
         private long handle;
-        NativeChat(MinecraftClient client) { this.client = client; }
+        private NativeForeign replacement;
+        NativeChat(MinecraftClient client,Supplier<ForeignObservation> foreignObservation) { this.client = client; this.foreignObservation=foreignObservation; }
         @Override public void requireClient(MinecraftClient current) {
             require(current == client && MinecraftClient.getInstance() == client && client.isOnThread(), "Wrong installed client/thread");
         }
@@ -476,6 +941,7 @@ final class InspectAcceptanceDriver {
             System.out.println(mode.substring(0, Math.min(mode.length(), 4096)));
         }
         @Override public void requireBinding() {
+            if(replacement!=null && replacement.bound) { replacement.checkBinding(); return; }
             require(enabled() && client.isOnThread() && MinecraftClient.getInstance() == client && client.isRunning(), "Input gate/client/thread unavailable");
             require(window != null && client.getWindow() == window && handle != 0 && client.getWindow().getHandle() == handle, "Window replaced");
             require(world != null && client.world == world && client.getServer() == server && client.player == player
@@ -542,6 +1008,411 @@ final class InspectAcceptanceDriver {
             var process = ProcessHandle.current();
             return new IdleIdentity(process.pid(),process.info().startInstant().orElseThrow(),UUID.fromString(System.getenv("MAPART_TEST_LAUNCH_ID")));
         }
+        @Override public void exitForeign() {
+            requireNeutral(); require(replacement==null,"Foreign exit already attempted");
+            replacement=new NativeForeign();
+            client.openGameMenu(false);
+            replacement.installed();
+            require(client.world==world && client.getServer()==server && client.player==player
+                    && client.getNetworkHandler()==handler && client.getNetworkHandler().getConnection()==connection,"Original binding changed before exit");
+            require(client.currentScreen!=null && client.currentScreen.getClass()==GameMenuScreen.class
+                    && ((GameMenuScreen)client.currentScreen).shouldShowMenu(),"Expected native pause menu");
+            var screen=client.currentScreen;
+            var button=uniqueButton(screen,ScreenTexts.returnToMenuOrDisconnect(client.isInSingleplayer()).getString());
+            replacement.installed(); require(client.currentScreen==screen && client.world==world && client.getServer()==server,"Exit menu/binding replaced");
+            require(button.active && button.visible,"Native exit button changed before press");
+            button.onPress(new MouseInput(0,0));
+        }
+        @Override public boolean createForeign(Runnable revalidate,UUID session) { return replacement.create(revalidate,session); }
+        @Override public boolean bindForeign() { return replacement.bind(); }
+        @Override public boolean settleForeign() { return replacement.settle(); }
+        @Override public boolean foreignClockAdvanced(String previous) {
+            replacement.checkBinding();
+            var clocks=JsonParser.parseString(previous).getAsJsonObject().getAsJsonObject("clocks");
+            require(client.player.age>=clocks.get("age").getAsLong() && client.world.getTime()>=clocks.get("worldTime").getAsLong(),"Foreign client admission clock regressed");
+            require(client.player.age>=replacement.clientAdmissionAge && client.world.getTime()>=replacement.clientAdmissionTime,"Foreign client clock regressed across admission checks");
+            replacement.clientAdmissionAge=client.player.age; replacement.clientAdmissionTime=client.world.getTime();
+            for(var pos:replacement.cells) loaded(client.world,pos);
+            return client.player.age>clocks.get("age").getAsLong() && client.world.getTime()>clocks.get("worldTime").getAsLong();
+        }
+        @Override public ForeignRead readForeign(long ordinal,long deadline,String previousServer,ForeignObservation expected) { return replacement.read(ordinal,deadline,previousServer,expected); }
+        @Override public void continueForeignRead(ForeignRead request) { replacement.continueRead(request); }
+        @Override public void retireForeignRead(ForeignRead request) {
+            request.retired.set(true);
+            if(replacement!=null && replacement.nativeRead==request) { replacement.nativeRead=null; replacement.serverRead=null; replacement.readProjection=null; }
+        }
+        @Override public JsonObject foreignMetadata() { return replacement.metadata(); }
+
+        private final class NativeForeign {
+            final ScenarioDefinition definition=ScenarioDefinition.load();
+            final List<BlockPos> cells=foreignCells(definition);
+            final Path saves,oldSave;
+            Path foreignSave;
+            Object foreignWorld,foreignPlayer,foreignHandler,foreignConnection,interaction;
+            MinecraftServer foreignServer;
+            UUID uuid;
+            // These two references are read/written only on the captured foreign server's own thread.
+            ServerWorld serverWorld;
+            ServerPlayerEntity serverPlayer;
+            boolean created,bound,creationCancelled;
+            long settleAge=-1;
+            int stableAges;
+            String settling;
+            long clientAdmissionAge=-1,clientAdmissionTime=-1;
+            ForeignRead nativeRead;
+            ForeignObservation readProjection;
+            Runnable serverRead;
+            final java.util.concurrent.atomic.AtomicReference<FailureObservation> nativeReadFailure=new java.util.concurrent.atomic.AtomicReference<>();
+            NativeForeign() {
+                saves=real(client.getLevelStorage().getSavesDirectory());
+                oldSave=real(client.getServer().getSavePath(WorldSavePath.ROOT));
+                require(oldSave.getParent().equals(saves),"Original inspect save outside canonical saves root");
+            }
+            void installed() {
+                requireClient(client);
+                require(!creationCancelled && enabled() && InspectScenarioHost.foreignAcceptanceEnabled() && client.isRunning()
+                        && client.getWindow()==window && handle!=0 && client.getWindow().getHandle()==handle
+                        && client.isWindowFocused() && client.getOverlay()==null,"Foreign installed client/window/gate/focus unavailable");
+            }
+            boolean create(Runnable revalidate,UUID session) {
+                installed(); require(!created,"Foreign world creation already attempted");
+                if(client.world!=null || client.getServer()!=null || client.player!=null || client.getNetworkHandler()!=null) {
+                    require(transitionScreen(client.currentScreen),"Unexpected exit interstitial/binding"); return false;
+                }
+                require(client.currentScreen!=null && client.currentScreen.getClass()==TitleScreen.class,"Expected title after native save/quit");
+                if(!client.isFinishedLoading()) return false;
+                revalidate.run();
+                CreateWorldScreen.show(client,() -> creationCancelled=true);
+                // show pumps native tasks: authenticate again in this same callback, before configuration or press.
+                revalidate.run(); installed(); requirePreworld();
+                require(client.currentScreen!=null && client.currentScreen.getClass()==CreateWorldScreen.class,"Foreign creation screen replaced");
+                var screen=(CreateWorldScreen)client.currentScreen; var creator=screen.getWorldCreator();
+                creator.setWorldName("mapart-ordinary-foreign-"+session);
+                creator.setGameMode(WorldCreator.Mode.SURVIVAL); creator.setCheatsEnabled(false);
+                var flat=creator.getGeneratorOptionsHolder().getCombinedRegistryManager().getOrThrow(RegistryKeys.WORLD_PRESET).getOrThrow(WorldPresets.FLAT);
+                creator.setWorldType(new WorldCreator.WorldType(flat)); creator.setSeed("2");
+                foreignSave=saves.resolve(creator.getWorldDirectoryName()).toAbsolutePath().normalize();
+                require(real(client.getLevelStorage().getSavesDirectory()).equals(saves) && foreignSave.getParent().equals(saves)
+                        && !foreignSave.equals(oldSave) && !Files.exists(foreignSave,java.nio.file.LinkOption.NOFOLLOW_LINKS),"Foreign destination exists/redirected/not distinct");
+                var button=uniqueButton(screen,net.minecraft.text.Text.translatable("selectWorld.create").getString());
+                revalidate.run(); installed(); requirePreworld();
+                require(client.currentScreen==screen && screen.getWorldCreator()==creator
+                        && client.getLevelStorage().getSavesDirectory().resolve(creator.getWorldDirectoryName()).toAbsolutePath().normalize().equals(foreignSave),"Foreign create screen/creator/save changed");
+                require(button.active && button.visible,"Native create button changed before press");
+                created=true; button.onPress(new MouseInput(0,0)); return true;
+            }
+            void requirePreworld() { require(client.world==null && client.getServer()==null && client.player==null && client.getNetworkHandler()==null,"Foreign creation over a world"); }
+            boolean bind() {
+                installed(); require(created && !bound,"Foreign binding phase invalid");
+                if(client.currentScreen!=null || client.world==null || client.getServer()==null || client.player==null || client.getNetworkHandler()==null) {
+                    require(transitionScreen(client.currentScreen),"Unexpected foreign loading interstitial"); return false;
+                }
+                require(client.world!=world && client.getServer()!=server && client.player!=player && client.getNetworkHandler()!=handler
+                        && client.getNetworkHandler().getConnection()!=connection,"Foreign native identities not distinct");
+                require(real(client.getServer().getSavePath(WorldSavePath.ROOT)).equals(foreignSave),"Actual foreign save changed/redirected");
+                foreignWorld=client.world; foreignServer=client.getServer(); foreignPlayer=client.player; foreignHandler=client.getNetworkHandler();
+                foreignConnection=client.getNetworkHandler().getConnection(); interaction=client.interactionManager; uuid=client.player.getUuid();
+                bound=true; checkBinding(); return true;
+            }
+            void checkBinding() {
+                installed();
+                require(nativeReadFailure.get()==null,"Foreign native callback failed/duplicated: "+nativeReadFailure.get());
+                require(bound && client.world==foreignWorld && client.getServer()==foreignServer && client.player==foreignPlayer
+                        && client.getNetworkHandler()==foreignHandler && client.getNetworkHandler().getConnection()==foreignConnection
+                        && client.getNetworkHandler().getConnection().isOpen() && client.player.getUuid().equals(uuid)
+                        && client.interactionManager==interaction && !client.isPaused(),"Foreign binding/server/UUID/connection replaced");
+                require(client.world.getRegistryKey().equals(World.OVERWORLD),"Foreign client dimension changed");
+            }
+            boolean settle() {
+                checkBinding(); requireNeutral(); requireInactive(client.player);
+                // Unknown/unloaded cells are hard failures even during setup; only physical settling may reset this count.
+                for(var cell:cells) loaded(client.world,cell);
+                var pose=poseAndVelocity(client.player); long age=client.player.age;
+                require(age>=settleAge,"Foreign setup age regressed");
+                if(age==settleAge) return false;
+                settleAge=age;
+                if(!client.player.isOnGround() || !Objects.equals(settling,pose)) { settling=pose; stableAges=client.player.isOnGround()?1:0; return false; }
+                return ++stableAges>=20;
+            }
+            ForeignRead read(long ordinal,long deadline,String previousServer,ForeignObservation expected) {
+                checkBinding(); requireNeutral(); require(System.nanoTime()-deadline<0,"Foreign native read expired before capture");
+                require(nativeRead==null && serverRead==null,"Foreign native read already outstanding");
+                requireReadProjection(expected,deadline); readProjection=expected;
+                var capturedServer=foreignServer; var capturedWorld=client.world; var capturedPlayer=client.player;
+                var value=readForeignPlayer(capturedPlayer,cells,-1,foreignSave);
+                var local=JsonParser.parseString(value).getAsJsonObject(); local.add("client",clientState(client));
+                var request=new ForeignRead(ordinal,deadline,canonicalText(local),previousServer); nativeRead=request;
+                serverRead=() -> {
+                    try {
+                        request.probeEntry();
+                        require(capturedServer.isOnThread() && System.nanoTime()-deadline<0 && InspectScenarioHost.foreignAcceptanceEnabled(),"Wrong foreign server thread/expired/disabled read");
+                        requireReadProjection(expected,deadline);
+                        require(capturedServer.getSavePath(WorldSavePath.ROOT).toAbsolutePath().normalize().equals(foreignSave),"Foreign server save changed");
+                        var level=capturedServer.getOverworld(); var players=capturedServer.getPlayerManager().getPlayerList();
+                        var sole=capturedServer.getPlayerManager().getPlayer(uuid);
+                        require(level!=null && level.getRegistryKey().equals(World.OVERWORLD) && players.size()==1
+                                && sole!=null && players.getFirst()==sole && sole.getEntityWorld()==level && sole.getUuid().equals(uuid),"Foreign server sole-player/world/UUID mismatch");
+                        if(serverWorld==null) { serverWorld=level; serverPlayer=sole; }
+                        require(level==serverWorld && sole==serverPlayer,"Foreign server world/player replaced");
+                        require(level.getSeed()==2 && level.getChunkManager().getChunkGenerator() instanceof net.minecraft.world.gen.chunk.FlatChunkGenerator
+                                && !capturedServer.getSaveProperties().areCommandsAllowed() && sole.getGameMode()==GameMode.SURVIVAL,"Foreign world seed/preset/cheats/mode changed");
+                        requireInactive(sole);
+                        for(var pos:cells) loaded(level,pos);
+                        var support=sole.getBlockPos().down(); loaded(level,support); loaded(level,support.up()); loaded(level,support.up(2));
+                        var clocks=new ForeignClock(sole.age,level.getTime(),capturedServer.getTicks());
+                        if(!request.admit(clocks)) return; // No full sample exists; only this same request may await natural clock readiness.
+                        var state=JsonParser.parseString(readForeignPlayer(sole,cells,capturedServer.getTicks(),foreignSave)).getAsJsonObject();
+                        require(foreignClock(canonicalText(state)).equals(clocks),"Foreign full capture clocks differ from admitted own-thread clocks");
+                        var settings=new JsonObject(); settings.addProperty("seed",level.getSeed()); settings.addProperty("generatorClass",level.getChunkManager().getChunkGenerator().getClass().getName());
+                        settings.addProperty("cheats",capturedServer.getSaveProperties().areCommandsAllowed()); settings.addProperty("solePlayerCount",players.size());
+                        settings.addProperty("solePlayerUuid",sole.getUuid().toString()); settings.addProperty("serverWorld",System.identityHashCode(level)); settings.addProperty("serverPlayer",System.identityHashCode(sole));
+                        state.add("serverWorld",settings); request.complete(canonicalText(state));
+                    } catch(RuntimeException | Error failure) {
+                        var detached=new FailureObservation(failure.getClass().getName(),failure.getMessage());
+                        request.failure.compareAndSet(null,detached); nativeReadFailure.compareAndSet(null,detached);
+                    }
+                };
+                capturedServer.execute(serverRead);
+                // Re-entrant native execute implementations may have changed the client binding; never consume on that assumption.
+                checkBinding(); require(client.world==capturedWorld && client.player==capturedPlayer && client.getServer()==capturedServer,"Foreign client replaced during read dispatch");
+                return request;
+            }
+            void continueRead(ForeignRead request) {
+                checkBinding(); requireNeutral();
+                require(nativeRead==request && serverRead!=null && !request.retired.get() && System.nanoTime()-request.deadline<0,"Foreign pending native request changed/expired");
+                requireReadProjection(readProjection,request.deadline);
+                for(var pos:cells) loaded(client.world,pos);
+                // consume() changes PENDING_CLOCK to REQUEUE_READY on the preceding END, never in this dispatch.
+                if(request.requeue()) foreignServer.execute(serverRead);
+            }
+            void requireReadProjection(ForeignObservation expected,long deadline) {
+                require(expected!=null && expected.equals(foreignObservation.get()) && expected.queueEntered() && expected.cancelled()
+                        && Set.of("HELD","CANCELLED_HOLD","REPLAY_REJECTED","FINAL_NATIVE_READ_REQUIRED").contains(expected.stage())
+                        && deadline==(expected.requestOrdinal()==0?expected.workDeadlineNanos():expected.cleanupDeadlineNanos())
+                        && System.nanoTime()-deadline<0,"Foreign native request projection/stage/deadline changed");
+            }
+            JsonObject metadata() {
+                checkBinding(); var out=new JsonObject(); out.addProperty("fixture",definition.fixture().name()); out.addProperty("fixtureHash",definition.definitionHash());
+                out.addProperty("oldSave",oldSave.toString()); out.addProperty("foreignSave",foreignSave.toString());
+                out.addProperty("oldWorld",System.identityHashCode(world)); out.addProperty("oldServer",System.identityHashCode(server));
+                out.addProperty("oldPlayer",System.identityHashCode(player)); out.addProperty("oldHandler",System.identityHashCode(handler)); out.addProperty("oldConnection",System.identityHashCode(connection));
+                out.addProperty("foreignWorld",System.identityHashCode(foreignWorld)); out.addProperty("foreignServer",System.identityHashCode(foreignServer));
+                out.addProperty("foreignPlayer",System.identityHashCode(foreignPlayer)); out.addProperty("foreignHandler",System.identityHashCode(foreignHandler)); out.addProperty("foreignConnection",System.identityHashCode(foreignConnection));
+                out.addProperty("playerUuid",uuid.toString()); out.addProperty("window",System.identityHashCode(window)); out.addProperty("windowHandle",handle);
+                out.addProperty("cellSchema","sorted checked union of worldCells and origin+expectedTargets; support/clearance separate"); out.addProperty("cellCount",cells.size());
+                var positions=new JsonArray(); cells.forEach(p -> positions.add(position(p))); out.addProperty("cellPositionsSha256",sha256(canonicalText(positions).getBytes(StandardCharsets.UTF_8)));
+                out.addProperty("inventorySchema","actual size, every index; main0..35, FEET36 LEGS37 CHEST38 HEAD39 OFFHAND40 BODY41 SADDLE42; all equipment enums; all handler slots/cursor/crafting/output");
+                out.addProperty("inventorySize",client.player.getInventory().size()); out.addProperty("playerHandlerType","native null type, exact PlayerScreenHandler");
+                out.addProperty("setupReadiness","20 strictly advancing client ages, same real pose/full velocity, onGround/neutral/no activity; no server/proof credit");
+                return out;
+            }
+        }
+    }
+
+    private static Path real(Path path) {
+        var absolute=path.toAbsolutePath().normalize();
+        try { require(absolute.toRealPath().equals(absolute),"Redirected canonical save path"); return absolute; }
+        catch(IOException failure) { throw new UncheckedIOException(failure); }
+    }
+    private static boolean transitionScreen(Object screen) {
+        return screen==null || Set.of("net.minecraft.client.gui.screen.MessageScreen","net.minecraft.client.gui.screen.ProgressScreen",
+                "net.minecraft.client.gui.screen.DownloadingTerrainScreen","net.minecraft.client.gui.screen.world.LevelLoadingScreen")
+                .contains(screen.getClass().getName());
+    }
+    static ButtonWidget uniqueButton(Object screen,String label) {
+        var buttons=new ArrayList<ButtonWidget>(); discover(screen,Collections.newSetFromMap(new IdentityHashMap<>()),buttons);
+        var matches=buttons.stream().filter(b -> b.getMessage().getString().equals(label)).toList();
+        require(matches.size()==1 && matches.getFirst().active && matches.getFirst().visible,"Expected one enabled visible native button: "+label);
+        return matches.getFirst();
+    }
+    private static void discover(Object element,Set<Object> seen,List<ButtonWidget> buttons) {
+        if(!seen.add(element)) return;
+        if(element instanceof ButtonWidget b) buttons.add(b);
+        if(element instanceof ParentElement p) for(Element child:p.children()) discover(child,seen,buttons);
+        if(element instanceof Widget w) w.forEachChild(child -> discover(child,seen,buttons));
+    }
+
+    static List<BlockPos> foreignCells(ScenarioDefinition definition) {
+        var cells=new TreeSet<BlockPos>(Comparator.comparingInt(BlockPos::getX).thenComparingInt(BlockPos::getY).thenComparingInt(BlockPos::getZ));
+        definition.worldCells().keySet().forEach(p -> cells.add(new BlockPos(p.x(),p.y(),p.z())));
+        var origin=definition.origin(); definition.expectedTargets().keySet().forEach(p -> cells.add(new BlockPos(
+                Math.addExact(origin.x(),p.x()),Math.addExact(origin.y(),p.y()),Math.addExact(origin.z(),p.z()))));
+        require(!cells.isEmpty(),"Empty foreign protected cell union"); return List.copyOf(cells);
+    }
+    private static JsonArray position(BlockPos p) { var out=new JsonArray(); out.add(p.getX()); out.add(p.getY()); out.add(p.getZ()); return out; }
+    private static <T> JsonElement encode(Codec<T> codec,T value,World world) {
+        return checkedEncode(codec,world.getRegistryManager().getOps(JsonOps.INSTANCE),value);
+    }
+    static <T> JsonElement checkedEncode(Codec<T> codec,com.mojang.serialization.DynamicOps<JsonElement> ops,T value) {
+        var result=codec.encodeStart(ops,value);
+        require(result.error().isEmpty(),"Foreign codec rejected complete value: "+result.error());
+        return result.getOrThrow();
+    }
+    private static WorldChunk loaded(World world,BlockPos p) {
+        int x=Math.floorDiv(p.getX(),16),z=Math.floorDiv(p.getZ(),16);
+        WorldChunk chunk;
+        if(world instanceof ServerWorld serverWorld) {
+            require(serverWorld.getServer().isOnThread(),"Foreign block read off server thread");
+            chunk=serverWorld.getChunkManager().getWorldChunk(x,z);
+        } else {
+            var client=MinecraftClient.getInstance(); require(client.isOnThread() && client.world==world,"Foreign block read off client thread");
+            chunk=((net.minecraft.client.world.ClientWorld)world).getChunkManager().getChunk(x,z,ChunkStatus.FULL,false);
+        }
+        return checkedForeignChunk(chunk,x,z,p);
+    }
+    static WorldChunk checkedForeignChunk(WorldChunk chunk,int x,int z,BlockPos p) {
+        require(chunk!=null && chunk.getStatus()==ChunkStatus.FULL && chunk.getPos().x==x && chunk.getPos().z==z,"Foreign protected cell lacks already-loaded FULL chunk: "+p);
+        return chunk;
+    }
+    private static JsonObject cell(World world,BlockPos pos) {
+        var chunk=loaded(world,pos); var out=new JsonObject(); out.add("position",position(pos)); out.addProperty("loaded",true);
+        out.add("blockState",encode(BlockState.CODEC,chunk.getBlockState(pos),world));
+        // CHECK and packed-NBT getters materialize pending block entities; inspect the two existing maps directly.
+        var live=chunk.getBlockEntities().get(pos); var pending=chunk.getBlockEntityNbt(pos);
+        require(chunk.getBlockEntityPositions().contains(pos)==(live!=null || pending!=null),"Foreign block-entity representation unknown");
+        out.add("pending",pending==null?JsonNull.INSTANCE:typedNbt(pending));
+        if(live==null) out.add("live",JsonNull.INSTANCE);
+        else {
+            require(!live.isRemoved() && live.getPos().equals(pos) && live.getWorld()==world,"Foreign live block entity removed/replaced");
+            var reporter=new ErrorReporter.Impl(); var view=NbtWriteView.create(reporter,world.getRegistryManager()); live.writeFullData(view);
+            require(reporter.isEmpty(),"Foreign live block entity serialization error: "+reporter.getErrorsAsString());
+            var data=new JsonObject(); data.addProperty("type",net.minecraft.registry.Registries.BLOCK_ENTITY_TYPE.getId(live.getType()).toString());
+            data.add("position",position(live.getPos())); data.addProperty("identity",System.identityHashCode(live)); data.add("data",typedNbt(view.getNbt())); out.add("live",data);
+        }
+        return out;
+    }
+    private static void requireInactive(PlayerEntity p) {
+        require(p.getStatusEffects().isEmpty() && p.hurtTime==0 && p.deathTime==0 && !p.isDead() && p.isAlive()
+                && !p.isUsingItem() && p.getItemUseTime()==0 && p.getItemUseTimeLeft()==0 && !p.handSwinging,"Foreign status/hurt/death/item-use/hand-swing activity");
+    }
+    private static String poseAndVelocity(PlayerEntity p) {
+        var out=new JsonObject(); String[] names={"x","y","z","vx","vy","vz"};
+        double[] values={p.getX(),p.getY(),p.getZ(),p.getVelocity().x,p.getVelocity().y,p.getVelocity().z};
+        for(int i=0;i<names.length;i++) out.add(names[i],floating(values[i]));
+        out.add("yaw",floating(p.getYaw())); out.add("headYaw",floating(p.headYaw)); out.add("bodyYaw",floating(p.bodyYaw)); out.add("pitch",floating(p.getPitch()));
+        out.addProperty("pose",p.getPose().name()); out.addProperty("onGround",p.isOnGround()); return canonicalText(out);
+    }
+    private static String readForeignPlayer(PlayerEntity p,List<BlockPos> cells,int serverTick,Path save) {
+        requireInactive(p); var world=p.getEntityWorld(); var state=new JsonObject();
+        var binding=new JsonObject(); binding.addProperty("world",System.identityHashCode(world)); binding.addProperty("player",System.identityHashCode(p));
+        binding.addProperty("uuid",p.getUuid().toString()); binding.addProperty("dimension",world.getRegistryKey().getValue().toString()); binding.addProperty("save",save.toString());
+        state.add("binding",binding);
+        var clocks=new JsonObject(); clocks.addProperty("age",p.age); clocks.addProperty("worldTime",world.getTime()); clocks.addProperty("timeOfDay",world.getTimeOfDay());
+        if(serverTick<0) clocks.add("serverTick",JsonNull.INSTANCE); else clocks.addProperty("serverTick",serverTick); state.add("clocks",clocks);
+        var player=JsonParser.parseString(poseAndVelocity(p)).getAsJsonObject(); state.add("player",player);
+        player.add("health",floating(p.getHealth())); player.add("absorption",floating(p.getAbsorptionAmount())); player.add("fallDistance",floating(p.fallDistance));
+        var abilities=p.getAbilities().pack(); var packed=new JsonObject();
+        packed.addProperty("invulnerable",abilities.invulnerable()); packed.addProperty("flying",abilities.flying()); packed.addProperty("mayFly",abilities.mayFly());
+        packed.addProperty("instabuild",abilities.instabuild()); packed.addProperty("mayBuild",abilities.mayBuild()); packed.add("flyingSpeed",floating(abilities.flyingSpeed())); packed.add("walkingSpeed",floating(abilities.walkingSpeed())); player.add("abilities",packed);
+        var reporter=new ErrorReporter.Impl(); var hunger=NbtWriteView.create(reporter,world.getRegistryManager()); p.getHungerManager().writeData(hunger);
+        require(reporter.isEmpty(),"Foreign hunger codec error: "+reporter.getErrorsAsString()); player.add("hunger",typedNbt(hunger.getNbt()));
+        var activity=new JsonObject(); activity.addProperty("handSwinging",p.handSwinging); activity.addProperty("handSwingTicks",p.handSwingTicks);
+        activity.add("lastHandSwingProgress",floating(p.lastHandSwingProgress)); activity.add("handSwingProgress",floating(p.handSwingProgress));
+        activity.addProperty("hurtTime",p.hurtTime); activity.addProperty("maxHurtTime",p.maxHurtTime); activity.addProperty("deathTime",p.deathTime);
+        activity.addProperty("stuckArrowTimer",p.stuckArrowTimer); activity.addProperty("stuckStingerTimer",p.stuckStingerTimer);
+        activity.addProperty("itemUseTime",p.getItemUseTime()); activity.addProperty("itemUseTimeLeft",p.getItemUseTimeLeft());
+        activity.addProperty("playerHitTimer",p.getPlayerHitTimer()); activity.addProperty("sleepTimer",p.getSleepTimer());
+        activity.add("limbSpeed",floating(p.limbAnimator.getSpeed())); activity.add("limbProgress",floating(p.limbAnimator.getAnimationProgress())); player.add("activity",activity);
+        var movement=new JsonObject(); movement.addProperty("noGravity",p.hasNoGravity()); movement.addProperty("noDrag",p.hasNoDrag()); movement.addProperty("jumping",p.isJumping());
+        movement.addProperty("vehicle",p.hasVehicle()); movement.addProperty("inFluid",p.isInFluid()); movement.addProperty("touchingWater",p.isTouchingWater());
+        movement.addProperty("submergedWater",p.isSubmergedInWater()); movement.addProperty("lava",p.isInLava()); movement.addProperty("climbing",p.isClimbing());
+        movement.addProperty("gliding",p.isGliding()); movement.addProperty("swimming",p.isSwimming()); movement.addProperty("sprinting",p.isSprinting()); movement.addProperty("sneaking",p.isSneaking());
+        movement.addProperty("usingItem",p.isUsingItem()); movement.add("finalGravity",floating(p.getFinalGravity())); player.add("movement",movement);
+        var effects=new JsonArray(); p.getStatusEffects().forEach(effect -> effects.add(encode(StatusEffectInstance.CODEC,effect,world))); player.add("effects",effects);
+        player.add("attributes",foreignAttributes(p));
+        var inventory=p.getInventory();
+        requireForeignInventorySchema(inventory.size(),inventory.getMainStacks().size(),net.minecraft.entity.player.PlayerInventory.getHotbarSize(),net.minecraft.entity.player.PlayerInventory.EQUIPMENT_SLOTS);
+        var inventoryData=new JsonObject(); inventoryData.addProperty("identity",System.identityHashCode(inventory));
+        inventoryData.addProperty("size",inventory.size()); inventoryData.addProperty("mainSize",inventory.getMainStacks().size()); inventoryData.addProperty("selected",inventory.getSelectedSlot());
+        var slots=new JsonArray(); for(int i=0;i<inventory.size();i++) {
+            var slot=new JsonObject(); slot.addProperty("index",i); slot.add("stack",encode(ItemStack.OPTIONAL_CODEC,inventory.getStack(i),world)); slots.add(slot);
+        } inventoryData.add("slots",slots); player.add("inventory",inventoryData);
+        var equipment=new JsonArray(); for(var slot:EquipmentSlot.values()) {
+            var row=new JsonObject(); row.addProperty("slot",slot.getName()); row.add("stack",encode(ItemStack.OPTIONAL_CODEC,p.getEquippedStack(slot),world)); equipment.add(row);
+        } player.add("equipment",equipment);
+        require(p.currentScreenHandler==p.playerScreenHandler && p.playerScreenHandler.getClass()==PlayerScreenHandler.class,"Foreign neutral handler is not exact player handler");
+        player.add("activeHandler",handler(p,p.currentScreenHandler)); player.add("playerHandler",handler(p,p.playerScreenHandler));
+        var crafting=new JsonArray(); var input=p.playerScreenHandler.getCraftingInput();
+        for(int i=0;i<input.size();i++) { var row=new JsonObject(); row.addProperty("index",i); row.add("stack",encode(ItemStack.OPTIONAL_CODEC,input.getStack(i),world)); crafting.add(row); }
+        player.addProperty("craftingSize",input.size()); player.add("crafting",crafting); player.add("craftingOutput",encode(ItemStack.OPTIONAL_CODEC,p.playerScreenHandler.getOutputSlot().getStack(),world));
+        var support=p.getBlockPos().down(); var supportData=new JsonObject(); supportData.add("block",cell(world,support)); supportData.add("clearance1",cell(world,support.up())); supportData.add("clearance2",cell(world,support.up(2)));
+        supportData.addProperty("supported",p.isSupportedBy(support)); supportData.add("supportingBlock",p.supportingBlockPos.map(InspectAcceptanceDriver::position).orElse(null)); player.add("support",supportData);
+        var blocks=new JsonArray(); for(var pos:cells) blocks.add(cell(world,pos)); state.add("cells",blocks);
+        if(p instanceof ServerPlayerEntity sp) {
+            player.addProperty("gameMode",sp.getGameMode().name()); player.addProperty("input",sp.getPlayerInput().toString());
+            require(sp.getGameMode()==GameMode.SURVIVAL && sp.getPlayerInput().equals(PlayerInput.DEFAULT),"Foreign server mode/input not neutral");
+            binding.addProperty("server",System.identityHashCode(((ServerWorld)world).getServer()));
+        }
+        return canonicalText(state);
+    }
+    static void requireForeignInventorySchema(int size,int main,int hotbar,Map<Integer,EquipmentSlot> equipment) {
+        var expected=Map.of(36,EquipmentSlot.FEET,37,EquipmentSlot.LEGS,38,EquipmentSlot.CHEST,39,EquipmentSlot.HEAD,
+                40,EquipmentSlot.OFFHAND,41,EquipmentSlot.BODY,42,EquipmentSlot.SADDLE);
+        require(main==36 && hotbar==9 && equipment.equals(expected) && size==Math.addExact(main,equipment.size())
+                && EquipmentSlot.values().length==8,"Pinned actual native inventory/equipment mapping changed");
+    }
+    private static JsonObject handler(PlayerEntity p,net.minecraft.screen.ScreenHandler handler) {
+        var out=new JsonObject(); out.addProperty("class",handler.getClass().getName()); out.addProperty("identity",System.identityHashCode(handler)); out.addProperty("syncId",handler.syncId);
+        require(handler.getClass()==PlayerScreenHandler.class,"Unexpected foreign handler class"); out.add("nativeType",JsonNull.INSTANCE);
+        out.addProperty("sameAsPlayer",handler==p.playerScreenHandler); out.addProperty("sameAsActive",handler==p.currentScreenHandler);
+        out.add("cursor",encode(ItemStack.OPTIONAL_CODEC,handler.getCursorStack(),p.getEntityWorld())); out.addProperty("slotCount",handler.slots.size());
+        var slots=new JsonArray(); for(int i=0;i<handler.slots.size();i++) {
+            var slot=handler.slots.get(i); var row=new JsonObject(); row.addProperty("listIndex",i); row.addProperty("id",slot.id); row.addProperty("inventoryIndex",slot.getIndex());
+            row.addProperty("inventoryIdentity",System.identityHashCode(slot.inventory)); row.addProperty("inventoryClass",slot.inventory.getClass().getName());
+            row.add("stack",encode(ItemStack.OPTIONAL_CODEC,slot.getStack(),p.getEntityWorld())); slots.add(row);
+        } out.add("slots",slots); return out;
+    }
+    private static JsonArray foreignAttributes(PlayerEntity p) {
+        var attributes=p.getAttributes(); var custom=new HashSet<String>();
+        for(var packed:attributes.pack()) require(custom.add(packed.attribute().getKey().orElseThrow().getValue().toString()),"Duplicate packed custom attribute");
+        var out=new JsonArray();
+        var entries=p.getEntityWorld().getRegistryManager().getOrThrow(RegistryKeys.ATTRIBUTE).streamEntries()
+                .sorted(Comparator.comparing(e -> e.registryKey().getValue().toString())).toList();
+        for(var entry:entries) {
+            String id=entry.registryKey().getValue().toString(); boolean supported=attributes.hasAttribute(entry),existing=custom.contains(id);
+            var row=new JsonObject(); row.addProperty("id",id); row.addProperty("supported",supported); row.addProperty("custom",existing);
+            require(!existing || supported,"Unsupported packed custom attribute");
+            if(supported) {
+                row.add("base",floating(attributes.getBaseValue(entry))); row.add("effective",floating(attributes.getValue(entry)));
+                var all=new JsonArray(); var persistent=new JsonArray();
+                if(existing) {
+                    // pack listed this exact existing instance in this uninterrupted own-thread read; never create a default.
+                    var instance=attributes.getCustomInstance(entry); require(instance!=null,"Packed custom attribute instance missing");
+                    all=modifiers(instance.getModifiers()); persistent=modifiers(instance.getPersistentModifiers());
+                }
+                row.add("modifiers",all); row.add("persistentModifiers",persistent); row.addProperty("defaultProvenance",existing?"pack-listed existing native instance":"vanilla PLAYER default builder has no default modifiers");
+            } out.add(row);
+        }
+        require(entries.stream().filter(e -> custom.contains(e.registryKey().getValue().toString())).count()==custom.size(),"Packed custom attribute absent from registry");
+        return out;
+    }
+    private static JsonArray modifiers(Set<EntityAttributeModifier> modifiers) {
+        var out=new JsonArray(); modifiers.stream().sorted(Comparator.comparing(m -> m.id().toString())).forEach(m -> {
+            var row=new JsonObject(); row.addProperty("id",m.id().toString()); row.add("value",floating(m.value())); row.addProperty("operation",m.operation().name()); out.add(row);
+        }); return out;
+    }
+    private static JsonObject clientState(MinecraftClient client) {
+        var out=new JsonObject(); var keys=new JsonArray();
+        for(var key:client.options.allKeys) {
+            var row=new JsonObject(); row.addProperty("translationKey",key.getId()); row.addProperty("pressed",key.isPressed());
+            row.addProperty("boundKey",key.getBoundKeyTranslationKey()); keys.add(row);
+        } out.add("keys",keys); out.addProperty("paused",client.isPaused()); out.addProperty("screenOpen",client.currentScreen!=null);
+        out.addProperty("autoJump",client.options.getAutoJump().getValue()); out.addProperty("viewDistanceRaw",client.options.getViewDistance().getValue()); out.addProperty("viewDistanceClamped",client.options.getClampedViewDistance());
+        out.addProperty("focused",client.isWindowFocused()); out.addProperty("overlay",client.getOverlay()!=null);
+        out.addProperty("mode",client.interactionManager.getCurrentGameMode().name()); out.addProperty("input",client.player.input.playerInput.toString());
+        out.addProperty("lastInput",client.player.getLastPlayerInput().toString()); out.addProperty("movementInput",client.player.input.getMovementInput().toString());
+        var status=MapArtClient.status(); out.addProperty("production",status.toString()); out.addProperty("controlOwner",status.controlOwner().name());
+        var fault=PredictionFaults.resetSnapshot();
+        require(!fault.active(),"Foreign read cannot validate or retire an active fault scope");
+        // resetSnapshot proved scope absent on this uninterrupted client thread; stateSnapshot.check is then a no-op.
+        var stateFault=PredictionFaults.stateSnapshot(); out.addProperty("fault",fault.toString()); out.addProperty("stateFault",stateFault.toString());
+        require(status.controlOwner()==BuildEngine.ControlOwner.NONE && !fault.active() && !stateFault.active()
+                && fault.failure().isEmpty() && stateFault.failure().isEmpty(),"Foreign production/fault ownership active");
+        var phase=status.engine().lifecycle().phase(); require(phase!=com.mapartrunner.core.run.RunLifecycle.Phase.RUNNING && phase!=com.mapartrunner.core.run.RunLifecycle.Phase.PAUSED,"Foreign production active");
+        require(client.interactionManager.getCurrentGameMode()==GameMode.SURVIVAL && client.player.input.playerInput.equals(PlayerInput.DEFAULT)
+                && client.player.getLastPlayerInput().equals(PlayerInput.DEFAULT) && client.player.input.getMovementInput().lengthSquared()==0,"Foreign client mode/input not neutral");
+        out.addProperty("handler",System.identityHashCode(client.getNetworkHandler())); out.addProperty("connection",System.identityHashCode(client.getNetworkHandler().getConnection()));
+        out.addProperty("server",System.identityHashCode(client.getServer())); out.addProperty("window",System.identityHashCode(client.getWindow())); out.addProperty("windowHandle",client.getWindow().getHandle()); return out;
     }
 
     private static void require(boolean condition, String reason) { if (!condition) throw new IllegalStateException(reason); }

@@ -22,6 +22,18 @@ final class ScenarioCommands {
                                String verdict, boolean evidenceComplete, String cleanupStatus, boolean cleanupSettled,
                                String evidenceDirectory, String summaryPath, Optional<FailureObservation> failure) { }
     record FailureObservation(String className, String message) { }
+    record ForeignGuardFact(String site,int entered,int refused,int passed,int effectCalled) { }
+    record ForeignFinalFacts(boolean retainedWatchUnchanged,boolean closedRunEvidenceUnchanged,
+                             String primaryClass,String primaryMessage,java.util.List<ForeignGuardFact> guards) {
+        ForeignFinalFacts { guards=java.util.List.copyOf(guards); }
+    }
+    record ForeignProofAck(UUID operationId,long requestOrdinal,long rows,long bytes,String sha256,String finalObservationIdentity) { }
+    record ForeignObservation(UUID sessionId,UUID operationId,int ordinal,String stage,long workDeadlineNanos,
+                              boolean queueEntered,boolean replayRejected,boolean cancelled,boolean boundaryRetired,
+                              long requestOrdinal,long cleanupDeadlineNanos,java.util.List<ForeignGuardFact> guards,
+                              ForeignFinalFacts finalFacts,ForeignProofAck seal) {
+        ForeignObservation { guards=java.util.List.copyOf(guards); }
+    }
 
     private final Executor worker;
     private final Inspect host;
@@ -130,6 +142,14 @@ final class ScenarioCommands {
                     if (command == Command.RUN || command == Command.RERUN) runner.assertResult(runner.run(definition));
                 });
             } catch (RuntimeException | Error failure) { primary = failure; }
+            if(host instanceof InspectScenarioHost concrete) {
+                try { concrete.awaitForeignReplacementBeforeCleanup(work,primary); }
+                catch(RuntimeException | Error secondary) { primary=retain(primary,secondary); }
+                finally {
+                    try { concrete.retireForeignReplacementBoundary(work); }
+                    catch(RuntimeException | Error secondary) { primary=retain(primary,secondary); }
+                }
+            }
             var cleanup = host.beginCleanup(work, primary);
             var failure = primary;
             var completion = host.inScope(cleanup, () -> runner.finishInspectOperation(operation, cleanup, failure));
@@ -174,6 +194,19 @@ final class ScenarioCommands {
         return new InspectObservation(isReady(), queued, exit != Exit.OPEN || cancelled || terminal != null, published);
     }
 
+    ForeignObservation observeForeignAcceptance() {
+        return host instanceof InspectScenarioHost concrete?concrete.observeForeignAcceptance():null;
+    }
+    boolean releaseForeignAcceptanceBoundary(MinecraftClient client) {
+        return host instanceof InspectScenarioHost concrete && concrete.releaseForeignAcceptanceBoundary(client);
+    }
+    boolean acknowledgeForeignReplayMeasurement(MinecraftClient client,UUID operationId,long workDeadlineNanos) {
+        return host instanceof InspectScenarioHost concrete && concrete.acknowledgeForeignReplayMeasurement(client,operationId,workDeadlineNanos);
+    }
+    boolean acknowledgeForeignFinalProof(MinecraftClient client,ForeignProofAck ack) {
+        return host instanceof InspectScenarioHost concrete && concrete.acknowledgeForeignFinalProof(client,ack);
+    }
+
     /** Fresh read-only input guard; equality authenticates values, never a reusable scope or permission. */
     synchronized void requireAcceptanceIdle(MinecraftClient client, PublishedCompletion expected) {
         if (!Boolean.getBoolean("mapart.test.inspect") || !Boolean.getBoolean("mapart.test.inspect.acceptance")
@@ -193,6 +226,10 @@ final class ScenarioCommands {
 
     /** Native intent only: no scope, IO, wait, interrupt or replacement worker. */
     synchronized boolean requestStop() {
+        if(host instanceof InspectScenarioHost concrete) {
+            try { concrete.abandonForeignAcceptance(); }
+            catch(RuntimeException | Error failure) { if(terminal==null) terminal=failure; else retain(terminal,failure); }
+        }
         if (releaseNativeStop()) return false;
         if (exit == Exit.REQUESTED) return true;
         boolean damagedAdmission = runner != null && runner.inspectAdmissionFailure().isPresent()
@@ -284,6 +321,12 @@ final class ScenarioCommands {
 
     private static String identity(Operation operation) {
         return operation.command() + " #" + operation.ordinal() + " " + operation.operationId();
+    }
+
+    private static Throwable retain(Throwable primary,Throwable secondary) {
+        if(primary==null) return secondary;
+        if(secondary!=null && secondary!=primary) primary.addSuppressed(secondary);
+        return primary;
     }
 
     private static String describe(ScenarioRunner.InspectCompletion completion) {

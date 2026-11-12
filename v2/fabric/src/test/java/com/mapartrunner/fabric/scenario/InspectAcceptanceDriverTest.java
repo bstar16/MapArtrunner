@@ -20,6 +20,324 @@ import static org.junit.jupiter.api.Assertions.*;
 
 /** Simulated input/clock policy checks. These do not establish native keyboard or gameplay acceptance. */
 class InspectAcceptanceDriverTest {
+    @Test void foreignCodecErrorsAndOutputFailureCannotProduceAnAcknowledgement() {
+        assertEquals(1,InspectAcceptanceDriver.checkedEncode(com.mojang.serialization.Codec.intRange(0,1),com.mojang.serialization.JsonOps.INSTANCE,1).getAsInt());
+        assertThrows(IllegalStateException.class,() -> InspectAcceptanceDriver.checkedEncode(com.mojang.serialization.Codec.intRange(0,1),com.mojang.serialization.JsonOps.INSTANCE,2));
+        foreign(f -> {
+            f.flushFailure=true; f.start(); f.until(() -> f.input.stops==1);
+            assertEquals(28,f.reads); assertEquals(1,f.flushes); assertEquals(0,f.sealAttempts); assertNull(f.ack);
+            assertEquals("SEAL",f.proofRows().getLast().get("kind").getAsString());
+            assertTrue(f.logs.stream().anyMatch(s -> s.contains("stdout failure")));
+        });
+    }
+
+    @Test void foreignFailureRetiresOutstandingReadOnceAndRetainsPrimaryAndSecondary() throws Exception {
+        foreign(f -> {
+            f.start(); f.until(() -> f.reads==1); var request=f.lastRead;
+            f.retireFailure=true; f.input.refusal="binding primary"; f.tick();
+            assertTrue(request.retired.get()); assertEquals(1,f.retireCalls); assertEquals(1,f.input.stops);
+            try {
+                var field=InspectAcceptanceDriver.class.getDeclaredField("driverFailure"); field.setAccessible(true); var failure=(Throwable)field.get(f.driver);
+                assertEquals("binding primary",failure.getMessage()); assertEquals("retire secondary",failure.getSuppressed()[0].getMessage());
+            } catch(ReflectiveOperationException failure) { throw new AssertionError(failure); }
+            f.tick(3); assertEquals(1,f.retireCalls); assertEquals(1,f.reads);
+        });
+    }
+
+    @Test void foreignClockAdmissionKeepsOneFrozenRequestAndRequiresIndependentServerProgress() {
+        var previous=foreignSample(1,true);
+        var request=new InspectAcceptanceDriver.ForeignRead(2,100,"frozen-client",previous);
+        request.probeEntry(); assertFalse(request.admit(new InspectAcceptanceDriver.ForeignClock(1,9_007_199_254_740_994L,1)));
+        assertFalse(request.requeue(),"Pending must first be consumed on END");
+        assertNull(request.consume(2,2)); assertTrue(request.requeue()); assertFalse(request.requeue(),"No overlapping queue callbacks");
+        request.probeEntry(); assertThrows(IllegalStateException.class,request::probeEntry);
+        assertTrue(request.admit(new InspectAcceptanceDriver.ForeignClock(2,9_007_199_254_740_995L,2)));
+        request.complete(foreignSample(2,true)); assertEquals(foreignSample(2,true),request.consume(2,99));
+        assertEquals("frozen-client",request.client); assertEquals(2,request.ordinal); assertEquals(100,request.deadline);
+        assertFalse(request.requeue()); assertThrows(IllegalStateException.class,request::probeEntry);
+        var regression=new InspectAcceptanceDriver.ForeignRead(2,100,"same",previous);
+        regression.probeEntry(); assertFalse(regression.admit(new InspectAcceptanceDriver.ForeignClock(2,9_007_199_254_740_995L,1)));
+        regression.consume(2,1); assertTrue(regression.requeue()); regression.probeEntry();
+        assertThrows(IllegalStateException.class,() -> regression.admit(new InspectAcceptanceDriver.ForeignClock(1,9_007_199_254_740_995L,2)),"Across-pending age regression remains failure even above old baseline");
+        var initial=new InspectAcceptanceDriver.ForeignRead(1,100,"initial"); initial.probeEntry();
+        assertTrue(initial.admit(new InspectAcceptanceDriver.ForeignClock(0,0,0)),"B0 has no synthetic predecessor");
+    }
+
+    @Test void foreignPendingClockDeliveryDoesNotRecaptureClientOrAddPairsAndFinalExpiryFails() {
+        foreign(f -> {
+            f.clockPendingOrdinal=4; f.clockPendingRemaining=3; f.start(); f.until(() -> f.ack!=null);
+            assertEquals(28,f.reads); assertEquals(28,f.fullCaptures); assertEquals(3,f.clockRequeues);
+            assertEquals(28,f.proofRows().stream().filter(r -> r.get("kind").getAsString().equals("SNAPSHOT") && r.get("side").getAsString().equals("client")).count());
+        });
+        foreign(f -> {
+            f.clockPendingOrdinal=28; f.clockPendingRemaining=100; f.start(); f.until(() -> f.reads==28);
+            f.tick(); f.now.set(f.pending.cleanupDeadlineNanos()); f.tick();
+            assertTrue(f.logs.stream().anyMatch(s -> s.contains("deadline expired")),f.logs.toString());
+            assertEquals(28,f.reads); assertEquals(27,f.fullCaptures); assertNull(f.ack); assertEquals(0,f.flushes);
+            assertTrue(f.proofRows().stream().noneMatch(r -> r.get("kind").getAsString().equals("SEAL")));
+        });
+    }
+
+    @Test void foreignNativeButtonSelectionUsesActualVisibleEnabledLabelAndOneIdentity() {
+        var button=net.minecraft.client.gui.widget.ButtonWidget.builder(net.minecraft.text.Text.literal("native create"),ignored -> {}).build();
+        assertSame(button,InspectAcceptanceDriver.uniqueButton(button,"native create"));
+        button.active=false; assertThrows(IllegalStateException.class,() -> InspectAcceptanceDriver.uniqueButton(button,"native create"));
+        button.active=true; button.visible=false; assertThrows(IllegalStateException.class,() -> InspectAcceptanceDriver.uniqueButton(button,"native create"));
+        button.visible=true; assertThrows(IllegalStateException.class,() -> InspectAcceptanceDriver.uniqueButton(button,"wrong label"));
+    }
+
+    @Test void foreignInventorySchemaChecksActualNativeMappingAndCompleteCheckedCellUnion() {
+        var equipment=new HashMap<Integer,net.minecraft.entity.EquipmentSlot>(); equipment.putAll(net.minecraft.entity.player.PlayerInventory.EQUIPMENT_SLOTS);
+        InspectAcceptanceDriver.requireForeignInventorySchema(43,36,9,equipment);
+        var changed=new HashMap<>(equipment); changed.put(42,net.minecraft.entity.EquipmentSlot.MAINHAND);
+        assertThrows(IllegalStateException.class,() -> InspectAcceptanceDriver.requireForeignInventorySchema(43,36,9,changed));
+        assertThrows(IllegalStateException.class,() -> InspectAcceptanceDriver.requireForeignInventorySchema(42,36,9,equipment));
+        var definition=ScenarioDefinition.load(); var cells=InspectAcceptanceDriver.foreignCells(definition);
+        var expected=new HashSet<net.minecraft.util.math.BlockPos>();
+        definition.worldCells().keySet().forEach(p -> expected.add(new net.minecraft.util.math.BlockPos(p.x(),p.y(),p.z())));
+        var origin=definition.origin(); definition.expectedTargets().keySet().forEach(p -> expected.add(new net.minecraft.util.math.BlockPos(
+                Math.addExact(origin.x(),p.x()),Math.addExact(origin.y(),p.y()),Math.addExact(origin.z(),p.z()))));
+        assertEquals(expected,new HashSet<>(cells)); assertEquals(expected.size(),cells.size());
+        assertThrows(IllegalStateException.class,() -> InspectAcceptanceDriver.checkedForeignChunk(null,0,0,new net.minecraft.util.math.BlockPos(0,64,0)));
+    }
+
+    @Test void foreignFixedProgramOwnSide28PairsAndSameFrozenClaimsSurviveContentionWithoutRemeasurement() {
+        foreign(f -> {
+            f.start(); f.until(() -> f.ack!=null);
+            assertEquals(List.of("/maparttest reset grounded-two-lane","/maparttest run grounded-two-lane","/maparttest rerun grounded-two-lane",
+                    "/maparttest reset grounded-two-lane","/maparttest run grounded-two-lane","/maparttest rerun grounded-two-lane","/maparttest last"),f.input.commands);
+            assertEquals(List.of("exit","create:before-show","create:after-show","create:before-press","bind","settle","settle"),f.nativeSteps);
+            assertEquals(28,f.reads); assertEquals(3,f.releaseAttempts); assertEquals(3,f.replayAttempts); assertEquals(3,f.sealAttempts);
+            assertEquals(1,f.flushes); assertEquals(0,f.input.stops); assertTrue(f.logs.stream().noneMatch(s -> s.contains("DRIVER_FAIL")),f.logs.toString());
+            var rows=f.proofRows(); assertEquals(1,rows.stream().filter(r -> r.get("kind").getAsString().equals("SEAL")).count());
+            assertEquals(InspectAcceptanceDriver.PAIR_LABELS,rows.stream().filter(r -> r.get("kind").getAsString().equals("SNAPSHOT")
+                    && r.get("side").getAsString().equals("client") && r.get("chunk").getAsInt()==0).map(r -> r.get("pair").getAsString()).toList());
+            assertEquals(4,rows.stream().filter(r -> r.get("kind").getAsString().equals("CHAT_REQUESTED")).count());
+            int count=f.logs.size(); f.tick(10); assertEquals(count,f.logs.size()); assertEquals(28,f.reads); assertEquals(0,f.input.stops);
+        });
+    }
+
+    @Test void foreignPendingClaimChangesFailWithoutNewMeasurementOrOrdinal() {
+        for(var point:List.of("release","P","F")) for(var mutation:List.of("request","deadline","stage","binding","stop","case","expiry")) foreign(f -> {
+            f.start();
+            f.until(() -> point.equals("release")?f.releaseAttempts==1:point.equals("P")?f.replayAttempts==1:f.sealAttempts==1);
+            int reads=f.reads,commands=f.input.commands.size();
+            var old=f.pending;
+            if(mutation.equals("binding")) f.input.refusal="foreign binding replaced";
+            else if(mutation.equals("stop")) f.driver.releaseOnStopping(null);
+            else if(mutation.equals("case")) System.setProperty("mapart.test.inspect.acceptance.case","baseline");
+            else if(mutation.equals("expiry")) f.now.set(point.equals("F")?old.cleanupDeadlineNanos():old.workDeadlineNanos());
+            else f.pending=new ForeignObservation(old.sessionId(),old.operationId(),old.ordinal(),mutation.equals("stage")?"ABANDONED":old.stage(),
+                    old.workDeadlineNanos(),old.queueEntered(),old.replayRejected(),old.cancelled(),old.boundaryRetired(),
+                    mutation.equals("request")?old.requestOrdinal()+1:old.requestOrdinal(),mutation.equals("deadline")?old.cleanupDeadlineNanos()+1:old.cleanupDeadlineNanos(),old.guards(),old.finalFacts(),old.seal());
+            f.tick(); assertTrue(f.logs.stream().anyMatch(s -> s.contains("DRIVER_FAIL")),point+"/"+mutation+f.logs);
+            assertEquals(reads,f.reads); assertEquals(commands,f.input.commands.size()); assertNull(f.ack);
+        });
+    }
+
+    private static void foreign(java.util.function.Consumer<ForeignFixture> test) {
+        var previous=System.getProperty("mapart.test.inspect.acceptance.case");
+        try { System.setProperty("mapart.test.inspect.acceptance.case","foreign-world"); test.accept(new ForeignFixture()); }
+        finally { if(previous==null) System.clearProperty("mapart.test.inspect.acceptance.case"); else System.setProperty("mapart.test.inspect.acceptance.case",previous); }
+    }
+
+    /** Partial native/claim doubles execute the production finite controller, never native authority. */
+    private static final class ForeignFixture implements InspectAcceptanceDriver.ForeignClaims {
+        final AtomicLong now=new AtomicLong(1);
+        final List<String> logs=new ArrayList<>(),nativeSteps=new ArrayList<>();
+        final UUID session=UUID.randomUUID(),operation=UUID.randomUUID();
+        final PublishedCompletion reset=new PublishedCompletion(session,UUID.randomUUID(),1,Command.RESET,Optional.empty(),"PASS",true,"RELEASED",true,"reset","reset/summary",Optional.empty());
+        final PublishedCompletion run=new PublishedCompletion(session,UUID.randomUUID(),2,Command.RUN,Optional.of(UUID.randomUUID()),"PASS",true,"RELEASED",true,"run","run/summary",Optional.empty());
+        InspectObservation observation=idle(null); ForeignObservation pending;
+        int reads,settles,releaseAttempts,replayAttempts,sealAttempts,flushes,fullCaptures,clockPendingOrdinal,clockPendingRemaining,clockRequeues;
+        ForeignProofAck candidate,ack;
+        boolean flushFailure,retireFailure;
+        int retireCalls;
+        InspectAcceptanceDriver.ForeignRead lastRead;
+        final SimulatedChat input=new SimulatedChat() {
+            @Override public void key(int code,boolean press,Object screen) {
+                super.key(code,press,screen);
+                if(code==84 && press) { this.screen=chat; draft=""; }
+            }
+            @Override public void exitForeign() {
+                nativeSteps.add("exit"); observation=new InspectObservation(false,true,true,Optional.of(run)); pending=projection("CANCELLED_HOLD",false,false,0,0);
+            }
+            @Override public boolean createForeign(Runnable revalidate,UUID expected) {
+                assertEquals(session,expected); nativeSteps.add("create:before-show"); revalidate.run(); nativeSteps.add("create:after-show"); revalidate.run(); nativeSteps.add("create:before-press"); return true;
+            }
+            @Override public boolean bindForeign() { nativeSteps.add("bind"); return true; }
+            @Override public boolean settleForeign() { nativeSteps.add("settle"); return ++settles==2; }
+            @Override public boolean foreignClockAdvanced(String previous) { return true; }
+            @Override public InspectAcceptanceDriver.ForeignRead readForeign(long ordinal,long deadline,String previousServer,ForeignObservation expected) {
+                assertEquals(pending,expected);
+                reads++; var read=new InspectAcceptanceDriver.ForeignRead(ordinal,deadline,foreignSample(ordinal,false),previousServer); lastRead=read;
+                if(ordinal==clockPendingOrdinal && clockPendingRemaining>0) { read.probeEntry(); assertFalse(read.admit(unitClock(ordinal-1))); }
+                else { read.enter(); read.complete(foreignSample(ordinal,true)); fullCaptures++; }
+                return read;
+            }
+            @Override public void continueForeignRead(InspectAcceptanceDriver.ForeignRead read) {
+                if(!read.requeue()) return;
+                clockRequeues++; read.probeEntry();
+                if(--clockPendingRemaining>0) assertFalse(read.admit(unitClock(read.ordinal-1)));
+                else { assertTrue(read.admit(unitClock(read.ordinal))); read.complete(foreignSample(read.ordinal,true)); fullCaptures++; }
+            }
+            @Override public JsonObject foreignMetadata() { var out=new JsonObject(); out.addProperty("fixtureHash","partial-unit-fixture"); return out; }
+            @Override public void flushForeign() { flushes++; if(flushFailure) throw new IllegalStateException("stdout failure"); }
+            @Override public void retireForeignRead(InspectAcceptanceDriver.ForeignRead read) {
+                retireCalls++; read.retired.set(true); if(retireFailure) throw new IllegalStateException("retire secondary");
+            }
+        };
+        final InspectAcceptanceDriver driver=new InspectAcceptanceDriver(() -> observation,input,now::get,() -> true,logs::add,this);
+        ForeignFixture() { input.now=now; }
+        InspectAcceptanceDriver.ForeignClock unitClock(long ordinal) { return new InspectAcceptanceDriver.ForeignClock(ordinal,9_007_199_254_740_993L+ordinal,ordinal); }
+        ForeignObservation projection(String stage,boolean replay,boolean retired,long request,long cleanup) {
+            var guards=request==0?List.<ForeignGuardFact>of():List.of(new ForeignGuardFact("CLEANUP_PREFLIGHT",1,1,0,0));
+            return new ForeignObservation(session,operation,3,stage,600_000_000_000L,true,replay,true,retired,request,cleanup,guards,
+                    request==0?null:new ForeignFinalFacts(true,true,"java.lang.IllegalStateException","original disconnect",guards),null);
+        }
+        void start() {
+            until(() -> input.commands.size()==1); observation=idle(reset); tick(2);
+            until(() -> input.commands.size()==2); observation=idle(run); tick(2);
+            until(() -> input.commands.size()==3); observation=new InspectObservation(true,true,false,Optional.of(run));
+            pending=new ForeignObservation(session,operation,3,"HELD",600_000_000_000L,true,false,false,false,0,0,List.of(),null,null);
+        }
+        void tick() { now.addAndGet(1_000_000); driver.tick(null); }
+        void tick(int count) { for(int i=0;i<count;i++) tick(); }
+        void until(java.util.function.BooleanSupplier condition) {
+            for(int i=0;i<400 && !condition.getAsBoolean();i++) tick();
+            assertTrue(condition.getAsBoolean(),logs.toString());
+        }
+        List<JsonObject> proofRows() { return logs.stream().filter(s -> s.startsWith(InspectAcceptanceDriver.ForeignProof.PREFIX))
+                .map(s -> JsonParser.parseString(s.substring(InspectAcceptanceDriver.ForeignProof.PREFIX.length())).getAsJsonObject()).toList(); }
+        public ForeignObservation observe() { return pending; }
+        public boolean release(MinecraftClient client) {
+            assertEquals(26,reads); if(++releaseAttempts<3) return false; pending=projection("REPLAY_REJECTED",true,false,0,0); return true;
+        }
+        public boolean replay(MinecraftClient client,UUID id,long deadline) {
+            assertEquals(operation,id); assertEquals(600_000_000_000L,deadline); assertEquals(27,reads);
+            if(++replayAttempts<3) return false; pending=projection("FINAL_NATIVE_READ_REQUIRED",true,true,1,now.get()+10_000_000_000L); return true;
+        }
+        public boolean seal(MinecraftClient client,ForeignProofAck seal) {
+            assertEquals(28,reads); assertEquals(1,flushes); assertEquals("SEAL",proofRows().getLast().get("kind").getAsString());
+            if(candidate==null) candidate=seal; else assertSame(candidate,seal,"Contention must deliver same frozen seal object");
+            if(++sealAttempts<3) return false; ack=seal; return true;
+        }
+    }
+
+    private static String foreignSample(long tick,boolean server) {
+        var state=new JsonObject(); var clocks=new JsonObject();
+        clocks.addProperty("age",tick); clocks.addProperty("worldTime",9_007_199_254_740_993L+tick); clocks.addProperty("timeOfDay",tick);
+        if(server) clocks.addProperty("serverTick",tick); else clocks.add("serverTick",com.google.gson.JsonNull.INSTANCE);
+        state.add("clocks",clocks); state.addProperty("binding","exact-"+server);
+        var player=new JsonObject(); var hunger=new net.minecraft.nbt.NbtCompound();
+        hunger.putInt("foodLevel",20); hunger.putInt("foodTickTimer",(int)tick); hunger.putFloat("foodSaturationLevel",5);
+        player.add("hunger",InspectAcceptanceDriver.typedNbt(hunger));
+        player.add("inventory",JsonParser.parseString("[{\"index\":0,\"stack\":{\"count\":2,\"components\":{\"custom\":\"original\"}}}]"));
+        player.add("velocity",InspectAcceptanceDriver.floating(-0.0784)); state.add("player",player);
+        state.add("cells",JsonParser.parseString("[{\"position\":[0,64,0],\"loaded\":true,\"state\":{\"Name\":\"minecraft:grass_block\"},\"pending\":null}]"));
+        return InspectAcceptanceDriver.canonicalText(state);
+    }
+
+    @Test void foreignOwnSideComparisonRejectsActualValuesSlotsComponentsTypesIdentityAndNonadvancingClocks() {
+        for(boolean server:List.of(false,true)) {
+            var baseline=foreignSample(1,server); var after=foreignSample(2,server);
+            InspectAcceptanceDriver.compareForeign(baseline,baseline,after,server);
+            assertThrows(IllegalStateException.class,() -> InspectAcceptanceDriver.compareForeign(baseline,baseline,baseline,server));
+            for(var mutation:List.of("binding","slot","component","hungerType","velocity","block","pending","loaded","clock","serverCredit")) {
+                var bad=JsonParser.parseString(after).getAsJsonObject(); var p=bad.getAsJsonObject("player");
+                switch(mutation) {
+                    case "binding" -> bad.addProperty("binding","replacement");
+                    case "slot" -> p.getAsJsonArray("inventory").get(0).getAsJsonObject().addProperty("index",1);
+                    case "component" -> p.getAsJsonArray("inventory").get(0).getAsJsonObject().getAsJsonObject("stack").getAsJsonObject("components").addProperty("custom","changed");
+                    case "hungerType" -> p.getAsJsonObject("hunger").getAsJsonObject("value").getAsJsonObject("foodLevel").addProperty("type",1);
+                    case "velocity" -> p.add("velocity",InspectAcceptanceDriver.floating(-0.0785));
+                    case "block" -> bad.getAsJsonArray("cells").get(0).getAsJsonObject().getAsJsonObject("state").addProperty("Name","minecraft:air");
+                    case "pending" -> bad.getAsJsonArray("cells").get(0).getAsJsonObject().addProperty("pending","unknown");
+                    case "loaded" -> bad.getAsJsonArray("cells").get(0).getAsJsonObject().addProperty("loaded",false);
+                    case "clock" -> bad.getAsJsonObject("clocks").addProperty("worldTime",9_007_199_254_740_994L);
+                    case "serverCredit" -> { if(server) bad.getAsJsonObject("clocks").addProperty("serverTick",1); else bad.getAsJsonObject("clocks").addProperty("serverTick",10); }
+                }
+                assertThrows(IllegalStateException.class,() -> InspectAcceptanceDriver.compareForeign(baseline,baseline,InspectAcceptanceDriver.canonicalText(bad),server),mutation);
+            }
+        }
+    }
+
+    @Test void foreignNativeRequestIsNonblockingSingleEntrySingleConsumptionAndOriginalDeadlineBound() {
+        var read=new InspectAcceptanceDriver.ForeignRead(1,100,foreignSample(1,false));
+        assertNull(read.consume(1,1)); read.enter(); assertThrows(IllegalStateException.class,read::enter);
+        read.complete(foreignSample(1,true)); assertEquals(foreignSample(1,true),read.consume(1,99));
+        assertThrows(IllegalStateException.class,() -> read.consume(1,99));
+        assertThrows(IllegalStateException.class,() -> read.complete("late"));
+        var expired=new InspectAcceptanceDriver.ForeignRead(2,100,"{}"); expired.enter(); expired.complete("{}");
+        assertThrows(IllegalStateException.class,() -> expired.consume(2,100));
+        assertThrows(IllegalStateException.class,() -> expired.consume(3,1));
+    }
+
+    @Test void foreignTypedEncodingPreservesTypesLongsArraysAndRawFloatingBits() {
+        var data=new net.minecraft.nbt.NbtCompound();
+        data.putByte("b",(byte)1); data.putInt("i",1); data.putLong("l",Long.MAX_VALUE);
+        data.putFloat("f",1.5f); data.putDouble("d",1.5d);
+        data.putByteArray("ba",new byte[]{-1,2}); data.putIntArray("ia",new int[]{-1,2});
+        data.putLongArray("la",new long[]{Long.MIN_VALUE,Long.MAX_VALUE});
+        var list=new net.minecraft.nbt.NbtList(); list.add(net.minecraft.nbt.NbtString.of("\u00e9\n")); data.put("list",list);
+        var encoded=InspectAcceptanceDriver.typedNbt(data).getAsJsonObject("value");
+        assertNotEquals(encoded.get("b"),encoded.get("i"));
+        assertEquals(Long.MAX_VALUE,encoded.getAsJsonObject("l").get("value").getAsLong());
+        assertEquals("3fc00000",encoded.getAsJsonObject("f").getAsJsonObject("value").get("bits").getAsString());
+        assertEquals("3ff8000000000000",encoded.getAsJsonObject("d").getAsJsonObject("value").get("bits").getAsString());
+        assertEquals("80000000",InspectAcceptanceDriver.floating(-0.0f).get("bits").getAsString());
+        assertEquals("8000000000000000",InspectAcceptanceDriver.floating(-0.0d).get("bits").getAsString());
+        assertNotEquals(encoded.get("ba"),encoded.get("ia")); assertNotEquals(encoded.get("ia"),encoded.get("la"));
+        assertThrows(IllegalStateException.class,() -> InspectAcceptanceDriver.floating(Float.NaN));
+        assertThrows(IllegalStateException.class,() -> InspectAcceptanceDriver.floating(Double.POSITIVE_INFINITY));
+        assertThrows(IllegalStateException.class,() -> InspectAcceptanceDriver.typedNbt(null));
+    }
+
+    @Test void foreignProofChunksAreByteExactContiguousLfHashedAndSealedOnce() throws Exception {
+        var lines=new ArrayList<String>(); var flushed=new int[1];
+        var proof=new InspectAcceptanceDriver.ForeignProof(lines::add,() -> flushed[0]++);
+        var raw="{\"unicode\":\""+"\u00e9".repeat(2500)+"\",\"long\":9223372036854775807}";
+        long request=0;
+        for(var pair:InspectAcceptanceDriver.PAIR_LABELS) proof.pair(pair,++request,raw,raw);
+        var observation=new ForeignObservation(UUID.randomUUID(),UUID.randomUUID(),3,"FINAL_NATIVE_READ_REQUIRED",Long.MAX_VALUE,
+                true,true,true,true,1,Long.MAX_VALUE,List.of(),null,null);
+        var ack=proof.seal(observation,"full-F-identity",Long.MAX_VALUE-1);
+        assertEquals(1,flushed[0]); assertEquals(lines.size()-1,ack.rows());
+        var digest=java.security.MessageDigest.getInstance("SHA-256"); long bytes=0; int row=0;
+        var decoded=new java.io.ByteArrayOutputStream();
+        for(var line:lines.subList(0,lines.size()-1)) {
+            assertTrue((line+"\n").getBytes(java.nio.charset.StandardCharsets.UTF_8).length<=4096);
+            var json=line.substring(InspectAcceptanceDriver.ForeignProof.PREFIX.length());
+            var value=JsonParser.parseString(json).getAsJsonObject(); assertEquals(row++,value.get("row").getAsInt());
+            var data=Base64.getDecoder().decode(value.get("base64").getAsString()); assertTrue(data.length<=1536);
+            if(value.get("pair").getAsString().equals("B0") && value.get("side").getAsString().equals("client")) decoded.write(data);
+            var hashBytes=(json+"\n").getBytes(java.nio.charset.StandardCharsets.UTF_8); digest.update(hashBytes); bytes+=hashBytes.length;
+        }
+        assertEquals(raw,decoded.toString(java.nio.charset.StandardCharsets.UTF_8));
+        assertEquals(bytes,ack.bytes()); assertEquals(HexFormat.of().formatHex(digest.digest()),ack.sha256());
+        assertThrows(IllegalStateException.class,() -> proof.row("LATE",new JsonObject()));
+        assertThrows(IllegalStateException.class,() -> proof.seal(observation,"duplicate",1));
+        var overflow=new InspectAcceptanceDriver.ForeignProof(lines::add,() -> {});
+        int before=lines.size(); assertThrows(IllegalStateException.class,() -> overflow.pair("B0",1,"x".repeat(262145),"{}"));
+        assertEquals(before,lines.size());
+        assertThrows(IllegalStateException.class,() -> overflow.pair("B0",1,"","{}")); assertEquals(before,lines.size());
+        assertThrows(IllegalStateException.class,() -> overflow.row("TOO_BIG",JsonParser.parseString("{\"x\":\""+"x".repeat(4096)+"\"}").getAsJsonObject()));
+        assertThrows(IllegalStateException.class,() -> overflow.seal(observation,"missing pairs",1));
+    }
+
+    @Test void foreignSelectionStartsWithRealResetInput() {
+        var previous=System.getProperty("mapart.test.inspect.acceptance.case");
+        try {
+            System.setProperty("mapart.test.inspect.acceptance.case","foreign-world");
+            var f=new Fixture(); f.send();
+            assertEquals(List.of("/maparttest reset grounded-two-lane"),f.input.commands,f.logs.toString());
+            assertEquals(0,f.input.stops);
+        } finally {
+            if(previous==null) System.clearProperty("mapart.test.inspect.acceptance.case");
+            else System.setProperty("mapart.test.inspect.acceptance.case",previous);
+        }
+    }
+
     @Test void resetArchiveSelectionStartsWithExplicitResetWithoutDisplacementOrIdle() {
         var previous = System.getProperty("mapart.test.inspect.acceptance.case");
         try {
@@ -625,7 +943,7 @@ class InspectAcceptanceDriverTest {
         }
     }
 
-    private static final class SimulatedChat implements InspectAcceptanceDriver.ChatBoundary {
+    private static class SimulatedChat implements InspectAcceptanceDriver.ChatBoundary {
         final Object chat = new Object(); Object screen; String draft = "", refusal, clientRefusal, entryRefusal, throwAt; boolean replaceOnChar;
         int stops; Runnable reenter; final List<String> events = new ArrayList<>(), commands = new ArrayList<>();
         public void requireClient(MinecraftClient current) {
