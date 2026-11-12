@@ -5,6 +5,8 @@ import net.minecraft.client.option.KeyBinding;
 import net.minecraft.client.util.InputUtil;
 import com.mapartrunner.core.run.BuildEngine.ControlOwner;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.*;
 import java.util.concurrent.atomic.AtomicLong;
@@ -149,6 +151,27 @@ class InspectAcceptanceDriverTest {
         displaced(f -> {
             f.beginForward(); f.input.pressed = false; int events = f.input.events.size();
             f.driver.releaseOnStopping(null); assertEquals(events, f.input.events.size());
+        });
+    }
+
+    @ParameterizedTest @ValueSource(booleans = {false, true})
+    void rejectedCurrentEntryRetainsForwardDebtEvenWhenCapturedClientCleanupWouldSucceed(boolean stopping) {
+        displaced(f -> {
+            f.beginForward(); int effects = f.input.events.size();
+            f.input.entryRefusal = "foreign current";
+            // Model a foreign current argument on the healthy installed client's own thread.
+            assertTrue(f.input.forwardPressed(f.input.forward), "Captured-client checks remain valid");
+            if (stopping) f.driver.releaseOnStopping(null); else f.tick();
+            assertTrue(f.input.pressed, "Rejected entry must retain the exact release debt");
+            assertEquals(effects, f.input.events.size()); assertEquals(0, f.input.stops);
+            f.input.entryRefusal = null;
+            if (stopping) f.driver.releaseOnStopping(null); else f.tick();
+            assertFalse(f.input.pressed);
+            assertEquals(1, Collections.frequency(f.input.events, "87-"));
+            assertEquals(0, Collections.frequency(f.input.events, "captured-false"));
+            if (stopping) f.driver.releaseOnStopping(null); else f.tick();
+            assertEquals(1, Collections.frequency(f.input.events, "87-"));
+            assertEquals(1, f.logs.stream().filter(s -> s.contains("DRIVER_FAIL") && s.contains("foreign current")).count());
         });
     }
 
@@ -382,9 +405,13 @@ class InspectAcceptanceDriverTest {
     }
 
     private static final class SimulatedChat implements InspectAcceptanceDriver.ChatBoundary {
-        final Object chat = new Object(); Object screen; String draft = "", refusal, clientRefusal, throwAt; boolean replaceOnChar;
+        final Object chat = new Object(); Object screen; String draft = "", refusal, clientRefusal, entryRefusal, throwAt; boolean replaceOnChar;
         int stops; Runnable reenter; final List<String> events = new ArrayList<>(), commands = new ArrayList<>();
-        public void requireClient(MinecraftClient current) { if (clientRefusal != null) throw new IllegalStateException(clientRefusal); }
+        public void requireClient(MinecraftClient current) {
+            if (entryRefusal != null) throw new IllegalStateException(entryRefusal);
+            requireCapturedClient();
+        }
+        private void requireCapturedClient() { if (clientRefusal != null) throw new IllegalStateException(clientRefusal); }
         public void captureBinding() { requireBinding(); }
         public void requireBinding() { if (refusal != null) throw new IllegalStateException(refusal); }
         public Object screen() { return screen; }
@@ -407,13 +434,13 @@ class InspectAcceptanceDriverTest {
         final Object forward = new Object(); boolean pressed, clearFails; double x, z;
         public Object forwardBinding() { requireBinding(); return forward; }
         public InspectAcceptanceDriver.Pose pose() { requireBinding(); return new InspectAcceptanceDriver.Pose(x, z); }
-        public boolean forwardPressed(Object binding) { requireClient(null); assertSame(forward, binding); return pressed; }
+        public boolean forwardPressed(Object binding) { requireCapturedClient(); assertSame(forward, binding); return pressed; }
         public void forward(Object binding, boolean press) {
             requireBinding(); assertSame(forward, binding); pressed = press;
             events.add("87" + (press ? "+" : "-")); callback("87" + (press ? "+" : "-"));
         }
         public void clearForward(Object binding) {
-            requireClient(null); assertSame(forward, binding); if (clearFails) throw new IllegalStateException("clear unavailable");
+            requireCapturedClient(); assertSame(forward, binding); if (clearFails) throw new IllegalStateException("clear unavailable");
             pressed = false; events.add("captured-false");
         }
     }

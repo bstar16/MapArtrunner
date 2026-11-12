@@ -74,8 +74,10 @@ final class InspectAcceptanceDriver {
     void tick(MinecraftClient current) {
         if (advancing) return;
         if (!enabled.getAsBoolean() && heldForward == null) return;
+        boolean validEntry = false;
         advancing = true;
         try {
+            input.requireClient(current); validEntry = true;
             require(enabled.getAsBoolean(), "Acceptance gate disabled while forward held");
             if (!selected) {
                 var value = System.getProperty("mapart.test.inspect.acceptance.case", "baseline");
@@ -83,7 +85,6 @@ final class InspectAcceptanceDriver {
                 displaced = value.equals("displaced"); selected = true;
             }
             if (stage == Stage.STOPPED) { requestStop(current); return; }
-            input.requireClient(current);
             var observed = observations.get();
             require(!observed.restartRequired(), "Inspect session unavailable; restart required");
             if (stage == Stage.WAIT_STARTUP) {
@@ -142,7 +143,8 @@ final class InspectAcceptanceDriver {
                 default -> throw new IllegalStateException("Unexpected driver stage");
             }
         } catch (RuntimeException | Error failure) {
-            fail(failure); requestStop(current);
+            fail(failure, validEntry);
+            if (validEntry) requestStop(current);
         } finally { advancing = false; }
     }
 
@@ -206,9 +208,10 @@ final class InspectAcceptanceDriver {
     /** Used by the existing CLIENT_STOPPING listener even when no later END callback arrives. */
     void releaseOnStopping(MinecraftClient current) {
         if (advancing) return;
+        boolean validEntry = false;
         advancing = true;
-        try { input.requireClient(current); releaseForward(); }
-        catch (RuntimeException | Error failure) { fail(failure); }
+        try { input.requireClient(current); validEntry = true; releaseForward(); }
+        catch (RuntimeException | Error failure) { fail(failure, validEntry); }
         finally { advancing = false; }
     }
 
@@ -280,25 +283,26 @@ final class InspectAcceptanceDriver {
         input.key(code, false, screen);
     }
 
-    private void fail(Throwable failure) {
-        try { releaseForward(); } catch (RuntimeException | Error release) { if (release != failure) failure.addSuppressed(release); }
+    private void fail(Throwable failure, boolean validEntry) {
+        // A rejected current argument retains debt even if captured-client checks would succeed.
+        if (validEntry) try { releaseForward(); } catch (RuntimeException | Error release) { if (release != failure) failure.addSuppressed(release); }
         if (failed) return;
         failed = true;
-        try { releaseKey(); } catch (RuntimeException | Error release) { failure.addSuppressed(release); }
+        if (validEntry) try { releaseKey(); } catch (RuntimeException | Error release) { failure.addSuppressed(release); }
         marker("DRIVER_FAIL " + failure.getClass().getName() + ": " + failure.getMessage());
         stage = Stage.STOPPED;
     }
 
     private void requestStop(MinecraftClient current) {
         if (stopRequested) return;
+        // Validate this entry before cleanup, not merely the captured client's own cleanup boundary.
+        try { input.requireClient(current); } catch (RuntimeException | Error unavailable) { return; }
         if (heldForward != null) {
-            try { releaseForward(); } catch (RuntimeException | Error failure) { fail(failure); }
+            try { releaseForward(); } catch (RuntimeException | Error failure) { fail(failure, true); }
             if (heldForward != null) return;
         }
-        // A wrong-thread/client callback cannot issue native stop. A later valid tick may deliver this same intent.
-        try { input.requireClient(current); } catch (RuntimeException | Error unavailable) { return; }
         stopRequested = true;
-        try { input.stop(); } catch (RuntimeException | Error failure) { fail(failure); }
+        try { input.stop(); } catch (RuntimeException | Error failure) { fail(failure, true); }
     }
 
     private String commandText() {
