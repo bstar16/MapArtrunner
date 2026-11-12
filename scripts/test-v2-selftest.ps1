@@ -753,14 +753,21 @@ try {
             Remove-Item -LiteralPath "$scenarios/two-lane-new/alias"
             New-Item -ItemType Junction -Path "$scenarios/two-lane-new/alias" -Target "$scenarios/two-lane-new/ordinary" | Out-Null
         }
+        $unknownAlias=[IO.Path]::GetFullPath((Join-Path $scenarios 'two-lane-new/alias'))
+        $unknownProof=@{MockReached=$false;ExpectedCause="Unknown reparse metadata: $unknownAlias";ActualCause=$null}
         try {
             function Get-Item {
                 param($LiteralPath,[switch]$Force)
                 $item=Microsoft.PowerShell.Management\Get-Item -LiteralPath $LiteralPath -Force:$Force -ErrorAction Stop
-                if ([IO.Path]::GetFullPath($LiteralPath) -eq [IO.Path]::GetFullPath((Join-Path $scenarios 'two-lane-new/alias'))) { $item | Add-Member LinkType 'Unknown' -Force }
+                if ([IO.Path]::GetFullPath($LiteralPath) -eq $unknownAlias) {
+                    $unknownProof.MockReached=$true
+                    return [pscustomobject]@{Attributes=$item.Attributes;LinkTarget=$item.LinkTarget;LinkType='Unknown'}
+                }
                 $item
             }
-            Reject $read 'unknown link metadata accepted'
+            try { & $read | Out-Null } catch { $unknownProof.ActualCause=$_.Exception.Message }
+            $unknownProof | ConvertTo-Json | Set-Content (Join-Path $testRoot 'unknown-link-proof.json')
+            Assert ($unknownProof.MockReached -and $unknownProof.ActualCause -ceq $unknownProof.ExpectedCause) "unknown link production rejection missing; actual=$($unknownProof.ActualCause)"
         } finally { Remove-Item Function:Get-Item }
         & $read | Out-Null
     }
