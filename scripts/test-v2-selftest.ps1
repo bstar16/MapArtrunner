@@ -39,6 +39,300 @@ try {
         }
         $regressions | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $testRoot 'review-regressions.json')
     }
+    Run 'Task8g automatic archive closes exact original roots once and rejects payload drift' {
+        $root=Join-Path $testRoot 'reference-fixture'; $game=Join-Path $root game
+        New-Item -ItemType Directory -Path (Join-Path $game logs),(Join-Path $root 'two-lane-stale') -Force | Out-Null
+        Set-Content (Join-Path $game 'logs/latest.log') 'reference diagnostics'
+        $before=@(Get-V2ScenarioInventory $root)
+        $payload=Join-Path $root ('two-lane-'+[guid]::NewGuid())
+        New-Item -ItemType Directory -Path (Join-Path $payload empty) -Force | Out-Null
+        Set-Content (Join-Path $payload bytes.txt) 'canonical bytes'
+        $launchId=[guid]::NewGuid().ToString('D'); $evidence=Join-Path $root ('launch-'+$launchId)
+        New-Item -ItemType Directory -Path $evidence | Out-Null
+        $context=[pscustomobject]@{LaunchId=$launchId;Evidence=$evidence;CleanupStatus='settled';Request=[pscustomobject]@{Mode='automatic'}}
+        Save-V2Artifacts -Evidence $evidence -Game $game -ScenarioRoot $root -Before $before -Owner $repo -Context $context
+        Assert (!(Test-Path (Join-Path $evidence scenarios))) 'automatic archive duplicated scenario payload'
+        $manifest=Read-V2ScenarioReferences -Evidence $evidence -ScenarioRoot $root -Owner $repo -LaunchId $launchId
+        Assert ($manifest.Roots.Count -eq 1 -and $manifest.Roots[0].Name -ceq (Split-Path $payload -Leaf)) 'stale root credited or fresh root lost'
+        Assert (@($manifest.Roots[0].Entries | Where-Object { $_.Path -ceq 'empty' -and $_.Kind -ceq 'directory' }).Count -eq 1) 'empty directory identity omitted'
+        $read={ Read-V2ScenarioReferences -Evidence $evidence -ScenarioRoot $root -Owner $repo -LaunchId $launchId -ClosureId $manifest.ClosureId }
+        foreach ($case in 'changed','missing','added','type','directory','root') {
+            $file=Join-Path $payload bytes.txt; $original=[IO.File]::ReadAllBytes($file)
+            try {
+                switch ($case) {
+                    changed { Set-Content $file 'different bytes' }
+                    missing { Remove-Item -LiteralPath $file }
+                    added { Set-Content (Join-Path $payload added.txt) 'extra' }
+                    type { Remove-Item -LiteralPath $file; New-Item -ItemType Directory -Path $file | Out-Null }
+                    directory { Remove-Item -LiteralPath (Join-Path $payload empty) }
+                    root { Remove-Item -LiteralPath $file; Remove-Item -LiteralPath (Join-Path $payload empty); Remove-Item -LiteralPath $payload }
+                }
+                Reject $read "reference reader accepted $case payload"
+            } finally {
+                if ($case -ceq 'type') { Remove-Item -LiteralPath $file }
+                if ($case -ceq 'added') { Remove-Item -LiteralPath (Join-Path $payload added.txt) }
+                if ($case -cin 'directory','root') { New-Item -ItemType Directory -Path (Join-Path $payload empty) -Force | Out-Null }
+                [IO.File]::WriteAllBytes($file,$original)
+            }
+        }
+        $path=Join-Path $evidence 'scenario-references.json'; $original=Get-Content $path -Raw
+        foreach ($case in 'schema','identity','closure','escape','duplicate','partial','root') {
+            try {
+                $bad=$original | ConvertFrom-Json
+                switch ($case) {
+                    schema { $bad.Schema='unknown' }
+                    identity { $bad.LaunchId=[guid]::NewGuid().ToString('D') }
+                    closure { $bad.ClosureId=[guid]::NewGuid().ToString('D') }
+                    escape { $bad.Roots[0].Entries[0].Path='../outside' }
+                    duplicate { $bad.Roots=@($bad.Roots)+@($bad.Roots) }
+                    partial { $bad.State='partial' }
+                    root { $bad.Roots[0].Name='../outside' }
+                }
+                $bad | ConvertTo-Json -Depth 30 | Set-Content $path
+                Reject $read "reference reader accepted $case manifest"
+            } finally { Set-Content $path $original }
+        }
+        & $read | Out-Null
+        $failedEvidence=Join-Path $root ('launch-'+[guid]::NewGuid()); New-Item -ItemType Directory -Path $failedEvidence | Out-Null
+        $failedContext=[pscustomobject]@{LaunchId=(Split-Path $failedEvidence -Leaf).Substring(7);Evidence=$failedEvidence;CleanupStatus='settled';Request=[pscustomobject]@{}}
+        $originalEntries=${function:Get-V2ReferenceEntries}; $mutation=@{Done=$false}; $originalBytes=[IO.File]::ReadAllBytes((Join-Path $payload bytes.txt))
+        try {
+            function Get-V2ReferenceEntries {
+                param($Path,$Owner,$Relative='.')
+                & $originalEntries $Path $Owner $Relative
+                if ($Path -eq $payload -and $Relative -ceq '.' -and !$mutation.Done) {
+                    $mutation.Done=$true; Set-Content (Join-Path $payload bytes.txt) 'changed during closure'
+                }
+            }
+            Reject { Save-V2Artifacts -Evidence $failedEvidence -Game $game -ScenarioRoot $root -Before $before -Owner $repo -Context $failedContext } 'writer accepted payload drift before closure'
+            Assert ($mutation.Done -and (Test-Path (Join-Path $failedEvidence scenario-references.partial.json)) -and !(Test-Path (Join-Path $failedEvidence scenario-references.json))) 'failed readback published a closed manifest'
+            Reject { Read-V2ScenarioReferences -Evidence $failedEvidence -ScenarioRoot $root -Owner $repo -LaunchId $failedContext.LaunchId } 'partial manifest consumed as retained archive'
+        } finally {
+            Set-Item Function:Get-V2ReferenceEntries $originalEntries
+            [IO.File]::WriteAllBytes((Join-Path $payload bytes.txt),$originalBytes)
+        }
+        $empty=Join-Path $root ('launch-'+[guid]::NewGuid()); New-Item -ItemType Directory -Path $empty | Out-Null
+        $emptyContext=[pscustomobject]@{LaunchId=(Split-Path $empty -Leaf).Substring(7);Evidence=$empty;CleanupStatus='settled';Request=[pscustomobject]@{}}
+        Save-V2Artifacts -Evidence $empty -Game $game -ScenarioRoot $root -Before @(Get-V2ScenarioInventory $root) -Owner $repo -Context $emptyContext
+        Assert ((Read-V2ScenarioReferences -Evidence $empty -ScenarioRoot $root -Owner $repo -LaunchId $emptyContext.LaunchId).Roots.Count -eq 0) 'empty startup invented scenario evidence'
+    }
+    Run 'Task8g automatic cancellation and failures retain diagnostics first cause and ownership' {
+        foreach ($case in 'cancelled','cancelled-invalid','worker0-invalid','worker7-invalid','timeout-invalid','unresolved') {
+            $root=Join-Path $testRoot ('reference-'+$case); $game=Join-Path $root game
+            $payload=Join-Path $root ('two-lane-'+[guid]::NewGuid())
+            New-Item -ItemType Directory -Path (Join-Path $game logs),(Join-Path $game crash-reports) -Force | Out-Null
+            Set-Content (Join-Path $game 'logs/latest.log') 'automatic diagnostics'
+            Set-Content (Join-Path $game 'crash-reports/failure.txt') 'automatic failure'
+            $worker="New-Item -ItemType Directory -Path '"+$payload.Replace("'","''")+"' | Out-Null; Set-Content -LiteralPath '"+(Join-Path $payload bytes.txt).Replace("'","''")+"' payload; Start-Sleep -Milliseconds "+$(if($case -cin 'worker7-invalid','unresolved'){'300; exit 7'}elseif($case -ceq 'worker0-invalid'){'300; exit 0'}else{'30000'})
+            $observation=[hashtable]::Synchronized(@{}); $pipeline=[Management.Automation.PowerShell]::Create()
+            $invocation=$null; $stopping=$null
+            try {
+                [void]$pipeline.AddScript({
+                    param($Source,$Owner,$Root,$Game,$Payload,$Worker,$Case,$Observation)
+                    $ErrorActionPreference='Stop'; . $Source
+                    $original=${function:Update-V2Processes}
+                    function Update-V2Processes {
+                        param($Job,$Records,$Handles,[switch]$Fast)
+                        & $original @PSBoundParameters
+                        if (Test-Path -LiteralPath (Join-Path $Payload bytes.txt)) {
+                            if (!$Observation.Ready) { $Observation.Snapshot=$result | ConvertTo-Json -Depth 12 -Compress; $Observation.Ready=$true }
+                            if ($Fast -and $Case -ceq 'unresolved') { throw 'Task8g deliberately unresolved after owned worker exit' }
+                        }
+                    }
+                    $archive={
+                        param($Evidence,$Before,$Context)
+                        Save-V2Artifacts -Evidence $Evidence -Game $Game -ScenarioRoot $Root -Before $Before -Owner $Owner -Context $Context
+                        if ($Case -like '*-invalid') {
+                            Set-Content -LiteralPath (Join-Path $Payload bytes.txt) 'changed before retention'
+                            [void](Read-V2ScenarioReferences -Evidence $Evidence -ScenarioRoot $Root -Owner $Owner -LaunchId $Context.LaunchId)
+                        }
+                    }
+                    Invoke-V2Supervisor -Worker ([scriptblock]::Create($Worker)) -EvidenceRoot $Root -WorkingDirectory $Owner -TimeoutMilliseconds $(if($Case -ceq 'timeout-invalid'){1800}else{10000}) -Archive $archive
+                }.ToString()).AddArgument((Join-Path $repo 'scripts/test-v2.ps1')).AddArgument($repo).AddArgument($root).AddArgument($game).AddArgument($payload).AddArgument($worker).AddArgument($case).AddArgument($observation)
+                $invocation=$pipeline.BeginInvoke(); $wait=[Diagnostics.Stopwatch]::StartNew()
+                while (!$observation.Ready -and !$invocation.IsCompleted -and $wait.ElapsedMilliseconds -lt 10000) { Start-Sleep -Milliseconds 20 }
+                Assert $observation.Ready "automatic $case did not reach owned payload observation"
+                $observed=$observation.Snapshot | ConvertFrom-Json
+                if ($case -like 'cancelled*') {
+                    $stopping=$pipeline.BeginStop($null,$null)
+                    Assert ($stopping.AsyncWaitHandle.WaitOne(15000)) 'HOLD: automatic cancelled pipeline did not settle'
+                    $pipeline.EndStop($stopping)
+                }
+                try { $returned=@($pipeline.EndInvoke($invocation)) }
+                catch [Management.Automation.MethodInvocationException] {
+                    if ($case -notlike 'cancelled*' -or $_.Exception.InnerException -isnot [Management.Automation.PipelineStoppedException]) { throw }
+                }
+                Assert (@($pipeline.Streams.Error | Where-Object { $_.Exception -isnot [Management.Automation.PipelineStoppedException] }).Count -eq 0) "automatic $case pipeline errors: $($pipeline.Streams.Error -join '; ')"
+                if ($case -like 'cancelled*') { Assert ($pipeline.InvocationStateInfo.State -eq 'Stopped') 'automatic pipeline was not actually stopped' }
+                else { Assert ($returned.Count -eq 1) 'automatic archive polluted scalar result pipeline' }
+                $outcome=Get-Content (Join-Path $observed.Evidence outcome.json) -Raw | ConvertFrom-Json
+                $lockBytes=(Get-Item (Join-Path $root supervisor.lock)).Length
+                Assert ((Get-Content (Join-Path $outcome.Evidence 'logs/latest.log') -Raw).Trim() -ceq 'automatic diagnostics') 'automatic failure lost logs'
+                Assert ((Test-Path (Join-Path $outcome.Evidence 'crash-reports/failure.txt')) -and (Test-Path (Join-Path $outcome.Evidence exit-code.txt))) 'automatic failure lost crash/exit evidence'
+                Assert ($outcome.LaunchId -ceq $observed.LaunchId -and @($outcome.Processes).Count -gt 0) 'automatic cancellation lost launch/held process identity'
+                if ($case -ceq 'unresolved') {
+                    Assert ($outcome.CleanupStatus -ceq 'unresolved' -and $outcome.CleanupError -like '*Task8g deliberately unresolved*' -and !(Test-Path (Join-Path $outcome.Evidence scenario-references.json))) 'unresolved cleanup closed immutable references'
+                } else {
+                    Assert ($outcome.CleanupStatus -ceq 'settled' -and $null -ne $outcome.WorkerExitCode -and @($outcome.Processes | Where-Object { $null -eq $_.ExitCode }).Count -eq 0) 'automatic failure lost settled held exits'
+                }
+                if ($case -ceq 'cancelled') {
+                    Assert ($outcome.ArchiveStatus -ceq 'retained' -and $lockBytes -eq 0 -and $outcome.ExitCode -ne 0 -and $outcome.TerminationRequested -and !$outcome.TimedOut) 'automatic cancellation lost truthful retained outcome'
+                    $manifest=Read-V2ScenarioReferences -Evidence $outcome.Evidence -ScenarioRoot $root -Owner $repo -LaunchId $outcome.LaunchId
+                    Assert ($manifest.Roots.Count -eq 1 -and !(Test-Path (Join-Path $outcome.Evidence scenarios))) 'automatic cancellation duplicated/lost payload'
+                } else {
+                    Assert ($outcome.ArchiveStatus -ceq 'failed' -and $outcome.ArchiveError -and $lockBytes -gt 0) 'automatic retention failure cleared ownership'
+                    Reject { Invoke-V2Supervisor -Worker { exit 0 } -EvidenceRoot $root -WorkingDirectory $repo } 'reference failure allowed rerun'
+                }
+                if ($case -cin 'worker7-invalid','unresolved') { Assert ($outcome.ExitCode -eq 7 -and $outcome.WorkerExitCode -eq 7 -and $outcome.PrimaryFailure.ExitCode -eq 7) 'reference/cleanup failure replaced primary worker7' }
+                if ($case -ceq 'worker0-invalid') { Assert ($outcome.ExitCode -eq 125 -and $outcome.WorkerExitCode -eq 0 -and !$outcome.PrimaryFailure) 'reference failure did not convert otherwise-successful0 to125' }
+                if ($case -ceq 'timeout-invalid') { Assert ($outcome.ExitCode -eq 124 -and $outcome.TimedOut) 'reference failure replaced timeout124' }
+                if ($case -ceq 'cancelled-invalid') { Assert ($outcome.ExitCode -ne 0 -and $outcome.TerminationRequested -and !$outcome.TimedOut) 'reference failure hid automatic cancellation' }
+            } finally {
+                if ($invocation -and !$invocation.IsCompleted) { $pipeline.Stop() }
+                if ($stopping) { $stopping.AsyncWaitHandle.Dispose() }
+                if ($invocation) { $invocation.AsyncWaitHandle.Dispose() }
+                $pipeline.Dispose()
+            }
+        }
+    }
+    Run 'Task7 inspect selection is explicit and leaves automatic requests intact' {
+        $request=New-V2Request -Inspect -Scenario grounded-two-lane -EulaAccepted
+        Assert ($request.Mode -ceq 'inspect' -and $request.Scenario -ceq 'grounded-two-lane') 'inspect mode/selection missing'
+        Assert (($request.Arguments -join ' ') -ceq '-p v2 :fabric:runInspect --no-daemon --console=plain') 'inspect manufactured automatic/EULA arguments'
+        Assert ($request.EulaProvenance -ceq 'operator-switch') 'inspect EULA provenance missing'
+        Assert ((New-V2Request -Inspect -Scenario grounded-two-lane -EulaEnvironment 1).EulaProvenance -ceq 'process MAPART_TEST_EULA_ACCEPTED=1') 'inspect process EULA provenance missing'
+        foreach ($selection in @(@{},@{Scenario='all'},@{Scenario='grounded-traversal'},@{Scenario='GROUNDED-TWO-LANE'},
+            @{Scenario='grounded-two-lane';Repeat='2'},@{Scenario='grounded-two-lane';Repeat='1'},@{Scenario='grounded-two-lane';WrongExpectedBlock=$true})) {
+            Reject { New-V2Request -Inspect @selection -EulaAccepted } 'invalid inspect request accepted'
+            Reject { . (Join-Path $PSScriptRoot 'test-v2.ps1') -Inspect @selection -EulaAccepted } 'invalid public inspect selection accepted'
+        }
+        Reject { New-V2Request -Inspect -Scenario grounded-two-lane -EulaEnvironment '' } 'inspect missing EULA accepted'
+        Reject { . (Join-Path $PSScriptRoot 'test-v2.ps1') -Inspect -Scenario grounded-two-lane -InternalSupportCase controlled -EulaAccepted } 'public inspect support accepted'
+        $automatic=New-V2Request -EulaAccepted
+        Assert ($automatic.Scenario -ceq 'all' -and $automatic.Repeat -eq 2 -and $automatic.Arguments -contains ':fabric:runClientGameTest') 'automatic defaults changed'
+    }
+    Run 'Task7 inherited JVM mode conflicts are refused without changing the parent' {
+        $names=@('JAVA_TOOL_OPTIONS','JDK_JAVA_OPTIONS','_JAVA_OPTIONS','JAVA_OPTS','GRADLE_OPTS')
+        Invoke-V2EnvironmentFixture $names {
+            foreach ($name in $names) { Remove-Item "Env:$name" -ErrorAction SilentlyContinue }
+            $inspectRequest=New-V2Request -Inspect -Scenario grounded-two-lane -EulaAccepted
+            $automaticRequest=New-V2Request -EulaAccepted
+            foreach ($name in $names) {
+                foreach ($option in @('-Dfabric.client.gametest','-Dfabric.client.gametest=','-Dfabric.client.gametest=false','"-Dfabric.client.gametest=false"')) {
+                    [Environment]::SetEnvironmentVariable($name,$option)
+                    Reject { New-V2Request -Inspect -Scenario grounded-two-lane -EulaAccepted } "inspect inherited $name enable accepted"
+                    Assert ([Environment]::GetEnvironmentVariable($name) -ceq $option) 'mode check changed parent option'
+                }
+                foreach ($case in @(
+                    @{Value='false';JvmEnabled=$false;WrapperEnabled=$false},
+                    @{Value='';JvmEnabled=$false;WrapperEnabled=$false},
+                    @{Value='TRUE';JvmEnabled=$true;WrapperEnabled=$true},
+                    @{Value='TrUe';JvmEnabled=$true;WrapperEnabled=$true},
+                    @{Value='"true"';JvmEnabled=$true;WrapperEnabled=$true},
+                    @{Value="'true'";JvmEnabled=$true;WrapperEnabled=$false})) {
+                    $option="-Dmapart.test.inspect=$($case.Value)"
+                    [Environment]::SetEnvironmentVariable($name,$option)
+                    $enabled=$(if($name -in 'JAVA_OPTS','GRADLE_OPTS'){$case.WrapperEnabled}else{$case.JvmEnabled})
+                    if ($enabled) {
+                        Reject { New-V2Request -EulaAccepted } 'automatic inherited inspect=true accepted'
+                        New-V2Request -Inspect -Scenario grounded-two-lane -EulaAccepted | Out-Null
+                    } else {
+                        Reject { New-V2Request -Inspect -Scenario grounded-two-lane -EulaAccepted } 'inspect disabling inherited option accepted'
+                        New-V2Request -EulaAccepted | Out-Null
+                    }
+                }
+                foreach ($option in @('-Dmapart.test.inspect','-Dmapart.test.inspect=" true"',"-Dmapart.test.inspect='tr`"ue'",'-Dmapart.test.inspect="tr''ue"')) {
+                    [Environment]::SetEnvironmentVariable($name,$option)
+                    Reject { New-V2Request -Inspect -Scenario grounded-two-lane -EulaAccepted } 'inspect inactive inherited option accepted'
+                    New-V2Request -EulaAccepted | Out-Null
+                }
+                foreach ($case in @(@{Request=$inspectRequest;Options='-Dfabric.client.gametest=false'},@{Request=$automaticRequest;Options='-Dmapart.test.inspect=TRUE'})) {
+                    [Environment]::SetEnvironmentVariable($name,$case.Options)
+                    $refused=Join-Path $testRoot ('mode-refused-'+$name)
+                    Reject { Invoke-V2Supervisor -RequireGame -Request $case.Request -EvidenceRoot $refused -WorkingDirectory $repo } 'real supervisor inherited conflict accepted'
+                    Assert (!(Test-Path -LiteralPath $refused)) 'inherited conflict reached filesystem work'
+                }
+                foreach ($option in @('-Doperator.diagnostic=kept','-DMapart.test.inspect=true -DFabric.client.gametest=false')) {
+                    [Environment]::SetEnvironmentVariable($name,$option)
+                    New-V2Request -Inspect -Scenario grounded-two-lane -EulaAccepted | Out-Null
+                    New-V2Request -EulaAccepted | Out-Null
+                }
+                Remove-Item "Env:$name" -ErrorAction SilentlyContinue
+            }
+            $env:JAVA_TOOL_OPTIONS='-Doperator.diagnostic=kept'
+            $environment=Resolve-V2GameEnvironment ([pscustomobject]@{Home='C:/unused-jdk'}) (New-V2Request -Inspect -Scenario grounded-two-lane -EulaAccepted)
+            Assert ($environment.JAVA_TOOL_OPTIONS -ceq $env:JAVA_TOOL_OPTIONS -and $environment.JAVA_TOOL_OPTIONS -notmatch 'gametest|headless|mapart.test.scenario|mapart.test.repeat') 'inspect appended automatic JVM settings'
+            Reject { Resolve-V2GameEnvironment ([pscustomobject]@{Home='C:/unused-jdk'}) (New-V2Request -Inspect -Scenario grounded-two-lane -EulaAccepted) controlled } 'inspect controlled support resolved'
+        }
+    }
+    Run 'Task7 wrapper adjacent mode quotes fail closed while direct JVM semantics remain unchanged' {
+        # Independent pinned JDK/cmd probe: task-7-review-quotes.json. Wrappers retain literal quotes
+        # in ins"pect, tr"ue and game"test; JVM-direct variables concatenate those same fragments.
+        $cases=@(
+            @{Option='-Dmapart.test.inspect="true"';AutomaticRejected=$true;InspectRejected=$false;AmbiguousWrapper=$false},
+            @{Option='-Dmapart.test."ins""pect"=true';AutomaticRejected=$true;InspectRejected=$false;AmbiguousWrapper=$true},
+            @{Option='-Dmapart.test.in"sp"ect=true';AutomaticRejected=$true;InspectRejected=$false;AmbiguousWrapper=$false},
+            @{Option='-Dmapart.test.inspect="tr""ue"';AutomaticRejected=$true;InspectRejected=$false;AmbiguousWrapper=$true},
+            @{Option='"-Dmapart.test.inspect=''true''"';AutomaticRejected=$false;InspectRejected=$true;AmbiguousWrapper=$false},
+            @{Option='-Dfabric.client."game""test"=false';AutomaticRejected=$false;InspectRejected=$true;AmbiguousWrapper=$true},
+            @{Option='-Dmapart.test.inspect=""';AutomaticRejected=$false;InspectRejected=$true;AmbiguousWrapper=$false},
+            @{Option='-DMapart.test.inspect="tr""ue"';AutomaticRejected=$false;InspectRejected=$false;AmbiguousWrapper=$false},
+            @{Option='-Doperator.diagnostic="tr""ue"';AutomaticRejected=$false;InspectRejected=$false;AmbiguousWrapper=$false})
+        $names=@('JAVA_OPTS','GRADLE_OPTS','JAVA_TOOL_OPTIONS','JDK_JAVA_OPTIONS','_JAVA_OPTIONS')
+        Invoke-V2EnvironmentFixture $names {
+            foreach ($name in $names) { Remove-Item "Env:$name" -ErrorAction SilentlyContinue }
+            foreach ($name in $names) { foreach ($case in $cases) {
+                [Environment]::SetEnvironmentVariable($name,$case.Option)
+                foreach ($inspect in $false,$true) {
+                    $expected=$(if($name -in 'JAVA_OPTS','GRADLE_OPTS' -and $case.AmbiguousWrapper){$true}
+                        elseif($inspect){$case.InspectRejected}else{$case.AutomaticRejected})
+                    $rejected=$false
+                    try { New-V2Request -Inspect:$inspect -Scenario grounded-two-lane -EulaAccepted | Out-Null } catch { $rejected=$true }
+                    Assert ($rejected -eq $expected) "quote policy differs for $name / inspect=$inspect / $($case.Option)"
+                }
+                Assert ([Environment]::GetEnvironmentVariable($name) -ceq $case.Option) 'quote validation changed parent options'
+                Remove-Item "Env:$name" -ErrorAction SilentlyContinue
+            } }
+        }
+    }
+    Run 'Task7 fixture registers the gated ordinary initializer beside five providers and ten mixins' {
+        $fixture=Join-Path $repo 'v2/fabric/src/gametest'
+        $metadata=Get-Content (Join-Path $fixture 'resources/fabric.mod.json') -Raw | ConvertFrom-Json
+        Assert ((@($metadata.entrypoints.client) -join ',') -ceq 'com.mapartrunner.fabric.scenario.ScenarioClientInitializer') 'ordinary initializer missing/duplicated'
+        Assert (@($metadata.entrypoints.'fabric-client-gametest').Count -eq 5) 'automatic provider count changed'
+        $mixins=Get-Content (Join-Path $fixture 'resources/mapart-test.mixins.json') -Raw | ConvertFrom-Json
+        Assert (@($mixins.client).Count -eq 10 -and $mixins.client -contains 'InspectExitMixin' -and $mixins.client -contains 'InspectKeyboardInvoker') 'accepted mixin configuration changed'
+    }
+    Run 'Task7 real inspect constructor shares its launch root with the existing archiver' {
+        $request=New-V2Request -Inspect -Scenario grounded-two-lane -EulaAccepted
+        $root=Join-Path $testRoot 'inspect-constructor'
+        $capture=@{}; $sentinel='Task7 before worker construction'; $caught=$null
+        $originalInfo=${function:New-V2ProcessInfo}; $originalJdk=${function:Find-V2Jdk}; $originalArchive=${function:Save-V2Artifacts}
+        try {
+            Set-Item Function:Find-V2Jdk -Value { [pscustomobject]@{Home='C:/unused-jdk'} }
+            Set-Item Function:Save-V2Artifacts -Value { param($Evidence,$Game,$ScenarioRoot,$Before,$Owner) $capture.ArchiveGame=$Game }
+            Set-Item Function:New-V2ProcessInfo -Value {
+                param($Executable,$WorkingDirectory,$Command,$Environment)
+                $capture.Game=$game; $capture.Command=$Command; $capture.Environment=$Environment
+                $capture.Request=Get-Content (Join-Path $evidence 'request.json') -Raw | ConvertFrom-Json
+                & $Archive $evidence $before
+                throw $sentinel
+            }
+            try { Invoke-V2Supervisor -RequireGame -Request $request -EvidenceRoot $root -WorkingDirectory $repo | Out-Null }
+            catch { $caught=$_.Exception.Message }
+        } finally {
+            Set-Item Function:New-V2ProcessInfo -Value $originalInfo; Set-Item Function:Find-V2Jdk -Value $originalJdk; Set-Item Function:Save-V2Artifacts -Value $originalArchive
+        }
+        Assert ($caught -ceq $sentinel) "inspect failed before constructor sentinel: $caught"
+        $expected=Join-Path $repo 'v2/fabric/build/run/inspect'
+        Assert ($capture.Game -ceq $expected -and $capture.ArchiveGame -ceq $expected) 'inspect launch/archive roots differ'
+        Assert ($capture.Command -match ':fabric:runInspect' -and $capture.Command -notmatch 'runClientGameTest|mapartTestEula|mapart.test.scenario|mapart.test.repeat') 'inspect worker selected automatic route'
+        Assert ($capture.Request.Request.Mode -ceq 'inspect' -and $capture.Request.StartupDeadlineMilliseconds -eq 600000) 'inspect request/startup identity changed'
+        $capture | ConvertTo-Json -Depth 12 | Set-Content (Join-Path $testRoot 'inspect-constructor-proof.json')
+        $refused=Join-Path $testRoot 'inspect-support-refused'
+        Reject { Invoke-V2Supervisor -RequireGame -Request $request -InternalSupportCase controlled -EvidenceRoot $refused -WorkingDirectory $repo } 'controlled inspect supervisor accepted'
+        Assert (!(Test-Path -LiteralPath $refused)) 'refused support created filesystem state'
+    }
     Run 'vanished owned PID tolerates stale enumeration without hiding other inventory failures' {
         $originalUpdate=${function:Update-V2Processes}; $capture=@{Process=$null}; $proof=@{}
         try {
@@ -301,14 +595,15 @@ try {
                 $inventoryProof.Add(@{ ScenarioRoot=$ScenarioRoot; ExclusiveHandleHeld=$held })
                 & $inventoryImplementation $ScenarioRoot
             }
-            $archive={ param($evidence,$before) Save-V2Artifacts -Evidence $evidence -Game $game -ScenarioRoot $atomicRoot -Before $before -Owner $repo }
+            $archive={ param($evidence,$before,$context) Save-V2Artifacts -Evidence $evidence -Game $game -ScenarioRoot $atomicRoot -Before $before -Owner $repo -Context $context }
             $a=Invoke-V2Supervisor -Worker ([scriptblock]::Create("New-Item -ItemType Directory -Path '" + $aPath.Replace("'","''") + "' | Out-Null; Set-Content -LiteralPath '" + (Join-Path $aPath artifact.txt).Replace("'","''") + "' A")) -EvidenceRoot $atomicRoot -WorkingDirectory $repo -TimeoutMilliseconds 10000 -Archive $archive
         } finally { Set-Item Function:Get-V2ScenarioInventory -Value $inventoryImplementation }
         @{ StaleExternalSnapshot=$staleSnapshot; InventoryEvents=@($inventoryProof); InvocationA=$a.Evidence; InvocationB=$b.Evidence } | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $testRoot 'atomic-inventory-proof.json')
         if ($a.CleanupStatus -ne 'settled') { throw 'HOLD: interleaved A ownership unresolved; no more launches.' }
         Assert ($a.ExitCode -eq 0 -and @($inventoryProof | Where-Object { !$_.ExclusiveHandleHeld }).Count -eq 0 -and $inventoryProof.Count -ge 2) 'inventory not taken under the exclusive launch handle'
-        Assert (Test-Path (Join-Path $a.Evidence 'scenarios/two-lane-A/artifact.txt')) 'A artifact missing'
-        Assert (!(Test-Path (Join-Path $a.Evidence 'scenarios/two-lane-B'))) 'completed interleaved B credited to A'
+        $references=Read-V2ScenarioReferences -Evidence $a.Evidence -ScenarioRoot $atomicRoot -Owner $repo -LaunchId $a.LaunchId
+        Assert ($references.Roots.Count -eq 1 -and $references.Roots[0].Name -ceq 'two-lane-A' -and (Get-Content (Join-Path $aPath artifact.txt) -Raw).Trim() -ceq 'A') 'A artifact missing or interleaved B credited'
+        Assert (!(Test-Path (Join-Path $a.Evidence scenarios))) 'automatic atomic inventory duplicated payload'
     }
     Regression 7 {
         $childPidFile=Join-Path $testRoot 'failed-worker-child-pid.txt'
@@ -369,6 +664,94 @@ try {
             $environmentProof=@{ Before=@{}; After=@{}; BeforeCount=$before.Count; AfterCount=$after.Count; EveryParentVariableCompared=$true }
             foreach ($name in $names) { $environmentProof.Before[$name]=$before[$name]; $environmentProof.After[$name]=$after[$name] }
             $environmentProof | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $testRoot 'parent-environment-proof.json')
+        }
+    }
+    Run 'live owned stdout and stderr expose small markers to readers while denying other writers' {
+        $caseRoot=Join-Path $testRoot ('live-streams-'+[guid]::NewGuid())
+        New-Item -ItemType Directory -Path $caseRoot | Out-Null
+        $release=Join-Path $caseRoot 'observer-release'
+        $ready=Join-Path $caseRoot 'worker-ready.json'
+        $pipeline=[Management.Automation.PowerShell]::Create()
+        $invocation=$null; $held=$null
+        $proof=[ordered]@{Streams=@();WorkerLive=$false;Outcome=$null}
+        try {
+            $worker={
+                [Console]::Out.WriteLine('INSPECT_ACCEPTANCE_IDLE {"event":"BEGIN","stream":"stdout"}')
+                [Console]::Error.WriteLine('INSPECT_ACCEPTANCE_IDLE {"event":"BEGIN","stream":"stderr"}')
+                $identity=@{Pid=$PID;StartedUtc=(Get-Process -Id $PID).StartTime.ToUniversalTime().ToString('o')} | ConvertTo-Json
+                [IO.File]::WriteAllText((Join-Path $env:TASK8N_ROOT 'worker-ready.tmp'),$identity)
+                [IO.File]::Move((Join-Path $env:TASK8N_ROOT 'worker-ready.tmp'),(Join-Path $env:TASK8N_ROOT 'worker-ready.json'))
+                $wait=[Diagnostics.Stopwatch]::StartNew()
+                while (!(Test-Path -LiteralPath (Join-Path $env:TASK8N_ROOT 'observer-release'))) {
+                    if ($wait.ElapsedMilliseconds -gt 15000) { exit 99 }
+                    Start-Sleep -Milliseconds 10
+                }
+                [Console]::Out.WriteLine('stdout EOF tail')
+                [Console]::Error.WriteLine('stderr EOF tail')
+                exit 7
+            }
+            [void]$pipeline.AddScript({
+                param($Source,$Owner,$Root,$WorkerText)
+                $ErrorActionPreference='Stop'
+                . $Source
+                Invoke-V2Supervisor -Worker ([scriptblock]::Create($WorkerText)) -Environment @{TASK8N_ROOT=$Root} -EvidenceRoot $Root -WorkingDirectory $Owner -TimeoutMilliseconds 25000 -Archive {
+                    param($Evidence,$Before,$Context)
+                    if ($Context.CleanupStatus -cne 'settled') { throw 'Archive ran before stream cleanup settled.' }
+                    Set-Content -LiteralPath (Join-Path $Evidence 'archive-streams-checked') 'streams settled before archive'
+                }
+            }.ToString()).AddArgument((Join-Path $repo 'scripts/test-v2.ps1')).AddArgument($repo).AddArgument($caseRoot).AddArgument($worker.ToString())
+            $invocation=$pipeline.BeginInvoke()
+            $wait=[Diagnostics.Stopwatch]::StartNew()
+            while (!(Test-Path -LiteralPath $ready) -and !$invocation.IsCompleted -and $wait.ElapsedMilliseconds -lt 10000) { Start-Sleep -Milliseconds 20 }
+            Assert (Test-Path -LiteralPath $ready) 'live stream worker never emitted its small markers'
+            $identity=Get-Content -LiteralPath $ready -Raw | ConvertFrom-Json
+            $held=[Diagnostics.Process]::GetProcessById($identity.Pid)
+            Assert ($held.StartTime.ToUniversalTime() -eq ([DateTimeOffset]$identity.StartedUtc).UtcDateTime -and !$held.HasExited) 'live stream worker identity changed/exited'
+            $launch=@(Get-ChildItem -LiteralPath $caseRoot -Directory -Filter 'launch-*')
+            Assert ($launch.Count -eq 1) 'live stream fixture lacks one actual launch'
+            foreach ($stream in 'stdout','stderr') {
+                $path=Join-Path $launch[0].FullName "launch.$stream.log"
+                $expected='INSPECT_ACCEPTANCE_IDLE {"event":"BEGIN","stream":"'+$stream+'"}'+"`r`n"
+                $text=$null; $readError=$null
+                $readClock=[Diagnostics.Stopwatch]::StartNew()
+                do {
+                    $reader=$null; $handle=$null
+                    try {
+                        $handle=[IO.File]::Open($path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite)
+                        $reader=[IO.StreamReader]::new($handle)
+                        $text=$reader.ReadToEnd(); $readError=$null
+                    } catch { $readError=$_.Exception.Message }
+                    finally { if ($reader) { $reader.Dispose() } elseif ($handle) { $handle.Dispose() } }
+                    if ($text -ceq $expected) { break }
+                    Start-Sleep -Milliseconds 20
+                } while ($readClock.ElapsedMilliseconds -lt 3000 -and !$held.HasExited)
+                $writerDenied=$false; $otherWriter=$null
+                try { $otherWriter=[IO.File]::Open($path,[IO.FileMode]::Open,[IO.FileAccess]::Write,[IO.FileShare]::ReadWrite) }
+                catch [IO.IOException] { $writerDenied=$true }
+                finally { if ($otherWriter) { $otherWriter.Dispose() } }
+                $proof.Streams+=@{Stream=$stream;ExactSmallMarker=($text -ceq $expected);Bytes=[Text.Encoding]::UTF8.GetByteCount($expected);ReadError=$readError;OtherWriterDenied=$writerDenied;WorkerLive=!$held.HasExited}
+            }
+            $proof.WorkerLive=!$held.HasExited -and !$invocation.IsCompleted -and !(Test-Path -LiteralPath $release)
+            Set-Content -LiteralPath $release 'observed'
+            Assert ($invocation.AsyncWaitHandle.WaitOne(15000)) 'HOLD: live stream supervisor did not settle'
+            $outcome=@($pipeline.EndInvoke($invocation))
+            Assert ($outcome.Count -eq 1 -and !$pipeline.HadErrors) "live stream supervisor failed: $($pipeline.Streams.Error -join '; ')"
+            $outcome=$outcome[0]; $proof.Outcome=$outcome
+            $proof | ConvertTo-Json -Depth 14 | Set-Content (Join-Path $caseRoot 'live-stream-proof.json')
+            Assert ($proof.WorkerLive -and @($proof.Streams | Where-Object { !$_.ExactSmallMarker -or $_.Bytes -ge 4096 -or !$_.OtherWriterDenied -or !$_.WorkerLive }).Count -eq 0) "live small marker reader/writer contract failed: $($proof.Streams | ConvertTo-Json -Compress)"
+            Assert ($outcome.ExitCode -eq 7 -and $outcome.WorkerExitCode -eq 7 -and $outcome.PrimaryFailure.ExitCode -eq 7 -and !$outcome.TimedOut -and !$outcome.TerminationRequested) 'live stream fixture lost raw worker failure/first cause'
+            Assert ($outcome.CleanupStatus -ceq 'settled' -and $outcome.ArchiveStatus -ceq 'retained' -and (Test-Path -LiteralPath (Join-Path $outcome.Evidence 'archive-streams-checked')) -and (Get-Item -LiteralPath (Join-Path $caseRoot 'supervisor.lock')).Length -eq 0) 'live stream EOF/archive/ownership did not settle'
+            Assert (@($outcome.Processes | Where-Object { $_.Pid -eq $held.Id -and $_.ExitCode -eq 7 }).Count -eq 1) 'live stream held worker raw exit missing'
+            foreach ($stream in 'stdout','stderr') {
+                $expected='INSPECT_ACCEPTANCE_IDLE {"event":"BEGIN","stream":"'+$stream+'"}'+"`r`n$stream EOF tail`r`n"
+                Assert ([IO.File]::ReadAllText((Join-Path $outcome.Evidence "launch.$stream.log")) -ceq $expected) "final $stream marker/tail bytes changed"
+            }
+        } finally {
+            if (!(Test-Path -LiteralPath $release)) { Set-Content -LiteralPath $release 'cleanup-release' }
+            if ($invocation -and !$invocation.IsCompleted) { $pipeline.Stop() }
+            if ($held) { $held.Dispose() }
+            if ($invocation) { $invocation.AsyncWaitHandle.Dispose() }
+            $pipeline.Dispose()
         }
     }
     Run 'owned worker exits0/7; startup125; archive failure never0 or masks7' {
@@ -435,6 +818,46 @@ try {
         Assert ($links.Count -eq 2 -and @($links | Where-Object { !$_.LinkTarget }).Count -eq 0) 'opaque live/dangling link provenance missing'
         Assert ((Get-Content "$scenarios/two-lane-new/ordinary/sentinel.bin" -Raw).Trim() -eq 'owned sentinel') 'sentinel bytes changed'
         Reject { Copy-V2Evidence "$scenarios/two-lane-new/ordinary" "$archiveFixture/../escape" $archiveFixture $archiveFixture } 'destination escape accepted'
+        $referenceLaunch=[guid]::NewGuid().ToString('D'); $referenceEvidence=Join-Path $archiveFixture ('launch-'+$referenceLaunch)
+        New-Item -ItemType Directory -Path $referenceEvidence | Out-Null
+        New-Item -ItemType Junction -Path "$scenarios/two-lane-redirect" -Target "$scenarios/two-lane-new/ordinary" | Out-Null
+        $context=[pscustomobject]@{LaunchId=$referenceLaunch;Evidence=$referenceEvidence;CleanupStatus='settled';Request=[pscustomobject]@{}}
+        Save-V2Artifacts -Evidence $referenceEvidence -Game $game -ScenarioRoot $scenarios -Before $before -Owner $archiveFixture -Context $context
+        $references=Read-V2ScenarioReferences -Evidence $referenceEvidence -ScenarioRoot $scenarios -Owner $archiveFixture -LaunchId $referenceLaunch
+        $ordinaryRoot=$references.Roots | Where-Object Name -CEQ 'two-lane-new'
+        $redirect=$references.Roots | Where-Object Name -CEQ 'two-lane-redirect'
+        Assert ($redirect.Entries.Count -eq 1 -and $redirect.Entries[0].Kind -ceq 'link') 'top redirect acquired ordinary provider authority'
+        $opaque=@($ordinaryRoot.Entries | Where-Object Kind -CEQ 'link')
+        Assert ($opaque.Count -eq 2 -and @($opaque | Where-Object { !$_.LinkTarget -or !$_.LinkType }).Count -eq 0) 'reference live/dangling metadata missing'
+        Assert (!(Test-Path "$referenceEvidence/scenarios") -and !(Test-Path -LiteralPath $absentPath)) 'reference archive followed/created link targets'
+        Assert ((Get-Item -LiteralPath "$scenarios/two-lane-new/alias" -Force).LinkTarget -ceq ($opaque | Where-Object Path -CEQ alias).LinkTarget) 'live link metadata changed'
+        Assert ((Get-Item -LiteralPath $linkPath -Force).LinkTarget -ceq ($opaque | Where-Object Path -CEQ dangling).LinkTarget) 'dangling link metadata changed'
+        $read={ Read-V2ScenarioReferences -Evidence $referenceEvidence -ScenarioRoot $scenarios -Owner $archiveFixture -LaunchId $referenceLaunch -ClosureId $references.ClosureId }
+        try {
+            Remove-Item -LiteralPath "$scenarios/two-lane-new/alias"
+            New-Item -ItemType Directory -Path "$scenarios/two-lane-new/alias" | Out-Null
+            Reject $read 'reference reader accepted reparse replacement'
+        } finally {
+            Remove-Item -LiteralPath "$scenarios/two-lane-new/alias"
+            New-Item -ItemType Junction -Path "$scenarios/two-lane-new/alias" -Target "$scenarios/two-lane-new/ordinary" | Out-Null
+        }
+        $unknownAlias=[IO.Path]::GetFullPath((Join-Path $scenarios 'two-lane-new/alias'))
+        $unknownProof=@{MockReached=$false;ExpectedCause="Unknown reparse metadata: $unknownAlias";ActualCause=$null}
+        try {
+            function Get-Item {
+                param($LiteralPath,[switch]$Force)
+                $item=Microsoft.PowerShell.Management\Get-Item -LiteralPath $LiteralPath -Force:$Force -ErrorAction Stop
+                if ([IO.Path]::GetFullPath($LiteralPath) -eq $unknownAlias) {
+                    $unknownProof.MockReached=$true
+                    return [pscustomobject]@{Attributes=$item.Attributes;LinkTarget=$item.LinkTarget;LinkType='Unknown'}
+                }
+                $item
+            }
+            try { & $read | Out-Null } catch { $unknownProof.ActualCause=$_.Exception.Message }
+            $unknownProof | ConvertTo-Json | Set-Content (Join-Path $testRoot 'unknown-link-proof.json')
+            Assert ($unknownProof.MockReached -and $unknownProof.ActualCause -ceq $unknownProof.ExpectedCause) "unknown link production rejection missing; actual=$($unknownProof.ActualCause)"
+        } finally { Remove-Item Function:Get-Item }
+        & $read | Out-Null
     }
     Run 'frozen closed traversal calculation includes all and rejects malformed admissions' {
         Assert ((Get-V2TimeoutMilliseconds all 1) -eq 6433400) 'all repeat1 omits traversal deadline'
@@ -468,6 +891,199 @@ $text=$receipt | ConvertTo-Json -Compress
     function Assert-V2Settled($Outcome) {
         if ($Outcome.CleanupStatus -ne 'settled') { throw 'HOLD: startup regression ownership unresolved; no more launches.' }
         Assert ($Outcome.ArchiveStatus -eq 'retained') 'startup evidence archive failed'
+    }
+    Run 'Task7b stopped pipeline retains actual READY, held exits and archive before clearing ownership' {
+        foreach ($case in 'ready','before-ready','archive-failure') {
+            $caseRoot=Join-Path $testRoot ('stopped-'+$case)
+            $observation=[hashtable]::Synchronized(@{})
+            $pipeline=[Management.Automation.PowerShell]::Create()
+            $invocation=$null; $stopping=$null
+            try {
+                $worker=$(if($case -ceq 'before-ready') { { Start-Sleep -Seconds 30 } }
+                    else { New-V2ReceiptWorker '$receipt=@{schema="mapartrunner-inspect-ready-v1";launchId=$receipt.launchId;pid=$receipt.pid;startedUtc=$receipt.startedUtc;scenario="grounded-two-lane";mode="inspect";sessionId=[guid]::NewGuid().ToString("D");event="INSPECT_WORLD_BOUND_COMMANDS_READY"}' 30000 })
+                [void]$pipeline.AddScript({
+                    param($Source,$Owner,$Root,$WorkerText,$Case,$Observation)
+                    $ErrorActionPreference='Stop'
+                    . $Source
+                    $originalOperations=${function:Update-V2InspectOperations}
+                    $originalProcesses=${function:Update-V2Processes}
+                    function Update-V2InspectOperations {
+                        param($State,$Result,$WorkingDirectory,$Clock,[switch]$RequireGame,[hashtable]$InternalInspectTest=@{})
+                        & $originalOperations @PSBoundParameters
+                        if (!$Observation.ContainsKey('Snapshot')) {
+                            $Observation.Snapshot=$Result | ConvertTo-Json -Depth 12 -Compress
+                            $Observation.HeldPid=$State.Held.Record.Pid
+                            $Observation.HeldStartedUtc=$State.Held.Record.StartedUtc
+                            $Observation.HeldLive=!$State.Held.Process.HasExited
+                            $Observation.Ready=$true
+                        }
+                    }
+                    function Update-V2Processes {
+                        param($Job,$Records,$Handles,[switch]$Fast)
+                        & $originalProcesses @PSBoundParameters
+                        if ($Case -ceq 'before-ready' -and !$Fast -and !$Observation.ContainsKey('Snapshot')) {
+                            $Observation.Snapshot=$result | ConvertTo-Json -Depth 12 -Compress
+                            $Observation.OwnedPids=@($Job.Pids())
+                            $Observation.Ready=$true
+                        }
+                    }
+                    $game=Join-Path $Root 'dummy-game'
+                    New-Item -ItemType Directory -Path (Join-Path $game 'logs') -Force | Out-Null
+                    Set-Content -LiteralPath (Join-Path $game 'logs/latest.log') 'owned dummy archive'
+                    $archive={
+                        param($Evidence,$Before)
+                        Save-V2Artifacts -Evidence $Evidence -Game $game -ScenarioRoot $Root -Before $Before -Owner $Owner
+                        if ($Case -ceq 'archive-failure') { throw 'Task7b deliberate archive failure' }
+                    }
+                    Invoke-V2Supervisor -Worker ([scriptblock]::Create($WorkerText)) -Request ([pscustomobject]@{Mode='inspect';Scenario='grounded-two-lane'}) -EvidenceRoot $Root -WorkingDirectory $Owner -TimeoutMilliseconds 20000 -StartupMilliseconds 10000 -Archive $archive
+                }.ToString()).AddArgument((Join-Path $repo 'scripts/test-v2.ps1')).AddArgument($repo).AddArgument($caseRoot).AddArgument($worker.ToString()).AddArgument($case).AddArgument($observation)
+                $invocation=$pipeline.BeginInvoke()
+                $wait=[Diagnostics.Stopwatch]::StartNew()
+                while (!$observation.Ready -and !$invocation.IsCompleted -and $wait.ElapsedMilliseconds -lt 10000) { Start-Sleep -Milliseconds 20 }
+                if (!$observation.Ready -and $invocation.IsCompleted) { [void]$pipeline.EndInvoke($invocation) }
+                Assert $observation.Ready "stopped $case never reached actual supervisor observation"
+                $accepted=$observation.Snapshot | ConvertFrom-Json
+                $observation.Snapshot | Set-Content (Join-Path $caseRoot 'observed-before-stop.json')
+                if ($case -ceq 'before-ready') {
+                    Assert ($null -eq $accepted.StartReceipt -and $null -eq $accepted.StartIdentity -and $null -eq $accepted.StartupAcceptedElapsedMilliseconds -and $observation.OwnedPids -contains $accepted.WorkerPid) 'pre-READY stop lacked actual owned worker or invented acceptance'
+                } else {
+                    Assert ($accepted.ReceiptStatus -ceq 'Accepted' -and $accepted.StartReceipt.event -ceq 'INSPECT_WORLD_BOUND_COMMANDS_READY' -and $null -ne $accepted.StartupAcceptedElapsedMilliseconds -and $observation.HeldLive -and $observation.HeldPid -eq $accepted.StartIdentity.Pid -and [DateTimeOffset]$observation.HeldStartedUtc -eq [DateTimeOffset]$accepted.StartIdentity.StartedUtc) 'stop was not after actual consumer acceptance of the same live held identity'
+                }
+                $stopClock=[Diagnostics.Stopwatch]::StartNew()
+                $stopping=$pipeline.BeginStop($null,$null)
+                Assert ($stopping.AsyncWaitHandle.WaitOne(15000)) 'HOLD: stopped pipeline exceeded original cleanup bound plus host allowance'
+                $pipeline.EndStop($stopping)
+                $stopped=$false
+                try { [void]$pipeline.EndInvoke($invocation) }
+                catch [Management.Automation.MethodInvocationException] {
+                    if ($_.Exception.InnerException -isnot [Management.Automation.PipelineStoppedException]) { throw }
+                    $stopped=$true
+                }
+                Assert ($stopped -and $pipeline.InvocationStateInfo.State -eq 'Stopped') 'pipeline was not actually stopped'
+                Assert (@($pipeline.Streams.Error | Where-Object { $_.Exception -isnot [Management.Automation.PipelineStoppedException] }).Count -eq 0) "unexpected stopped-pipeline error: $($pipeline.Streams.Error -join '; ')"
+                $outcomePath=Join-Path $accepted.Evidence 'outcome.json'
+                $proof=@{Case=$case;PipelineState=[string]$pipeline.InvocationStateInfo.State;PipelineStoppedException=$stopped;StopElapsedMilliseconds=$stopClock.ElapsedMilliseconds;OutcomePresent=(Test-Path -LiteralPath $outcomePath);LockBytes=(Get-Item -LiteralPath (Join-Path $caseRoot 'supervisor.lock')).Length;Observation=$accepted}
+                $proof | ConvertTo-Json -Depth 14 | Set-Content (Join-Path $caseRoot 'stop-proof.json')
+                Assert $proof.OutcomePresent "stopped $case lost durable outcome after actual pipeline cancellation"
+                $outcome=Get-Content -LiteralPath $outcomePath -Raw | ConvertFrom-Json
+                Assert ($outcome.CleanupStatus -ceq 'settled' -and $null -ne $outcome.WorkerExitCode -and @($outcome.Processes).Count -gt 0 -and @($outcome.Processes | Where-Object {$null -eq $_.ExitCode}).Count -eq 0) 'stopped pipeline lost actual held exits/settlement'
+                Assert (@($outcome.Processes | Where-Object {$_.Pid -eq $outcome.WorkerPid -and $_.ExitCode -eq $outcome.WorkerExitCode}).Count -eq 1) 'raw worker exit differs from original held process'
+                Assert ($outcome.ExitCode -ne 0 -and $outcome.TerminationRequested -and !$outcome.TimedOut) 'interruption became success or renewed deadline timeout'
+                Assert ((Test-Path -LiteralPath (Join-Path $accepted.Evidence 'exit-code.txt')) -and (Get-Content -LiteralPath (Join-Path $accepted.Evidence 'logs/latest.log') -Raw).Trim() -ceq 'owned dummy archive') 'stopped pipeline lost exit summary/archive bytes'
+                Assert ($outcome.LaunchId -ceq $accepted.LaunchId -and $outcome.StartupAcceptedElapsedMilliseconds -eq $accepted.StartupAcceptedElapsedMilliseconds -and ($outcome.StartIdentity | ConvertTo-Json -Compress) -ceq ($accepted.StartIdentity | ConvertTo-Json -Compress) -and ($outcome.StartReceipt | ConvertTo-Json -Compress) -ceq ($accepted.StartReceipt | ConvertTo-Json -Compress)) 'cancellation changed accepted receipt/identity/original clock'
+                if ($case -ceq 'archive-failure') {
+                    Assert ($outcome.ArchiveStatus -ceq 'failed' -and $outcome.ArchiveError -like '*Task7b deliberate archive failure*' -and $proof.LockBytes -gt 0) 'cancelled archive failure lost failure/retained ownership'
+                    Reject { Invoke-V2Supervisor -Worker { exit 0 } -EvidenceRoot $caseRoot -WorkingDirectory $repo } 'cancelled archive failure allowed rerun'
+                } else { Assert ($outcome.ArchiveStatus -ceq 'retained' -and $proof.LockBytes -eq 0) 'cancelled settled archive did not clear ownership' }
+            } finally {
+                if ($invocation -and !$invocation.IsCompleted) { $pipeline.Stop() }
+                if ($stopping) { $stopping.AsyncWaitHandle.Dispose() }
+                if ($invocation) { $invocation.AsyncWaitHandle.Dispose() }
+                $pipeline.Dispose()
+            }
+        }
+    }
+    Run 'inspect READY establishes one session only after the same owned receipt checks' {
+        $request=[pscustomobject]@{Mode='inspect';Scenario='grounded-two-lane'}
+        $originalUpdate=${function:Update-V2Processes}; $proof=@{Checked=$false;Latched=$false;Samples=0;Session=$null;Elapsed=$null}
+        try {
+            Set-Item Function:Update-V2Processes -Value {
+                param($Job,$Records,$Handles,[switch]$Fast)
+                & $originalUpdate $Job $Records $Handles -Fast:$Fast
+                if ($Fast) { return }
+                $held=$Handles | Where-Object { $_.Record.Pid -eq $process.Id } | Select-Object -First 1
+                $file=Join-Path $evidence 'test-start.json'
+                if (!$proof.Checked) {
+                    $proof.Checked=$true
+                    $data=@{schema='mapartrunner-inspect-ready-v1';launchId=$launchId;pid=$held.Record.Pid;startedUtc=$held.Record.StartedUtc
+                        scenario='grounded-two-lane';mode='inspect';sessionId='a420fdb6-92ee-4691-a827-141d70ca5ab0';event='INSPECT_WORLD_BOUND_COMMANDS_READY'}
+                    $valid=$data | ConvertTo-Json -Compress
+                    $arguments=@{Evidence=$evidence;LaunchId=$launchId;Request=$Request;Handles=@($Handles);OwnedPids=@($Job.Pids());WorkerPid=$process.Id}
+                    Assert ((Read-V2StartReceipt @arguments).Status -ceq 'Missing') 'missing inspect receipt accepted'
+                    $cases=@(
+                        '{', '{}', '[]', (' '*4097),
+                        ($valid -replace '\{"','{"schema":"mapartrunner-inspect-ready-v1","'),
+                        ($valid -replace '\{"','{"repeat":2,"'),
+                        ($valid -replace '"mode":"inspect"','"mode":"automatic"'),
+                        ($valid -replace 'INSPECT_WORLD_BOUND_COMMANDS_READY','SELECTED_PROVIDER_RUNTEST_ENTERED'),
+                        ($valid -replace 'mapartrunner-inspect-ready-v1','mapartrunner-test-start-v1'),
+                        ($valid -replace 'grounded-two-lane','all'),
+                        ($valid -replace 'a420fdb6-92ee-4691-a827-141d70ca5ab0','A420FDB6-92EE-4691-A827-141D70CA5AB0'),
+                        ($valid -replace 'a420fdb6-92ee-4691-a827-141d70ca5ab0','not-a-session'),
+                        ($valid -replace ('"launchId":"'+$launchId+'"'),'"launchId":"00000000-0000-0000-0000-000000000000"'),
+                        ($valid -replace ('"pid":'+$held.Record.Pid),'"pid":1.5'),
+                        ($valid -replace '"sessionId":"[^"]+"','"sessionId":1')
+                    )
+                    foreach ($field in @($data.Keys)) {
+                        $partial=@{}+$data; $partial.Remove($field); $cases+=($partial | ConvertTo-Json -Compress)
+                    }
+                    foreach ($text in $cases) {
+                        [IO.File]::WriteAllText($file,$text,[Text.UTF8Encoding]::new($false))
+                        $checked=Read-V2StartReceipt @arguments
+                        Assert ($checked.Status -ceq 'Rejected' -and !$checked.Receipt -and !$checked.Identity) 'malformed inspect receipt established identity'
+                    }
+                    [IO.File]::WriteAllBytes($file,[byte[]]@(0xff,0xfe,0xff))
+                    Assert ((Read-V2StartReceipt @arguments).Status -ceq 'Rejected') 'invalid inspect UTF8 accepted'
+                    [IO.File]::WriteAllText($file,$valid,[Text.UTF8Encoding]::new($false))
+                    $arguments.OwnedPids=@()
+                    Assert ((Read-V2StartReceipt @arguments).Status -ceq 'Rejected') 'foreign inspect PID accepted'
+                    $arguments.OwnedPids=@($Job.Pids()); $arguments.Handles=@()
+                    $pending=Read-V2StartReceipt @arguments
+                    Assert ($pending.Status -ceq 'Pending' -and !$pending.Receipt -and !$pending.Identity -and !$result.StartReceipt) 'pending inspect inventory established a session'
+                    $record=$held.Record.PSObject.Copy(); $record.StartedUtc='2000-01-01T00:00:00Z'
+                    $arguments.Handles=@([pscustomobject]@{Process=$held.Process;Record=$record})
+                    Assert ((Read-V2StartReceipt @arguments).Status -ceq 'Rejected') 'reused inspect PID accepted'
+                    $record=$held.Record.PSObject.Copy(); $record.ExitCode=0
+                    $arguments.Handles=@([pscustomobject]@{Process=$held.Process;Record=$record})
+                    Assert ((Read-V2StartReceipt @arguments).Status -ceq 'Rejected') 'dead inspect record accepted'
+                    $record=$held.Record.PSObject.Copy(); $record.StartedUtc='2000-01-01T00:00:00Z'
+                    $arguments.Handles=@([pscustomobject]@{Process=$held.Process;Record=$record})
+                    $data.startedUtc=$record.StartedUtc
+                    [IO.File]::WriteAllText($file,($data | ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
+                    Assert ((Read-V2StartReceipt @arguments).Status -ceq 'Rejected') 'inspect creation record credited over actual held StartTime'
+                    [IO.File]::WriteAllText($file,$valid,[Text.UTF8Encoding]::new($false))
+                    $record=$held.Record.PSObject.Copy(); $record.IsGame=$true; $record.IdentityVerified=$true
+                    $arguments.Handles=@([pscustomobject]@{Process=$held.Process;Record=$record})
+                    Assert ((Read-V2StartReceipt @arguments -RequireGame -JavaExecutable (Join-Path $actualJdk.Home 'bin/java.exe')).Status -ceq 'Rejected') 'wrong configured JDK accepted for inspect'
+                    $arguments.Handles=@($Handles)
+                    Assert ((Read-V2StartReceipt @arguments -RequireGame -JavaExecutable (Join-Path $actualJdk.Home 'bin/java.exe')).Status -ceq 'Rejected') 'dummy credited as inspect game'
+                    $arguments.Request=New-V2Request -EulaAccepted
+                    Assert ((Read-V2StartReceipt @arguments).Status -ceq 'Rejected') 'untrusted receipt selected inspect mode'
+                    $arguments.Request=[pscustomobject]@{Mode='INSPECT';Scenario='grounded-two-lane'}
+                    Assert ((Read-V2StartReceipt @arguments).Status -ceq 'Rejected') 'unknown request mode accepted'
+                    $arguments.Request=$Request
+                    $arguments.Evidence='relative'
+                    Assert ((Read-V2StartReceipt @arguments).Status -ceq 'Rejected') 'relative inspect evidence accepted'
+                    $linkParent=Join-Path $testRoot ('receipt-link-'+[guid]::NewGuid())
+                    New-Item -ItemType Directory -Path $linkParent | Out-Null
+                    $link=Join-Path $linkParent "launch-$launchId"
+                    try {
+                        New-Item -ItemType Junction -Path $link -Target $evidence | Out-Null
+                        $arguments.Evidence=$link
+                        Assert ((Read-V2StartReceipt @arguments).Status -ceq 'Rejected') 'reparse inspect evidence accepted'
+                    } finally { if (Test-Path -LiteralPath $link) { Remove-Item -LiteralPath $link -Force }; Remove-Item -LiteralPath $linkParent -Force }
+                    $arguments.Evidence=$evidence
+                    Assert ((Read-V2StartReceipt @arguments).Status -ceq 'Accepted') 'valid inspect READY rejected'
+                }
+                elseif ($result.StartReceipt) {
+                    if (!$proof.Latched) { $proof.Session=$result.StartReceipt.sessionId; $proof.Elapsed=$result.StartupAcceptedElapsedMilliseconds }
+                    Assert ($result.StartReceipt.sessionId -ceq $proof.Session -and $result.StartupAcceptedElapsedMilliseconds -eq $proof.Elapsed) 'later inspect READY replaced session or renewed time'
+                    $proof.Latched=$true
+                    $proof.Samples++
+                    $later=$result.StartReceipt.PSObject.Copy(); $later.sessionId=[guid]::NewGuid().ToString('D')
+                    [IO.File]::WriteAllText($file,($later | ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
+                }
+            }
+            $outcome=Invoke-V2Supervisor -Worker { Start-Sleep -Milliseconds 700; exit 0 } -Request $request -EvidenceRoot $testRoot -WorkingDirectory $repo -TimeoutMilliseconds 6000 -StartupMilliseconds 3000
+        } finally { Set-Item Function:Update-V2Processes -Value $originalUpdate }
+        Assert-V2Settled $outcome
+        Assert ($proof.Checked -and $proof.Latched -and $proof.Samples -ge 2 -and $outcome.ExitCode -eq 0 -and $outcome.StartReceipt.sessionId -ceq 'a420fdb6-92ee-4691-a827-141d70ca5ab0') 'inspect readiness/latch path was not exercised'
+        $early=Invoke-V2Supervisor -Worker { exit 0 } -Request ([pscustomobject]@{Mode='inspect';Scenario='grounded-two-lane'}) -EvidenceRoot $testRoot -WorkingDirectory $repo -TimeoutMilliseconds 6000 -StartupMilliseconds 3000
+        Assert-V2Settled $early
+        Assert ($early.ExitCode -eq 125 -and !$early.StartReceipt -and !$early.StartIdentity) 'early inspect worker established readiness'
+        $missing=Invoke-V2Supervisor -Worker { Start-Sleep -Seconds 30 } -Request ([pscustomobject]@{Mode='inspect';Scenario='grounded-two-lane'}) -EvidenceRoot $testRoot -WorkingDirectory $repo -TimeoutMilliseconds 5000 -StartupMilliseconds 40
+        Assert-V2Settled $missing
+        Assert ($missing.ExitCode -eq 124 -and $missing.TimeoutPhase -ceq 'STARTUP' -and !$missing.StartReceipt -and !$missing.StartIdentity) 'missing inspect READY escaped startup or established session'
     }
     Run 'controlled support rejects noncanonical requests before JDK or worker construction' {
         $originalJdk=${function:Find-V2Jdk}; $originalInfo=${function:New-V2ProcessInfo}
@@ -718,6 +1334,538 @@ Write-Output ('TRANSPORT='+(@{support=$env:MAPART_TWO_LANE_SUPPORT_CASE;launchId
         $request=Get-Content -LiteralPath (Join-Path $success.Evidence 'request.json') -Raw | ConvertFrom-Json
         Assert ($request.Request.ChildEnvironment.MAPART_TEST_LAUNCH_ID -ceq $success.LaunchId -and $request.Request.ChildEnvironment.MAPART_TEST_LAUNCH_DIR -ceq $success.Evidence) 'final child challenge absent from request'
         Assert ($overall.LaunchId -cne $success.LaunchId) 'launch challenge reused'
+    }
+    Run 'inspect phase reader enforces exact clocks schema identity paths and original age' {
+        Assert ([bool](Get-Command Read-V2InspectOperationReceipt -ErrorAction SilentlyContinue)) 'inspect phase reader is missing'
+        $originalUpdate=${function:Update-V2Processes}; $proof=@{Done=$false}
+        try {
+            Set-Item Function:Update-V2Processes -Value {
+                param($Job,$Records,$Handles,[switch]$Fast)
+                & $originalUpdate $Job $Records $Handles -Fast:$Fast
+                if ($Fast -or $proof.Done -or !$result.StartReceipt) { return }
+                $proof.Done=$true; $held=$Handles | Where-Object { $_.Record.Pid -eq $process.Id } | Select-Object -First 1
+                $session=$result.StartReceipt.sessionId; $id=[guid]::NewGuid().ToString('D')
+                $directory=Join-Path $repo "v2/fabric/build/scenario-results/two-lane-$session/inspect-operations/op-1-$id"
+                New-Item -ItemType Directory -Path $directory -Force | Out-Null
+                $time=[DateTimeOffset]::UtcNow; $time=[DateTimeOffset]::new($time.Ticks-($time.Ticks%10000),[TimeSpan]::Zero)
+                $data=[ordered]@{schema='mapartrunner-inspect-operation-v1';launchId=$launchId;pid=$process.Id;startedUtc=$result.StartReceipt.startedUtc
+                    mode='inspect';sessionId=$session;ordinal=1;operationId=$id;command='RUN';phase='WORK';phaseStartedUtc=$time.ToString('o')
+                    phaseDeadlineUtc=$time.AddMilliseconds(600000).ToString('o');evidenceDir=$directory;verdict=$null;cleanupStatus=$null}
+                $file=Join-Path $evidence 'inspect-op-1.begin.json'
+                $arguments=@{Evidence=$evidence;WorkingDirectory=$repo;StartReceipt=$result.StartReceipt;StartIdentity=$result.StartIdentity
+                    Held=$held;Ordinal=1;Phase='begin';Previous=$null;PreviousSettledUtc=$null;InternalInspectTest=@{NowUtc=$time}}
+                function Check-Phase($Candidate) {
+                    [IO.File]::WriteAllText($file,($Candidate|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
+                    Read-V2InspectOperationReceipt @arguments
+                }
+                Assert ((Check-Phase $data).Status -ceq 'Accepted') 'legitimate future BEGIN deadline rejected'
+                foreach($change in @(
+                    { $candidate.phaseStartedUtc=$time.AddMilliseconds(1).ToString('o') },
+                    { $candidate.phaseDeadlineUtc=$time.AddMilliseconds(600001).ToString('o') },
+                    { $candidate.sessionId=[guid]::NewGuid().ToString('D') },
+                    { $candidate.evidenceDir=$evidence }, { $candidate.ordinal=2 }, { $candidate.ordinal=1.5 },
+                    { $candidate.operationId='1-1-1-1-1' }, { $candidate.pid=$PID }, { $candidate.phase='CLEANUP' },
+                    { $candidate.verdict='SUCCESS' }, { $candidate.cleanupStatus='SETTLED' }, { $candidate.extra=1 },
+                    { $candidate.Remove('verdict') }, { $candidate.ordinal='1' }, { $candidate.pid='1' },
+                    { $candidate.schema='wrong' }, { $candidate.mode='automatic' }, { $candidate.command='STARTUP' },
+                    { $candidate.phaseDeadlineUtc=$null }, { $candidate.phaseStartedUtc=$null },
+                    { $candidate.phaseStartedUtc=([DateTimeOffset]::Parse($data.startedUtc)).AddMilliseconds(-1).ToString('o') }
+                )) {
+                    $candidate=@{}+$data; & $change
+                    Assert ((Check-Phase $candidate).Status -ceq 'Rejected') 'malformed/future/mismatched BEGIN accepted'
+                }
+                foreach($raw in @('{','[]','{}',(' '*4097), (($data|ConvertTo-Json -Compress) -replace '\{"','{"schema":"duplicate","'))) {
+                    [IO.File]::WriteAllText($file,$raw,[Text.UTF8Encoding]::new($false))
+                    Assert ((Read-V2InspectOperationReceipt @arguments).Status -ceq 'Rejected') 'malformed/duplicate/oversize JSON accepted'
+                }
+                [IO.File]::WriteAllBytes($file,[byte[]]@(0xff,0xfe))
+                Assert ((Read-V2InspectOperationReceipt @arguments).Status -ceq 'Rejected') 'invalid UTF8 phase accepted'
+                $oldHeld=$held.Record.StartedUtc; $oldIdentity=$result.StartIdentity.StartedUtc
+                try {
+                    $held.Record.StartedUtc=([DateTimeOffset]::Parse($oldHeld)).AddMilliseconds(5).UtcDateTime.ToString('o')
+                    $result.StartIdentity.StartedUtc=$held.Record.StartedUtc
+                    $candidate=@{}+$data; $candidate.phaseDeadlineUtc=$time.AddMilliseconds(600001).ToString('o')
+                    Assert ((Check-Phase $candidate).Status -ceq 'Rejected') 'identity10ms tolerance extended deadline'
+                } finally {$held.Record.StartedUtc=$oldHeld;$result.StartIdentity.StartedUtc=$oldIdentity}
+                $begin=(Check-Phase $data).Receipt
+                $arguments.Phase='cleanup'; $arguments.Previous=$begin; $file=Join-Path $evidence 'inspect-op-1.cleanup.json'
+                $middle=@{}+$data; $middle.phase='CLEANUP'; $middle.verdict='TIMEOUT'; $middle.phaseDeadlineUtc=$time.AddMilliseconds(10000).ToString('o')
+                $checked=Check-Phase $middle
+                Assert ($checked.Status -ceq 'Accepted') "legal cleanup rejected: $($checked.Reason)"
+                $candidate=@{}+$middle; $candidate.phaseDeadlineUtc=$time.AddMilliseconds(10001).ToString('o')
+                Assert ((Check-Phase $candidate).Status -ceq 'Rejected') 'cleanup own cap +1ms accepted'
+                $arguments.InternalInspectTest.NowUtc=$time.AddMilliseconds(600001)
+                $candidate=@{}+$middle; $candidate.phaseStartedUtc=$time.AddMilliseconds(600001).ToString('o'); $candidate.phaseDeadlineUtc=$time.AddMilliseconds(610001).ToString('o')
+                Assert ((Check-Phase $candidate).Status -ceq 'Rejected') 'cleanup original work cap +1ms accepted'
+                $arguments.InternalInspectTest.NowUtc=$time
+                $cleanup=(Check-Phase $middle).Receipt
+                $arguments.Phase='end'; $arguments.Previous=$cleanup; $file=Join-Path $evidence 'inspect-op-1.end.json'
+                $end=@{}+$middle; $end.phase='SETTLED'; $end.cleanupStatus='SETTLED'; $end.phaseDeadlineUtc=$null
+                $checked=Check-Phase $end
+                Assert ($checked.Status -ceq 'Accepted') "valid END rejected: $($checked.Reason)"
+                $candidate=@{}+$end; $candidate.phaseDeadlineUtc=$time.ToString('o')
+                Assert ((Check-Phase $candidate).Status -ceq 'Rejected') 'nonnull END deadline accepted'
+                $candidate=@{}+$end; $candidate.phaseStartedUtc=$time.AddMilliseconds(-1).ToString('o')
+                Assert ((Check-Phase $candidate).Status -ceq 'Rejected') 'END occurrence moved backwards'
+                $arguments.Ordinal=2; $file=Join-Path $evidence 'inspect-op-2.end.json'
+                Assert ((Check-Phase $end).Status -ceq 'Rejected') 'late old END settled newer ordinal'
+                Remove-Item -LiteralPath $file; $arguments.Ordinal=1
+                $arguments.Phase='begin'; $arguments.Previous=$null; $file=Join-Path $evidence 'inspect-op-1.begin.json'
+                $candidate=@{}+$data; $candidate.command='CLOSE'; $candidate.phaseDeadlineUtc=$time.AddMilliseconds(10000).ToString('o')
+                $close=(Check-Phase $candidate)
+                Assert ($close.Status -ceq 'Accepted') 'CLOSE shared ceiling rejected'
+                $candidate.phaseDeadlineUtc=$time.AddMilliseconds(10001).ToString('o')
+                Assert ((Check-Phase $candidate).Status -ceq 'Rejected') 'CLOSE cap +1ms accepted'
+                $arguments.Phase='cleanup'; $arguments.Previous=$close.Receipt; $arguments.InternalInspectTest.NowUtc=$time.AddMilliseconds(5000)
+                $file=Join-Path $evidence 'inspect-op-1.cleanup.json'
+                $candidate=@{}+$middle; $candidate.command='CLOSE'; $candidate.phaseStartedUtc=$time.AddMilliseconds(5000).ToString('o'); $candidate.phaseDeadlineUtc=$time.AddMilliseconds(10001).ToString('o')
+                Assert ((Check-Phase $candidate).Status -ceq 'Rejected') 'CLOSE CLEANUP renewed shared ceiling'
+                foreach($name in 'begin','cleanup','end') { Remove-Item -LiteralPath (Join-Path $evidence "inspect-op-1.$name.json") }
+            }
+            $worker=New-V2ReceiptWorker '$receipt=@{schema="mapartrunner-inspect-ready-v1";launchId=$receipt.launchId;pid=$receipt.pid;startedUtc=$receipt.startedUtc;scenario="grounded-two-lane";mode="inspect";sessionId=[guid]::NewGuid().ToString("D");event="INSPECT_WORLD_BOUND_COMMANDS_READY"}' 3000
+            $outcome=Invoke-V2Supervisor -Worker $worker -Request ([pscustomobject]@{Mode='inspect';Scenario='grounded-two-lane'}) -EvidenceRoot $testRoot -WorkingDirectory $repo -TimeoutMilliseconds 6000 -StartupMilliseconds 3000
+        } finally { Set-Item Function:Update-V2Processes -Value $originalUpdate }
+        Assert-V2Settled $outcome
+        Assert ($proof.Done -and $outcome.ExitCode -eq 0) 'phase parser dummy failed'
+    }
+    Run 'Task7b exit metadata policy withholds phases until the same signaled handle supplies a valid bound' {
+        # Policy model, not a reproduction of the historical Windows timestamp failures.
+        foreach($code in 0,7) {
+            $start=[DateTimeOffset]::UtcNow.AddSeconds(-30); $time=$start.AddMilliseconds(100)
+            $model=[pscustomobject]@{Id=9000+$code;StartTime=$start.UtcDateTime;HasExited=$true;ExitCode=$code
+                Signal=$false;Unknown=($code -eq 0);CachedExit=[DateTime]::FromFileTimeUtc(0);ValidExit=$start.AddSeconds(2).UtcDateTime;Refreshes=0;RefreshMode='valid'}
+            $model | Add-Member ScriptMethod WaitForExit {param($Milliseconds) $this.Signal}
+            $model | Add-Member ScriptMethod Refresh {
+                $this.Refreshes++
+                if($this.RefreshMode -ceq 'throw'){throw 'policy model refresh unavailable'}
+                if($this.Signal){$this.CachedExit=$(if($this.RefreshMode -ceq 'invalid'){[DateTime]::FromFileTimeUtc(0)}else{$this.ValidExit});$this.Unknown=$false}
+            }
+            $model | Add-Member ScriptProperty ExitTime {if($this.Unknown){throw 'policy model exit time unknown'};$this.CachedExit}
+            $record=[pscustomobject]@{Pid=$model.Id;StartedUtc=$start.ToString('o');Executable='policy-model';IsGame=$false;ExitCode=$null;ExitedUtc=$null;ObservedExitUtc=$null}
+            $held=[pscustomobject]@{Process=$model;Record=$record}
+            Update-V2ProcessExits @($held) -IncludeExiting
+            Assert ($record.ExitCode -eq $code -and $null -eq $record.ExitedUtc) 'early actual code became a known nonsignaled exit bound'
+            $launch=[guid]::NewGuid().ToString('D'); $session=[guid]::NewGuid().ToString('D'); $operation=[guid]::NewGuid().ToString('D')
+            $evidence=Join-Path $testRoot "launch-$launch"
+            $directory=Join-Path $repo "v2/fabric/build/scenario-results/two-lane-$session/inspect-operations/op-1-$operation"
+            New-Item -ItemType Directory -Path $evidence,$directory -Force | Out-Null
+            $ready=[pscustomobject]@{launchId=$launch;pid=$model.Id;startedUtc=$record.StartedUtc;mode='inspect';sessionId=$session}
+            $identity=[pscustomobject]@{Pid=$record.Pid;StartedUtc=$record.StartedUtc;Executable=$record.Executable;IsGame=$false}
+            $data=@{schema='mapartrunner-inspect-operation-v1';launchId=$launch;pid=$model.Id;startedUtc=$record.StartedUtc;mode='inspect';sessionId=$session;ordinal=1;operationId=$operation;command='RUN';evidenceDir=$directory}
+            $frames=@{}
+            foreach($phase in 'begin','cleanup','end') {
+                $frame=@{}+$data; $frame.phase=@{begin='WORK';cleanup='CLEANUP';end='SETTLED'}[$phase]
+                $frame.phaseStartedUtc=$time.AddMilliseconds(@{begin=0;cleanup=10;end=20}[$phase]).ToString('o')
+                $frame.phaseDeadlineUtc=$(if($phase -ceq 'end'){$null}else{$time.AddMilliseconds(@{begin=1000;cleanup=1010}[$phase]).ToString('o')})
+                $frame.verdict=$(if($phase -ceq 'begin'){$null}else{'SUCCESS'}); $frame.cleanupStatus=$(if($phase -ceq 'end'){'SETTLED'}else{$null})
+                $frames[$phase]=$frame; $frame|ConvertTo-Json -Compress|Set-Content (Join-Path $evidence "inspect-op-1.$phase.json")
+            }
+            $outcome=[pscustomobject]@{Evidence=$evidence;StartReceipt=$ready;StartIdentity=$identity;WorkerPid=$model.Id;TerminationRequested=$false;ExitCode=0;PrimaryFailure=$null;ObservedFailures=[Collections.Generic.List[object]]::new()}
+            Set-V2ObservedFailure $outcome @($record)
+            Assert ($outcome.ExitCode -eq $code) 'early code7 failure precedence was delayed'
+            $state=[pscustomobject]@{Held=$held;NextOrdinal=1;NextPhase='begin';Previous=$null;SettledUtc=$null;Active=$false;CapElapsed=$null;Accepted=@{};Outcomes=[Collections.Generic.List[object]]::new();MetadataPending=$false}
+            $clock=[Diagnostics.Stopwatch]::StartNew(); $allowance=@{WorkMilliseconds=1000;CleanupMilliseconds=1000}
+            Update-V2InspectOperations $state $outcome $repo $clock -InternalInspectTest $allowance
+            Assert ($state.MetadataPending -and !$state.Accepted.Count -and !$state.Outcomes.Count -and $state.NextOrdinal -eq 1 -and $null -eq $state.CapElapsed) 'unknown metadata advanced provisional phase/ordinal/watchdog state'
+            $model.Signal=$true
+            # Repair is required even though the code was already latched; a cached zero is not a bound.
+            $record.ExitedUtc=[DateTime]::FromFileTimeUtc(0).ToString('o')
+            Update-V2ProcessExits @($held) -IncludeExiting
+            Assert ($record.ExitCode -eq $code -and [DateTimeOffset]$record.ExitedUtc -eq [DateTimeOffset]$model.ValidExit -and $model.Refreshes -gt 0) 'signaled held timestamp was not repaired independently of latched code'
+            $verified=$model.ValidExit
+            foreach($failure in 'throw','invalid') {
+                foreach($replacement in 'same','changed') {
+                    $model.RefreshMode=$failure
+                    Update-V2ProcessExits @($held) -IncludeExiting
+                    Assert ($record.ExitedUtc -and [DateTimeOffset]$record.ExitedUtc -eq [DateTimeOffset]$verified) "verified exit bound was erased by $failure observation"
+                    $model.RefreshMode='valid'; $model.ValidExit=$(if($replacement -ceq 'changed'){$verified.AddSeconds(1)}else{$verified})
+                    if($replacement -ceq 'changed') {
+                        Reject {Update-V2ProcessExits @($held) -IncludeExiting} "changed verified bound survived $failure observation"
+                    } else {Update-V2ProcessExits @($held) -IncludeExiting}
+                    Assert ($record.ExitCode -eq $code -and [DateTimeOffset]$record.ExitedUtc -eq [DateTimeOffset]$verified) 'replacement changed immutable bound or original code'
+                    $model.ValidExit=$verified
+                    Update-V2ProcessExits @($held) -IncludeExiting
+                }
+            }
+            Update-V2InspectOperations $state $outcome $repo $clock -InternalInspectTest $allowance
+            Assert (!$state.MetadataPending -and $state.Outcomes.Count -eq 1 -and $state.NextOrdinal -eq 2 -and $outcome.ExitCode -eq $code) 'verified final frames did not reconcile with original failure precedence'
+            $arguments=@{Evidence=$evidence;WorkingDirectory=$repo;StartReceipt=$ready;StartIdentity=$identity;Held=$held;Ordinal=1;Phase='end';Previous=[pscustomobject]$frames.cleanup;InternalInspectTest=$allowance}
+            foreach($late in @($start.AddSeconds(2).AddMilliseconds(1),$time.AddMilliseconds(1011))) {
+                $frame=@{}+$frames.end; $frame.phaseStartedUtc=$late.ToString('o'); $frame|ConvertTo-Json -Compress|Set-Content (Join-Path $evidence 'inspect-op-1.end.json')
+                Assert ((Read-V2InspectOperationReceipt @arguments).Status -ceq 'Rejected') 'real post-exit or END deadline +1ms was accepted'
+            }
+        }
+    }
+    Run 'Task8i distinct native exit drains wrapper inside the original cleanup allowance' {
+        $proofs=[Collections.Generic.List[object]]::new()
+        foreach($case in 'worker0','worker7','worker7-tail','native9','stuck','metadata') {
+            $originalUpdate=${function:Update-V2Processes}; $originalReader=${function:Read-V2StartReceipt}; $originalExits=${function:Update-V2ProcessExits}
+            $caseRoot=Join-Path $testRoot ('wrapper-drain-'+$case)
+            New-Item -ItemType Directory -Path $caseRoot | Out-Null
+            $proof=@{Case=$case;NativePid=0;TailPid=0;CleanupSamples=0;WithheldSamples=0;ArchiveSawLock=$false}
+            # Real child publishes its own identity/ordered CLOSE; parent stays alive after its actual exit.
+            $child=@'
+$ErrorActionPreference='Stop'
+$self=[Diagnostics.Process]::GetCurrentProcess(); $session=[guid]::NewGuid().ToString('D'); $operation=[guid]::NewGuid().ToString('D')
+$ready=@{schema='mapartrunner-inspect-ready-v1';launchId=$env:MAPART_TEST_LAUNCH_ID;pid=$PID;startedUtc=$self.StartTime.ToUniversalTime().ToString('o');scenario='grounded-two-lane';mode='inspect';sessionId=$session;event='INSPECT_WORLD_BOUND_COMMANDS_READY'}
+$ready|ConvertTo-Json -Compress|Set-Content (Join-Path $env:MAPART_TEST_LAUNCH_DIR 'test-start.json')
+$wait=[Diagnostics.Stopwatch]::StartNew()
+while(!(Test-Path (Join-Path $env:MAPART_TEST_LAUNCH_DIR 'child-anchored'))){if($wait.ElapsedMilliseconds -gt 8000){exit 99};Start-Sleep -Milliseconds 10}
+$directory=Join-Path $env:TASK8I_REPO "v2/fabric/build/scenario-results/two-lane-$session/inspect-operations/op-1-$operation"
+New-Item -ItemType Directory -Path $directory|Out-Null
+$start=[DateTimeOffset]::UtcNow; $deadline=$start.AddMilliseconds(10000)
+foreach($phase in 'begin','cleanup','end') {
+    $frame=@{schema='mapartrunner-inspect-operation-v1';launchId=$ready.launchId;pid=$PID;startedUtc=$ready.startedUtc;mode='inspect';sessionId=$session;ordinal=1;operationId=$operation;command='CLOSE';evidenceDir=$directory
+        phase=@{begin='WORK';cleanup='CLEANUP';end='SETTLED'}[$phase];phaseStartedUtc=[DateTimeOffset]::UtcNow.ToString('o');phaseDeadlineUtc=$(if($phase -ceq 'end'){$null}else{$deadline.ToString('o')});verdict=$(if($phase -ceq 'begin'){$null}else{'SUCCESS'});cleanupStatus=$(if($phase -ceq 'end'){'SETTLED'}else{$null})}
+    if($phase -ceq 'begin'){$frame.phaseStartedUtc=$start.ToString('o')}
+    $frame|ConvertTo-Json -Compress|Set-Content (Join-Path $env:MAPART_TEST_LAUNCH_DIR "inspect-op-1.$phase.json")
+}
+while(!(Test-Path (Join-Path $env:MAPART_TEST_LAUNCH_DIR 'close-consumed'))){if($wait.ElapsedMilliseconds -gt 8000){exit 99};Start-Sleep -Milliseconds 10}
+Write-Output 'Task8i native trailing stdout';[Console]::Error.WriteLine('Task8i native trailing stderr')
+if($env:TASK8I_CASE -ceq 'native9'){exit 9};exit 0
+'@
+            $childPath=Join-Path $caseRoot 'native.ps1'; $child|Set-Content $childPath
+            $worker={
+                $info=[Diagnostics.ProcessStartInfo]::new((Join-Path $PSHOME pwsh.exe));$info.UseShellExecute=$false
+                foreach($arg in @('-NoProfile','-File',$env:TASK8I_CHILD)){$info.ArgumentList.Add($arg)}
+                $native=[Diagnostics.Process]::Start($info)
+                Set-Content (Join-Path $env:MAPART_TEST_LAUNCH_DIR 'native-pid.txt') $native.Id
+                $native.WaitForExit();$native.Dispose()
+                if($env:TASK8I_CASE -cin 'stuck','worker7-tail') {
+                    $tail=[Diagnostics.ProcessStartInfo]::new((Join-Path $PSHOME pwsh.exe));$tail.UseShellExecute=$false
+                    foreach($arg in @('-NoProfile','-Command','Start-Sleep -Seconds 30')){$tail.ArgumentList.Add($arg)}
+                    $tailProcess=[Diagnostics.Process]::Start($tail)
+                    Set-Content (Join-Path $env:MAPART_TEST_LAUNCH_DIR 'tail-pid.txt') $tailProcess.Id
+                    $tailProcess.Dispose()
+                }
+                if($env:TASK8I_CASE -cin 'stuck','native9'){Start-Sleep -Seconds 30}
+                Start-Sleep -Milliseconds 2000
+                Write-Output 'Task8i wrapper trailing stdout';[Console]::Error.WriteLine('Task8i wrapper trailing stderr')
+                if($env:TASK8I_CASE -cin 'worker7','worker7-tail'){exit 7};exit 0
+            }
+            try {
+                Set-Item Function:Update-V2Processes -Value {
+                    param($Job,$Records,$Handles,[switch]$Fast)
+                    & $originalUpdate @PSBoundParameters
+                    $pidFile=Join-Path $evidence 'native-pid.txt'
+                    if(Test-Path $pidFile){$proof.NativePid=[int](Get-Content $pidFile -Raw)}
+                    $tailFile=Join-Path $evidence 'tail-pid.txt'
+                    if(Test-Path $tailFile){$proof.TailPid=[int](Get-Content $tailFile -Raw)}
+                    foreach($record in $Records){if($record.Pid -eq $proof.NativePid){$record.IsGame=$true}}
+                    if($result.StartIdentity){Set-Content (Join-Path $evidence 'child-anchored') 'accepted'}
+                    if($result.InspectOperations.Count){Set-Content (Join-Path $evidence 'close-consumed') 'accepted'}
+                    if($cleanupClock){$proof.CleanupSamples++;if(!$result.TerminationRequested){$proof.LastNaturalSampleMilliseconds=$cleanupClock.ElapsedMilliseconds}}
+                }
+                Set-Item Function:Read-V2StartReceipt -Value {
+                    param($Evidence,$LaunchId,$Request,$Handles,$OwnedPids,$WorkerPid,$JavaExecutable,[switch]$RequireGame)
+                    # Test-only anchoring adapts the existing direct-dummy restriction. Real checks stay exact.
+                    if($RequireGame){return (& $originalReader @PSBoundParameters)}
+                    if(!$proof.NativePid){return [pscustomobject]@{Status='Pending';Reason='Awaiting owned dummy child'}}
+                    $native=@($Handles|Where-Object {$_.Record.Pid -eq $proof.NativePid})
+                    if($native.Count -ne 1){return [pscustomobject]@{Status='Pending';Reason='Awaiting owned dummy child'}}
+                    $arguments=@{}+$PSBoundParameters
+                    $shadow=$native[0].Record.PSObject.Copy();$shadow.Ownership='directly started gated worker'
+                    $arguments.Handles=@([pscustomobject]@{Process=$native[0].Process;Record=$shadow});$arguments.WorkerPid=$proof.NativePid
+                    $checked=& $originalReader @arguments
+                    if($checked.Status -ceq 'Accepted') {
+                        $realArguments=@{}+$arguments;$realArguments.RequireGame=$true;$realArguments.JavaExecutable=Join-Path $PSHOME 'not-configured-java.exe'
+                        $realCheck=& $originalReader @realArguments
+                        Assert ($realCheck.Status -ceq 'Rejected' -and $realCheck.Reason -like '*configured JDK native game*') 'dummy anchoring bypassed configured real JDK checks'
+                        $checked.Identity.Ownership=$native[0].Record.Ownership
+                    }
+                    $checked
+                }
+                Set-Item Function:Update-V2ProcessExits -Value {
+                    param($Handles,[switch]$IncludeExiting)
+                    & $originalExits @PSBoundParameters
+                    if($proof.Case -ceq 'metadata') {
+                        foreach($entry in $Handles){if($entry.Record.Pid -eq $proof.NativePid -and $entry.Process.HasExited){$entry.Record.ExitedUtc=$null;$proof.WithheldSamples++}}
+                    }
+                }
+                $archive={param($Evidence,$Before,$Context)
+                    $proof.CleanupFinishedMilliseconds=$cleanupClock.ElapsedMilliseconds
+                    $proof.ArchiveSawLock=$lock.Length -gt 0 -and $Context.Evidence -ceq $Evidence
+                    foreach($name in 'launch.stdout.log','launch.stderr.log'){Assert (Test-Path (Join-Path $Evidence $name)) 'archive preceded output files'}
+                }
+                $outcome=Invoke-V2Supervisor -Worker $worker -Request ([pscustomobject]@{Mode='inspect';Scenario='grounded-two-lane'}) -EvidenceRoot $caseRoot -WorkingDirectory $repo -StartupMilliseconds 6000 -Environment @{TASK8I_CHILD=$childPath;TASK8I_REPO=$repo;TASK8I_CASE=$case} -Archive $archive
+            } finally {Set-Item Function:Update-V2Processes -Value $originalUpdate;Set-Item Function:Read-V2StartReceipt -Value $originalReader;Set-Item Function:Update-V2ProcessExits -Value $originalExits}
+            $native=@($outcome.Processes|Where-Object {$_.Pid -eq $proof.NativePid})
+            $wrapper=@($outcome.Processes|Where-Object {$_.Pid -eq $outcome.WorkerPid})
+            $proof.Outcome=$outcome;$proof.LockBytes=(Get-Item (Join-Path $caseRoot 'supervisor.lock')).Length
+            if($native[0].ExitedUtc -and $wrapper[0].ExitedUtc){$proof.NativeToWorkerMilliseconds=([DateTimeOffset]$wrapper[0].ExitedUtc-[DateTimeOffset]$native[0].ExitedUtc).TotalMilliseconds}
+            $proofs.Add($proof);$proofs|ConvertTo-Json -Depth 14|Set-Content (Join-Path $testRoot 'wrapper-drain-proofs.json')
+            Assert ($native.Count -eq 1 -and $native[0].Pid -ne $outcome.WorkerPid -and $outcome.StartIdentity.Pid -eq $proof.NativePid -and $proof.ArchiveSawLock) 'distinct owned child anchoring/archive lock not exercised'
+            Assert ($outcome.InspectOperations.Count -eq 1 -and $outcome.InspectOperations[0].command -ceq 'CLOSE' -and $outcome.InspectOperations[0].cleanupStatus -ceq 'SETTLED') 'actual ordered CLOSE lost'
+            Assert ($proof.CleanupFinishedMilliseconds -lt 11000 -and $outcome.ArchiveStatus -ceq 'retained') 'cleanup renewed original10000ms bound or lost archive'
+            if($case -cin 'worker0','worker7','worker7-tail','metadata') {
+                Assert ((Get-Content (Join-Path $outcome.Evidence 'launch.stdout.log') -Raw) -like '*Task8i wrapper trailing stdout*' -and (Get-Content (Join-Path $outcome.Evidence 'launch.stderr.log') -Raw) -like '*Task8i wrapper trailing stderr*') 'wrapper trailing output lost'
+            }
+            if($case -ceq 'metadata') {
+                Assert ($proof.WithheldSamples -gt 0 -and $outcome.ExitCode -eq 125 -and $outcome.WorkerExitCode -eq 0 -and $outcome.CleanupStatus -ceq 'unresolved' -and $outcome.CleanupError -like '*exit metadata*' -and $proof.LockBytes -gt 0 -and !$outcome.TerminationRequested -and $proof.CleanupFinishedMilliseconds -ge 10000) 'withheld metadata did not exhaust original remainder and retain ownership'
+                continue
+            }
+            Assert-V2Settled $outcome
+            Assert ($proof.LockBytes -eq 0 -and @($outcome.Processes|Where-Object {$null -eq $_.ExitCode}).Count -eq 0) 'settled cleanup retained lock or lost raw exits'
+            if($case -cin 'stuck','native9','worker7-tail') {
+                Assert ($outcome.TerminationRequested -and $outcome.SupervisorError -like '*forced termination*') 'forced termination lost explanation'
+                if($case -cin 'stuck','worker7-tail'){Assert ($proof.TailPid -gt 0 -and @($outcome.Processes|Where-Object {$_.Pid -eq $proof.TailPid -and $_.ExitCode -eq 125}).Count -eq 1) 'actual owned tail exit125 missing'}
+                if($case -ceq 'stuck') {Assert ($native[0].ExitCode -eq 0 -and $outcome.WorkerExitCode -eq 125 -and $outcome.ExitCode -eq 125 -and !$outcome.PrimaryFailure -and $proof.LastNaturalSampleMilliseconds -ge 8800 -and $proof.CleanupFinishedMilliseconds -ge 9000 -and $proof.CleanupFinishedMilliseconds -lt 10000 -and $outcome.Processes.Count -ge 3) 'healthy stuck wrapper/descendant did not use original9000ms allocation'}
+                elseif($case -ceq 'native9') {Assert ($native[0].ExitCode -eq 9 -and $outcome.WorkerExitCode -eq 125 -and $outcome.ExitCode -eq 9 -and $outcome.PrimaryFailure.Pid -eq $proof.NativePid -and $proof.CleanupFinishedMilliseconds -lt 2000) 'early native failure entered healthy delay or lost first cause'}
+                else {Assert ($native[0].ExitCode -eq 0 -and $outcome.WorkerExitCode -eq 7 -and $outcome.ExitCode -eq 7 -and $outcome.PrimaryFailure.Pid -eq $outcome.WorkerPid -and $outcome.ObservedFailures.Count -eq 1 -and $proof.NativeToWorkerMilliseconds -ge 1800 -and $proof.CleanupFinishedMilliseconds -lt 4000) 'late worker failure did not stop healthy waiting or lost raw first cause'}
+            } else {
+                $code=$(if($case -ceq 'worker7'){7}else{0})
+                Assert ($native[0].ExitCode -eq 0 -and $outcome.WorkerExitCode -eq $code -and $outcome.ExitCode -eq $code -and !$outcome.TerminationRequested -and $proof.NativeToWorkerMilliseconds -ge 1800) "wrapper $case was forced before actual delayed exit: public=$($outcome.ExitCode), worker=$($outcome.WorkerExitCode), delay=$($proof.NativeToWorkerMilliseconds)"
+                if($code){Assert ($outcome.PrimaryFailure.Pid -eq $outcome.WorkerPid -and $outcome.PrimaryFailure.ExitCode -eq 7 -and $outcome.ObservedFailures.Count -eq 1) 'late actual worker7 lost first cause'}
+            }
+        }
+    }
+    Run 'Task7b final held settlement reconciles pending metadata within the original cleanup allowance' {
+        $proofs=[Collections.Generic.List[object]]::new()
+        foreach($case in 'code0','code7','unknown') {
+            $originalUpdate=${function:Update-V2Processes}; $originalExits=${function:Update-V2ProcessExits}
+            $proof=@{Case=$case;Published=$false;CleanupSamples=0;PendingSamples=0}
+            $caseRoot=Join-Path $testRoot ('exit-metadata-'+$case)
+            try {
+                Set-Item Function:Update-V2ProcessExits -Value {
+                    param($Handles,[switch]$IncludeExiting)
+                    & $originalExits @PSBoundParameters
+                    if (!$proof.Published) {return}
+                    foreach($entry in $Handles) {
+                        if($entry.Record.Pid -ne $process.Id){continue}
+                        if($cleanupClock){$proof.CleanupSamples++;$proof.CleanupElapsed=$cleanupClock.ElapsedMilliseconds}
+                        if($proof.Case -ceq 'unknown' -or !$cleanupClock -or $proof.CleanupSamples -lt 2) {
+                            $entry.Record.ExitedUtc=$null; $proof.PendingSamples++
+                            Assert (!$inspectState.Accepted.Count -and $inspectState.NextOrdinal -eq 1 -and $null -eq $inspectState.CapElapsed) 'metadata-withholding fixture saw provisional acceptance'
+                        }
+                    }
+                }
+                Set-Item Function:Update-V2Processes -Value {
+                    param($Job,$Records,$Handles,[switch]$Fast)
+                    & $originalUpdate @PSBoundParameters
+                    if($Fast -or !$result.StartReceipt -or $proof.Published){return}
+                    $proof.Published=$true; $stamp=[DateTimeOffset]::UtcNow; $operation=[guid]::NewGuid().ToString('D'); $session=$result.StartReceipt.sessionId
+                    $directory=Join-Path $repo "v2/fabric/build/scenario-results/two-lane-$session/inspect-operations/op-1-$operation"
+                    New-Item -ItemType Directory -Path $directory -Force|Out-Null
+                    foreach($phase in 'begin','cleanup','end') {
+                        $frame=@{schema='mapartrunner-inspect-operation-v1';launchId=$launchId;pid=$process.Id;startedUtc=$result.StartReceipt.startedUtc;mode='inspect';sessionId=$session;ordinal=1;operationId=$operation;command='RUN';evidenceDir=$directory
+                            phase=@{begin='WORK';cleanup='CLEANUP';end='SETTLED'}[$phase];phaseStartedUtc=$stamp.ToString('o');phaseDeadlineUtc=$(if($phase -ceq 'end'){$null}else{$stamp.AddMilliseconds(1000).ToString('o')});verdict=$(if($phase -ceq 'begin'){$null}else{'SUCCESS'});cleanupStatus=$(if($phase -ceq 'end'){'SETTLED'}else{$null})}
+                        $frame|ConvertTo-Json -Compress|Set-Content (Join-Path $evidence "inspect-op-1.$phase.json")
+                    }
+                    Set-Content (Join-Path $evidence 'metadata-done') 'done'
+                    Assert ($process.WaitForExit(3000)) 'metadata fixture worker did not exit'
+                }
+                $code=$(if($case -ceq 'code7'){7}else{0})
+                $body=New-V2ReceiptWorker '$receipt=@{schema="mapartrunner-inspect-ready-v1";launchId=$receipt.launchId;pid=$receipt.pid;startedUtc=$receipt.startedUtc;scenario="grounded-two-lane";mode="inspect";sessionId=[guid]::NewGuid().ToString("D");event="INSPECT_WORLD_BOUND_COMMANDS_READY"}' 0
+                $text=$body.ToString() -replace 'Start-Sleep -Milliseconds 0\s+exit 0',('$bound=[Diagnostics.Stopwatch]::StartNew();while(!(Test-Path (Join-Path $env:MAPART_TEST_LAUNCH_DIR "metadata-done"))){if($bound.ElapsedMilliseconds -gt 8000){exit 99};Start-Sleep -Milliseconds 10};exit '+$code)
+                $outcome=Invoke-V2Supervisor -Worker ([scriptblock]::Create($text)) -Request ([pscustomobject]@{Mode='inspect';Scenario='grounded-two-lane'}) -EvidenceRoot $caseRoot -WorkingDirectory $repo -StartupMilliseconds 3000 -InternalInspectTest @{WorkMilliseconds=1000;CleanupMilliseconds=1000}
+                $proof.Outcome=$outcome
+            } finally {Set-Item Function:Update-V2Processes -Value $originalUpdate;Set-Item Function:Update-V2ProcessExits -Value $originalExits}
+            $proofs.Add($proof); $proofs|ConvertTo-Json -Depth 14|Set-Content (Join-Path $testRoot 'exit-metadata-proofs.json')
+            Assert ($proof.PendingSamples -gt 0 -and $outcome.WorkerExitCode -eq $code) 'metadata withholding missed actual raw worker exit'
+            if($case -ceq 'unknown') {
+                Assert ($outcome.ExitCode -eq 125 -and $outcome.CleanupStatus -ceq 'unresolved' -and $outcome.InspectIncomplete -and $outcome.CleanupError -like '*exit metadata*' -and !$outcome.InspectOperations.Count -and (Get-Item (Join-Path $caseRoot 'supervisor.lock')).Length -gt 0) 'persistent unknown metadata did not fail closed/retain ownership'
+            } else {
+                Assert-V2Settled $outcome
+                Assert ($outcome.ExitCode -eq $code -and $outcome.InspectOperations.Count -eq 1 -and !$outcome.InspectIncomplete -and !$outcome.TerminationRequested -and (Get-Item (Join-Path $caseRoot 'supervisor.lock')).Length -eq 0) 'final held drain lost valid frames or original code precedence'
+            }
+        }
+    }
+    Run 'inspect ordered polling idle timeout cleanup exit and escalation share the owned backend' {
+        Reject { Invoke-V2Supervisor -RequireGame -InternalInspectTest @{} -Worker {exit 0} } 'real inspect clock override accepted'
+        # Policy-only reproduction of Windows exit-code visibility before its wait handle is signaled.
+        $exiting=[pscustomobject]@{HasExited=$true;ExitCode=7;ExitTime=[DateTime]::UtcNow}
+        $exiting | Add-Member ScriptMethod WaitForExit { param($Milliseconds) return $false }
+        $exitRecord=[pscustomobject]@{ExitCode=$null;ExitedUtc=$null;ObservedExitUtc=$null}
+        $exitHandles=@([pscustomobject]@{Process=$exiting;Record=$exitRecord})
+        Update-V2ProcessExits $exitHandles
+        Assert ($null -eq $exitRecord.ExitCode) 'automatic wait-based exit policy changed'
+        Update-V2ProcessExits $exitHandles -IncludeExiting
+        Assert ($exitRecord.ExitCode -eq 7 -and $null -eq $exitRecord.ExitedUtc) 'inspect early code was lost or nonsignaled timestamp became a bound'
+        $phaseProofs=[Collections.Generic.List[object]]::new()
+        foreach($case in 'idle','all-at-once-aged','aged-begin','timeout-settled','missing-cleanup','stuck-cleanup','close-stuck','unresolved','rewrite','exit-final','exit-late-phase','worker7','missing-ordinal','ready-dies-before-anchor') {
+            $originalUpdate=${function:Update-V2Processes}; $originalReader=${function:Read-V2StartReceipt}
+            $proof=@{Case=$case;Stage=0;Session=[guid]::NewGuid().ToString('D');Id=[guid]::NewGuid().ToString('D')}
+            try {
+                Set-Item Function:Update-V2Processes -Value {
+                    param($Job,$Records,$Handles,[switch]$Fast)
+                    & $originalUpdate $Job $Records $Handles -Fast:$Fast
+                    if ($Fast) { return }
+                    $time=[DateTimeOffset]::UtcNow
+                    $held=$Handles | Where-Object { $_.Record.Pid -eq $process.Id } | Select-Object -First 1
+                    $done=Join-Path $evidence 'fixture-done'
+                    if (!$result.StartReceipt) {
+                        $ready=@{schema='mapartrunner-inspect-ready-v1';launchId=$launchId;pid=$process.Id;startedUtc=$held.Record.StartedUtc
+                            scenario='grounded-two-lane';mode='inspect';sessionId=$proof.Session;event='INSPECT_WORLD_BOUND_COMMANDS_READY'}
+                        [IO.File]::WriteAllText((Join-Path $evidence 'test-start.json'),($ready|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
+                        return
+                    }
+                    if (!$proof.ContainsKey('ReadyUtc')) { $proof.ReadyUtc=$time }
+                    $age=($time-$proof.ReadyUtc).TotalMilliseconds
+                    function Publish-Phase([string]$Suffix,$Occurrence,$Deadline,[string]$Verdict,[string]$Cleanup,[int]$Ordinal=1) {
+                        $directory=Join-Path $repo "v2/fabric/build/scenario-results/two-lane-$($proof.Session)/inspect-operations/op-$Ordinal-$($proof.Id)"
+                        New-Item -ItemType Directory -Path $directory -Force | Out-Null
+                        $phaseName=@{begin='WORK';cleanup='CLEANUP';end='SETTLED'}[$Suffix]
+                        $data=@{schema='mapartrunner-inspect-operation-v1';launchId=$launchId;pid=$process.Id;startedUtc=$result.StartReceipt.startedUtc
+                            mode='inspect';sessionId=$proof.Session;ordinal=$Ordinal;operationId=$proof.Id;command=$(if($proof.Case -ceq 'close-stuck'){'CLOSE'}else{'RUN'});phase=$phaseName
+                            phaseStartedUtc=$Occurrence.ToString('o');phaseDeadlineUtc=$(if($null -ne $Deadline){$Deadline.ToString('o')}else{$null})
+                            evidenceDir=$directory;verdict=$(if($Verdict){$Verdict}else{$null});cleanupStatus=$(if($Cleanup){$Cleanup}else{$null})}
+                        $path=Join-Path $evidence "inspect-op-$Ordinal.$Suffix.json"
+                        Assert (!(Test-Path -LiteralPath $path)) 'fixture attempted phase replacement'
+                        [IO.File]::WriteAllText($path,($data|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
+                    }
+                    if ($proof.Case -ceq 'idle') { if($age -ge 1600){Set-Content $done 'done'}; return }
+                    if ($proof.Case -cin 'all-at-once-aged','aged-begin') {
+                        if ($age -ge 1600 -and !$proof.Stage) {
+                            $start=$proof.ReadyUtc
+                            Publish-Phase begin $start $start.AddMilliseconds(400) '' ''
+                            if ($proof.Case -ceq 'all-at-once-aged') {
+                                Publish-Phase cleanup $start.AddMilliseconds(30) $start.AddMilliseconds(1000) 'SUCCESS' ''
+                                Publish-Phase end $start.AddMilliseconds(50) $null 'FAILURE' 'SETTLED'
+                                Set-Content $done 'done'
+                            }
+                            $proof.Stage=1
+                        } elseif($proof.Stage) {
+                            $proof.AfterPublicationSamples++
+                        }; return
+                    }
+                    if ($proof.Case -cin 'exit-final','exit-late-phase') {
+                        if ($age -ge 300) {Set-Content $done 'done'}
+                        if ($held.Process.HasExited -and !$proof.Stage) {
+                            $start=$proof.ReadyUtc
+                            Publish-Phase begin $start $start.AddMilliseconds(400) '' ''
+                            Publish-Phase cleanup $start.AddMilliseconds(20) $start.AddMilliseconds(1000) 'SUCCESS' ''
+                            Publish-Phase end $(if($proof.Case -ceq 'exit-late-phase'){$time}else{$start.AddMilliseconds(30)}) $null 'SUCCESS' 'SETTLED'
+                            $proof.Stage=1
+                        }; return
+                    }
+                    if (!$proof.Stage) {
+                        $proof.Start=$time; $proof.Stage=1
+                        if ($proof.Case -ceq 'missing-ordinal') { Publish-Phase begin $time $time.AddMilliseconds(400) '' '' 2 }
+                        else { Publish-Phase begin $time $time.AddMilliseconds($(if($proof.Case -ceq 'close-stuck'){1000}else{400})) '' '' }
+                        if ($proof.Case -ceq 'worker7') { Set-Content $done 'done' }
+                    }
+                    if ($proof.Case -ceq 'rewrite' -and $inspectState.Active) {
+                        Add-Content -LiteralPath (Join-Path $evidence 'inspect-op-1.begin.json') ' '; return
+                    }
+                    if ($proof.Case -ceq 'missing-ordinal') {if($age -ge 1600){Set-Content $done 'done'};return}
+                    if ($proof.Case -cin 'missing-cleanup','close-stuck','worker7') { return }
+                    $workAge=($time-$proof.Start).TotalMilliseconds
+                    if ($proof.Stage -eq 1 -and $workAge -ge 400) {
+                        Publish-Phase cleanup $time $proof.Start.AddMilliseconds(1400) 'TIMEOUT' ''
+                        $proof.Stage=2
+                    } elseif ($proof.Stage -eq 2 -and $proof.Case -cne 'stuck-cleanup') {
+                        Publish-Phase end $time $null 'TIMEOUT' $(if($proof.Case -ceq 'unresolved'){'UNRESOLVED'}else{'SETTLED'})
+                        $proof.Stage=3; if($proof.Case -cne 'unresolved'){Set-Content $done 'done'}
+                    }
+                }
+                $exit=$(if($case -ceq 'worker7'){7}else{0})
+                $worker=[scriptblock]::Create('$fixtureClock=[Diagnostics.Stopwatch]::StartNew(); while(!(Test-Path (Join-Path $env:MAPART_TEST_LAUNCH_DIR "fixture-done"))) { if($fixtureClock.ElapsedMilliseconds -gt 8000){exit 99}; Start-Sleep -Milliseconds 10 }; exit '+$exit)
+                if ($case -ceq 'ready-dies-before-anchor') {
+                    Set-Item Function:Read-V2StartReceipt -Value {
+                        param($Evidence,$LaunchId,$Request,$Handles,$OwnedPids,$WorkerPid,$JavaExecutable,[switch]$RequireGame)
+                        $checked=& $originalReader @PSBoundParameters
+                        if ($checked.Status -ceq 'Accepted') {
+                            Set-Content -LiteralPath (Join-Path $Evidence 'fixture-done') 'done'
+                            $held=$Handles | Where-Object {$_.Record.Pid -eq $WorkerPid} | Select-Object -First 1
+                            Assert ($held.Process.WaitForExit(3000)) 'live READY race fixture did not exit'
+                        }
+                        $checked
+                    }
+                }
+                $outcome=Invoke-V2Supervisor -Worker $worker -Request ([pscustomobject]@{Mode='inspect';Scenario='grounded-two-lane'}) -EvidenceRoot $testRoot -WorkingDirectory $repo -TimeoutMilliseconds 100 -StartupMilliseconds 3000 -InternalInspectTest @{WorkMilliseconds=400;CleanupMilliseconds=1000}
+            } finally { Set-Item Function:Update-V2Processes -Value $originalUpdate; Set-Item Function:Read-V2StartReceipt -Value $originalReader }
+            Assert-V2Settled $outcome
+            $expected=$(if($case -cin 'aged-begin','missing-cleanup','stuck-cleanup','close-stuck'){124}elseif($case -cin 'unresolved','rewrite','exit-late-phase','ready-dies-before-anchor'){125}elseif($case -ceq 'worker7'){7}else{0})
+            Assert ($outcome.ExitCode -eq $expected) "inspect $case public exit mismatch: $($outcome.ExitCode) $($outcome.SupervisorError) $($outcome.InspectEscalation)"
+            Assert (@($outcome.Processes|Where-Object {$null -eq $_.ExitCode}).Count -eq 0) "inspect $case raw exit missing"
+            Assert ((Get-Item -LiteralPath (Join-Path $testRoot 'supervisor.lock')).Length -eq 0) "inspect $case settled lock retained"
+            if($case -cin 'aged-begin','missing-cleanup','stuck-cleanup','close-stuck','unresolved','rewrite') {Assert ($outcome.TerminationRequested -and $outcome.InspectIncomplete -and $outcome.WorkerExitCode -eq 125) "inspect $case did not use owned Stop/raw125"}
+            if($case -cin 'all-at-once-aged','timeout-settled','exit-final') {Assert ($outcome.InspectOperations.Count -eq 1 -and !$outcome.TimedOut -and !$outcome.InspectIncomplete) "inspect $case settlement lost"}
+            if($case -ceq 'missing-ordinal') {Assert ($outcome.InspectOperations.Count -eq 0 -and !$outcome.TimedOut) 'consumer skipped failed/missing ordinal'}
+            if($case -ceq 'aged-begin') {Assert (!$proof.AfterPublicationSamples -and $outcome.TimedOut) 'delayed BEGIN received a new allowance'}
+            if($case -ceq 'ready-dies-before-anchor') {Assert (!$outcome.StartReceipt -and !$outcome.StartIdentity -and $null -eq $outcome.StartupAcceptedElapsedMilliseconds) 'first READY was latched after original process death'}
+            $phaseProofs.Add(@{Case=$case;Outcome=$outcome;Fixture=$proof})
+        }
+        $phaseProofs|ConvertTo-Json -Depth 14|Set-Content (Join-Path $testRoot 'inspect-phase-proofs.json')
+    }
+    Run 'inspect reconciles records published after Missing at exit and cap decisions' {
+        $decisionProofs=[Collections.Generic.List[object]]::new(); $decisionFailures=[Collections.Generic.List[string]]::new()
+        foreach($case in 'active-exit','idle-exit','timely-cap','late-cap') {
+            $originalUpdate=${function:Update-V2Processes}; $originalPhaseReader=${function:Read-V2InspectOperationReceipt}
+            $proof=@{Case=$case;Seeded=$false;Triggered=$false;Session=[guid]::NewGuid().ToString('D');Id=[guid]::NewGuid().ToString('D')}
+            try {
+                Set-Item Function:Update-V2Processes -Value {
+                    param($Job,$Records,$Handles,[switch]$Fast)
+                    & $originalUpdate $Job $Records $Handles -Fast:$Fast
+                    if ($Fast -or $result.StartReceipt) { return }
+                    $held=$Handles|Where-Object {$_.Record.Pid -eq $process.Id}|Select-Object -First 1
+                    $ready=@{schema='mapartrunner-inspect-ready-v1';launchId=$launchId;pid=$held.Record.Pid;startedUtc=$held.Record.StartedUtc
+                        scenario='grounded-two-lane';mode='inspect';sessionId=$proof.Session;event='INSPECT_WORLD_BOUND_COMMANDS_READY'}
+                    [IO.File]::WriteAllText((Join-Path $evidence 'test-start.json'),($ready|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
+                }
+                Set-Item Function:Read-V2InspectOperationReceipt -Value {
+                    param($Evidence,$WorkingDirectory,$StartReceipt,$StartIdentity,$Held,$Ordinal,$Phase,$Previous,$PreviousSettledUtc,
+                        [switch]$RequireGame,$InternalInspectTest,$Clock)
+                    function Publish-DecisionPhase([string]$Suffix,$Occurrence,$Deadline) {
+                        $directory=Join-Path $repo "v2/fabric/build/scenario-results/two-lane-$($proof.Session)/inspect-operations/op-1-$($proof.Id)"
+                        New-Item -ItemType Directory -Path $directory -Force|Out-Null
+                        $data=@{schema='mapartrunner-inspect-operation-v1';launchId=$StartReceipt.launchId;pid=$StartReceipt.pid;startedUtc=$StartReceipt.startedUtc
+                            mode='inspect';sessionId=$proof.Session;ordinal=1;operationId=$proof.Id;command='RUN'
+                            phase=@{begin='WORK';cleanup='CLEANUP';end='SETTLED'}[$Suffix];phaseStartedUtc=$Occurrence.ToString('o')
+                            phaseDeadlineUtc=$(if($null -ne $Deadline){$Deadline.ToString('o')}else{$null});evidenceDir=$directory
+                            verdict=$(if($Suffix -ceq 'begin'){$null}else{'SUCCESS'});cleanupStatus=$(if($Suffix -ceq 'end'){'SETTLED'}else{$null})}
+                        $path=Join-Path $Evidence "inspect-op-1.$Suffix.json"
+                        Assert (!(Test-Path -LiteralPath $path)) 'decision fixture attempted receipt replacement'
+                        [IO.File]::WriteAllText($path,($data|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
+                    }
+                    if (!$proof.Seeded -and $Ordinal -eq 1 -and $Phase -ceq 'begin' -and $proof.Case -cne 'idle-exit') {
+                        $proof.Start=[DateTimeOffset]::UtcNow; $proof.Seeded=$true
+                        Publish-DecisionPhase begin $proof.Start $proof.Start.AddMilliseconds(1000)
+                        if ($proof.Case -cin 'timely-cap','late-cap') { Publish-DecisionPhase cleanup $proof.Start $proof.Start.AddMilliseconds(2000) }
+                    }
+                    $checked=& $originalPhaseReader @PSBoundParameters
+                    $expectedMissing=$(if($proof.Case -ceq 'idle-exit'){'begin'}elseif($proof.Case -ceq 'active-exit'){'cleanup'}else{'end'})
+                    if (!$proof.Triggered -and $Ordinal -eq 1 -and $Phase -ceq $expectedMissing -and $checked.Status -ceq 'Missing') {
+                        # Force publication after the real reader returned Missing; do not let the inventory hook publish it.
+                        $proof.Triggered=$true; $proof.MissingPhase=$Phase; $proof.MissingElapsed=$Clock.Elapsed.TotalMilliseconds
+                        $proof.ActiveAtMissing=$State.Active; $proof.OriginalCap=$State.CapElapsed
+                        if ($proof.Case -ceq 'idle-exit') {
+                            $proof.Start=[DateTimeOffset]::UtcNow
+                            Publish-DecisionPhase begin $proof.Start $proof.Start.AddMilliseconds(1000)
+                        }
+                        if ($proof.Case -cin 'active-exit','idle-exit') {
+                            $time=[DateTimeOffset]::UtcNow
+                            Publish-DecisionPhase cleanup $time $time.AddMilliseconds(2000)
+                            Publish-DecisionPhase end ([DateTimeOffset]::UtcNow) $null
+                            Set-Content -LiteralPath (Join-Path $Evidence 'decision-done') 'done'
+                            Assert ($Held.Process.WaitForExit(3000)) 'decision fixture original worker did not exit'
+                            $proof.ActualExitUtc=$Held.Process.ExitTime.ToUniversalTime().ToString('o')
+                        } else {
+                            Assert ($Clock.Elapsed.TotalMilliseconds -lt $State.CapElapsed) 'cap fixture reached Missing after its cap'
+                            if ($proof.Case -ceq 'timely-cap') { Publish-DecisionPhase end ([DateTimeOffset]::UtcNow) $null }
+                            $remaining=[Math]::Max(0,[Math]::Ceiling($State.CapElapsed-$Clock.Elapsed.TotalMilliseconds)+20)
+                            Start-Sleep -Milliseconds $remaining
+                            if ($proof.Case -ceq 'late-cap') { Publish-DecisionPhase end ([DateTimeOffset]::UtcNow) $null }
+                            $proof.DecisionElapsed=$Clock.Elapsed.TotalMilliseconds
+                        }
+                    }
+                    if ($proof.Case -ceq 'timely-cap' -and $proof.Triggered -and $Ordinal -eq 1 -and $Phase -ceq 'end' -and $checked.Status -ceq 'Accepted') {
+                        Set-Content -LiteralPath (Join-Path $Evidence 'decision-done') 'done'
+                    }
+                    $checked
+                }
+                $worker={ $bounded=[Diagnostics.Stopwatch]::StartNew(); while(!(Test-Path (Join-Path $env:MAPART_TEST_LAUNCH_DIR 'decision-done'))) { if($bounded.ElapsedMilliseconds -gt 8000){exit 99}; Start-Sleep -Milliseconds 10 }; exit 0 }
+                $outcome=Invoke-V2Supervisor -Worker $worker -Request ([pscustomobject]@{Mode='inspect';Scenario='grounded-two-lane'}) -EvidenceRoot $testRoot -WorkingDirectory $repo -TimeoutMilliseconds 100 -StartupMilliseconds 3000 -InternalInspectTest @{WorkMilliseconds=1000;CleanupMilliseconds=2000}
+            } finally { Set-Item Function:Update-V2Processes -Value $originalUpdate; Set-Item Function:Read-V2InspectOperationReceipt -Value $originalPhaseReader }
+            Assert-V2Settled $outcome
+            $settled=$proof.Triggered -and $outcome.InspectOperations.Count -eq 1 -and !$outcome.InspectIncomplete -and !$outcome.TimedOut -and $outcome.ExitCode -eq 0 -and $outcome.WorkerExitCode -eq 0
+            $passed=$(if($case -ceq 'late-cap'){$proof.Triggered -and $outcome.ExitCode -eq 125 -and $outcome.InspectIncomplete -and $outcome.InspectOperations.Count -eq 0 -and $outcome.InspectEscalation -like '*Invalid END*'}else{$settled})
+            $passed=$passed -and (Get-Item -LiteralPath (Join-Path $testRoot 'supervisor.lock')).Length -eq 0 -and @($outcome.Processes|Where-Object {$null -eq $_.ExitCode}).Count -eq 0
+            $decisionProofs.Add(@{Case=$case;Passed=$passed;Fixture=$proof;Outcome=$outcome})
+            if (!$passed) { $decisionFailures.Add("${case}: public=$($outcome.ExitCode), raw=$($outcome.WorkerExitCode), ENDs=$($outcome.InspectOperations.Count), incomplete=$($outcome.InspectIncomplete), timeout=$($outcome.TimedOut), error=$($outcome.SupervisorError), escalation=$($outcome.InspectEscalation)") }
+        }
+        $decisionProofs|ConvertTo-Json -Depth 14|Set-Content (Join-Path $testRoot 'inspect-decision-proofs.json')
+        Assert (!$decisionFailures.Count) ($decisionFailures -join '; ')
     }
     Run 'observed native failure precedence has deterministic simultaneous ordering' {
         $failures=@(

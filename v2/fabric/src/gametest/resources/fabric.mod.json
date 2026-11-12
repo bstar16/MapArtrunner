@@ -6,6 +6,7 @@
   "environment": "client",
   "mixins": ["mapart-test.mixins.json"],
   "entrypoints": {
+    "client": ["com.mapartrunner.fabric.scenario.ScenarioClientInitializer"],
     "fabric-client-gametest": [
       "com.mapartrunner.fabric.scenario.EnvironmentProbeGameTest",
       "com.mapartrunner.fabric.scenario.GroundedSingleLaneGameTest",

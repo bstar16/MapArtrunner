@@ -4,16 +4,63 @@ param(
     [ValidateSet('1','2',IgnoreCase=$false)][string]$Repeat = '2',
     [ValidateScript({ ![string]::IsNullOrWhiteSpace($_) })][string]$JavaHome,
     [switch]$EulaAccepted,
-    [switch]$WrongExpectedBlock
+    [switch]$WrongExpectedBlock,
+    [switch]$Inspect
 )
+
+# Validate dot-sourced callers too, before they can reach any launch side effects.
+if ($Inspect -and (!$PSBoundParameters.ContainsKey('Scenario') -or $Scenario -cne 'grounded-two-lane' -or
+    $PSBoundParameters.ContainsKey('Repeat') -or $PSBoundParameters.ContainsKey('WrongExpectedBlock'))) {
+    throw '-Inspect requires explicit -Scenario grounded-two-lane and forbids -Repeat and -WrongExpectedBlock.'
+}
+
+function Assert-V2InheritedMode {
+    param([switch]$Inspect)
+    foreach ($name in 'JAVA_TOOL_OPTIONS','JDK_JAVA_OPTIONS','_JAVA_OPTIONS','JAVA_OPTS','GRADLE_OPTS') {
+        $options=[Environment]::GetEnvironmentVariable($name)
+        # JVM option names are case-sensitive; Boolean.getBoolean accepts only case-insensitive true.
+        # The batch wrapper uses cmd double quotes; JVM environment options also accept single quotes.
+        $wrapper=$name -in 'JAVA_OPTS','GRADLE_OPTS'
+        $tokens=$(if($wrapper){'(?:[^\s"]+|"[^"]*")+'}else{'(?:[^\s"'']+|"[^"]*"|''[^'']*'')+'})
+        $quotes=$(if($wrapper){'"([^"]*)"'}else{'"([^"]*)"|''([^'']*)'''})
+        foreach ($token in [regex]::Matches($options ?? '', $tokens)) {
+            $option=[regex]::Replace($token.Value,$quotes,{param($match)
+                if($match.Groups[1].Success){$match.Groups[1].Value}else{$match.Groups[2].Value}})
+            $property=[regex]::Match($option,'^-D(fabric\.client\.gametest|mapart\.test\.inspect)(?:=(.*))?$')
+            if (!$property.Success) { continue }
+            # cmd/JDK preserves a literal quote between adjacent quoted fragments; do not guess mode.
+            if ($wrapper -and $token.Value -match '"[^"]*""[^"]*"') {
+                throw "Ambiguous adjacent quotes in inherited mode option in $name."
+            }
+            if ($Inspect -and $property.Groups[1].Value -ceq 'fabric.client.gametest') {
+                throw "-Inspect conflicts with inherited fabric.client.gametest in $name (even false enables it)."
+            }
+            if ($property.Groups[1].Value -ceq 'mapart.test.inspect') {
+                $enabled=$property.Groups[2].Value -ieq 'true'
+                if ([bool]$Inspect -ne $enabled) { throw "Requested mode conflicts with inherited mapart.test.inspect in $name." }
+            }
+        }
+    }
+}
 
 function New-V2Request {
     param([ValidateSet('all','grounded-two-lane','grounded-traversal',IgnoreCase=$false)][string]$Scenario = 'all',
         [ValidateSet('1','2',IgnoreCase=$false)][string]$Repeat = '2', [switch]$EulaAccepted,
-        [string]$EulaEnvironment = $env:MAPART_TEST_EULA_ACCEPTED, [switch]$WrongExpectedBlock)
+        [string]$EulaEnvironment = $env:MAPART_TEST_EULA_ACCEPTED, [switch]$WrongExpectedBlock, [switch]$Inspect)
+    if ($Inspect -and (!$PSBoundParameters.ContainsKey('Scenario') -or $Scenario -cne 'grounded-two-lane' -or
+        $PSBoundParameters.ContainsKey('Repeat') -or $PSBoundParameters.ContainsKey('WrongExpectedBlock'))) {
+        throw '-Inspect requires explicit -Scenario grounded-two-lane and forbids -Repeat and -WrongExpectedBlock.'
+    }
+    Assert-V2InheritedMode -Inspect:$Inspect
     if ($WrongExpectedBlock -and $Scenario -ne 'grounded-two-lane') { throw '-WrongExpectedBlock requires -Scenario grounded-two-lane.' }
     if (!$EulaAccepted -and $EulaEnvironment -cne '1') {
         throw 'Accept the Minecraft EULA for these disposable instances, then pass -EulaAccepted or set process MAPART_TEST_EULA_ACCEPTED=1.'
+    }
+    if ($Inspect) {
+        # configureTests EULA acceptance also deletes the automatic directory; ordinary inspect avoids it.
+        return [pscustomobject]@{Mode='inspect';Scenario=$Scenario;WrongExpectedBlock=$false
+            EulaProvenance=$(if ($EulaAccepted) {'operator-switch'} else {'process MAPART_TEST_EULA_ACCEPTED=1'})
+            Arguments=@('-p','v2',':fabric:runInspect','--no-daemon','--console=plain')}
     }
     $arguments = @('-p','v2',':fabric:runClientGameTest','-PmapartTestEula=true','--no-daemon','--console=plain')
     # Omit defaults so the public default invocation exercises the source defaults.
@@ -92,9 +139,10 @@ function Find-V2Jdk {
 }
 
 function New-V2Environment {
-    param($Jdk, [switch]$WrongExpectedBlock)
+    param($Jdk, [switch]$WrongExpectedBlock, [switch]$Inspect)
+    Assert-V2InheritedMode -Inspect:$Inspect
     $options = $env:JAVA_TOOL_OPTIONS
-    $options = "$options -Dfabric.client.gametest.modid=mapart-test -Djava.awt.headless=true".Trim()
+    if (!$Inspect) { $options = "$options -Dfabric.client.gametest.modid=mapart-test -Djava.awt.headless=true".Trim() }
     @{
         JAVA_HOME=$Jdk.Home; PATH="$(Join-Path $Jdk.Home bin);$env:PATH"; JAVA_TOOL_OPTIONS=$options
         MAPART_PROBE_WRONG_EXPECTED_BLOCK=$null; MAPART_WITHHELD_OBSERVATION_EXPECT_SUCCESS=$null
@@ -106,7 +154,9 @@ function New-V2Environment {
 
 function Resolve-V2GameEnvironment {
     param($Jdk, $Request, [ValidateSet('ordinary','controlled',IgnoreCase=$false)][string]$InternalSupportCase='ordinary')
-    $environment=New-V2Environment -Jdk $Jdk -WrongExpectedBlock:($Request.WrongExpectedBlock)
+    $inspect=$Request.PSObject.Properties['Mode'] -and $Request.Mode -ceq 'inspect'
+    if ($inspect -and $InternalSupportCase -cne 'ordinary') { throw 'Inspect forbids controlled support.' }
+    $environment=New-V2Environment -Jdk $Jdk -WrongExpectedBlock:($Request.WrongExpectedBlock) -Inspect:$inspect
     if ($InternalSupportCase -ceq 'controlled') { $environment.MAPART_TWO_LANE_SUPPORT_CASE='controlled' }
     $environment
 }
@@ -162,6 +212,10 @@ function Read-V2StartReceipt {
         $uuid=[guid]::Empty
         if (![guid]::TryParseExact($LaunchId,'D',[ref]$uuid) -or $uuid.ToString('D') -cne $LaunchId -or
             ![IO.Path]::IsPathFullyQualified($Evidence) -or (Split-Path $Evidence -Leaf) -cne "launch-$LaunchId") { throw 'Invalid owned launch identity/directory.' }
+        # Legacy requests are automatic. Only the trusted request selects the schema, never candidate JSON.
+        $mode=$(if ($Request.PSObject.Properties['Mode']) { $Request.Mode } else { 'automatic' })
+        if ($mode -isnot [string] -or $mode -cnotin 'automatic','inspect') { throw 'Invalid startup request mode.' }
+        $inspect=$mode -ceq 'inspect'
         [void](Assert-V2ManagedPath $Evidence (Split-Path $Evidence))
         $path=Join-Path $Evidence 'test-start.json'
         $item=Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
@@ -175,25 +229,34 @@ function Read-V2StartReceipt {
         $root=$document.RootElement
         if ($root.ValueKind -ne [Text.Json.JsonValueKind]::Object) { throw 'Receipt is not an object.' }
         $names=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-        $expected=@('schema','launchId','pid','startedUtc','scenario','repeat','provider','event')
+        $expected=$(if ($inspect) { @('schema','launchId','pid','startedUtc','scenario','mode','sessionId','event') }
+            else { @('schema','launchId','pid','startedUtc','scenario','repeat','provider','event') })
         foreach ($property in $root.EnumerateObject()) {
             if ($expected -cnotcontains $property.Name -or !$names.Add($property.Name)) { throw 'Receipt has unknown or duplicate fields.' }
         }
         if ($names.Count -ne 8) { throw 'Receipt fields are incomplete.' }
         $strings=@{}
-        foreach ($name in 'schema','launchId','startedUtc','scenario','provider','event') {
+        foreach ($name in @($expected | Where-Object { $_ -cnotin 'pid','repeat' })) {
             $value=$root.GetProperty($name)
             if ($value.ValueKind -ne [Text.Json.JsonValueKind]::String) { throw "Receipt $name is not a string." }
             $strings[$name]=$value.GetString()
         }
-        [int]$receiptPid=0; $pidValue=$root.GetProperty('pid'); $repeatValue=$root.GetProperty('repeat')
+        [int]$receiptPid=0; $pidValue=$root.GetProperty('pid')
         if ($pidValue.ValueKind -ne [Text.Json.JsonValueKind]::Number -or $pidValue.GetRawText() -cnotmatch '^[1-9][0-9]*$' -or !$pidValue.TryGetInt32([ref]$receiptPid)) { throw 'Receipt PID is not a positive integer.' }
-        if ($repeatValue.ValueKind -ne [Text.Json.JsonValueKind]::Number -or $repeatValue.GetRawText() -cnotin '1','2' -or
-            $repeatValue.GetInt32() -ne $Request.Repeat) { throw 'Receipt repeat differs from request.' }
-        if ($strings.schema -cne 'mapartrunner-test-start-v1' -or $strings.event -cne 'SELECTED_PROVIDER_RUNTEST_ENTERED' -or
-            $strings.launchId -cne $LaunchId -or $strings.scenario -cne $Request.Scenario) { throw 'Receipt schema/event/challenge/scenario differs from request.' }
-        $providers=@('environment-probe','single-lane','schematic-import','grounded-two-lane','grounded-traversal')
-        if ($strings.provider -cnotin $providers -or ($Request.Scenario -cne 'all' -and $strings.provider -cne $Request.Scenario)) { throw 'Receipt provider was not selected.' }
+        if ($strings.launchId -cne $LaunchId -or $strings.scenario -cne $Request.Scenario) { throw 'Receipt schema/event/challenge/scenario differs from request.' }
+        if ($inspect) {
+            if ($strings.schema -cne 'mapartrunner-inspect-ready-v1' -or $strings.event -cne 'INSPECT_WORLD_BOUND_COMMANDS_READY' -or
+                $strings.mode -cne 'inspect' -or $strings.scenario -cne 'grounded-two-lane') { throw 'Receipt inspect schema/event/mode/scenario differs from request.' }
+            $session=[guid]::Empty
+            if (![guid]::TryParseExact($strings.sessionId,'D',[ref]$session) -or $session.ToString('D') -cne $strings.sessionId) { throw 'Receipt session UUID is not canonical.' }
+        } else {
+            $repeatValue=$root.GetProperty('repeat')
+            if ($repeatValue.ValueKind -ne [Text.Json.JsonValueKind]::Number -or $repeatValue.GetRawText() -cnotin '1','2' -or
+                $repeatValue.GetInt32() -ne $Request.Repeat) { throw 'Receipt repeat differs from request.' }
+            if ($strings.schema -cne 'mapartrunner-test-start-v1' -or $strings.event -cne 'SELECTED_PROVIDER_RUNTEST_ENTERED') { throw 'Receipt schema/event/challenge/scenario differs from request.' }
+            $providers=@('environment-probe','single-lane','schematic-import','grounded-two-lane','grounded-traversal')
+            if ($strings.provider -cnotin $providers -or ($Request.Scenario -cne 'all' -and $strings.provider -cne $Request.Scenario)) { throw 'Receipt provider was not selected.' }
+        }
         $started=[DateTimeOffset]::MinValue
         if ($strings.startedUtc -cnotmatch '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$' -or
             ![DateTimeOffset]::TryParse($strings.startedUtc,[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::AssumeUniversal,[ref]$started)) { throw 'Invalid receipt process creation time.' }
@@ -209,12 +272,169 @@ function Read-V2StartReceipt {
             if (!$record.IsGame -or !$record.IdentityVerified -or !$JavaExecutable -or
                 ![IO.Path]::GetFullPath($record.Executable).Equals([IO.Path]::GetFullPath($JavaExecutable),[StringComparison]::OrdinalIgnoreCase)) { throw 'Receipt is not the configured JDK native game.' }
         } elseif ($record.Pid -ne $WorkerPid -or $record.Ownership -cne 'directly started gated worker') { throw 'Dummy receipt is not the directly held worker.' }
-        $receipt=[pscustomobject]@{schema=$strings.schema;launchId=$strings.launchId;pid=$receiptPid;startedUtc=$strings.startedUtc
-            scenario=$strings.scenario;repeat=$repeatValue.GetInt32();provider=$strings.provider;event=$strings.event}
+        # A canonical first READY session becomes trusted only after every shared path/process check above.
+        if ($inspect -and $started -gt [DateTimeOffset]::UtcNow) { throw 'Inspect process creation is in the future.' }
+        $receipt=$(if ($inspect) {
+            [pscustomobject]@{schema=$strings.schema;launchId=$strings.launchId;pid=$receiptPid;startedUtc=$strings.startedUtc
+                scenario=$strings.scenario;mode=$strings.mode;sessionId=$strings.sessionId;event=$strings.event}
+        } else {
+            [pscustomobject]@{schema=$strings.schema;launchId=$strings.launchId;pid=$receiptPid;startedUtc=$strings.startedUtc
+                scenario=$strings.scenario;repeat=$repeatValue.GetInt32();provider=$strings.provider;event=$strings.event}
+        })
         [pscustomobject]@{Status='Accepted';Reason=$null;Receipt=$receipt
             Identity=[pscustomobject]@{Pid=$record.Pid;StartedUtc=$record.StartedUtc;Executable=$record.Executable;IsGame=$record.IsGame;Ownership=$record.Ownership}}
     } catch { [pscustomobject]@{Status='Rejected';Reason=$_.Exception.Message} }
     finally { if ($document) { $document.Dispose() }; if ($stream) { $stream.Dispose() } }
+}
+
+function Read-V2InspectOperationReceipt {
+    param([string]$Evidence,[string]$WorkingDirectory,$StartReceipt,$StartIdentity,$Held,
+        [int]$Ordinal,[ValidateSet('begin','cleanup','end')][string]$Phase,$Previous,$PreviousSettledUtc,
+        [switch]$RequireGame,[hashtable]$InternalInspectTest=@{},[Diagnostics.Stopwatch]$Clock)
+    $document=$null
+    try {
+        if ($RequireGame -and $InternalInspectTest.Count) { throw 'Inspect test clocks/allowances are dummy-only.' }
+        $workMs=600000; $cleanupMs=10000
+        foreach($key in $InternalInspectTest.Keys) {
+            if ($key -cnotin 'NowUtc','WorkMilliseconds','CleanupMilliseconds') { throw 'Unknown inspect test override.' }
+        }
+        if ($InternalInspectTest.ContainsKey('WorkMilliseconds')) { $workMs=$InternalInspectTest.WorkMilliseconds }
+        if ($InternalInspectTest.ContainsKey('CleanupMilliseconds')) { $cleanupMs=$InternalInspectTest.CleanupMilliseconds }
+        if ($workMs -isnot [int] -or $cleanupMs -isnot [int] -or $workMs -lt 1 -or $workMs -gt 600000 -or $cleanupMs -lt 1 -or $cleanupMs -gt 10000) { throw 'Invalid dummy inspect allowance.' }
+        if (!$StartReceipt -or $StartReceipt.mode -cne 'inspect' -or !$StartIdentity -or !$Held -or $Ordinal -lt 1) { throw 'Live READY anchor required.' }
+        $moduleRoot=Join-Path $WorkingDirectory 'v2/fabric/build/scenario-results'
+        [void](Assert-V2ManagedPath $Evidence $moduleRoot)
+        if ($RequireGame -and [IO.Path]::GetFullPath($Evidence) -cne (Join-Path $moduleRoot ('launch-'+$StartReceipt.launchId))) { throw 'Wrong module launch directory.' }
+        $path=Join-Path $Evidence "inspect-op-$Ordinal.$Phase.json"
+        $item=Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+        if (!$item) {
+            Update-V2ProcessExits @($Held) -IncludeExiting
+            if ($null -ne $Held.Record.ExitCode -and !$Held.Record.ExitedUtc) { return [pscustomobject]@{Status='PendingExitMetadata'} }
+            return [pscustomobject]@{Status='Missing'}
+        }
+        if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Phase must be an ordinary file.' }
+        $stream=[IO.File]::Open($path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+        try {
+            if ($stream.Length -lt 1 -or $stream.Length -gt 4096) { throw 'Phase exceeds1..4096bytes.' }
+            $bytes=[byte[]]::new([int]$stream.Length); $stream.ReadExactly($bytes)
+        } finally { $stream.Dispose() }
+        $text=[Text.UTF8Encoding]::new($false,$true).GetString($bytes)
+        $document=[Text.Json.JsonDocument]::Parse($text); $root=$document.RootElement
+        if ($root.ValueKind -ne [Text.Json.JsonValueKind]::Object) { throw 'Phase is not an object.' }
+        $keys=@('schema','launchId','pid','startedUtc','mode','sessionId','ordinal','operationId','command','phase','phaseStartedUtc','phaseDeadlineUtc','evidenceDir','verdict','cleanupStatus')
+        $names=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        foreach($property in $root.EnumerateObject()) {
+            if ($keys -cnotcontains $property.Name -or !$names.Add($property.Name)) { throw 'Unknown/duplicate phase field.' }
+        }
+        if ($names.Count -ne 15) { throw 'Phase requires exactly15fields.' }
+        $data=[ordered]@{}
+        foreach($key in $keys) {
+            $value=$root.GetProperty($key)
+            if ($key -cin 'pid','ordinal') {
+                [int]$number=0
+                if ($value.ValueKind -ne [Text.Json.JsonValueKind]::Number -or $value.GetRawText() -cnotmatch '^[1-9][0-9]*$' -or !$value.TryGetInt32([ref]$number)) { throw 'Phase integer invalid.' }
+                $data[$key]=$number
+            } elseif ($key -cin 'phaseDeadlineUtc','verdict','cleanupStatus' -and $value.ValueKind -eq [Text.Json.JsonValueKind]::Null) { $data[$key]=$null }
+            else {
+                if ($value.ValueKind -ne [Text.Json.JsonValueKind]::String) { throw "Phase $key type invalid." }
+                $data[$key]=$value.GetString()
+            }
+        }
+        $receipt=[pscustomobject]$data
+        if ($receipt.schema -cne 'mapartrunner-inspect-operation-v1' -or $receipt.mode -cne 'inspect' -or
+            $receipt.launchId -cne $StartReceipt.launchId -or $receipt.sessionId -cne $StartReceipt.sessionId -or
+            $receipt.pid -ne $StartReceipt.pid -or $receipt.startedUtc -cne $StartReceipt.startedUtc -or $receipt.ordinal -ne $Ordinal -or
+            $receipt.command -cnotin 'RESET','RUN','RERUN','CLOSE') { throw 'Phase launch/session/operation identity mismatch.' }
+        $uuid=[guid]::Empty
+        if (![guid]::TryParseExact($receipt.operationId,'D',[ref]$uuid) -or $uuid.ToString('D') -cne $receipt.operationId) { throw 'Noncanonical operation UUID.' }
+        $expected=Join-Path $moduleRoot "two-lane-$($StartReceipt.sessionId)/inspect-operations/op-$Ordinal-$($receipt.operationId)"
+        if (![IO.Path]::IsPathFullyQualified($receipt.evidenceDir) -or $receipt.evidenceDir -cne $expected -or !(Test-Path -LiteralPath $expected -PathType Container)) { throw 'Wrong operation evidence directory.' }
+        [void](Assert-V2ManagedPath $expected $moduleRoot)
+        if ($Previous -and ($receipt.operationId -cne $Previous.operationId -or $receipt.command -cne $Previous.command -or $receipt.evidenceDir -cne $Previous.evidenceDir)) { throw 'Phase changed operation identity.' }
+        $nativeStarted=[DateTimeOffset]$Held.Process.StartTime.ToUniversalTime()
+        if ($Held.Record.Pid -ne $StartIdentity.Pid -or $Held.Record.StartedUtc -cne $StartIdentity.StartedUtc -or
+            $Held.Record.Executable -cne $StartIdentity.Executable -or $Held.Process.Id -ne $StartIdentity.Pid -or
+            [Math]::Abs(($Held.Process.StartTime.ToUniversalTime()-[DateTimeOffset]::Parse($StartIdentity.StartedUtc).UtcDateTime).TotalMilliseconds) -gt 10) { throw 'Original held process identity changed.' }
+        if ($RequireGame -and (!$StartIdentity.IsGame -or !$Held.Record.IdentityVerified)) { throw 'Original configured JDK identity unavailable.' }
+        $exitBound=$null
+        if ($Held.Process.HasExited -or $null -ne $Held.Record.ExitCode) {
+            Update-V2ProcessExits @($Held) -IncludeExiting
+            if (!$Held.Record.ExitedUtc) { return [pscustomobject]@{Status='PendingExitMetadata'} }
+            $exitBound=[DateTimeOffset]::Parse($Held.Record.ExitedUtc)
+        }
+        # Sample after the complete candidate/held-identity read, never before a concurrently published phase.
+        $sampledElapsed=$(if($Clock){$Clock.Elapsed.TotalMilliseconds}else{$null})
+        $now=[DateTimeOffset]::UtcNow
+        if ($InternalInspectTest.ContainsKey('NowUtc')) { $now=[DateTimeOffset]$InternalInspectTest.NowUtc }
+        $times=@{}
+        foreach($key in 'startedUtc','phaseStartedUtc','phaseDeadlineUtc') {
+            if ($null -eq $receipt.$key) { continue }
+            $parsed=[DateTimeOffset]::MinValue
+            if ($receipt.$key -cnotmatch '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|\+00:00)$' -or
+                ![DateTimeOffset]::TryParse($receipt.$key,[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::AssumeUniversal,[ref]$parsed)) { throw 'Invalid phase UTC.' }
+            $times[$key]=$parsed
+        }
+        $occurrence=$times.phaseStartedUtc; $deadline=$times.phaseDeadlineUtc
+        if ($times.startedUtc -gt $now -or $occurrence -gt $now -or $occurrence -lt $times.startedUtc -or $occurrence -lt $nativeStarted -or
+            ($Previous -and $occurrence -lt [DateTimeOffset]::Parse($Previous.phaseStartedUtc)) -or
+            ($PreviousSettledUtc -and $occurrence -lt $PreviousSettledUtc) -or ($exitBound -and $occurrence -gt $exitBound)) {
+            throw "Future/backwards/post-exit occurrence: process=$($times.startedUtc.ToString('o')); phase=$($occurrence.ToString('o')); now=$($now.ToString('o')); exit=$exitBound; previous=$($Previous.phaseStartedUtc); settled=$PreviousSettledUtc"
+        }
+        $close=$receipt.command -ceq 'CLOSE'
+        switch($Phase) {
+            begin {
+                if ($Previous -or $receipt.phase -cne 'WORK' -or $null -ne $receipt.verdict -or $null -ne $receipt.cleanupStatus -or
+                    !$deadline -or $deadline -ne $occurrence.AddMilliseconds($(if($close){$cleanupMs}else{$workMs}))) { throw 'Invalid BEGIN/deadline.' }
+            }
+            cleanup {
+                if (!$Previous -or $Previous.phase -cne 'WORK' -or $receipt.phase -cne 'CLEANUP' -or
+                    $receipt.verdict -cnotin 'SUCCESS','FAILURE','TIMEOUT' -or $null -ne $receipt.cleanupStatus -or !$deadline -or
+                    $deadline -lt $occurrence -or $deadline -gt $occurrence.AddMilliseconds($cleanupMs) -or
+                    $deadline -gt ([DateTimeOffset]::Parse($Previous.phaseDeadlineUtc)).AddMilliseconds($(if($close){0}else{$cleanupMs}))) { throw 'Invalid CLEANUP/cap.' }
+            }
+            end {
+                if (!$Previous -or $Previous.phase -cne 'CLEANUP' -or $receipt.phase -cne 'SETTLED' -or $null -ne $deadline -or
+                    $receipt.verdict -cnotin 'SUCCESS','FAILURE','TIMEOUT' -or $receipt.cleanupStatus -cnotin 'SETTLED','UNRESOLVED' -or
+                    $occurrence -gt [DateTimeOffset]::Parse($Previous.phaseDeadlineUtc)) { throw 'Invalid END/late settlement.' }
+            }
+        }
+        [pscustomobject]@{Status='Accepted';Receipt=$receipt;Text=$text;NowUtc=$now;DeadlineUtc=$deadline;OccurrenceUtc=$occurrence;SampledElapsed=$sampledElapsed}
+    } catch { [pscustomobject]@{Status='Rejected';Reason=$_.Exception.Message} }
+    finally { if ($document) { $document.Dispose() } }
+}
+
+function Update-V2InspectOperations {
+    param($State,$Result,[string]$WorkingDirectory,$Clock,[switch]$RequireGame,[hashtable]$InternalInspectTest=@{})
+    # A pinned live-READY handle is retained for final records after exit; never look up a replacement PID.
+    foreach($entry in $State.Accepted.Values) {
+        $item=Get-Item -LiteralPath $entry.Path -Force -ErrorAction Stop
+        if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $item.Length -gt 4096 -or
+            [Text.UTF8Encoding]::new($false,$true).GetString([IO.File]::ReadAllBytes($entry.Path)) -cne $entry.Text) { throw 'Accepted inspect receipt was rewritten/removed.' }
+    }
+    # Pending metadata is transient; it never latches a frame, ordinal or watchdog cap.
+    $State.MetadataPending=$false
+    while ($true) {
+        $checked=Read-V2InspectOperationReceipt -Evidence $Result.Evidence -WorkingDirectory $WorkingDirectory -StartReceipt $Result.StartReceipt -StartIdentity $Result.StartIdentity `
+            -Held $State.Held -Ordinal $State.NextOrdinal -Phase $State.NextPhase -Previous $State.Previous -PreviousSettledUtc $State.SettledUtc -RequireGame:$RequireGame -InternalInspectTest $InternalInspectTest -Clock $Clock
+        if ($checked.Status -ceq 'PendingExitMetadata') { $State.MetadataPending=$true; return }
+        if ($checked.Status -ceq 'Missing') { return }
+        if ($checked.Status -cne 'Accepted') { throw "Invalid inspect phase: $($checked.Reason)" }
+        $name="inspect-op-$($State.NextOrdinal).$($State.NextPhase).json"
+        $State.Accepted[$name]=@{Path=(Join-Path $Result.Evidence $name);Text=$checked.Text}
+        $State.Previous=$checked.Receipt
+        if ($State.NextPhase -ceq 'begin') {
+            $State.NextPhase='cleanup'; $State.Active=$true
+            $cleanupMs=$(if($InternalInspectTest.ContainsKey('CleanupMilliseconds')){$InternalInspectTest.CleanupMilliseconds}else{10000})
+            $State.CapElapsed=$checked.SampledElapsed+($checked.DeadlineUtc.AddMilliseconds($(if($checked.Receipt.command -ceq 'CLOSE'){0}else{$cleanupMs}))-$checked.NowUtc).TotalMilliseconds
+        } elseif ($State.NextPhase -ceq 'cleanup') {
+            $State.NextPhase='end'
+            $State.CapElapsed=[Math]::Min($State.CapElapsed,$checked.SampledElapsed+($checked.DeadlineUtc-$checked.NowUtc).TotalMilliseconds)
+        } else {
+            $State.Outcomes.Add($checked.Receipt)
+            if ($checked.Receipt.cleanupStatus -cne 'SETTLED') { throw 'Inspect owned cleanup is UNRESOLVED.' }
+            $State.SettledUtc=$checked.OccurrenceUtc; $State.NextOrdinal++; $State.NextPhase='begin'; $State.Previous=$null; $State.Active=$false; $State.CapElapsed=$null
+        }
+    }
 }
 
 function Set-V2ObservedFailure {
@@ -325,15 +545,111 @@ function Get-V2ScenarioInventory {
     }
 }
 
-function Save-V2Artifacts {
-    param([string]$Evidence, [string]$Game, [string]$ScenarioRoot, [object[]]$Before, [string]$Owner)
+function Assert-V2EvidenceName {
+    param([string]$Name)
+    # Reject Windows aliases as well as escapes; metadata must name one unambiguous child.
+    if (!$Name -or $Name -match '[\\/:\x00-\x1f<>"|?*]' -or $Name -match '[. ]$|^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\.|$)') { throw "Ambiguous evidence name: $Name" }
+}
+
+function Get-V2ReferenceEntries {
+    param([string]$Path, [string]$Owner, [string]$Relative='.')
+    [void](Assert-V2ManagedPath (Split-Path $Path) $Owner)
+    $item=Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        if ($item.LinkType -cnotin 'Junction','SymbolicLink' -or !$item.LinkTarget) { throw "Unknown reparse metadata: $Path" }
+        [pscustomobject][ordered]@{Path=$Relative;Kind='link';Attributes=[int]$item.Attributes;LinkType=$item.LinkType;LinkTarget=$item.LinkTarget}
+        return
+    }
+    [void](Assert-V2ManagedPath $Path $Owner)
+    if ($item.PSIsContainer) {
+        [pscustomobject][ordered]@{Path=$Relative;Kind='directory'}
+        $seen=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($child in Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop | Sort-Object Name) {
+            Assert-V2EvidenceName $child.Name
+            if (!$seen.Add($child.Name)) { throw "Duplicate evidence name: $($child.Name)" }
+            $relativeChild=$(if($Relative -ceq '.'){$child.Name}else{$Relative+'/'+$child.Name})
+            Get-V2ReferenceEntries $child.FullName $Owner $relativeChild
+        }
+    } else {
+        [pscustomobject][ordered]@{Path=$Relative;Kind='file';Size=[long]$item.Length;Sha256=(Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop).Hash}
+    }
+}
+
+function Assert-V2ScenarioReferences {
+    param($Manifest,[string]$Evidence,[string]$ScenarioRoot,[string]$Owner,[string]$LaunchId,[string]$ClosureId)
     [void](Assert-V2ManagedPath $Evidence $Owner)
+    [void](Assert-V2ManagedPath $ScenarioRoot $Owner)
+    if ((@($Manifest.PSObject.Properties.Name | Sort-Object) -join ',') -cne 'After,Before,CleanupStatus,ClosureId,Evidence,LaunchId,Roots,ScenarioRoot,Schema,State') { throw 'Invalid scenario reference schema fields.' }
+    $uuid=[guid]::Empty
+    if (![guid]::TryParseExact($LaunchId,'D',[ref]$uuid) -or (Split-Path $Evidence -Leaf) -cne ('launch-'+$LaunchId) -or
+        $Manifest.Schema -cne 'mapartrunner-scenario-references-v1' -or $Manifest.State -cne 'closed' -or
+        $Manifest.LaunchId -cne $LaunchId -or $Manifest.CleanupStatus -cne 'settled' -or
+        ![guid]::TryParseExact($Manifest.ClosureId,'D',[ref]$uuid) -or ($ClosureId -and $Manifest.ClosureId -cne $ClosureId) -or
+        $Manifest.Evidence -cne [IO.Path]::GetFullPath($Evidence) -or $Manifest.ScenarioRoot -cne [IO.Path]::GetFullPath($ScenarioRoot)) { throw 'Invalid scenario reference closure/launch identity.' }
+    foreach ($phase in 'Before','After') {
+        $path=Join-Path $Evidence ('scenarios-'+$phase.ToLowerInvariant()+'.json')
+        [void](Assert-V2ManagedPath $path $Owner)
+        $inventory=@(Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop)
+        if ((ConvertTo-Json -InputObject $inventory -Depth 5 -Compress) -cne (ConvertTo-Json -InputObject @($Manifest.$phase) -Depth 5 -Compress)) { throw "Reference $phase inventory mismatch." }
+        $seen=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($entry in $inventory) {
+            Assert-V2EvidenceName $entry.Name
+            if ($entry.Name -cnotmatch '^(environment-probe|single-lane|lane-import|schematic-import|two-lane|archive-self-check)-' -or !$seen.Add($entry.Name)) { throw 'Invalid/duplicate scenario inventory name.' }
+        }
+    }
+    $selected=@($Manifest.After | Where-Object { $_.Name -notin @($Manifest.Before | ForEach-Object Name) })
+    if (@($Manifest.Roots).Count -ne $selected.Count) { throw 'Reference selected root count mismatch.' }
+    for ($i=0;$i -lt $selected.Count;$i++) {
+        $root=$Manifest.Roots[$i]
+        if ((@($root.PSObject.Properties.Name | Sort-Object) -join ',') -cne 'Entries,Name' -or $root.Name -cne $selected[$i].Name) { throw 'Reference selected root identity mismatch.' }
+        # Manifest entry paths are never traversed: regenerate the complete set from this exact owned root.
+        $actual=@(Get-V2ReferenceEntries (Join-Path $ScenarioRoot $root.Name) $ScenarioRoot)
+        if ((ConvertTo-Json -InputObject $actual -Depth 8 -Compress) -cne (ConvertTo-Json -InputObject @($root.Entries) -Depth 8 -Compress)) { throw "Reference payload changed: $($root.Name)" }
+    }
+}
+
+function Read-V2ScenarioReferences {
+    param([string]$Evidence,[string]$ScenarioRoot,[string]$Owner,[string]$LaunchId,[string]$ClosureId)
+    $path=Join-Path $Evidence 'scenario-references.json'
+    [void](Assert-V2ManagedPath $path $Owner)
+    $manifest=Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    Assert-V2ScenarioReferences $manifest $Evidence $ScenarioRoot $Owner $LaunchId $ClosureId
+    return $manifest
+}
+
+function Save-V2Artifacts {
+    param([string]$Evidence, [string]$Game, [string]$ScenarioRoot, [object[]]$Before, [string]$Owner, $Context=$null)
+    [void](Assert-V2ManagedPath $Evidence $Owner)
+    [void](Assert-V2ManagedPath $ScenarioRoot $Owner)
     $after=@(Get-V2ScenarioInventory $ScenarioRoot)
-    @($Before) | ConvertTo-Json -Depth 5 -AsArray | Set-Content (Join-Path $Evidence 'scenarios-before.json')
-    $after | ConvertTo-Json -Depth 5 -AsArray | Set-Content (Join-Path $Evidence 'scenarios-after.json')
+    ConvertTo-Json -InputObject @($Before) -Depth 5 | Set-Content (Join-Path $Evidence 'scenarios-before.json')
+    ConvertTo-Json -InputObject $after -Depth 5 | Set-Content (Join-Path $Evidence 'scenarios-after.json')
     $links=[Collections.Generic.List[object]]::new()
     foreach ($folder in 'logs','crash-reports') {
         foreach ($link in @(Copy-V2Evidence (Join-Path $Game $folder) (Join-Path $Evidence $folder) $Game $Evidence)) { $links.Add($link) }
+    }
+    if ($Context -and !($Context.Request.PSObject.Properties['Mode'] -and $Context.Request.Mode -ceq 'inspect')) {
+        ConvertTo-Json -InputObject $links.ToArray() -Depth 5 | Set-Content (Join-Path $Evidence 'reparse-points.json')
+        # Only the existing finalizer can settle writers. Closure precedes outcome publication/lock release.
+        if ($Context.CleanupStatus -cne 'settled' -or $Context.Evidence -cne $Evidence) { throw 'Automatic reference retention requires settled launch cleanup.' }
+        $roots=@(foreach ($artifact in $after) {
+            if (@($Before | Where-Object Name -EQ $artifact.Name).Count) { continue }
+            Assert-V2EvidenceName $artifact.Name
+            [pscustomobject][ordered]@{Name=$artifact.Name;Entries=@(Get-V2ReferenceEntries (Join-Path $ScenarioRoot $artifact.Name) $ScenarioRoot)}
+        })
+        $manifest=[pscustomobject][ordered]@{Schema='mapartrunner-scenario-references-v1';State='closed';LaunchId=$Context.LaunchId
+            ClosureId=[guid]::NewGuid().ToString('D');CleanupStatus=$Context.CleanupStatus;Evidence=[IO.Path]::GetFullPath($Evidence)
+            ScenarioRoot=[IO.Path]::GetFullPath($ScenarioRoot);Before=@($Before);After=$after;Roots=$roots}
+        $partial=Join-Path $Evidence 'scenario-references.partial.json'; $closed=Join-Path $Evidence 'scenario-references.json'
+        [void](Assert-V2ManagedPath $partial $Owner); [void](Assert-V2ManagedPath $closed $Owner)
+        $bytes=[Text.UTF8Encoding]::new($false).GetBytes(($manifest | ConvertTo-Json -Depth 20))
+        $stream=[IO.File]::Open($partial,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+        try { $stream.Write($bytes); $stream.Flush($true) } finally { $stream.Dispose() }
+        $readback=Get-Content -LiteralPath $partial -Raw | ConvertFrom-Json -ErrorAction Stop
+        Assert-V2ScenarioReferences $readback $Evidence $ScenarioRoot $Owner $Context.LaunchId $manifest.ClosureId
+        [IO.File]::Move($partial,$closed)
+        [void](Read-V2ScenarioReferences -Evidence $Evidence -ScenarioRoot $ScenarioRoot -Owner $Owner -LaunchId $Context.LaunchId -ClosureId $manifest.ClosureId)
+        return
     }
     foreach ($artifact in $after) {
         # UUID directories present before launch are never credited as this invocation's artifacts.
@@ -342,7 +658,7 @@ function Save-V2Artifacts {
         New-Item -ItemType Directory -Path (Split-Path $destination) -Force | Out-Null
         foreach ($link in @(Copy-V2Evidence (Join-Path $ScenarioRoot $artifact.Name) $destination $ScenarioRoot $Evidence)) { $links.Add($link) }
     }
-    $links | ConvertTo-Json -Depth 5 -AsArray | Set-Content (Join-Path $Evidence 'reparse-points.json')
+    ConvertTo-Json -InputObject $links.ToArray() -Depth 5 | Set-Content (Join-Path $Evidence 'reparse-points.json')
 }
 
 function Update-V2Processes {
@@ -376,12 +692,35 @@ function Update-V2Processes {
             if ($Job.Pids() -contains $ownedId) { throw }
         }
     }
+    Update-V2ProcessExits $Handles
+}
+
+function Update-V2ProcessExits {
+    param([object[]]$Handles,[switch]$IncludeExiting)
     $observedUtc=[DateTime]::UtcNow.ToString('o')
     foreach ($held in $Handles) {
-        if ($null -eq $held.Record.ExitCode -and $held.Process.WaitForExit(0)) {
+        # HasExited can expose the real exit code before Windows signals WaitForExit(0).
+        $signaled=$held.Process.WaitForExit(0)
+        if ($null -eq $held.Record.ExitCode -and ($signaled -or ($IncludeExiting -and $held.Process.HasExited))) {
             $held.Record.ExitCode=$held.Process.ExitCode; $held.Record.ObservedExitUtc=$observedUtc
-            try { $held.Record.ExitedUtc=$held.Process.ExitTime.ToUniversalTime().ToString('o') } catch { }
         }
+        [DateTimeOffset]$previousTime=[DateTimeOffset]::MinValue
+        if (![DateTimeOffset]::TryParse($held.Record.ExitedUtc,[ref]$previousTime) -or
+            $previousTime -lt [DateTimeOffset]::Parse($held.Record.StartedUtc)) { $held.Record.ExitedUtc=$null }
+        if (!$signaled) { continue }
+        # Codes may arrive early; only a signaled original handle can supply/repair the exit bound.
+        # A verified bound remains authoritative through unavailable/invalid later samples.
+        $previous=$held.Record.ExitedUtc
+        try {
+            $held.Process.Refresh()
+            $started=$held.Process.StartTime.ToUniversalTime(); $exit=$held.Process.ExitTime.ToUniversalTime()
+        } catch { continue }
+        if ($held.Process.Id -ne $held.Record.Pid -or
+            [Math]::Abs(($started-[DateTimeOffset]::Parse($held.Record.StartedUtc).UtcDateTime).TotalMilliseconds) -gt 10 -or
+            $held.Process.ExitCode -ne $held.Record.ExitCode) { throw 'Original held exit identity changed.' }
+        if ($exit -lt $started -or $exit -gt [DateTime]::UtcNow) { continue }
+        if ($previous -and [DateTimeOffset]::Parse($previous).UtcDateTime -ne $exit) { throw 'Original held exit timestamp changed.' }
+        $held.Record.ExitedUtc=$exit.ToString('o')
     }
 }
 
@@ -390,8 +729,13 @@ function Invoke-V2Supervisor {
         [string]$WorkingDirectory, [int]$TimeoutMilliseconds=600000,
         [string]$WorkerExecutable=(Join-Path $PSHOME pwsh.exe), [scriptblock]$Archive={}, $Request=$null,
         [switch]$RequireGame, [ValidateRange(1,2147483647)][int]$StartupMilliseconds=600000,
-        [ValidateSet('ordinary','controlled',IgnoreCase=$false)][string]$InternalSupportCase='ordinary')
+        [ValidateSet('ordinary','controlled',IgnoreCase=$false)][string]$InternalSupportCase='ordinary',
+        [hashtable]$InternalInspectTest=@{})
     $ErrorActionPreference='Stop'
+    $inspectMode=$Request -and $Request.PSObject.Properties['Mode'] -and $Request.Mode -ceq 'inspect'
+    if ($inspectMode -and $InternalSupportCase -cne 'ordinary') { throw 'Inspect forbids controlled support.' }
+    if ($RequireGame) { Assert-V2InheritedMode -Inspect:$inspectMode }
+    if ($RequireGame -and $PSBoundParameters.ContainsKey('InternalInspectTest')) { throw 'Inspect test clocks/allowances are dummy-only.' }
     if ($InternalSupportCase -ceq 'controlled') {
         $canonical=New-V2Request -Scenario grounded-two-lane -Repeat 2 -EulaAccepted
         if (!$RequireGame -or $Request -isnot [pscustomobject] -or $Request.Scenario -isnot [string] -or $Request.Scenario -cne $canonical.Scenario -or
@@ -422,8 +766,8 @@ function Invoke-V2Supervisor {
         # Snapshot and final launch preflight share this handle through cleanup and archive.
         $before=@(Get-V2ScenarioInventory $EvidenceRoot)
         if ($RequireGame) {
-            $TimeoutMilliseconds=Get-V2TimeoutMilliseconds $Request.Scenario $Request.Repeat
-            $game=Join-Path $WorkingDirectory 'v2/fabric/build/run/clientGameTest'
+            if (!$inspectMode) { $TimeoutMilliseconds=Get-V2TimeoutMilliseconds $Request.Scenario $Request.Repeat }
+            $game=Join-Path $WorkingDirectory $(if($inspectMode){'v2/fabric/build/run/inspect'}else{'v2/fabric/build/run/clientGameTest'})
             [void](Assert-V2ManagedPath $game $WorkingDirectory)
             $jdkArguments=@{}
             if ($Request.PSObject.Properties['JavaHome']) { $jdkArguments.JavaHome=$Request.JavaHome }
@@ -436,7 +780,7 @@ function Invoke-V2Supervisor {
             $Request | Add-Member ScenarioInventoryBefore $before -Force
             $workerText='& ' + "'" + $wrapper.Replace("'","''") + "' " + (($Request.Arguments | ForEach-Object { "'" + $_.Replace("'","''") + "'" }) -join ' ') + "`n`$nativeExit=`$LASTEXITCODE`nexit `$nativeExit"
             $Worker=[scriptblock]::Create($workerText)
-            $Archive={ param($evidence,$before) Save-V2Artifacts -Evidence $evidence -Game $game -ScenarioRoot $EvidenceRoot -Before $before -Owner $WorkingDirectory }
+            $Archive={ param($evidence,$before,$context) Save-V2Artifacts -Evidence $evidence -Game $game -ScenarioRoot $EvidenceRoot -Before $before -Owner $WorkingDirectory -Context $context }
         }
         $launchId=[guid]::NewGuid().ToString('D')
         $evidence=Join-Path $EvidenceRoot ('launch-' + $launchId)
@@ -447,6 +791,8 @@ function Invoke-V2Supervisor {
             $Environment.MAPART_TEST_LAUNCH_ID=$launchId; $Environment.MAPART_TEST_LAUNCH_DIR=$evidence
         }
         if (!$Request) { $Request=[pscustomobject]@{Scenario='all';Repeat=2} }
+        $inspectMode=$Request.PSObject.Properties['Mode'] -and $Request.Mode -ceq 'inspect'
+        if ($InternalInspectTest.Count -and (!$inspectMode -or !$dummyStartup)) { throw 'Inspect test support requires a controlled dummy inspect receipt.' }
         $Request | Add-Member SupportCase $InternalSupportCase -Force
         $Request | Add-Member SupportCaseSource $(if ($InternalSupportCase -ceq 'controlled') {'internal-reviewed-controlled-support'} else {'ordinary-default'}) -Force
         $Request | Add-Member ChildEnvironment $Environment -Force
@@ -458,6 +804,12 @@ function Invoke-V2Supervisor {
             WorkerPid=$null; PrimaryFailure=$null; ObservedFailures=[Collections.Generic.List[object]]::new(); TerminationRequested=$false
             ExitCode=125; WorkerExitCode=$null; TimedOut=$false; SupervisorError=$null; CleanupStatus='unresolved'; CleanupError=$null
             ArchiveStatus='pending'; ArchiveError=$null; Request=$Request; Processes=$records; NativeGameExitCodes=@() }
+        $inspectState=$null; $inspectEnded=$false
+        if ($inspectMode) {
+            $result | Add-Member InspectOperations ([Collections.Generic.List[object]]::new())
+            $result | Add-Member InspectEscalation $null
+            $result | Add-Member InspectIncomplete $false
+        }
         $result | ConvertTo-Json -Depth 10 | Set-Content (Join-Path $evidence 'request.json')
         $gate=Join-Path $evidence 'worker-assigned'
         $command="`$ErrorActionPreference='Stop'; `$gateClock=[Diagnostics.Stopwatch]::StartNew(); while (!(Test-Path -LiteralPath '" + $gate.Replace("'","''") + "')) { if (`$gateClock.ElapsedMilliseconds -ge 10000) { exit 125 }; Start-Sleep -Milliseconds 20 };`n" + $Worker.ToString()
@@ -478,7 +830,9 @@ function Invoke-V2Supervisor {
                 Executable=$WorkerExecutable; CommandLine=($process.StartInfo.ArgumentList -join ' '); Ownership='directly started gated worker'
                 ExitCode=$null; ExitedUtc=$null; ObservedExitUtc=$null; IdentityVerified=$false; IsGame=$false }
             $records.Add($rootRecord); $handles.Add([pscustomobject]@{ Process=$process; Record=$rootRecord })
-            $stdoutFile=[IO.File]::Create((Join-Path $evidence 'launch.stdout.log')); $stderrFile=[IO.File]::Create((Join-Path $evidence 'launch.stderr.log'))
+            # Readers must see even small live markers; retain exclusive write/delete ownership.
+            $stdoutFile=[IO.FileStream]::new((Join-Path $evidence 'launch.stdout.log'),[IO.FileMode]::Create,[IO.FileAccess]::Write,[IO.FileShare]::Read,1,[IO.FileOptions]::Asynchronous)
+            $stderrFile=[IO.FileStream]::new((Join-Path $evidence 'launch.stderr.log'),[IO.FileMode]::Create,[IO.FileAccess]::Write,[IO.FileShare]::Read,1,[IO.FileOptions]::Asynchronous)
             $stdout=$process.StandardOutput.BaseStream.CopyToAsync($stdoutFile); $stderr=$process.StandardError.BaseStream.CopyToAsync($stderrFile)
             $job.Assign($process.Handle)
             Update-V2Processes $job $records $handles
@@ -487,7 +841,7 @@ function Invoke-V2Supervisor {
                 # Dummy inventory guards may publish from the actual held identity; real workers are still gated.
                 if ($RequireGame) { $result.ReceiptRejectionReason='Receipt existed before worker gate release.'; throw $result.ReceiptRejectionReason }
             }
-            if ($clock.ElapsedMilliseconds -lt $deadlineMilliseconds -and (!$requiresReceipt -or $clock.ElapsedMilliseconds -lt $StartupMilliseconds)) { Set-Content -LiteralPath $gate -Value 'assigned' }
+            if (($inspectMode -or $clock.ElapsedMilliseconds -lt $deadlineMilliseconds) -and (!$requiresReceipt -or $clock.ElapsedMilliseconds -lt $StartupMilliseconds)) { Set-Content -LiteralPath $gate -Value 'assigned' }
             while ($true) {
                 Update-V2Processes $job $records $handles
                 if ($process.WaitForExit(0)) {
@@ -495,12 +849,59 @@ function Invoke-V2Supervisor {
                     if ($null -eq $rootRecord.ExitCode) {
                         # The worker can exit after inventory; latch that observation before testing either deadline.
                         $rootRecord.ExitCode=$process.ExitCode; $rootRecord.ObservedExitUtc=[DateTime]::UtcNow.ToString('o')
-                        try { $rootRecord.ExitedUtc=$process.ExitTime.ToUniversalTime().ToString('o') } catch { }
+                        Update-V2ProcessExits @($handles) -IncludeExiting
                     }
                     if (!$result.PrimaryFailure) { $result.ExitCode=$process.ExitCode }
                 }
                 Set-V2ObservedFailure $result $records
-                if (($requiresReceipt -and $null -eq $result.StartupAcceptedElapsedMilliseconds -and $clock.ElapsedMilliseconds -ge $StartupMilliseconds) -or $clock.ElapsedMilliseconds -ge $deadlineMilliseconds) {
+                if ($inspectState) {
+                    $inspectFailure=$null
+                    try { Update-V2InspectOperations $inspectState $result $WorkingDirectory $clock -RequireGame:$RequireGame -InternalInspectTest $InternalInspectTest }
+                    catch { $inspectFailure=$_ }
+                    # Only refresh the same retained handles; phase reading can outlive the earlier exit sample.
+                    Update-V2ProcessExits @($handles) -IncludeExiting
+                    if ($null -ne $rootRecord.ExitCode) { $result.WorkerExitCode=$rootRecord.ExitCode; if (!$result.PrimaryFailure) { $result.ExitCode=$rootRecord.ExitCode } }
+                    Set-V2ObservedFailure $result $records
+                    if ($inspectFailure) {
+                        $result.InspectEscalation=$inspectFailure.Exception.Message; $result.InspectIncomplete=$true
+                        if (!$result.PrimaryFailure) { $result.ExitCode=125 }; break
+                    }
+                    $inspectExitObserved=$inspectState.Held.Process.HasExited -or $null -ne $result.WorkerExitCode -or $result.PrimaryFailure
+                    $inspectCapObserved=$inspectState.Active -and $clock.Elapsed.TotalMilliseconds -ge $inspectState.CapElapsed
+                    if ($inspectExitObserved -or $inspectCapObserved) {
+                        # Missing was only a snapshot. Reconcile after the positive exit/cap observation,
+                        # including idle's next BEGIN, before declaring completion, incompleteness or timeout.
+                        try { Update-V2InspectOperations $inspectState $result $WorkingDirectory $clock -RequireGame:$RequireGame -InternalInspectTest $InternalInspectTest }
+                        catch { $inspectFailure=$_ }
+                        Update-V2ProcessExits @($handles) -IncludeExiting
+                        Set-V2ObservedFailure $result $records
+                        if ($null -ne $rootRecord.ExitCode) { $result.WorkerExitCode=$rootRecord.ExitCode }
+                        if ($inspectFailure) {
+                            $result.InspectEscalation=$inspectFailure.Exception.Message; $result.InspectIncomplete=$true
+                            if (!$result.PrimaryFailure) { $result.ExitCode=125 }
+                            break
+                        }
+                        if ($inspectExitObserved -and $inspectState.MetadataPending) { $inspectEnded=$true; break }
+                        if ($inspectState.Active -and $clock.Elapsed.TotalMilliseconds -ge $inspectState.CapElapsed) {
+                            $result.TimedOut=$true; $result.TimeoutPhase='INSPECT_'+$inspectState.NextPhase.ToUpperInvariant()
+                            $result.InspectEscalation='Inspect operation did not settle by its original cleanup cap.'; $result.InspectIncomplete=$true
+                            if (!$result.PrimaryFailure) { $result.ExitCode=124 }; break
+                        }
+                        if ($inspectExitObserved) {
+                            $inspectEnded=$true
+                            if ($inspectState.Active) {
+                                $result.InspectIncomplete=$true; $result.InspectEscalation='Process exited with unfinished inspect operation.'
+                                if (!$result.PrimaryFailure) { $result.ExitCode=125 }
+                            }
+                            break
+                        }
+                    }
+                    # An exit arriving after the captured observation belongs to the next ordinary poll,
+                    # whose decision will reconcile again; never fall through to automatic exit handling.
+                    Start-Sleep -Milliseconds 50
+                    continue
+                }
+                if (($requiresReceipt -and $null -eq $result.StartupAcceptedElapsedMilliseconds -and $clock.ElapsedMilliseconds -ge $StartupMilliseconds) -or (!$inspectMode -and $clock.ElapsedMilliseconds -ge $deadlineMilliseconds)) {
                     $result.TimedOut=$true
                     $result.TimeoutPhase=$(if($requiresReceipt -and $null -eq $result.StartupAcceptedElapsedMilliseconds -and $clock.ElapsedMilliseconds -ge $StartupMilliseconds){'STARTUP'}else{'OVERALL'})
                     if ($result.TimeoutPhase -ceq 'STARTUP') { $result.ReceiptRejectionReason='Startup deadline elapsed without a validated selected-provider receipt.' }
@@ -518,10 +919,23 @@ function Invoke-V2Supervisor {
                         break
                     }
                     if ($receipt.Status -ceq 'Accepted') {
-                        if ($clock.ElapsedMilliseconds -ge $StartupMilliseconds -or $clock.ElapsedMilliseconds -ge $deadlineMilliseconds) { continue }
+                        if ($clock.ElapsedMilliseconds -ge $StartupMilliseconds -or (!$inspectMode -and $clock.ElapsedMilliseconds -ge $deadlineMilliseconds)) { continue }
+                        if ($inspectMode) {
+                            $held=@($handles | Where-Object { $_.Record.Pid -eq $receipt.Identity.Pid -and $_.Record.StartedUtc -ceq $receipt.Identity.StartedUtc })
+                            if ($held.Count -ne 1 -or $held[0].Process.HasExited) {
+                                $result.ReceiptStatus='Rejected'; $result.ReceiptRejectionReason='Inspect READY lost its live original process before anchoring.'
+                                throw $result.ReceiptRejectionReason
+                            }
+                        }
                         # Acceptance latches phase/identity once; neither absolute deadline nor stopwatch is renewed.
                         $result.StartReceipt=$receipt.Receipt; $result.StartIdentity=$receipt.Identity
                         $result.StartupAcceptedElapsedMilliseconds=$clock.ElapsedMilliseconds
+                        if ($inspectMode) {
+                            $inspectState=[pscustomobject]@{Held=$held[0];NextOrdinal=1;NextPhase='begin';Previous=$null;SettledUtc=$null
+                                Active=$false;CapElapsed=$null;Accepted=@{};Outcomes=$result.InspectOperations;MetadataPending=$false}
+                            # Inspect phases/exits are processed by the same next iteration, before their clocks.
+                            continue
+                        }
                     }
                 }
                 if ($null -ne $result.WorkerExitCode -or $result.PrimaryFailure) {
@@ -539,20 +953,38 @@ function Invoke-V2Supervisor {
                 # Keep records/handles until every owned member has exited, even when the root already exited.
                 Update-V2Processes $job $records $handles -Fast
                 Set-V2ObservedFailure $result $records
-                # Normal shutdown may outlive the worker briefly; drain shares both existing fixed budgets.
-                while ($null -ne $result.WorkerExitCode -and !$result.TimedOut -and !$result.SupervisorError -and
-                    @($job.Pids()).Count -and $cleanupClock.ElapsedMilliseconds -lt 1000 -and $clock.ElapsedMilliseconds -lt $deadlineMilliseconds) {
+                # Healthy native exit may precede wrapper exit. Leave the final1000ms of this same
+                # cleanup clock for force/held metadata/streams; that reserve cannot guarantee settlement.
+                $healthyInspectDrain=$inspectMode -and $inspectEnded -and $inspectState.Held.Process.HasExited -and
+                    !$result.PrimaryFailure -and !$result.TimedOut -and !$result.SupervisorError -and !$result.InspectEscalation -and !$result.InspectIncomplete
+                $normalDrainMilliseconds=$(if($healthyInspectDrain){9000}else{1000})
+                while (($null -ne $result.WorkerExitCode -or $inspectEnded) -and !$result.TimedOut -and !$result.SupervisorError -and
+                    !($inspectMode -and $result.InspectEscalation) -and (!$healthyInspectDrain -or !$result.PrimaryFailure) -and
+                    @($job.Pids()).Count -and $cleanupClock.ElapsedMilliseconds -lt $normalDrainMilliseconds -and ($inspectMode -or $clock.ElapsedMilliseconds -lt $deadlineMilliseconds)) {
                     Update-V2Processes $job $records $handles -Fast
                     Set-V2ObservedFailure $result $records
+                    if ($inspectState) { Update-V2InspectOperations $inspectState $result $WorkingDirectory $clock -RequireGame:$RequireGame -InternalInspectTest $InternalInspectTest }
+                    if ($healthyInspectDrain) {
+                        # Phase reads can outlive the inventory sample; latch actual failures before force.
+                        Update-V2ProcessExits @($handles) -IncludeExiting
+                        Set-V2ObservedFailure $result $records
+                    }
+                    if ($inspectEnded -and $process.WaitForExit(0)) {
+                        $result.WorkerExitCode=$process.ExitCode
+                        if (!$result.PrimaryFailure -and !$result.InspectEscalation) { $result.ExitCode=$process.ExitCode }
+                    }
                     Start-Sleep -Milliseconds 25
                 }
                 if (@($job.Pids()).Count) {
-                    if (!$result.TimedOut -and !$result.ReceiptRejectionReason -and $clock.ElapsedMilliseconds -ge $deadlineMilliseconds) {
+                    if (!$inspectMode -and !$result.TimedOut -and !$result.ReceiptRejectionReason -and $clock.ElapsedMilliseconds -ge $deadlineMilliseconds) {
                         $result.TimedOut=$true
                         $result.TimeoutPhase='OVERALL'
                         if (!$result.PrimaryFailure -and $result.ExitCode -eq 0) { $result.ExitCode=124 }
                     }
                     elseif ($result.ExitCode -eq 0) { $result.ExitCode=125; $result.SupervisorError='Owned descendants required forced termination after bounded normal drain.' }
+                    elseif ($inspectMode -and $inspectEnded -and !$result.SupervisorError) {
+                        $result.SupervisorError='Owned descendants required forced termination after bounded normal drain.'
+                    }
                     $result.TerminationRequested=$true
                     $job.Stop()
                 }
@@ -567,8 +999,33 @@ function Invoke-V2Supervisor {
                     if (!$held.Process.WaitForExit($remaining)) { throw "Held owned process did not settle: $($held.Record.Pid)" }
                     $held.Record.ExitCode=$held.Process.ExitCode
                 }
+                Update-V2ProcessExits @($handles) -IncludeExiting
                 if ($result.WorkerPid -and $process.WaitForExit(0)) { $result.WorkerExitCode=$process.ExitCode }
                 Set-V2ObservedFailure $result $records
+                if ($inspectEnded -and !$result.InspectEscalation) {
+                    # Reconcile only after held settlement, sharing the original process/stream allowance.
+                    do {
+                        Update-V2ProcessExits @($handles) -IncludeExiting
+                        try { Update-V2InspectOperations $inspectState $result $WorkingDirectory $clock -RequireGame:$RequireGame -InternalInspectTest $InternalInspectTest }
+                        catch {
+                            $result.InspectIncomplete=$true; $result.InspectEscalation=$_.Exception.Message
+                            if (!$result.PrimaryFailure) { $result.ExitCode=125 }; break
+                        }
+                        if (!$inspectState.MetadataPending) { break }
+                        if ($cleanupClock.ElapsedMilliseconds -ge 10000) {
+                            $result.InspectIncomplete=$true; $result.InspectEscalation='Inspect exit metadata did not settle within10000ms.'
+                            throw $result.InspectEscalation
+                        }
+                        Start-Sleep -Milliseconds ([Math]::Max(0,[Math]::Min(25,10000-[int]$cleanupClock.ElapsedMilliseconds)))
+                    } while ($true)
+                    if ($inspectState.Active -and !$result.InspectEscalation) {
+                        $result.InspectIncomplete=$true; $result.InspectEscalation='Process exited with unfinished inspect operation.'
+                        if (!$result.PrimaryFailure) { $result.ExitCode=125 }
+                    }
+                }
+                if ($inspectEnded -and !$result.PrimaryFailure -and !$result.InspectEscalation -and !$result.TimedOut -and !$result.SupervisorError -and $null -ne $result.WorkerExitCode) {
+                    $result.ExitCode=$result.WorkerExitCode
+                }
                 foreach ($copy in @($stdout,$stderr)) {
                     if ($copy) {
                         $remaining=[Math]::Max(0,10000-[int]$cleanupClock.ElapsedMilliseconds)
@@ -579,19 +1036,20 @@ function Invoke-V2Supervisor {
                 if ($stdoutFile) { $stdoutFile.Flush($true) }; if ($stderrFile) { $stderrFile.Flush($true) }
                 $result.CleanupStatus='settled'
             } catch { $result.CleanupError=$_.Exception.ToString(); if ($result.ExitCode -eq 0) { $result.ExitCode=125 } }
+            # Pipeline cancellation resumes only finally; retain evidence before releasing owned handles.
+            $result.NativeGameExitCodes=@($records | Where-Object IsGame | Select-Object -ExpandProperty ExitCode)
+            if ($RequireGame -and (!$result.NativeGameExitCodes.Count -or @($result.NativeGameExitCodes | Where-Object { $null -eq $_ }).Count)) {
+                $result.SupervisorError += ' Native game process exit was not observed.'
+                if ($result.ExitCode -eq 0) { $result.ExitCode=125 }
+            }
+            if ($result.ExitCode -eq 0 -and @($result.NativeGameExitCodes | Where-Object { $_ -ne 0 }).Count) { $result.ExitCode=125; $result.SupervisorError += ' Native game failed despite worker0.' }
+            try { & $Archive $evidence $before $result; $result.ArchiveStatus='retained' }
+            catch { $result.ArchiveStatus='failed'; $result.ArchiveError=$_.Exception.ToString(); if ($result.ExitCode -eq 0) { $result.ExitCode=125 } }
+            $result | ConvertTo-Json -Depth 12 | Set-Content (Join-Path $evidence 'outcome.json')
+            "exitCode=$($result.ExitCode); workerExitCode=$($result.WorkerExitCode); timedOut=$($result.TimedOut); cleanup=$($result.CleanupStatus); archive=$($result.ArchiveStatus)" | Set-Content (Join-Path $evidence 'exit-code.txt')
+            # Clear only after durable outcome/evidence and verified cleanup; unresolved ownership blocks rerun.
+            if ($result.CleanupStatus -eq 'settled' -and $result.ArchiveStatus -eq 'retained') { $lock.SetLength(0); $lock.Flush($true) }
         }
-        $result.NativeGameExitCodes=@($records | Where-Object IsGame | Select-Object -ExpandProperty ExitCode)
-        if ($RequireGame -and (!$result.NativeGameExitCodes.Count -or @($result.NativeGameExitCodes | Where-Object { $null -eq $_ }).Count)) {
-            $result.SupervisorError += ' Native game process exit was not observed.'
-            if ($result.ExitCode -eq 0) { $result.ExitCode=125 }
-        }
-        if ($result.ExitCode -eq 0 -and @($result.NativeGameExitCodes | Where-Object { $_ -ne 0 }).Count) { $result.ExitCode=125; $result.SupervisorError += ' Native game failed despite worker0.' }
-        try { & $Archive $evidence $before; $result.ArchiveStatus='retained' }
-        catch { $result.ArchiveStatus='failed'; $result.ArchiveError=$_.Exception.ToString(); if ($result.ExitCode -eq 0) { $result.ExitCode=125 } }
-        $result | ConvertTo-Json -Depth 12 | Set-Content (Join-Path $evidence 'outcome.json')
-        "exitCode=$($result.ExitCode); workerExitCode=$($result.WorkerExitCode); timedOut=$($result.TimedOut); cleanup=$($result.CleanupStatus); archive=$($result.ArchiveStatus)" | Set-Content (Join-Path $evidence 'exit-code.txt')
-        # Clear only after durable outcome/evidence and verified cleanup; unresolved ownership blocks rerun.
-        if ($result.CleanupStatus -eq 'settled' -and $result.ArchiveStatus -eq 'retained') { $lock.SetLength(0); $lock.Flush($true) }
         return $result
     } finally {
         if ($job) { $job.Dispose() }
@@ -605,7 +1063,11 @@ function Invoke-V2Supervisor {
 if ($MyInvocation.InvocationName -ne '.') {
     $ErrorActionPreference='Stop'
     try {
-        $request=New-V2Request -Scenario $Scenario -Repeat $Repeat -EulaAccepted:$EulaAccepted -WrongExpectedBlock:$WrongExpectedBlock
+        $selection=@{}
+        foreach ($name in 'Scenario','Repeat','EulaAccepted','WrongExpectedBlock','Inspect') {
+            if ($PSBoundParameters.ContainsKey($name)) { $selection[$name]=$PSBoundParameters[$name] }
+        }
+        $request=New-V2Request @selection
         if (!$IsWindows -or $PSVersionTable.PSVersion.Major -lt 7) { throw 'Requires Windows and PowerShell7.' }
         $repo=Split-Path $PSScriptRoot
         $scenarioRoot=Join-Path $repo 'v2/fabric/build/scenario-results'

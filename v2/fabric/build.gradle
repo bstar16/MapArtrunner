@@ -35,18 +35,30 @@ loom {
         property 'mapart.test.scenario', providers.gradleProperty('mapart.test.scenario').getOrElse('all')
         property 'mapart.test.repeat', providers.gradleProperty('mapart.test.repeat').getOrElse('2')
     }
+    runs {
+        inspect {
+            client()
+            source sourceSets.gametest
+            runDir 'build/run/inspect'
+            property 'mapart.test.inspect', 'true'
+        }
+    }
 }
 
 sourceSets.test.resources.srcDir rootProject.file('test-fixtures')
 sourceSets.gametest.resources.srcDir rootProject.file('test-fixtures')
 
+sourceSets.test {
+    compileClasspath += sourceSets.gametest.output + sourceSets.gametest.compileClasspath
+    runtimeClasspath += sourceSets.gametest.output + sourceSets.gametest.runtimeClasspath
+}
+
 tasks.named('compileTestJava', JavaCompile) {
-    source('src/gametest/java/com/mapartrunner/fabric/scenario/threading/RegistrationAcknowledgement.java')
-    source('src/gametest/java/com/mapartrunner/fabric/scenario/threading/PacketHandlerAwait.java')
-    source('src/gametest/java/com/mapartrunner/fabric/scenario/TraversalCapture.java')
+    dependsOn tasks.named('gametestClasses')
 }
 
 tasks.named('test', Test) {
+    dependsOn tasks.named('gametestClasses')
     workingDir = layout.buildDirectory.dir('run/unitTest').get().asFile
     doFirst {
         workingDir.mkdirs()

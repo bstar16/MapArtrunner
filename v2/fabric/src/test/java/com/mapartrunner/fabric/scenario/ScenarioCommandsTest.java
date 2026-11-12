@@ -1,0 +1,792 @@
+package com.mapartrunner.fabric.scenario;
+
+import com.mojang.brigadier.CommandDispatcher;
+import net.fabricmc.fabric.api.client.command.v2.FabricClientCommandSource;
+import org.junit.jupiter.api.*;
+import org.junit.jupiter.api.io.TempDir;
+
+import java.lang.reflect.*;
+import java.nio.file.*;
+import java.time.Instant;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
+import java.util.function.*;
+
+import static com.mapartrunner.fabric.scenario.ScenarioHost.*;
+import static org.junit.jupiter.api.Assertions.*;
+
+/** Actual Commands/Runner/Host lifecycle; synthetic native boundaries never claim chat/world acceptance. */
+class ScenarioCommandsTest {
+    @BeforeAll static void bootstrap() {
+        net.minecraft.SharedConstants.createGameVersion(); net.minecraft.Bootstrap.initialize();
+    }
+    @TempDir Path directory;
+    // JUnit owns cleanup of these temporary trees; the native game root is never a fixture cleanup target.
+    Path receiptModule;
+
+    @Test void resetArchiveSelectionCannotArmBeforeRealWorkerBeginOrBypassMissingNativeResetGuard() throws Exception {
+        withResetArchive(() -> {
+            for(Command command:List.of(Command.RESET,Command.RERUN)) {
+                var f=fixture(null,null); assertEquals(1,f.commands.enqueue(command,message -> { }));
+                assertNull(field(ScenarioRunner.class,"inspectResetDiagnostic").get(f.runner));
+                assertEquals(0,fieldInt(f.runner,"inspectOrdinal")); f.queue.remove().run();
+                var completion=f.runner.lastInspectCompletion().orElseThrow();
+                assertEquals("FAIL",completion.verdict()); assertTrue(completion.runId().isEmpty());
+                assertTrue(completion.failure().getMessage().contains("startup"));
+                assertFalse(completion.failure() instanceof ScenarioRunner.SimulatedInspectResetFailure);
+                assertNull(field(ScenarioRunner.class,"inspectResetDiagnostic").get(f.runner));
+                assertFalse(Files.exists(completion.evidenceDirectory().resolve("simulated-reset-fault-verification.json")));
+                byte[] closed=Files.readAllBytes(completion.summaryPath());
+                assertEquals(1,f.commands.enqueue(Command.RESET,message -> { })); f.queue.remove().run();
+                assertArrayEquals(closed,Files.readAllBytes(completion.summaryPath()));
+                assertEquals(2,f.neutralScopes.size()); assertEquals(2,f.outcomes.size()); assertEquals(0,f.nativeEffects.get());
+            }
+            var f=fixture(null,null,operation -> assertDoesNotThrow(() -> Files.writeString(operation.evidenceDirectory().resolve("operation.json"),"collision")));
+            f.commands.enqueue(Command.RESET,message -> { }); f.queue.remove().run();
+            assertTrue(f.runner.inspectAdmissionFailure().isPresent()); assertTrue(f.neutralScopes.isEmpty());
+            assertTrue(f.commands.observeInspect().restartRequired()); assertNull(field(ScenarioRunner.class,"inspectResetDiagnostic").get(f.runner));
+        });
+    }
+
+    @Test void actualWorkerKeepsDetachedPrimaryAndClosesIncompleteProofButPreCallbackFailureLeavesInertDiagnostic() throws Exception {
+        withResetArchive(() -> {
+            for(boolean cleanupReceiptFailure:List.of(false,true)) {
+                var holder=new Fixture[1]; var primary=new ScenarioRunner.SimulatedInspectResetFailure[1]; var retained=new Object[1];
+                var launch=launch();
+                var receipts=new ScenarioLaunchReceipt(launch.getFileName().toString().substring(7),launch.toString(),path -> { },launch.getParent());
+                var f=fixture(receipts,null,operation -> { },false,scope -> {
+                    try {
+                        var current=holder[0]; var operation=scope.operation();
+                        primary[0]=new ScenarioRunner.SimulatedInspectResetFailure(new ScenarioRunner.ResetFailureFacts("ARCHIVE_BEFORE_COMMITTED",
+                                operation.sessionId(),operation.operationId(),operation.ordinal(),3,ScenarioDefinition.load().definitionHash(),"synthetic-policy-stage",scope.deadlineNanos()));
+                        // Synthetic read-only owner snapshot at the existing neutral boundary, never the native fault hook.
+                        var diagnostic=field(ScenarioRunner.class,"inspectResetDiagnostic"); var constructor=diagnostic.getType().getDeclaredConstructors()[0]; constructor.setAccessible(true);
+                        retained[0]=constructor.newInstance(operation,primary[0],operation.evidenceDirectory().resolve("reset-3"),3,null,
+                                new ScenarioRunner.InspectIdleObservation(new ScenarioObserver.Watch().retained()),null,null,null,null,null,null,null,null,null);
+                        diagnostic.set(current.runner,retained[0]);
+                        if(cleanupReceiptFailure) Files.writeString(launch.resolve("inspect-op-1.cleanup.json"),"collision");
+                    } catch(Exception error) { throw new AssertionError(error); }
+                    throw primary[0];
+                }); holder[0]=f;
+                f.commands.enqueue(Command.RESET,message -> { }); f.queue.remove().run();
+                if(cleanupReceiptFailure) {
+                    assertTrue(f.commands.observeInspect().restartRequired()); assertTrue(f.runner.lastInspectCompletion().isEmpty());
+                    assertSame(retained[0],field(ScenarioRunner.class,"inspectResetDiagnostic").get(f.runner));
+                    assertEquals(0,f.commands.enqueue(Command.RESET,message -> { })); assertTrue(f.queue.isEmpty());
+                    // Even if scheduling fields were cleared externally, Runner rejects the private stale diagnostic.
+                    set(f.runner,"inspectOperation",null);
+                    assertThrows(AssertionError.class,() -> f.runner.beginInspectOperation(Command.RUN));
+                } else {
+                    var result=f.runner.lastInspectCompletion().orElseThrow(); assertSame(primary[0],result.failure());
+                    assertFalse(result.evidenceComplete()); assertTrue(result.cleanupSettled()); assertTrue(result.runId().isEmpty());
+                    assertNull(field(ScenarioRunner.class,"inspectResetDiagnostic").get(f.runner));
+                    assertTrue(f.commands.lastDescription().contains(result.operationId().toString()));
+                    assertEquals(1,f.outcomes.size()); assertFalse(f.commands.observeInspect().busy());
+                }
+                assertEquals(0,f.nativeEffects.get(),"This partial worker test never reaches a native reset/archive hook");
+            }
+        });
+    }
+
+    private interface ResetWorkerTest { void run() throws Exception; }
+    private static void withResetArchive(ResetWorkerTest test) throws Exception {
+        var names=List.of("mapart.test.inspect","mapart.test.inspect.acceptance","fabric.client.gametest","mapart.test.inspect.acceptance.case");
+        var old=new HashMap<String,String>(); names.forEach(name -> old.put(name,System.getProperty(name)));
+        try { System.setProperty(names.get(0),"true"); System.setProperty(names.get(1),"true"); System.clearProperty(names.get(2)); System.setProperty(names.get(3),"reset-archive"); test.run(); }
+        finally { names.forEach(name -> { if(old.get(name)==null) System.clearProperty(name); else System.setProperty(name,old.get(name)); }); }
+    }
+
+    @Test void grammarHasExactlyFourLiteralBranches() {
+        var commands = new ScenarioCommands(new ArrayDeque<Runnable>()::add, nativeHost());
+        var dispatcher = new CommandDispatcher<FabricClientCommandSource>(); commands.register(dispatcher);
+        var root = dispatcher.getRoot().getChild("maparttest");
+        assertNull(root.getCommand()); assertEquals(4, root.getChildren().size());
+        for (var action : new String[]{"reset", "run", "rerun"}) {
+            var node = root.getChild(action);
+            assertNull(node.getCommand()); assertEquals(1, node.getChildren().size());
+            assertNotNull(node.getChild("grounded-two-lane").getCommand());
+            assertTrue(node.getChild("grounded-two-lane").getChildren().isEmpty());
+        }
+        assertNotNull(root.getChild("last").getCommand()); assertTrue(root.getChild("last").getChildren().isEmpty());
+    }
+
+    @Test void receiptFixturePublishesOnlyWithinTemporaryRootsAndPreservesNativeRoot() throws Exception {
+        var nativeGame = loadedModule().resolve("build/run/inspect");
+        var before = Files.exists(nativeGame, LinkOption.NOFOLLOW_LINKS) ? Files.readAttributes(nativeGame,
+                java.nio.file.attribute.BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS) : null;
+        var launch = launch(); var launchId = launch.getFileName().toString().substring(7);
+        var receipts = new ScenarioLaunchReceipt(launchId, launch.toString(), null, launch.getParent());
+        var f = fixture(receipts, null);
+        var roots = (ScenarioRunner.Roots) field(ScenarioRunner.class, "roots").get(f.runner);
+        assertTrue(roots.game().startsWith(directory.toRealPath())); assertTrue(roots.evidence().startsWith(directory.toRealPath()));
+        assertFalse(roots.game().startsWith(nativeGame)); assertFalse(roots.evidence().startsWith(loadedModule()));
+        f.commands.enqueue(Command.RUN, message -> { }); f.queue.remove().run();
+        var operation = f.outcomes.getFirst().operation();
+        assertTrue(operation.evidenceDirectory().startsWith(roots.evidence())); assertEquals(roots.evidence(), launch.getParent());
+        assertTrue(Files.isRegularFile(launch.resolve("inspect-op-1.begin.json")));
+        assertTrue(Files.isRegularFile(launch.resolve("inspect-op-1.cleanup.json")));
+        assertTrue(Files.isRegularFile(launch.resolve("inspect-op-1.end.json")));
+        var now = Instant.now();
+        var nativeEvidence = loadedModule().resolve("build/scenario-results");
+        var defaultReceipts = new ScenarioLaunchReceipt(launchId, launch.toString(), null, false);
+        // Default authority resolves its native evidence parent before checking this foreign operation.
+        if (Files.exists(nativeEvidence, LinkOption.NOFOLLOW_LINKS)) {
+            var refusal = assertThrows(AssertionError.class,
+                    () -> defaultReceipts.operation(operation, "WORK", now, now.plusMillis(600000), null, null));
+            assertEquals("Wrong/redirected operation evidence", refusal.getMessage());
+        } else {
+            var refusal = assertThrows(java.io.UncheckedIOException.class,
+                    () -> defaultReceipts.operation(operation, "WORK", now, now.plusMillis(600000), null, null));
+            assertEquals("Cannot publish owned startup", refusal.getMessage());
+            var missing = assertInstanceOf(NoSuchFileException.class, refusal.getCause());
+            assertEquals(nativeEvidence, Path.of(missing.getFile()));
+        }
+        var foreign = new Operation(operation.sessionId(), 1, operation.operationId(), Command.RUN, launch);
+        assertThrows(AssertionError.class, () -> receipts.operation(foreign, "WORK", now, now.plusMillis(600000), null, null));
+        assertThrows(AssertionError.class, () -> new ScenarioLaunchReceipt(launchId, launch.toString(), null,
+                roots.evidence().resolve(".")).operation(operation, "WORK", now, now.plusMillis(600000), null, null));
+        assertEquals(before != null, Files.exists(nativeGame, LinkOption.NOFOLLOW_LINKS));
+        if (before != null) {
+            var after = Files.readAttributes(nativeGame, java.nio.file.attribute.BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+            assertEquals(before.fileKey(), after.fileKey()); assertEquals(before.creationTime(), after.creationTime());
+            assertEquals(before.lastModifiedTime(), after.lastModifiedTime());
+        }
+    }
+
+    @Test void inactivePropertyIsInertAndUsesStandardBooleanSemantics() {
+        var previous = System.getProperty("mapart.test.inspect");
+        try {
+            for (var value : List.of("false", "1", "yes", "")) {
+                System.setProperty("mapart.test.inspect", value);
+                assertDoesNotThrow(() -> new ScenarioClientInitializer().onInitializeClient());
+                assertFalse(ScenarioClientInitializer.deferStop(null));
+            }
+            System.clearProperty("mapart.test.inspect");
+            assertDoesNotThrow(() -> new ScenarioClientInitializer().onInitializeClient());
+            assertFalse(ScenarioClientInitializer.deferStop(null));
+            System.setProperty("mapart.test.inspect", "true");
+            assertFalse(ScenarioClientInitializer.deferStop(null), "Absent installed owner is inert");
+        } finally {
+            if (previous == null) System.clearProperty("mapart.test.inspect"); else System.setProperty("mapart.test.inspect", previous);
+        }
+    }
+
+    @Test void callbacksQueueOnlyOneWorkerAndRefuseBeforeReadyOrOnForeignWorld() throws Exception {
+        var f = fixture(null, null); var replies = new ArrayList<String>();
+        set(f.commands, "ready", false);
+        assertEquals(0, f.commands.enqueue(Command.RUN, replies::add)); assertTrue(f.queue.isEmpty());
+        set(f.commands, "ready", true);
+        assertEquals(0, f.commands.submit(Command.RUN, null, replies::add));
+        assertEquals(0, field(ScenarioRunner.class, "inspectOrdinal").getInt(f.runner)); assertTrue(f.queue.isEmpty());
+        assertEquals(1, f.commands.enqueue(Command.RUN, replies::add));
+        assertEquals(0, f.commands.enqueue(Command.RESET, replies::add)); assertEquals(1, f.queue.size());
+        assertEquals(0, field(ScenarioRunner.class, "inspectOrdinal").getInt(f.runner));
+        f.queue.remove().run(); assertTrue(f.queue.isEmpty());
+        assertTrue(f.commands.lastDescription().contains("#1"));
+    }
+
+    @Test void inspectObservationSeparatesPublicationFromWorkerSettlementAndRetainsSnapshots() throws Exception {
+        var inactive = new ScenarioCommands(new ArrayDeque<Runnable>()::add, nativeHost()).observeInspect();
+        assertFalse(inactive.ready()); assertFalse(inactive.busy()); assertFalse(inactive.restartRequired());
+        assertTrue(inactive.last().isEmpty());
+        var f = fixture(null, null);
+        var initial = f.commands.observeInspect();
+        assertTrue(initial.ready()); assertFalse(initial.busy()); assertFalse(initial.restartRequired());
+        assertTrue(initial.last().isEmpty());
+        var feedback = new ArrayList<ScenarioCommands.InspectObservation>();
+        assertEquals(1, f.commands.enqueue(Command.RUN, message -> feedback.add(f.commands.observeInspect())));
+        var queued = f.commands.observeInspect();
+        assertTrue(queued.ready()); assertTrue(queued.busy()); assertFalse(queued.restartRequired());
+        assertTrue(queued.last().isEmpty());
+        assertEquals(0, fieldInt(f.runner, "inspectOrdinal")); assertTrue(f.outcomes.isEmpty());
+        assertEquals(1, f.queue.size()); assertEquals(0, f.nativeEffects.get());
+        assertFalse(Files.exists((Path) field(ScenarioRunner.class, "inspectDirectory").get(f.runner)));
+        f.queue.remove().run();
+        var published = feedback.getFirst();
+        assertTrue(published.ready()); assertTrue(published.busy()); assertFalse(published.restartRequired());
+        var observed = published.last().orElseThrow();
+        var completion = f.runner.lastInspectCompletion().orElseThrow();
+        assertEquals(completion.sessionId(), observed.sessionId()); assertEquals(completion.operationId(), observed.operationId());
+        assertEquals(1, observed.ordinal()); assertEquals(Command.RUN, observed.command());
+        assertEquals(completion.runId(), observed.runId()); assertEquals("FAIL", observed.verdict());
+        assertEquals(completion.evidenceComplete(), observed.evidenceComplete());
+        assertEquals(completion.cleanupStatus(), observed.cleanupStatus()); assertTrue(observed.cleanupSettled());
+        assertEquals(completion.evidenceDirectory().toString(), observed.evidenceDirectory());
+        assertEquals(completion.summaryPath().toString(), observed.summaryPath());
+        assertEquals(completion.failure().getClass().getName(), observed.failure().orElseThrow().className());
+        assertEquals(completion.failure().getMessage(), observed.failure().orElseThrow().message());
+        var settled = f.commands.observeInspect();
+        assertTrue(settled.ready()); assertFalse(settled.busy()); assertFalse(settled.restartRequired());
+        assertEquals(observed, settled.last().orElseThrow());
+        byte[] bytes = Files.readAllBytes(completion.summaryPath());
+        f.commands.enqueue(Command.RESET, message -> { });
+        var successorQueued = f.commands.observeInspect();
+        assertTrue(successorQueued.busy()); assertEquals(settled.last(), successorQueued.last());
+        f.queue.remove().run();
+        var successor = f.commands.observeInspect();
+        assertEquals(2, successor.last().orElseThrow().ordinal());
+        assertNotEquals(observed.operationId(), successor.last().orElseThrow().operationId());
+        f.commands.cancel(new IllegalStateException("replacement after successor"));
+        var cancelled = f.commands.observeInspect();
+        assertFalse(cancelled.ready()); assertFalse(cancelled.busy()); assertTrue(cancelled.restartRequired());
+        assertEquals(successor.last(), cancelled.last());
+        assertTrue(initial.last().isEmpty()); assertTrue(queued.last().isEmpty());
+        assertTrue(published.busy()); assertFalse(settled.busy()); assertFalse(settled.restartRequired());
+        assertEquals(observed, settled.last().orElseThrow()); assertEquals(1, observed.ordinal());
+        assertArrayEquals(bytes, Files.readAllBytes(completion.summaryPath()));
+    }
+
+    @Test void inspectObservationCopiesNullableFailureMessageAndHasOnlyImmutableValueComponents() throws Exception {
+        var failure = new IllegalStateException();
+        var f = fixture(null, null, operation -> { }, false, scope -> { throw failure; });
+        f.commands.enqueue(Command.RUN, message -> { }); f.queue.remove().run();
+        var observed = f.commands.observeInspect().last().orElseThrow().failure().orElseThrow();
+        assertEquals(IllegalStateException.class.getName(), observed.className()); assertNull(observed.message());
+        failure.addSuppressed(new IllegalArgumentException("later mutable graph"));
+        assertEquals(observed, f.commands.observeInspect().last().orElseThrow().failure().orElseThrow());
+        for (var type : List.of(ScenarioCommands.InspectObservation.class, ScenarioCommands.PublishedCompletion.class,
+                ScenarioCommands.FailureObservation.class)) {
+            assertTrue(type.isRecord());
+            for (var component : type.getRecordComponents())
+                assertTrue(Set.of(boolean.class, int.class, UUID.class, Command.class, String.class, Optional.class)
+                        .contains(component.getType()), component::toString);
+        }
+    }
+
+    @Test void acceptanceGuardRequiresGatesSettledValueEqualCurrentResultAndNativeAuthorityWithoutAllocation() throws Exception {
+        var names = List.of("mapart.test.inspect", "mapart.test.inspect.acceptance", "fabric.client.gametest");
+        var previous = new HashMap<String, String>(); names.forEach(name -> previous.put(name, System.getProperty(name)));
+        try {
+            System.setProperty(names.get(0), "true"); System.setProperty(names.get(1), "true"); System.clearProperty(names.get(2));
+            var f = fixture(null, null);
+            f.commands.enqueue(Command.RUN, message -> {
+                var publishedWhileBusy = f.commands.observeInspect().last().orElseThrow();
+                assertThrows(IllegalStateException.class, () -> f.commands.requireAcceptanceIdle(null, publishedWhileBusy));
+            });
+            f.queue.remove().run(); var current = f.commands.observeInspect().last().orElseThrow();
+            var equal = new ScenarioCommands.PublishedCompletion(current.sessionId(), current.operationId(), current.ordinal(),
+                    current.command(), current.runId(), current.verdict(), current.evidenceComplete(), current.cleanupStatus(),
+                    current.cleanupSettled(), current.evidenceDirectory(), current.summaryPath(), current.failure());
+            assertNotSame(current, equal); assertEquals(current, equal);
+            // Equal values reach Runner's real native-world guard. This unit fixture owns no native world.
+            assertEquals("Inspect command session/world unavailable",
+                    assertThrows(AssertionError.class, () -> f.commands.requireAcceptanceIdle(null, equal)).getMessage());
+            assertThrows(IllegalStateException.class, () -> f.commands.requireAcceptanceIdle(null, null));
+            var changed = new ScenarioCommands.PublishedCompletion(equal.sessionId(), UUID.randomUUID(), equal.ordinal(),
+                    equal.command(), equal.runId(), equal.verdict(), equal.evidenceComplete(), equal.cleanupStatus(),
+                    equal.cleanupSettled(), equal.evidenceDirectory(), equal.summaryPath(), equal.failure());
+            assertThrows(IllegalStateException.class, () -> f.commands.requireAcceptanceIdle(null, changed));
+            for (var name : names) {
+                System.setProperty(name, "false");
+                assertThrows(IllegalStateException.class, () -> f.commands.requireAcceptanceIdle(null, equal));
+                if (name.equals("fabric.client.gametest")) System.clearProperty(name); else System.setProperty(name, "true");
+            }
+            set(f.commands, "ready", false);
+            assertThrows(IllegalStateException.class, () -> f.commands.requireAcceptanceIdle(null, equal));
+            set(f.commands, "ready", true);
+            set(f.commands, "terminal", new IllegalStateException("terminal"));
+            assertThrows(IllegalStateException.class, () -> f.commands.requireAcceptanceIdle(null, equal));
+            set(f.commands, "terminal", null);
+            assertTrue(f.commands.requestStop());
+            assertThrows(IllegalStateException.class, () -> f.commands.requireAcceptanceIdle(null, equal));
+            assertEquals(1, fieldInt(f.runner, "inspectOrdinal"));
+            assertEquals(1, f.queue.size(), "Only the existing explicit close request may enqueue work");
+            assertEquals(0, f.nativeEffects.get(), "Read-only guards must not dispatch native actions");
+            var cancelled = fixture(null, null); cancelled.commands.enqueue(Command.RUN, message -> { }); cancelled.queue.remove().run();
+            var old = cancelled.commands.observeInspect().last().orElseThrow(); cancelled.commands.cancel(new IllegalStateException("test cancel"));
+            assertThrows(IllegalStateException.class, () -> cancelled.commands.requireAcceptanceIdle(null, old));
+            assertEquals(1, fieldInt(cancelled.runner, "inspectOrdinal")); assertTrue(cancelled.queue.isEmpty());
+        } finally {
+            names.forEach(name -> { if (previous.get(name) == null) System.clearProperty(name); else System.setProperty(name, previous.get(name)); });
+        }
+    }
+
+    @Test void runBeforeResetAndTwoResetFailuresHaveDistinctOwnedNoUuidEvidence() throws Exception {
+        var f = fixture(null, null);
+        for (var command : List.of(Command.RUN, Command.RESET, Command.RESET)) {
+            assertEquals(1, f.commands.enqueue(command, message -> { })); f.queue.remove().run();
+            var result = f.runner.lastInspectCompletion().orElseThrow();
+            assertEquals(command, result.command()); assertEquals("FAIL", result.verdict());
+            assertTrue(result.runId().isEmpty()); assertTrue(result.cleanupSettled());
+            assertTrue(Files.exists(result.evidenceDirectory().resolve("operation.json")));
+            assertTrue(Files.exists(result.summaryPath())); assertTrue(f.commands.isReady());
+            assertTrue(f.commands.lastDescription().contains(result.operationId().toString()));
+        }
+        assertEquals(3, field(ScenarioRunner.class, "inspectOrdinal").getInt(f.runner));
+        assertEquals(3, f.outcomes.size()); assertEquals(3, f.neutralScopes.size());
+        assertEquals(3, f.outcomes.stream().map(o -> o.operation().operationId()).distinct().count());
+        assertTrue(f.runner.lastInspectCompletion().orElseThrow().failure().getMessage().contains("startup"));
+    }
+
+    @Test void rerunSharesOneWorkScopeAndFailsAtResetBeforeRunWithoutRepairingWorld() throws Exception {
+        var f = fixture(null, null);
+        assertEquals(1, f.commands.enqueue(Command.RERUN, message -> { })); f.queue.remove().run();
+        var result = f.runner.lastInspectCompletion().orElseThrow();
+        assertEquals(Command.RERUN, result.command()); assertTrue(result.runId().isEmpty());
+        assertTrue(result.failure().getMessage().contains("startup"));
+        assertEquals(1, f.neutralScopes.size()); assertEquals(600_000_000_001L, f.neutralScopes.getFirst().deadlineNanos());
+        assertEquals(1, f.outcomes.size()); assertEquals(result.operationId(), f.outcomes.getFirst().operation().operationId());
+    }
+
+    @Test void busyAndLastStayReadOnlyThroughActualHostSettlementAndOldCompletionCannotPromote() throws Exception {
+        var holder = new Fixture[1]; var snapshots = new ArrayList<String>();
+        var f = fixture(null, outcome -> {
+            var current = holder[0]; snapshots.add(current.commands.lastDescription());
+            assertEquals(0, current.commands.enqueue(Command.RESET, message -> { }));
+            assertTrue(current.commands.lastDescription().contains("active"));
+            assertEquals(outcome.operation().ordinal(), fieldInt(current.runner, "inspectOrdinal"));
+        }); holder[0] = f;
+        f.commands.enqueue(Command.RUN, message -> { }); f.queue.remove().run();
+        var a = f.runner.lastInspectCompletion().orElseThrow(); byte[] bytes = Files.readAllBytes(a.summaryPath());
+        f.commands.enqueue(Command.RESET, message -> { }); f.queue.remove().run();
+        var b = f.runner.lastInspectCompletion().orElseThrow();
+        assertTrue(snapshots.getFirst().contains("last: none")); assertTrue(snapshots.getLast().contains(a.operationId().toString()));
+        assertTrue(f.commands.lastDescription().contains(b.operationId().toString()));
+        var stale = new Operation(a.sessionId(), a.ordinal(), a.operationId(), a.command(), a.evidenceDirectory());
+        assertThrows(IllegalStateException.class, () -> invoke(f.commands, "publish", new Class<?>[]{Operation.class, ScenarioRunner.InspectCompletion.class}, stale, a));
+        assertTrue(f.commands.lastDescription().contains(b.operationId().toString())); assertArrayEquals(bytes, Files.readAllBytes(a.summaryPath()));
+    }
+
+    @Test void everyN1FailureKeepsPriorLastAndPermanentlyRefusesSuccessorAfterWorkerReturn() throws Exception {
+        for (var boundary : List.of("allocation", "header", "pre-link", "post-link")) {
+            var launch = launch();
+            var receipts = new ScenarioLaunchReceipt(launch.getFileName().toString().substring(7), launch.toString(),
+                    path -> { if (boundary.equals("post-link") && path.getFileName().toString().equals("inspect-op-2.begin.json"))
+                        throw new IllegalStateException("after native hard link"); }, launch.getParent());
+            Consumer<Operation> header = operation -> {
+                if (boundary.equals("header") && operation.ordinal() == 2)
+                    assertDoesNotThrow(() -> Files.writeString(operation.evidenceDirectory().resolve("operation.json"), "collision"));
+            };
+            var f = fixture(receipts, null, header);
+            f.commands.enqueue(Command.RUN, message -> { }); f.queue.remove().run();
+            var prior = f.runner.lastInspectCompletion().orElseThrow(); byte[] bytes = Files.readAllBytes(prior.summaryPath());
+            var priorObservation = f.commands.observeInspect();
+            if (boundary.equals("allocation")) {
+                // Inject only the unavailable allocation parent; preserve every prior operation byte.
+                var blocked = prior.evidenceDirectory().getParent().resolve("allocation-blocked"); Files.writeString(blocked, "blocked");
+                set(f.runner, "inspectDirectory", blocked);
+            }
+            if (boundary.equals("pre-link")) Files.writeString(launch.resolve("inspect-op-2.begin.json"), "existing BEGIN");
+            f.commands.enqueue(Command.RESET, message -> { }); f.queue.remove().run();
+            var failed = f.runner.failedInspectAdmission().orElseThrow();
+            assertEquals(2, failed.ordinal()); assertFalse(f.commands.isReady());
+            assertSame(prior, f.runner.lastInspectCompletion().orElseThrow());
+            assertTrue(f.commands.lastDescription().contains(prior.operationId().toString()));
+            var failedObservation = f.commands.observeInspect();
+            assertFalse(failedObservation.ready()); assertFalse(failedObservation.busy()); assertTrue(failedObservation.restartRequired());
+            assertEquals(priorObservation.last(), failedObservation.last());
+            assertTrue(priorObservation.ready()); assertFalse(priorObservation.restartRequired());
+            for (var command : List.of(Command.RESET, Command.RUN, Command.RERUN)) {
+                var replies = new ArrayList<String>(); assertEquals(0, f.commands.enqueue(command, replies::add));
+                assertTrue(replies.getFirst().contains("restart required"));
+            }
+            assertTrue(f.queue.isEmpty()); assertEquals(2, fieldInt(f.runner, "inspectOrdinal"));
+            assertEquals(1, f.neutralScopes.size(), "No native work after damaged admission");
+            assertArrayEquals(bytes, Files.readAllBytes(prior.summaryPath()));
+            assertFalse(Files.exists(launch.resolve("inspect-op-3.begin.json")));
+            if (boundary.equals("post-link")) assertTrue(Files.readString(launch.resolve("inspect-op-2.begin.json")).contains("WORK"));
+            var begin = launch.resolve("inspect-op-2.begin.json");
+            byte[] retainedBegin = Files.exists(begin) ? Files.readAllBytes(begin) : null;
+            assertTrue(f.commands.requestStop(), "N1 survives terminal mutation admission");
+            assertTrue(f.commands.requestStop()); assertEquals(1, f.queue.size());
+            f.queue.remove().run(); assertTrue(f.commands.releaseNativeStop()); assertFalse(f.commands.requestStop());
+            assertTrue(field(ScenarioRunner.class, "closed").getBoolean(f.runner));
+            assertEquals(2, fieldInt(f.runner, "inspectOrdinal")); assertSame(prior, f.runner.lastInspectCompletion().orElseThrow());
+            assertFalse(Files.exists(launch.resolve("inspect-op-2.cleanup.json"))); assertFalse(Files.exists(launch.resolve("inspect-op-2.end.json")));
+            if (retainedBegin != null) assertArrayEquals(retainedBegin, Files.readAllBytes(begin));
+            assertEquals(0, f.commands.enqueue(Command.RUN, message -> { })); assertTrue(f.queue.isEmpty());
+            assertArrayEquals(bytes, Files.readAllBytes(prior.summaryPath()));
+        }
+    }
+
+    @Test void unresolvedSettlementCannotReopenAdmissionOrPromoteLast() throws Exception {
+        var f = fixture(null, outcome -> { throw new IllegalStateException("END settlement failed"); });
+        f.commands.enqueue(Command.RUN, message -> { }); f.queue.remove().run();
+        assertFalse(f.commands.isReady()); assertTrue(f.runner.lastInspectCompletion().isEmpty());
+        assertEquals(0, f.commands.enqueue(Command.RESET, message -> { }));
+        assertEquals(1, fieldInt(f.runner, "inspectOrdinal")); assertTrue(f.queue.isEmpty());
+        assertThrows(AssertionError.class, f.runner::close); assertEquals(1, fieldInt(f.runner, "inspectOrdinal"));
+        assertFalse(f.commands.requestStop()); assertTrue(f.queue.isEmpty());
+    }
+
+    @Test void unresolvedRunnerReleaseCannotPromoteLastOrReserveSuccessorAfterEnd() throws Exception {
+        var f = fixture(null, null, operation -> { }, true);
+        set(f.runner, "worldCreated", true); // Synthetic native envelope; actual release is deliberately unavailable.
+        f.commands.enqueue(Command.RUN, message -> { }); f.queue.remove().run();
+        assertEquals(CleanupStatus.UNRESOLVED, f.outcomes.getFirst().cleanup());
+        assertTrue(f.runner.lastInspectCompletion().isEmpty()); assertFalse(f.commands.isReady());
+        for (var command : List.of(Command.RESET, Command.RUN, Command.RERUN))
+            assertEquals(0, f.commands.enqueue(command, message -> { }));
+        assertEquals(1, fieldInt(f.runner, "inspectOrdinal")); assertTrue(f.queue.isEmpty());
+        assertThrows(AssertionError.class, f.runner::close);
+    }
+
+    @Test void cancellationInvalidatesQueuedWorkAndNeverBindsAReplacement() throws Exception {
+        var f = fixture(null, null); f.commands.enqueue(Command.RUN, message -> { });
+        f.commands.cancel(new IllegalStateException("foreign replacement")); f.queue.remove().run();
+        assertEquals(0, fieldInt(f.runner, "inspectOrdinal")); assertTrue(f.runner.lastInspectCompletion().isEmpty());
+        assertEquals(0, f.commands.enqueue(Command.RESET, message -> { })); assertTrue(f.commands.lastDescription().contains("restart required"));
+    }
+
+    @Test void cancellationDuringSettlementRetainsPriorPublishedLast() throws Exception {
+        var holder = new Fixture[1];
+        var f = fixture(null, outcome -> {
+            if (outcome.operation().ordinal() == 2) holder[0].commands.cancel(new IllegalStateException("replacement during END"));
+        }); holder[0] = f;
+        f.commands.enqueue(Command.RUN, message -> { }); f.queue.remove().run();
+        var prior = f.runner.lastInspectCompletion().orElseThrow();
+        var priorObservation = f.commands.observeInspect();
+        var replies = new ArrayList<String>(); f.commands.enqueue(Command.RESET, replies::add); f.queue.remove().run();
+        assertEquals(2, f.runner.lastInspectCompletion().orElseThrow().ordinal());
+        var cancelled = f.commands.observeInspect();
+        assertFalse(cancelled.ready()); assertFalse(cancelled.busy()); assertTrue(cancelled.restartRequired());
+        assertEquals(priorObservation.last(), cancelled.last(), "Commands retains last while Runner has unpublished successor");
+        assertTrue(priorObservation.ready()); assertFalse(priorObservation.restartRequired());
+        assertTrue(f.commands.lastDescription().contains(prior.operationId().toString()));
+        assertTrue(f.commands.lastDescription().contains("restart required"));
+        assertTrue(replies.getLast().contains("restart required"));
+        assertEquals(0, f.commands.enqueue(Command.RUN, message -> { }));
+        assertEquals(2, fieldInt(f.runner, "inspectOrdinal"));
+    }
+
+    @Test void nativeCancellationAndStoppingReturnWhileRealBeginPublicationStillHoldsPhaseLock() throws Exception {
+        for (var boundary : List.of("cancel", "stopping", "application-exit")) {
+            var entered = new CountDownLatch(1); var release = new CountDownLatch(1);
+            var returned = new CountDownLatch(1); var holder = new Fixture[1];
+            var launch = launch();
+            var receipts = new ScenarioLaunchReceipt(launch.getFileName().toString().substring(7), launch.toString(), path -> {
+                if (!path.getFileName().toString().equals("inspect-op-1.begin.json")) return;
+                assertTrue(assertDoesNotThrow(() -> (java.util.concurrent.locks.ReentrantLock)
+                        field(InspectScenarioHost.class, "lock").get(holder[0].nativeHost)).isHeldByCurrentThread());
+                entered.countDown(); assertDoesNotThrow(() -> assertTrue(release.await(10, TimeUnit.SECONDS)));
+            }, launch.getParent());
+            var f = fixture(receipts, null); holder[0] = f;
+            var callbackFailure = new AtomicReference<Throwable>(); var expected = new AtomicReference<Throwable>();
+            var original = new IllegalStateException("native cancellation original");
+            var callback = new Thread(() -> {
+                f.nativeThread.set(true);
+                try {
+                    if (boundary.equals("stopping")) f.nativeHost.onStopping(null);
+                    if (boundary.equals("application-exit")) assertTrue(f.commands.requestStop());
+                    else f.commands.cancel(original); // Same synchronous owner call as the initializer lifecycle callbacks.
+                    @SuppressWarnings("unchecked") var cause = (AtomicReference<Throwable>) field(InspectScenarioHost.class, "originalFailure").get(f.nativeHost);
+                    expected.set(cause.get());
+                } catch (Throwable failure) { callbackFailure.set(failure); }
+                finally { f.nativeThread.remove(); returned.countDown(); }
+            }, "inspect-native-cancel-test");
+            f.commands.enqueue(Command.RUN, message -> { });
+            var worker = new Thread(f.queue.remove(), "inspect-command-publication-test");
+            try {
+                worker.start(); assertTrue(entered.await(2, TimeUnit.SECONDS)); callback.start();
+                assertTrue(returned.await(2, TimeUnit.SECONDS), "Native callback blocked behind receipt publication");
+                assertEquals(1, release.getCount(), "Callback must return before the phase lock is released");
+                assertNull(callbackFailure.get()); assertNotNull(expected.get());
+                if (boundary.equals("cancel")) assertSame(original, expected.get());
+                if (boundary.equals("application-exit")) assertEquals("Inspect application exit requested", expected.get().getMessage());
+                assertFalse(f.commands.isReady());
+            } finally {
+                release.countDown(); worker.join(5000); callback.join(5000);
+                assertFalse(worker.isAlive()); assertFalse(callback.isAlive());
+            }
+            assertSame(expected.get(), f.runner.lastInspectCompletion().orElseThrow().failure());
+            assertTrue(f.neutralScopes.isEmpty()); assertEquals(0, f.nativeEffects.get());
+            assertTrue(f.commands.lastDescription().contains("last: none"));
+            assertEquals(0, f.commands.enqueue(Command.RESET, message -> { }));
+            assertEquals(1, fieldInt(f.runner, "inspectOrdinal"));
+        }
+    }
+
+    @Test void initializationReturnsImmediatelyAndCannotManufactureReadyOnFactoryFailure() throws Exception {
+        var queue = new ArrayDeque<Runnable>(); var nativeEffects = new AtomicInteger();
+        var host = new InspectScenarioHost(() -> 1L, () -> false, () -> false,
+                action -> nativeEffects.incrementAndGet(), action -> nativeEffects.incrementAndGet(), outcome -> fail("No startup outcome"));
+        var commands = new ScenarioCommands(queue::add, host); var stops = new AtomicInteger();
+        commands.initialize(new ScenarioObserver.Watch(), new ScenarioLaunchReceipt(null, null), stops::incrementAndGet);
+        assertEquals(1, queue.size()); assertFalse(commands.isReady()); assertEquals(0, stops.get());
+        var startup = commands.observeInspect();
+        assertFalse(startup.ready()); assertTrue(startup.busy()); assertFalse(startup.restartRequired()); assertTrue(startup.last().isEmpty());
+        // The real factory reads native root metadata, then refuses the unit launcher's unmanaged binding.
+        var diagnostic = new java.io.ByteArrayOutputStream(); var previous = System.err;
+        try {
+            System.setErr(new java.io.PrintStream(diagnostic)); queue.remove().run();
+        } finally { System.setErr(previous); }
+        var failure = (Throwable) field(ScenarioCommands.class, "terminal").get(commands);
+        var nativeGame = loadedModule().resolve("build/run/inspect");
+        assertTrue(failure instanceof IllegalStateException && "Cannot establish loaded-module authority".equals(failure.getMessage())
+                        && failure.getCause() instanceof NoSuchFileException missing && nativeGame.equals(Path.of(missing.getFile()))
+                || failure instanceof AssertionError && "Unmanaged/redirected game root".equals(failure.getMessage()),
+                () -> "Unexpected startup failure: " + failure);
+        var text = diagnostic.toString(java.nio.charset.StandardCharsets.UTF_8);
+        assertTrue(text.contains("Inspect startup failed; ordinary client stop requested"));
+        assertTrue(text.contains(failure.toString()), "Retain the actual authority refusal diagnostic");
+        assertNull(field(ScenarioCommands.class, "runner").get(commands));
+        assertEquals(0, nativeEffects.get()); assertTrue(queue.isEmpty());
+        assertEquals(1, stops.get()); assertFalse(commands.isReady());
+        var terminal = commands.observeInspect();
+        assertFalse(terminal.ready()); assertFalse(terminal.busy()); assertTrue(terminal.restartRequired()); assertTrue(terminal.last().isEmpty());
+        assertTrue(startup.busy()); assertFalse(startup.restartRequired());
+        assertFalse(commands.requestStop(), "Failure's native stop must pass through without recursive CLOSE");
+        assertEquals(0, commands.enqueue(Command.RUN, message -> { }));
+        assertThrows(IllegalStateException.class, () -> commands.initialize(new ScenarioObserver.Watch(), null, () -> { }));
+    }
+
+    @Test void firstExitClosesAdmissionAndRepeatedRequestsNeverRenewOrQueueAnotherClose() throws Exception {
+        var f = fixture(null, null); var now = new AtomicLong(1);
+        set(f.commands, "clock", (LongSupplier) now::get);
+        assertTrue(f.commands.requestStop()); assertEquals(1, f.queue.size());
+        assertEquals(0, f.commands.enqueue(Command.RUN, message -> { }));
+        now.set(9_000_000_001L); assertTrue(f.commands.requestStop()); assertEquals(1, f.queue.size());
+        now.set(10_000_000_001L);
+        set(f.commands, "clock", (LongSupplier) () -> { throw new AssertionError("Observation must not read time"); });
+        var observation = f.commands.observeInspect();
+        assertFalse(observation.ready()); assertTrue(observation.busy()); assertTrue(observation.restartRequired());
+        assertTrue(observation.last().isEmpty());
+        assertEquals("REQUESTED", field(ScenarioCommands.class, "exit").get(f.commands).toString());
+        set(f.commands, "clock", (LongSupplier) now::get);
+        assertTrue(f.commands.releaseNativeStop());
+        assertFalse(f.commands.requestStop()); f.queue.remove().run();
+        assertEquals(0, fieldInt(f.runner, "inspectOrdinal"), "Cutoff cannot allocate late CLOSE permission");
+        assertTrue(f.outcomes.isEmpty()); assertEquals(0, f.nativeEffects.get());
+    }
+
+    @Test void cutoffDuringCloseAllocationRetainsIncompleteTruthWithoutIssuingLateWork() throws Exception {
+        var now = new AtomicLong(1);
+        var f = fixture(null, null, operation -> {
+            if (operation.command() == Command.CLOSE) now.set(10_000_000_001L);
+        }); set(f.commands, "clock", (LongSupplier) now::get);
+        f.commands.enqueue(Command.RUN, message -> { }); f.queue.remove().run();
+        var prior = f.runner.lastInspectCompletion().orElseThrow();
+        assertTrue(f.commands.requestStop()); f.queue.remove().run();
+        var pending = (Operation) field(ScenarioRunner.class, "inspectOperation").get(f.runner);
+        assertEquals(Command.CLOSE, pending.command()); assertEquals(2, pending.ordinal());
+        var header = pending.evidenceDirectory().resolve("operation.json"); var bytes = Files.readAllBytes(header);
+        assertFalse(Files.exists(pending.evidenceDirectory().resolve("completion.json")));
+        assertNull(field(InspectScenarioHost.class, "current").get(f.nativeHost));
+        assertSame(prior, f.runner.lastInspectCompletion().orElseThrow()); assertEquals(1, f.outcomes.size());
+        assertTrue(f.commands.releaseNativeStop()); assertFalse(f.commands.requestStop()); assertTrue(f.queue.isEmpty());
+        assertArrayEquals(bytes, Files.readAllBytes(header)); assertEquals(0, f.nativeEffects.get());
+    }
+
+    @Test void idleExitUsesActualCloseScopeAndSettlesWhileDisconnectRetainsPublishedLast() throws Exception {
+        var holder = new Fixture[1];
+        var f = fixture(null, outcome -> {
+            if (outcome.operation().command() == Command.CLOSE) {
+                assertTrue(holder[0].commands.requestStop(), "Reentrant native intent stays deferred through END");
+                holder[0].commands.cancel(new IllegalStateException("Inspect connection disconnected; restart required"));
+            }
+        }); holder[0] = f;
+        f.commands.enqueue(Command.RUN, message -> { }); f.queue.remove().run();
+        var prior = f.runner.lastInspectCompletion().orElseThrow();
+        assertTrue(f.commands.requestStop()); f.queue.remove().run();
+        var close = f.runner.lastInspectCompletion().orElseThrow();
+        assertEquals(Command.CLOSE, close.command()); assertTrue(close.cleanupSettled()); assertEquals("PASS", close.verdict());
+        assertTrue(Files.exists(close.summaryPath())); assertTrue(field(ScenarioRunner.class, "closed").getBoolean(f.runner));
+        assertEquals(2, f.outcomes.size()); assertTrue(f.commands.lastDescription().contains(prior.operationId().toString()));
+        assertFalse(f.commands.lastDescription().contains(close.operationId().toString()));
+        assertTrue(f.commands.releaseNativeStop()); assertFalse(f.commands.requestStop()); assertTrue(f.queue.isEmpty());
+    }
+
+    @Test void exitCancelsQueuedWorkWithoutReservingSuccessorClose() throws Exception {
+        var f = fixture(null, null); f.commands.enqueue(Command.RUN, message -> { });
+        assertTrue(f.commands.requestStop()); assertEquals(1, f.queue.size());
+        f.queue.remove().run(); assertTrue(f.commands.releaseNativeStop());
+        assertEquals(0, fieldInt(f.runner, "inspectOrdinal")); assertTrue(f.outcomes.isEmpty());
+        assertEquals(0, f.commands.enqueue(Command.RUN, message -> { }));
+    }
+
+    @Test void pendingWorkExitUnwindsItsOriginalCleanupAndRetainsPriorLastAndCause() throws Exception {
+        var holder = new Fixture[1]; var stopInWork = new AtomicBoolean();
+        var f = fixture(null, null, operation -> { }, false, scope -> {
+            if (stopInWork.get()) {
+                assertTrue(holder[0].commands.requestStop());
+                assertTrue(holder[0].commands.requestStop());
+            }
+        }); holder[0] = f;
+        f.commands.enqueue(Command.RUN, message -> { }); f.queue.remove().run();
+        var prior = f.runner.lastInspectCompletion().orElseThrow(); stopInWork.set(true);
+        f.commands.enqueue(Command.RESET, message -> { }); f.queue.remove().run();
+        var cancelled = f.runner.lastInspectCompletion().orElseThrow();
+        assertEquals(Command.RESET, cancelled.command()); assertTrue(cancelled.cleanupSettled());
+        assertEquals("Inspect application exit requested", cancelled.failure().getMessage());
+        assertTrue(f.commands.lastDescription().contains(prior.operationId().toString()));
+        assertSame(prior, field(ScenarioCommands.class, "last").get(f.commands));
+        assertTrue(f.commands.releaseNativeStop()); assertEquals(2, fieldInt(f.runner, "inspectOrdinal"));
+        assertEquals(2, f.outcomes.size()); assertTrue(f.queue.isEmpty()); assertEquals(0, f.nativeEffects.get());
+    }
+
+    @Test void exitDuringIssuedCleanupRetainsOriginalFailureAndDoesNotStartAnotherClose() throws Exception {
+        var holder = new Fixture[1]; var original = new AtomicReference<Throwable>();
+        var f = fixture(null, outcome -> {
+            if (outcome.operation().ordinal() != 2) return;
+            var current = assertDoesNotThrow(() -> (Scope) field(InspectScenarioHost.class, "current").get(holder[0].nativeHost));
+            assertEquals(Kind.CLEANUP, current.kind());
+            @SuppressWarnings("unchecked") var cause = assertDoesNotThrow(() -> (AtomicReference<Throwable>)
+                    field(InspectScenarioHost.class, "originalFailure").get(holder[0].nativeHost));
+            original.set(cause.get());
+            assertTrue(holder[0].commands.requestStop()); assertSame(original.get(), cause.get());
+        }); holder[0] = f;
+        f.commands.enqueue(Command.RUN, message -> { }); f.queue.remove().run();
+        var prior = f.runner.lastInspectCompletion().orElseThrow();
+        f.commands.enqueue(Command.RESET, message -> { }); f.queue.remove().run();
+        assertSame(original.get(), f.runner.lastInspectCompletion().orElseThrow().failure());
+        assertTrue(f.commands.lastDescription().contains(prior.operationId().toString()));
+        assertEquals(2, fieldInt(f.runner, "inspectOrdinal")); assertTrue(f.queue.isEmpty());
+        assertTrue(f.commands.releaseNativeStop()); assertEquals(0, f.nativeEffects.get());
+    }
+
+    @Test void pendingStartupExitUsesOriginalStartupCleanupWithoutN1OrOrdinaryLast() throws Exception {
+        var f = fixture(null, null);
+        invoke(f.runner, "reserveInspectStartup", new Class<?>[]{});
+        set(f.commands, "ready", false); set(f.commands, "queued", true);
+        Runnable startup = () -> {
+            assertTrue(f.commands.requestStop()); f.nativeHost.waitTick();
+        };
+        var failure = assertThrows(IllegalStateException.class, () -> invoke(f.runner, "initializeInspectStartup",
+                new Class<?>[]{Runnable.class}, startup));
+        invoke(f.commands, "workerFinished", new Class<?>[]{});
+        assertEquals("Inspect application exit requested", failure.getMessage());
+        assertTrue(f.runner.inspectAdmissionFailure().isEmpty()); assertTrue(f.runner.failedInspectAdmission().isEmpty());
+        assertNull(field(InspectScenarioHost.class, "current").get(f.nativeHost));
+        assertTrue(f.runner.lastInspectCompletion().isEmpty()); assertTrue(f.outcomes.isEmpty());
+        assertEquals(0, fieldInt(f.runner, "inspectOrdinal")); assertTrue(f.commands.releaseNativeStop());
+        assertFalse(f.commands.requestStop()); assertTrue(f.queue.isEmpty()); assertEquals(0, f.nativeEffects.get());
+    }
+
+    @Test void damagedCloseAdmissionUsesN1OnceWithoutRepairingItsPhaseStream() throws Exception {
+        var f = fixture(null, null, operation -> {
+            if (operation.command() == Command.CLOSE)
+                assertDoesNotThrow(() -> Files.writeString(operation.evidenceDirectory().resolve("operation.json"), "collision"));
+        });
+        f.commands.enqueue(Command.RUN, message -> { }); f.queue.remove().run();
+        var prior = f.runner.lastInspectCompletion().orElseThrow();
+        assertTrue(f.commands.requestStop()); f.queue.remove().run();
+        assertTrue(f.runner.inspectAdmissionFailure().isPresent()); assertEquals(2, fieldInt(f.runner, "inspectOrdinal"));
+        assertTrue(field(ScenarioRunner.class, "closed").getBoolean(f.runner));
+        assertTrue(field(InspectScenarioHost.class, "shutdownIssued").getBoolean(f.nativeHost));
+        assertSame(prior, f.runner.lastInspectCompletion().orElseThrow()); assertEquals(1, f.outcomes.size());
+        assertTrue(f.commands.releaseNativeStop()); assertFalse(f.commands.requestStop()); assertTrue(f.queue.isEmpty());
+    }
+
+    @Test void pendingNativeActionIsRefusedAfterExitCancellationAndNativeStopping() throws Exception {
+        var holder = new Fixture[1]; var nativeQueue = new LinkedBlockingQueue<Runnable>(); var effects = new AtomicInteger();
+        var f = fixture(null, null, operation -> { }, false,
+                scope -> holder[0].nativeHost.runOnClient(client -> effects.incrementAndGet()), nativeQueue::add);
+        holder[0] = f;
+        f.commands.enqueue(Command.RUN, message -> { }); var worker = new Thread(f.queue.remove(), "inspect-late-action-test");
+        try {
+            worker.start(); var late = nativeQueue.poll(2, TimeUnit.SECONDS); assertNotNull(late);
+            assertTrue(f.commands.requestStop());
+            worker.join(5000); assertFalse(worker.isAlive()); assertTrue(f.commands.releaseNativeStop());
+            f.nativeThread.set(true);
+            try { f.nativeHost.onStopping(null); late.run(); }
+            finally { f.nativeThread.remove(); }
+            assertEquals(0, effects.get()); assertEquals(1, fieldInt(f.runner, "inspectOrdinal"));
+            assertEquals("Inspect application exit requested", f.runner.lastInspectCompletion().orElseThrow().failure().getMessage());
+            assertFalse(f.commands.requestStop()); assertTrue(f.queue.isEmpty());
+        } finally {
+            f.commands.cancel(new IllegalStateException("test finally")); worker.join(5000); assertFalse(worker.isAlive());
+        }
+    }
+
+    @Test void retainedN1CannotRenewIssuedExpiredOrSettledCleanup() throws Exception {
+        for (var state : List.of("issued", "expired", "settled", "stopped")) {
+            var f = fixture(null, null, operation -> {
+                assertDoesNotThrow(() -> Files.writeString(operation.evidenceDirectory().resolve("operation.json"), "collision"));
+            });
+            f.commands.enqueue(Command.RUN, message -> { }); f.queue.remove().run();
+            var failed = f.runner.failedInspectAdmission().orElseThrow();
+            var now = new AtomicLong(1); set(f.nativeHost, "clock", (LongSupplier) now::get);
+            var cleanup = f.nativeHost.beginShutdownCleanup(failed, f.runner.inspectAdmissionFailure().orElseThrow());
+            if (state.equals("expired")) now.set(cleanup.deadlineNanos());
+            if (state.equals("settled")) f.nativeHost.inScope(cleanup, () -> f.nativeHost.settleCleanup(cleanup,
+                    new FinalOutcome(failed, Verdict.FAILURE, CleanupStatus.SETTLED)));
+            if (state.equals("stopped")) {
+                f.nativeThread.set(true); try { f.nativeHost.onStopping(null); } finally { f.nativeThread.remove(); }
+            }
+            var current = field(InspectScenarioHost.class, "current").get(f.nativeHost);
+            assertTrue(f.commands.requestStop()); f.queue.remove().run();
+            assertSame(current, field(InspectScenarioHost.class, "current").get(f.nativeHost));
+            assertEquals(1, fieldInt(f.runner, "inspectOrdinal")); assertTrue(f.outcomes.isEmpty());
+            assertTrue(f.commands.releaseNativeStop()); assertFalse(f.commands.requestStop());
+            assertEquals(0, f.nativeEffects.get()); assertTrue(f.queue.isEmpty());
+        }
+    }
+
+    private Fixture fixture(ScenarioLaunchReceipt receipts, Consumer<FinalOutcome> observe) throws Exception {
+        return fixture(receipts, observe, operation -> { });
+    }
+    private Fixture fixture(ScenarioLaunchReceipt receipts, Consumer<FinalOutcome> observe, Consumer<Operation> header) throws Exception {
+        return fixture(receipts, observe, header, false);
+    }
+    private Fixture fixture(ScenarioLaunchReceipt receipts, Consumer<FinalOutcome> observe, Consumer<Operation> header,
+                            boolean failRelease) throws Exception {
+        return fixture(receipts, observe, header, failRelease, scope -> { });
+    }
+    private Fixture fixture(ScenarioLaunchReceipt receipts, Consumer<FinalOutcome> observe, Consumer<Operation> header,
+                            boolean failRelease, Consumer<Scope> onNeutral) throws Exception {
+        return fixture(receipts, observe, header, failRelease, onNeutral,
+                action -> fail("No native client action in lifecycle fixture"));
+    }
+    private Fixture fixture(ScenarioLaunchReceipt receipts, Consumer<FinalOutcome> observe, Consumer<Operation> header,
+                            boolean failRelease, Consumer<Scope> onNeutral, Consumer<Runnable> clientQueue) throws Exception {
+        var outcomes = new ArrayList<FinalOutcome>(); var neutral = new ArrayList<Scope>();
+        var nativeThread = ThreadLocal.withInitial(() -> false); var nativeEffects = new AtomicInteger();
+        var nativeHost = new InspectScenarioHost(() -> 1L, nativeThread::get, () -> false,
+                action -> { nativeEffects.incrementAndGet(); clientQueue.accept(action); },
+                action -> { nativeEffects.incrementAndGet(); fail("No native server action in lifecycle fixture"); },
+                outcome -> { outcomes.add(outcome); if (observe != null) observe.accept(outcome); }, receipts, Instant::now);
+        // Only native chat observation is substituted. All scope/evidence/admission/settlement owners are real.
+        var host = (Inspect) Proxy.newProxyInstance(Inspect.class.getClassLoader(), new Class<?>[]{Inspect.class}, (proxy, method, arguments) -> {
+            if (method.getName().equals("awaitNeutralChat")) {
+                var current = (Scope) field(InspectScenarioHost.class, "current").get(nativeHost);
+                onNeutral.accept(current);
+                var op = current.operation();
+                neutral.add(nativeHost.requireScope(op, Kind.WORK)); return null;
+            }
+            try { return method.invoke(nativeHost, arguments); }
+            catch (InvocationTargetException failure) { throw failure.getCause(); }
+        });
+        var module = receipts == null ? Files.createTempDirectory(directory, "module-") : receiptModule;
+        var build = Files.createDirectories(module.resolve("build"));
+        var game = Files.createDirectories(build.resolve("run/inspect"));
+        var evidence = build.resolve("scenario-results");
+        var roots = new ScenarioRunner.Roots(module, game, build, evidence, game.resolve("saves"));
+        var watch = new ScenarioObserver.Watch();
+        var runner = failRelease ? new ScenarioRunner(host, watch, roots,
+                () -> { throw new IllegalStateException("owned release unavailable"); }, watch::freeze)
+                : new ScenarioRunner(host, watch, roots, header);
+        var queue = new ArrayDeque<Runnable>(); var commands = new ScenarioCommands(queue::add, host);
+        set(commands, "runner", runner); set(commands, "ready", true);
+        return new Fixture(commands, runner, queue, outcomes, neutral, nativeHost, nativeThread, nativeEffects);
+    }
+
+    private Path launch() throws Exception {
+        if (receiptModule == null) receiptModule = Files.createTempDirectory(directory, "receipt-module-");
+        var root = Files.createDirectories(receiptModule.resolve("build/scenario-results"));
+        return Files.createDirectory(root.resolve("launch-" + UUID.randomUUID()));
+    }
+    private static Path loadedModule() throws Exception {
+        var source = Path.of(ScenarioRunner.class.getProtectionDomain().getCodeSource().getLocation().toURI()).toRealPath();
+        return source.getParent().getParent().getParent().getParent();
+    }
+    private static InspectScenarioHost nativeHost() {
+        return new InspectScenarioHost(() -> 1L, () -> false, () -> false, Runnable::run, Runnable::run, outcome -> { });
+    }
+    private static Field field(Class<?> type, String name) throws Exception {
+        var field = type.getDeclaredField(name); field.setAccessible(true); return field;
+    }
+    private static void set(Object owner, String name, Object value) throws Exception { field(owner.getClass(), name).set(owner, value); }
+    private static int fieldInt(Object owner, String name) {
+        try { return field(owner.getClass(), name).getInt(owner); } catch (Exception failure) { throw new AssertionError(failure); }
+    }
+    private static void invoke(Object owner, String name, Class<?>[] types, Object... arguments) {
+        try { var method = owner.getClass().getDeclaredMethod(name, types); method.setAccessible(true); method.invoke(owner, arguments); }
+        catch (InvocationTargetException failure) {
+            if (failure.getCause() instanceof Error fatal) throw fatal; throw (RuntimeException) failure.getCause();
+        } catch (ReflectiveOperationException failure) { throw new AssertionError(failure); }
+    }
+    private record Fixture(ScenarioCommands commands, ScenarioRunner runner, ArrayDeque<Runnable> queue,
+                           List<FinalOutcome> outcomes, List<Scope> neutralScopes, InspectScenarioHost nativeHost,
+                           ThreadLocal<Boolean> nativeThread, AtomicInteger nativeEffects) { }
+}
