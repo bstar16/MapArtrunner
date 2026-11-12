@@ -114,6 +114,74 @@ class ScenarioCommandsTest {
         assertTrue(f.commands.lastDescription().contains("#1"));
     }
 
+    @Test void inspectObservationSeparatesPublicationFromWorkerSettlementAndRetainsSnapshots() throws Exception {
+        var inactive = new ScenarioCommands(new ArrayDeque<Runnable>()::add, nativeHost()).observeInspect();
+        assertFalse(inactive.ready()); assertFalse(inactive.busy()); assertFalse(inactive.restartRequired());
+        assertTrue(inactive.last().isEmpty());
+        var f = fixture(null, null);
+        var initial = f.commands.observeInspect();
+        assertTrue(initial.ready()); assertFalse(initial.busy()); assertFalse(initial.restartRequired());
+        assertTrue(initial.last().isEmpty());
+        var feedback = new ArrayList<ScenarioCommands.InspectObservation>();
+        assertEquals(1, f.commands.enqueue(Command.RUN, message -> feedback.add(f.commands.observeInspect())));
+        var queued = f.commands.observeInspect();
+        assertTrue(queued.ready()); assertTrue(queued.busy()); assertFalse(queued.restartRequired());
+        assertTrue(queued.last().isEmpty());
+        assertEquals(0, fieldInt(f.runner, "inspectOrdinal")); assertTrue(f.outcomes.isEmpty());
+        assertEquals(1, f.queue.size()); assertEquals(0, f.nativeEffects.get());
+        assertFalse(Files.exists((Path) field(ScenarioRunner.class, "inspectDirectory").get(f.runner)));
+        f.queue.remove().run();
+        var published = feedback.getFirst();
+        assertTrue(published.ready()); assertTrue(published.busy()); assertFalse(published.restartRequired());
+        var observed = published.last().orElseThrow();
+        var completion = f.runner.lastInspectCompletion().orElseThrow();
+        assertEquals(completion.sessionId(), observed.sessionId()); assertEquals(completion.operationId(), observed.operationId());
+        assertEquals(1, observed.ordinal()); assertEquals(Command.RUN, observed.command());
+        assertEquals(completion.runId(), observed.runId()); assertEquals("FAIL", observed.verdict());
+        assertEquals(completion.evidenceComplete(), observed.evidenceComplete());
+        assertEquals(completion.cleanupStatus(), observed.cleanupStatus()); assertTrue(observed.cleanupSettled());
+        assertEquals(completion.evidenceDirectory().toString(), observed.evidenceDirectory());
+        assertEquals(completion.summaryPath().toString(), observed.summaryPath());
+        assertEquals(completion.failure().getClass().getName(), observed.failure().orElseThrow().className());
+        assertEquals(completion.failure().getMessage(), observed.failure().orElseThrow().message());
+        var settled = f.commands.observeInspect();
+        assertTrue(settled.ready()); assertFalse(settled.busy()); assertFalse(settled.restartRequired());
+        assertEquals(observed, settled.last().orElseThrow());
+        byte[] bytes = Files.readAllBytes(completion.summaryPath());
+        f.commands.enqueue(Command.RESET, message -> { });
+        var successorQueued = f.commands.observeInspect();
+        assertTrue(successorQueued.busy()); assertEquals(settled.last(), successorQueued.last());
+        f.queue.remove().run();
+        var successor = f.commands.observeInspect();
+        assertEquals(2, successor.last().orElseThrow().ordinal());
+        assertNotEquals(observed.operationId(), successor.last().orElseThrow().operationId());
+        f.commands.cancel(new IllegalStateException("replacement after successor"));
+        var cancelled = f.commands.observeInspect();
+        assertFalse(cancelled.ready()); assertFalse(cancelled.busy()); assertTrue(cancelled.restartRequired());
+        assertEquals(successor.last(), cancelled.last());
+        assertTrue(initial.last().isEmpty()); assertTrue(queued.last().isEmpty());
+        assertTrue(published.busy()); assertFalse(settled.busy()); assertFalse(settled.restartRequired());
+        assertEquals(observed, settled.last().orElseThrow()); assertEquals(1, observed.ordinal());
+        assertArrayEquals(bytes, Files.readAllBytes(completion.summaryPath()));
+    }
+
+    @Test void inspectObservationCopiesNullableFailureMessageAndHasOnlyImmutableValueComponents() throws Exception {
+        var failure = new IllegalStateException();
+        var f = fixture(null, null, operation -> { }, false, scope -> { throw failure; });
+        f.commands.enqueue(Command.RUN, message -> { }); f.queue.remove().run();
+        var observed = f.commands.observeInspect().last().orElseThrow().failure().orElseThrow();
+        assertEquals(IllegalStateException.class.getName(), observed.className()); assertNull(observed.message());
+        failure.addSuppressed(new IllegalArgumentException("later mutable graph"));
+        assertEquals(observed, f.commands.observeInspect().last().orElseThrow().failure().orElseThrow());
+        for (var type : List.of(ScenarioCommands.InspectObservation.class, ScenarioCommands.PublishedCompletion.class,
+                ScenarioCommands.FailureObservation.class)) {
+            assertTrue(type.isRecord());
+            for (var component : type.getRecordComponents())
+                assertTrue(Set.of(boolean.class, int.class, UUID.class, Command.class, String.class, Optional.class)
+                        .contains(component.getType()), component::toString);
+        }
+    }
+
     @Test void runBeforeResetAndTwoResetFailuresHaveDistinctOwnedNoUuidEvidence() throws Exception {
         var f = fixture(null, null);
         for (var command : List.of(Command.RUN, Command.RESET, Command.RESET)) {
@@ -173,6 +241,7 @@ class ScenarioCommandsTest {
             var f = fixture(receipts, null, header);
             f.commands.enqueue(Command.RUN, message -> { }); f.queue.remove().run();
             var prior = f.runner.lastInspectCompletion().orElseThrow(); byte[] bytes = Files.readAllBytes(prior.summaryPath());
+            var priorObservation = f.commands.observeInspect();
             if (boundary.equals("allocation")) {
                 // Inject only the unavailable allocation parent; preserve every prior operation byte.
                 var blocked = prior.evidenceDirectory().getParent().resolve("allocation-blocked"); Files.writeString(blocked, "blocked");
@@ -184,6 +253,10 @@ class ScenarioCommandsTest {
             assertEquals(2, failed.ordinal()); assertFalse(f.commands.isReady());
             assertSame(prior, f.runner.lastInspectCompletion().orElseThrow());
             assertTrue(f.commands.lastDescription().contains(prior.operationId().toString()));
+            var failedObservation = f.commands.observeInspect();
+            assertFalse(failedObservation.ready()); assertFalse(failedObservation.busy()); assertTrue(failedObservation.restartRequired());
+            assertEquals(priorObservation.last(), failedObservation.last());
+            assertTrue(priorObservation.ready()); assertFalse(priorObservation.restartRequired());
             for (var command : List.of(Command.RESET, Command.RUN, Command.RERUN)) {
                 var replies = new ArrayList<String>(); assertEquals(0, f.commands.enqueue(command, replies::add));
                 assertTrue(replies.getFirst().contains("restart required"));
@@ -243,7 +316,13 @@ class ScenarioCommandsTest {
         }); holder[0] = f;
         f.commands.enqueue(Command.RUN, message -> { }); f.queue.remove().run();
         var prior = f.runner.lastInspectCompletion().orElseThrow();
+        var priorObservation = f.commands.observeInspect();
         var replies = new ArrayList<String>(); f.commands.enqueue(Command.RESET, replies::add); f.queue.remove().run();
+        assertEquals(2, f.runner.lastInspectCompletion().orElseThrow().ordinal());
+        var cancelled = f.commands.observeInspect();
+        assertFalse(cancelled.ready()); assertFalse(cancelled.busy()); assertTrue(cancelled.restartRequired());
+        assertEquals(priorObservation.last(), cancelled.last(), "Commands retains last while Runner has unpublished successor");
+        assertTrue(priorObservation.ready()); assertFalse(priorObservation.restartRequired());
         assertTrue(f.commands.lastDescription().contains(prior.operationId().toString()));
         assertTrue(f.commands.lastDescription().contains("restart required"));
         assertTrue(replies.getLast().contains("restart required"));
@@ -305,6 +384,8 @@ class ScenarioCommandsTest {
         var commands = new ScenarioCommands(queue::add, host); var stops = new AtomicInteger();
         commands.initialize(new ScenarioObserver.Watch(), new ScenarioLaunchReceipt(null, null), stops::incrementAndGet);
         assertEquals(1, queue.size()); assertFalse(commands.isReady()); assertEquals(0, stops.get());
+        var startup = commands.observeInspect();
+        assertFalse(startup.ready()); assertTrue(startup.busy()); assertFalse(startup.restartRequired()); assertTrue(startup.last().isEmpty());
         // The real factory reads native root metadata, then refuses the unit launcher's unmanaged binding.
         var diagnostic = new java.io.ByteArrayOutputStream(); var previous = System.err;
         try {
@@ -322,6 +403,9 @@ class ScenarioCommandsTest {
         assertNull(field(ScenarioCommands.class, "runner").get(commands));
         assertEquals(0, nativeEffects.get()); assertTrue(queue.isEmpty());
         assertEquals(1, stops.get()); assertFalse(commands.isReady());
+        var terminal = commands.observeInspect();
+        assertFalse(terminal.ready()); assertFalse(terminal.busy()); assertTrue(terminal.restartRequired()); assertTrue(terminal.last().isEmpty());
+        assertTrue(startup.busy()); assertFalse(startup.restartRequired());
         assertFalse(commands.requestStop(), "Failure's native stop must pass through without recursive CLOSE");
         assertEquals(0, commands.enqueue(Command.RUN, message -> { }));
         assertThrows(IllegalStateException.class, () -> commands.initialize(new ScenarioObserver.Watch(), null, () -> { }));
@@ -333,7 +417,14 @@ class ScenarioCommandsTest {
         assertTrue(f.commands.requestStop()); assertEquals(1, f.queue.size());
         assertEquals(0, f.commands.enqueue(Command.RUN, message -> { }));
         now.set(9_000_000_001L); assertTrue(f.commands.requestStop()); assertEquals(1, f.queue.size());
-        now.set(10_000_000_001L); assertTrue(f.commands.releaseNativeStop());
+        now.set(10_000_000_001L);
+        set(f.commands, "clock", (LongSupplier) () -> { throw new AssertionError("Observation must not read time"); });
+        var observation = f.commands.observeInspect();
+        assertFalse(observation.ready()); assertTrue(observation.busy()); assertTrue(observation.restartRequired());
+        assertTrue(observation.last().isEmpty());
+        assertEquals("REQUESTED", field(ScenarioCommands.class, "exit").get(f.commands).toString());
+        set(f.commands, "clock", (LongSupplier) now::get);
+        assertTrue(f.commands.releaseNativeStop());
         assertFalse(f.commands.requestStop()); f.queue.remove().run();
         assertEquals(0, fieldInt(f.runner, "inspectOrdinal"), "Cutoff cannot allocate late CLOSE permission");
         assertTrue(f.outcomes.isEmpty()); assertEquals(0, f.nativeEffects.get());

@@ -6,6 +6,8 @@ import net.minecraft.client.MinecraftClient;
 import net.minecraft.text.Text;
 
 import java.util.Objects;
+import java.util.Optional;
+import java.util.UUID;
 import java.util.concurrent.Executor;
 import java.util.function.Consumer;
 import java.util.function.LongSupplier;
@@ -15,6 +17,12 @@ import static net.fabricmc.fabric.api.client.command.v2.ClientCommandManager.lit
 
 /** One worker owns startup and mutations. Native callbacks only check authority and enqueue. */
 final class ScenarioCommands {
+    record InspectObservation(boolean ready, boolean busy, boolean restartRequired, Optional<PublishedCompletion> last) { }
+    record PublishedCompletion(UUID sessionId, UUID operationId, int ordinal, Command command, Optional<UUID> runId,
+                               String verdict, boolean evidenceComplete, String cleanupStatus, boolean cleanupSettled,
+                               String evidenceDirectory, String summaryPath, Optional<FailureObservation> failure) { }
+    record FailureObservation(String className, String message) { }
+
     private final Executor worker;
     private final Inspect host;
     private ScenarioRunner runner;
@@ -155,6 +163,16 @@ final class ScenarioCommands {
     }
 
     synchronized boolean isReady() { return exit == Exit.OPEN && ready && !cancelled && terminal == null; }
+
+    /** Commands publication can precede worker settlement; paths describe evidence without granting authority. */
+    synchronized InspectObservation observeInspect() {
+        var published = Optional.ofNullable(last).map(completion -> new PublishedCompletion(
+                completion.sessionId(), completion.operationId(), completion.ordinal(), completion.command(), completion.runId(),
+                completion.verdict(), completion.evidenceComplete(), completion.cleanupStatus(), completion.cleanupSettled(),
+                completion.evidenceDirectory().toString(), completion.summaryPath().toString(),
+                Optional.ofNullable(completion.failure()).map(failure -> new FailureObservation(failure.getClass().getName(), failure.getMessage()))));
+        return new InspectObservation(isReady(), queued, exit != Exit.OPEN || cancelled || terminal != null, published);
+    }
 
     /** Native intent only: no scope, IO, wait, interrupt or replacement worker. */
     synchronized boolean requestStop() {
