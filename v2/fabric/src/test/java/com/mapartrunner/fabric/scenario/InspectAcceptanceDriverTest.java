@@ -890,6 +890,278 @@ class InspectAcceptanceDriverTest {
         }
     }
 
+    @Test void expiryFixedFiveChatProgramRetainsFailedRunAndWaitsForWorkerBeforeReset3AndLast() {
+        expiry(f -> {
+            f.start();
+            f.now.set(f.work-1); f.tick(8);
+            assertEquals(2,f.input.commands.size()); assertEquals(0,f.neutralChecks); assertEquals(0,f.input.stops);
+            f.busy(); f.until(() -> f.ackAttempts==1);
+            assertEquals(3,f.input.commands.size()); assertEquals(2,f.observation.last().orElseThrow().ordinal()+1);
+            f.observation=new InspectObservation(true,true,false,Optional.of(f.run)); f.tick(3);
+            assertEquals(3,f.input.commands.size()); assertEquals(1,f.ackAttempts);
+            f.observation=idle(f.run); f.tick();
+            f.until(() -> f.input.commands.size()==4); f.observation=idle(f.reset3); f.tick();
+            f.until(() -> f.input.stops==1);
+            assertEquals(List.of("/maparttest reset grounded-two-lane","/maparttest run grounded-two-lane",
+                    "/maparttest rerun grounded-two-lane","/maparttest reset grounded-two-lane","/maparttest last"),f.input.commands);
+            assertEquals(3,f.logs.stream().filter(s -> s.contains("RESULT command=")).count());
+            assertTrue(f.logs.stream().anyMatch(s -> s.contains("EXPIRY_RETAINED") && s.contains(f.operation.toString())
+                    && s.contains(f.run.runId().orElseThrow().toString()) && s.contains(f.run.summaryPath()) && s.contains("work-expiry-proof.json")));
+            assertTrue(f.logs.stream().anyMatch(s -> s.contains("LAST submitted") && s.contains(f.reset3.operationId().toString())));
+            assertTrue(f.logs.stream().anyMatch(s -> s.contains("command=/maparttest run") && s.contains("denied RERUN role")));
+            assertTrue(f.logs.stream().noneMatch(s -> s.contains("DRIVER_FAIL")),f.logs.toString());
+            assertEquals(1,f.ackAttempts); assertEquals(10,f.input.events.stream().filter(s -> s.endsWith("+")).count());
+            assertEquals(10,f.input.events.stream().filter(s -> s.endsWith("-")).count());
+        });
+    }
+
+    @Test void expirySameFrozenAckRetriesOnlyLaterCallbacksAndNeverAgainAfterSuccess() {
+        expiry(f -> {
+            f.ackFalse=2; f.start(); f.busy(); f.until(() -> f.ackAttempts==1);
+            var candidate=f.candidate; int commands=f.input.commands.size(),neutral=f.neutralChecks;
+            f.tick(); assertEquals(2,f.ackAttempts); assertSame(candidate,f.candidate);
+            f.tick(); assertEquals(3,f.ackAttempts); assertSame(candidate,f.ack);
+            f.tick(10); assertEquals(3,f.ackAttempts); assertEquals(commands,f.input.commands.size());
+            assertEquals(neutral+2,f.neutralChecks); f.assertHealthy();
+        });
+    }
+
+    @Test void expiryNullAndFiniteIntermediateProjectionsNeverAcquireInputOrNeutralOwner() {
+        expiry(f -> {
+            f.start(); f.input.neutral=false;
+            f.now.set(300_000_000_000L); f.tick(10);
+            for(var stage:List.of("ARMED","HELD","EXPIRED","REPLAY_QUEUED","CLEANUP_PENDING")) {
+                f.projection=f.project(stage,0,0,null); f.tick();
+            }
+            assertEquals(0,f.neutralChecks); assertEquals(2,f.input.commands.size()); assertEquals(0,f.ackAttempts); f.assertHealthy();
+        });
+    }
+
+    @Test void expiryRejectsChangedIdentityCountsTimeoutProofCutoffsAndPrematureAcknowledgement() {
+        for(var field:List.of("session","operation","run","ordinal","work","outer","wrapper","action","replayCount","rejected","distinct",
+                "primaryClass","primaryMessage","replayClass","replayMessage","retired","request","cleanup","tooEarly","late","outerLate","refusal","ack","incomplete","replayFailed","unknown")) expiry(f -> {
+            f.start(); f.projection=f.project("HELD",0,0,null); f.tick(); f.busyProjection();
+            var p=f.projection;
+            f.projection=new ExpiryObservation(field.equals("session")?UUID.randomUUID():p.sessionId(),
+                    field.equals("operation")?UUID.randomUUID():p.operationId(),field.equals("run")?UUID.randomUUID():p.runId(),
+                    field.equals("ordinal")?3:2,field.equals("incomplete")?"INCOMPLETE":field.equals("replayFailed")?"REPLAY_FAILED":field.equals("unknown")?"UNKNOWN":p.stage(),
+                    field.equals("work")?p.workDeadlineNanos()+1:p.workDeadlineNanos(),field.equals("outer")?p.outerCutoffNanos()+1:p.outerCutoffNanos(),
+                    field.equals("wrapper")?1:2,field.equals("action")?1:0,field.equals("replayCount")?2:1,!field.equals("rejected"),!field.equals("retired"),
+                    field.equals("cleanup")?p.outerCutoffNanos()+1:p.cleanupDeadlineNanos(),field.equals("request")?2:1,field.equals("refusal")?1:0,
+                    field.equals("ack")?new ExpiryBusyAck(f.operation,1,p.cleanupDeadlineNanos()):null,
+                    new FailureObservation(field.equals("primaryClass")?"java.lang.IllegalStateException":f.timeout.className(),field.equals("primaryMessage")?"stale scope":f.timeout.message()),
+                    new FailureObservation(field.equals("replayClass")?"java.lang.IllegalStateException":f.timeout.className(),field.equals("replayMessage")?"cancelled":f.timeout.message()),!field.equals("distinct"));
+            if(field.equals("tooEarly")) f.now.set(f.work-1);
+            if(field.equals("late")) f.now.set(p.cleanupDeadlineNanos());
+            if(field.equals("outerLate")) f.now.set(p.outerCutoffNanos());
+            f.tick(); f.assertFailed(); assertEquals(2,f.input.commands.size(),field); assertEquals(0,f.ackAttempts,field);
+        });
+    }
+
+    @Test void expiryCleanupDeadlineBeatsFreshInputAllowanceAndZeroRefusalNeverRetypes() {
+        for(boolean zero:List.of(false,true)) expiry(f -> {
+            f.start(); f.recordRefusal=!zero; f.busy();
+            if(zero) f.tick(4);
+            f.now.set(f.projection.cleanupDeadlineNanos()); f.tick(); f.assertFailed();
+            assertEquals(zero?3:2,f.input.commands.size()); assertEquals(0,f.ackAttempts);
+            f.tick(3); assertEquals(zero?3:2,f.input.commands.size());
+        });
+    }
+
+    @Test void expiryRevalidatesEveryCharacterEnterHandoffAndAckWithoutResendOrUncertainRetry() {
+        for(var failure:List.of("screen","binding","char","enter","charGate","enterCase","handoffScreen","ackThrow","ackBinding","duplicate","changedRequest","ackLost")) expiry(f -> {
+            f.start(); f.busy();
+            switch(failure) {
+                case "screen" -> f.input.screen=new Object();
+                case "binding" -> f.input.refusal="binding replaced";
+                case "char" -> f.input.throwAt="char";
+                case "enter" -> f.input.throwAt="257+";
+                case "charGate" -> f.input.reenter=() -> { f.enabled=false; f.driver.tick(null); };
+                case "enterCase" -> f.onBusyEnter=() -> System.setProperty("mapart.test.inspect.acceptance.case","baseline");
+            }
+            f.tick();
+            if(List.of("handoffScreen","ackThrow","ackBinding","duplicate","changedRequest","ackLost").contains(failure)) {
+                if(failure.equals("handoffScreen")) f.input.screen=new Object();
+                if(failure.equals("duplicate")) f.projection=f.withRefusals(2);
+                if(failure.equals("changedRequest")) {
+                    var p=f.projection; f.projection=new ExpiryObservation(p.sessionId(),p.operationId(),p.runId(),2,p.stage(),p.workDeadlineNanos(),p.outerCutoffNanos(),2,0,1,true,true,
+                            p.cleanupDeadlineNanos()-1,1,p.busyRefusals(),null,p.primary(),p.replay(),true);
+                }
+                f.tick();
+                if(failure.equals("ackThrow")) f.ackThrow=true;
+                if(failure.equals("ackBinding")) f.input.refusal="ack binding replaced";
+                if(failure.equals("ackLost")) f.projection=f.project("SEALED_BEFORE_END",1,1,new ExpiryBusyAck(f.operation,1,f.projection.cleanupDeadlineNanos()));
+            }
+            f.tick(3); f.assertFailed();
+            assertTrue(f.input.commands.size()<=3,failure); assertTrue(f.ackAttempts<=(failure.equals("ackThrow")?1:0),failure);
+            assertEquals(f.input.events.stream().filter(s -> s.equals("257+")).count(),f.input.events.stream().filter(s -> s.equals("257-")).count(),failure);
+        });
+    }
+
+    @Test void expiryReentrantInputCallbacksAndAckCannotDuplicateFiniteProgramActions() {
+        expiry(f -> {
+            f.start(); f.input.reenter=() -> f.driver.tick(null); f.ackReenter=true; f.busy(); f.until(() -> f.ackAttempts==1);
+            f.tick(5); assertEquals(3,f.input.commands.size()); assertEquals(1,f.ackAttempts); f.assertHealthy();
+        });
+    }
+
+    @Test void expiryBusyChatWaitsForNaturalClosureAndStopsAtItsOriginalCleanupLimit() {
+        for(boolean expire:List.of(false,true)) expiry(f -> {
+            f.start(); f.keepBusyScreen=true; f.busy(); f.tick(); f.tick(3);
+            assertEquals(3,f.input.commands.size()); assertEquals(0,f.ackAttempts);
+            if(expire) { f.now.set(f.projection.cleanupDeadlineNanos()); f.tick(); f.assertFailed(); }
+            else { f.input.screen=null; f.tick(2); assertEquals(1,f.ackAttempts); f.assertHealthy(); }
+            assertEquals(3,f.input.commands.size());
+        });
+    }
+
+    @Test void expiryWorkScreenLostProjectionAndBusyOpenCallbackFailureCannotAcquireMoreInput() {
+        for(var failure:List.of("screen","projection","open")) expiry(f -> {
+            f.start();
+            if(failure.equals("screen")) f.input.screen=new Object();
+            if(failure.equals("projection")) { f.projection=f.project("HELD",0,0,null); f.tick(); f.projection=null; }
+            if(failure.equals("open")) { f.input.throwAt="84+"; f.busyProjection(); }
+            f.tick(3); f.assertFailed(); assertEquals(2,f.input.commands.size()); assertEquals(0,f.ackAttempts);
+            assertEquals(f.input.events.stream().filter(s -> s.equals("84+")).count(),f.input.events.stream().filter(s -> s.equals("84-")).count());
+        });
+    }
+
+    @Test void expiryAcknowledgementDoesNotAllowUnsealedOrChangedProofAndCannotBeRetriedAfterException() {
+        for(var failure:List.of("unsealed","changedSeal","appliedThenThrow")) expiry(f -> {
+            f.start(); f.busy();
+            if(failure.equals("appliedThenThrow")) f.ackApplyThenThrow=true;
+            f.until(() -> f.ackAttempts==1);
+            if(!failure.equals("appliedThenThrow")) {
+                if(failure.equals("changedSeal")) f.tick();
+                var p=f.projection;
+                f.projection=new ExpiryObservation(p.sessionId(),p.operationId(),p.runId(),2,failure.equals("unsealed")?"BUSY_REQUIRED":p.stage(),
+                        p.workDeadlineNanos(),p.outerCutoffNanos(),2,0,1,true,true,p.cleanupDeadlineNanos(),1,1,p.acknowledgement(),p.primary(),p.replay(),true);
+                if(failure.equals("changedSeal")) f.projection=f.withRefusals(0);
+                f.observation=idle(f.run);
+            }
+            f.tick(3); f.assertFailed(); assertEquals(1,f.ackAttempts); assertEquals(3,f.input.commands.size());
+        });
+    }
+
+    @Test void expiryReset3RemainsAnOrdinaryFreshSuccessfulReset() {
+        for(var failure:List.of("run","failure","operation","directory","summary","evidence","settled")) expiry(f -> {
+            f.start(); f.busy(); f.until(() -> f.ackAttempts==1); f.observation=idle(f.run); f.tick();
+            f.until(() -> f.input.commands.size()==4);
+            var c=f.reset3;
+            f.observation=idle(new PublishedCompletion(c.sessionId(),failure.equals("operation")?f.operation:c.operationId(),3,Command.RESET,
+                    failure.equals("run")?Optional.of(f.runId):Optional.empty(),"PASS",!failure.equals("evidence"),"RELEASED",!failure.equals("settled"),
+                    failure.equals("directory")?f.run.evidenceDirectory():c.evidenceDirectory(),failure.equals("summary")?f.run.summaryPath():c.summaryPath(),
+                    failure.equals("failure")?Optional.of(f.timeout):Optional.empty()));
+            f.tick(); f.assertFailed(); assertEquals(4,f.input.commands.size());
+        });
+    }
+
+    @Test void expiryGateCaseStoppingAndInvalidEntryRetireLocalActivityDuringWorkChatAndAck() {
+        for(var point:List.of("work","chat","ack")) for(var change:List.of("gate","case","stop","entry")) expiry(f -> {
+            f.start();
+            if(!point.equals("work")) f.busy();
+            if(point.equals("ack")) f.tick(2);
+            int commands=f.input.commands.size(),keys=f.input.events.size();
+            switch(change) {
+                case "gate" -> f.enabled=false;
+                case "case" -> System.setProperty("mapart.test.inspect.acceptance.case","baseline");
+                case "stop" -> f.driver.releaseOnStopping(null);
+                case "entry" -> f.input.entryRefusal="wrong thread/current client";
+            }
+            f.tick(3);
+            assertEquals(commands,f.input.commands.size(),point+change); assertEquals(keys,f.input.events.size(),point+change);
+            assertEquals(0,f.ackAttempts,point+change);
+            if(!change.equals("stop")) assertTrue(f.logs.stream().anyMatch(s -> s.contains("DRIVER_FAIL")),point+change+f.logs);
+            if(change.equals("entry") || change.equals("stop")) assertEquals(0,f.input.stops);
+        });
+    }
+
+    @Test void expiryRequiresSealedProofExactFailedRunEvidenceAndStablePublicationBeforeWorkerIdle() {
+        for(var field:List.of("session","operation","run","verdict","class","message","cancelled","stale","complete","settled","cleanup","directory","summary","early","pending")) expiry(f -> {
+            f.start(); f.busy();
+            if(!field.equals("early")) f.until(() -> f.ackAttempts==1);
+            var c=f.run;
+            var bad=new PublishedCompletion(field.equals("session")?UUID.randomUUID():c.sessionId(),field.equals("operation")?UUID.randomUUID():c.operationId(),2,Command.RUN,
+                    field.equals("run")?Optional.of(UUID.randomUUID()):c.runId(),field.equals("verdict")?"PASS":"FAIL",!field.equals("complete"),
+                    field.equals("cleanup")?"UNRESOLVED":"RELEASED",!field.equals("settled"),field.equals("directory")?f.reset.evidenceDirectory():c.evidenceDirectory(),
+                    field.equals("summary")?f.reset.summaryPath():c.summaryPath(),Optional.of(new FailureObservation(field.equals("class") || field.equals("cancelled") || field.equals("stale")?"java.lang.IllegalStateException":f.timeout.className(),
+                    field.equals("message") || field.equals("cancelled") || field.equals("stale")?field:f.timeout.message())));
+            if(field.equals("pending")) {
+                f.observation=new InspectObservation(true,true,false,Optional.of(c)); f.tick();
+                bad=new PublishedCompletion(c.sessionId(),c.operationId(),2,c.command(),c.runId(),c.verdict(),true,"RELEASED",true,c.evidenceDirectory(),"changed-summary",c.failure());
+            }
+            f.observation=idle(bad); f.tick(); f.assertFailed(); assertEquals(field.equals("early")?2:3,f.input.commands.size());
+        });
+    }
+
+    private static void expiry(java.util.function.Consumer<ExpiryFixture> test) {
+        var previous=System.getProperty("mapart.test.inspect.acceptance.case");
+        try { System.setProperty("mapart.test.inspect.acceptance.case","work-expiry"); test.accept(new ExpiryFixture()); }
+        finally { if(previous==null) System.clearProperty("mapart.test.inspect.acceptance.case"); else System.setProperty("mapart.test.inspect.acceptance.case",previous); }
+    }
+
+    /** Immutable owner/input doubles drive the actual policy; they establish no native expiry/effect evidence. */
+    private static final class ExpiryFixture implements InspectAcceptanceDriver.ExpiryClaims {
+        final AtomicLong now=new AtomicLong(1);
+        final long work=600_000_000_000L;
+        final UUID session=UUID.randomUUID(),operation=UUID.randomUUID(),runId=UUID.randomUUID();
+        final FailureObservation timeout=new FailureObservation("com.mapartrunner.fabric.scenario.ScenarioHost$ScopeTimeoutException","Inspect scope absolute deadline expired");
+        final PublishedCompletion reset=new PublishedCompletion(session,UUID.randomUUID(),1,Command.RESET,Optional.empty(),"PASS",true,"RELEASED",true,"reset1","reset1/summary",Optional.empty());
+        final PublishedCompletion run=new PublishedCompletion(session,operation,2,Command.RUN,Optional.of(runId),"FAIL",true,"RELEASED",true,"run2","run2/summary",Optional.of(timeout));
+        final PublishedCompletion reset3=new PublishedCompletion(session,UUID.randomUUID(),3,Command.RESET,Optional.empty(),"PASS",true,"RELEASED",true,"reset3","reset3/summary",Optional.empty());
+        final List<String> logs=new ArrayList<>();
+        InspectObservation observation=idle(null);
+        ExpiryObservation projection;
+        boolean enabled=true,recordRefusal=true,ackThrow,ackReenter,ackApplyThenThrow,keepBusyScreen;
+        int neutralChecks,ackAttempts,ackFalse;
+        Runnable onBusyEnter;
+        ExpiryBusyAck candidate,ack;
+        final SimulatedChat input=new SimulatedChat() {
+            @Override public void key(int code,boolean press,Object expected) {
+                super.key(code,press,expected);
+                if(code==84 && press) { screen=chat; draft=""; }
+                if(code==257 && press && commands.size()==3) {
+                    if(recordRefusal) projection=withRefusals(1);
+                    if(keepBusyScreen) screen=chat;
+                    if(onBusyEnter!=null) onBusyEnter.run();
+                }
+            }
+            @Override public void requireNeutral() { neutralChecks++; super.requireNeutral(); }
+        };
+        final InspectAcceptanceDriver driver=new InspectAcceptanceDriver(() -> observation,input,now::get,() -> enabled,logs::add,this);
+        ExpiryFixture() { input.now=now; }
+        void tick() { driver.tick(null); }
+        void tick(int count) { for(int i=0;i<count;i++) tick(); }
+        void until(java.util.function.BooleanSupplier done) { for(int i=0;i<30 && !done.getAsBoolean();i++) tick(); assertTrue(done.getAsBoolean(),logs.toString()); }
+        void start() {
+            until(() -> input.commands.size()==1); observation=idle(reset); tick();
+            until(() -> input.commands.size()==2); observation=new InspectObservation(true,true,false,Optional.of(reset)); tick();
+        }
+        void busyProjection() { now.set(work+1); projection=project("BUSY_REQUIRED",1,0,null); }
+        void busy() { busyProjection(); tick(); }
+        ExpiryObservation project(String stage,long request,int refusals,ExpiryBusyAck ack) {
+            return new ExpiryObservation(session,operation,runId,2,stage,work,work+10_000_000_000L,
+                    request==0?1:2,0,request==0?0:1,request!=0,request!=0,request==0?0:work+7_000_000_000L,request,refusals,ack,
+                    request==0?null:timeout,request==0?null:new FailureObservation(timeout.className(),timeout.message()),request!=0);
+        }
+        ExpiryObservation withRefusals(int count) {
+            var p=projection; return new ExpiryObservation(p.sessionId(),p.operationId(),p.runId(),p.ordinal(),p.stage(),p.workDeadlineNanos(),p.outerCutoffNanos(),
+                    p.wrapperEntries(),p.actionEntries(),p.replayCount(),p.replayRejected(),p.boundaryRetired(),p.cleanupDeadlineNanos(),p.requestOrdinal(),count,p.acknowledgement(),p.primary(),p.replay(),p.distinctReplayFailure());
+        }
+        public ExpiryObservation observe() { return projection; }
+        public boolean acknowledge(MinecraftClient client,ExpiryBusyAck value) {
+            ackAttempts++; if(candidate==null) candidate=value; else assertSame(candidate,value);
+            if(ackReenter) driver.tick(null);
+            if(ackThrow) throw new IllegalStateException("uncertain ack application");
+            if(ackAttempts<=ackFalse) return false;
+            ack=value; projection=project("SEALED_BEFORE_END",1,1,ack);
+            if(ackApplyThenThrow) throw new IllegalStateException("ack applied then threw");
+            return true;
+        }
+        void assertHealthy() { assertTrue(logs.stream().noneMatch(s -> s.contains("DRIVER_FAIL")),logs.toString()); assertEquals(0,input.stops); }
+        void assertFailed() { assertEquals(1,logs.stream().filter(s -> s.contains("DRIVER_FAIL")).count(),logs.toString()); }
+    }
+
     private static InspectObservation idle(PublishedCompletion completion) { return new InspectObservation(true, false, false, Optional.ofNullable(completion)); }
 
     private static final class Fixture {
