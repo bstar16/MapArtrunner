@@ -25,6 +25,78 @@ class ScenarioCommandsTest {
     // JUnit owns cleanup of these temporary trees; the native game root is never a fixture cleanup target.
     Path receiptModule;
 
+    @Test void resetArchiveSelectionCannotArmBeforeRealWorkerBeginOrBypassMissingNativeResetGuard() throws Exception {
+        withResetArchive(() -> {
+            for(Command command:List.of(Command.RESET,Command.RERUN)) {
+                var f=fixture(null,null); assertEquals(1,f.commands.enqueue(command,message -> { }));
+                assertNull(field(ScenarioRunner.class,"inspectResetDiagnostic").get(f.runner));
+                assertEquals(0,fieldInt(f.runner,"inspectOrdinal")); f.queue.remove().run();
+                var completion=f.runner.lastInspectCompletion().orElseThrow();
+                assertEquals("FAIL",completion.verdict()); assertTrue(completion.runId().isEmpty());
+                assertTrue(completion.failure().getMessage().contains("startup"));
+                assertFalse(completion.failure() instanceof ScenarioRunner.SimulatedInspectResetFailure);
+                assertNull(field(ScenarioRunner.class,"inspectResetDiagnostic").get(f.runner));
+                assertFalse(Files.exists(completion.evidenceDirectory().resolve("simulated-reset-fault-verification.json")));
+                byte[] closed=Files.readAllBytes(completion.summaryPath());
+                assertEquals(1,f.commands.enqueue(Command.RESET,message -> { })); f.queue.remove().run();
+                assertArrayEquals(closed,Files.readAllBytes(completion.summaryPath()));
+                assertEquals(2,f.neutralScopes.size()); assertEquals(2,f.outcomes.size()); assertEquals(0,f.nativeEffects.get());
+            }
+            var f=fixture(null,null,operation -> assertDoesNotThrow(() -> Files.writeString(operation.evidenceDirectory().resolve("operation.json"),"collision")));
+            f.commands.enqueue(Command.RESET,message -> { }); f.queue.remove().run();
+            assertTrue(f.runner.inspectAdmissionFailure().isPresent()); assertTrue(f.neutralScopes.isEmpty());
+            assertTrue(f.commands.observeInspect().restartRequired()); assertNull(field(ScenarioRunner.class,"inspectResetDiagnostic").get(f.runner));
+        });
+    }
+
+    @Test void actualWorkerKeepsDetachedPrimaryAndClosesIncompleteProofButPreCallbackFailureLeavesInertDiagnostic() throws Exception {
+        withResetArchive(() -> {
+            for(boolean cleanupReceiptFailure:List.of(false,true)) {
+                var holder=new Fixture[1]; var primary=new ScenarioRunner.SimulatedInspectResetFailure[1]; var retained=new Object[1];
+                var launch=launch();
+                var receipts=new ScenarioLaunchReceipt(launch.getFileName().toString().substring(7),launch.toString(),path -> { },launch.getParent());
+                var f=fixture(receipts,null,operation -> { },false,scope -> {
+                    try {
+                        var current=holder[0]; var operation=scope.operation();
+                        primary[0]=new ScenarioRunner.SimulatedInspectResetFailure(new ScenarioRunner.ResetFailureFacts("ARCHIVE_BEFORE_COMMITTED",
+                                operation.sessionId(),operation.operationId(),operation.ordinal(),3,ScenarioDefinition.load().definitionHash(),"synthetic-policy-stage",scope.deadlineNanos()));
+                        // Synthetic read-only owner snapshot at the existing neutral boundary, never the native fault hook.
+                        var diagnostic=field(ScenarioRunner.class,"inspectResetDiagnostic"); var constructor=diagnostic.getType().getDeclaredConstructors()[0]; constructor.setAccessible(true);
+                        retained[0]=constructor.newInstance(operation,primary[0],operation.evidenceDirectory().resolve("reset-3"),3,null,
+                                new ScenarioRunner.InspectIdleObservation(new ScenarioObserver.Watch().retained()),null,null,null,null,null,null,null,null,null);
+                        diagnostic.set(current.runner,retained[0]);
+                        if(cleanupReceiptFailure) Files.writeString(launch.resolve("inspect-op-1.cleanup.json"),"collision");
+                    } catch(Exception error) { throw new AssertionError(error); }
+                    throw primary[0];
+                }); holder[0]=f;
+                f.commands.enqueue(Command.RESET,message -> { }); f.queue.remove().run();
+                if(cleanupReceiptFailure) {
+                    assertTrue(f.commands.observeInspect().restartRequired()); assertTrue(f.runner.lastInspectCompletion().isEmpty());
+                    assertSame(retained[0],field(ScenarioRunner.class,"inspectResetDiagnostic").get(f.runner));
+                    assertEquals(0,f.commands.enqueue(Command.RESET,message -> { })); assertTrue(f.queue.isEmpty());
+                    // Even if scheduling fields were cleared externally, Runner rejects the private stale diagnostic.
+                    set(f.runner,"inspectOperation",null);
+                    assertThrows(AssertionError.class,() -> f.runner.beginInspectOperation(Command.RUN));
+                } else {
+                    var result=f.runner.lastInspectCompletion().orElseThrow(); assertSame(primary[0],result.failure());
+                    assertFalse(result.evidenceComplete()); assertTrue(result.cleanupSettled()); assertTrue(result.runId().isEmpty());
+                    assertNull(field(ScenarioRunner.class,"inspectResetDiagnostic").get(f.runner));
+                    assertTrue(f.commands.lastDescription().contains(result.operationId().toString()));
+                    assertEquals(1,f.outcomes.size()); assertFalse(f.commands.observeInspect().busy());
+                }
+                assertEquals(0,f.nativeEffects.get(),"This partial worker test never reaches a native reset/archive hook");
+            }
+        });
+    }
+
+    private interface ResetWorkerTest { void run() throws Exception; }
+    private static void withResetArchive(ResetWorkerTest test) throws Exception {
+        var names=List.of("mapart.test.inspect","mapart.test.inspect.acceptance","fabric.client.gametest","mapart.test.inspect.acceptance.case");
+        var old=new HashMap<String,String>(); names.forEach(name -> old.put(name,System.getProperty(name)));
+        try { System.setProperty(names.get(0),"true"); System.setProperty(names.get(1),"true"); System.clearProperty(names.get(2)); System.setProperty(names.get(3),"reset-archive"); test.run(); }
+        finally { names.forEach(name -> { if(old.get(name)==null) System.clearProperty(name); else System.setProperty(name,old.get(name)); }); }
+    }
+
     @Test void grammarHasExactlyFourLiteralBranches() {
         var commands = new ScenarioCommands(new ArrayDeque<Runnable>()::add, nativeHost());
         var dispatcher = new CommandDispatcher<FabricClientCommandSource>(); commands.register(dispatcher);

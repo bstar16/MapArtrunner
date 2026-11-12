@@ -285,6 +285,7 @@ final class ScenarioRunner implements AutoCloseable {
         require(inspectStartupFailure==null,"Inspect startup failed; restart required");
         require(inspectUnresolvedCleanupFailure==null, "Owned inspect cleanup is unresolved; restart required");
         require(inspectOperation==null, "Inspect operation is still busy/unsettled");
+        require(inspectResetDiagnostic==null,"Stale reset diagnostic; restart required");
         Objects.requireNonNull(command);
         require(command!=Command.STARTUP || !inspectStartupReserved && inspectOrdinal==0 && !worldCreated, "Startup is single-use");
         checkRoots(roots); // Read-only authority precedes reservation and allocation.
@@ -314,6 +315,7 @@ final class ScenarioRunner implements AutoCloseable {
     }
 
     void failInspectAdmission(Operation operation, Throwable primary) {
+        try {
         require(inspectMode && inspectStartupFailure==null && operation==inspectOperation && operation.command()!=Command.STARTUP
                 && !inspectFinalizing, "Foreign, startup or already finalized admission failure");
         Objects.requireNonNull(primary);
@@ -324,6 +326,7 @@ final class ScenarioRunner implements AutoCloseable {
         inspectAdmissionFailure=primary; failedInspectAdmission=operation;
         // Latch first; a failing transport cancellation cannot restore mutation admission.
         capture(primary,() -> ((Inspect)host).cancelSession(primary));
+        } finally { inspectResetDiagnostic=null; }
     }
 
     Optional<Throwable> inspectAdmissionFailure() { return Optional.ofNullable(inspectAdmissionFailure); }
@@ -447,6 +450,211 @@ final class ScenarioRunner implements AutoCloseable {
         }
     }
 
+    enum ResetFault { RESET_AFTER_RESTORE_BEFORE_READINESS, ARCHIVE_BEFORE_COMMITTED }
+
+    /** Detached values only: neither the Throwable nor its facts may retain Scope/native/Watch graphs. */
+    record ResetFailureFacts(String point, UUID sessionId, UUID operationId, int ordinal, int resetOrdinal,
+                             String definitionHash, String stage, long workDeadlineNanos) { }
+    static final class SimulatedInspectResetFailure extends IllegalStateException {
+        private final ResetFailureFacts facts;
+        SimulatedInspectResetFailure(ResetFailureFacts facts) { super("SIMULATED_INSPECT_" + facts.point()); this.facts=facts; }
+    }
+
+    /** Correlated facts, never permission. Only the issuing Host's current WORK permits dispatch. */
+    record ResetIdentity(Operation operation, Scope work, UUID invocation, ScenarioDefinition profile,
+                         ScenarioDefinition definition, Path save, Object server, Object serverWorld, Object serverPlayer,
+                         Object clientWorld, Object clientPlayer, Object handler, Object connection, int resetOrdinal, Path stage) {
+        boolean same(ResetIdentity other) {
+            return other!=null && operation==other.operation && work==other.work && invocation.equals(other.invocation)
+                    && profile==other.profile && definition==other.definition && Objects.equals(save,other.save)
+                    && server==other.server && serverWorld==other.serverWorld && serverPlayer==other.serverPlayer
+                    && clientWorld==other.clientWorld && clientPlayer==other.clientPlayer && handler==other.handler
+                    && connection==other.connection && resetOrdinal==other.resetOrdinal && stage.equals(other.stage);
+        }
+    }
+
+    /** RESET stack owns ARMED -> CONSUMED -> RETIRED; retirement precedes worker catch/cleanup. */
+    private static final class ResetToken {
+        private final ResetFault point;
+        private final ResetIdentity identity;
+        private final SimulatedInspectResetFailure failure;
+        private enum State { ARMED, CONSUMED, RETIRED }
+        private State state=State.ARMED;
+        ResetToken(ResetFault point, ResetIdentity identity) {
+            requireResetFaultGates();
+            require(point!=null && identity.operation.command()==Command.RESET && identity.work.kind()==Kind.WORK
+                    && identity.work.operation()==identity.operation && identity.operation.sessionId().equals(identity.invocation)
+                    && identity.profile.fixture()==ScenarioDefinition.Fixture.TWO_LANE,
+                    "Invalid reset fault binding");
+            identity.profile.requireSame(identity.definition);
+            require(selectResetFault(true,"true","true",null,"reset-archive",identity.operation.command(),identity.operation.ordinal(),
+                    identity.resetOrdinal-1,true)==point && identity.stage.equals(identity.operation.evidenceDirectory().resolve("reset-"+identity.resetOrdinal))
+                    && identity.save!=null && identity.server!=null && identity.serverWorld!=null && identity.serverPlayer!=null
+                    && identity.clientWorld!=null && identity.clientPlayer!=null && identity.handler!=null && identity.connection!=null,"Incomplete reset fault identity");
+            this.point=point; this.identity=identity;
+            var label=point==ResetFault.RESET_AFTER_RESTORE_BEFORE_READINESS?"RESET_AFTER_RESTORE_BEFORE_READINESS":"ARCHIVE_BEFORE_COMMITTED";
+            failure=new SimulatedInspectResetFailure(new ResetFailureFacts(label,identity.invocation,identity.operation.operationId(),
+                    identity.operation.ordinal(),identity.resetOrdinal,identity.definition.definitionHash(),identity.stage.toString(),identity.work.deadlineNanos()));
+        }
+        void check(ResetIdentity current, ResetFault actual) {
+            try {
+                requireResetFaultGates();
+                require(state==State.ARMED && point==actual && identity.same(current),"Stale, consumed or foreign reset fault");
+            } catch(RuntimeException | Error error) { retire(); throw error; }
+        }
+        void fire(ResetIdentity current, ResetFault actual) {
+            check(current,actual); state=State.CONSUMED; throw failure;
+        }
+        void retire() { state=State.RETIRED; }
+    }
+
+    static ResetFault selectResetFault(boolean inspect, String inspectGate, String acceptance, String automatic,
+                                       String selection, Command command, int ordinal, int resets, boolean predecessor) {
+        if(!inspect || !Boolean.parseBoolean(inspectGate) || !Boolean.parseBoolean(acceptance) || automatic!=null) return null;
+        require(Set.of("baseline","displaced","reset-archive").contains(selection),"Unknown acceptance case: "+selection);
+        if(!selection.equals("reset-archive") || command!=Command.RESET) return null;
+        if(ordinal==1 || ordinal==5) {
+            require(resets==(ordinal==1?0:2) && predecessor,"Invalid reset fault counter/predecessor");
+            return ordinal==1?ResetFault.RESET_AFTER_RESTORE_BEFORE_READINESS:ResetFault.ARCHIVE_BEFORE_COMMITTED;
+        }
+        require(ordinal==3 && resets==1 || ordinal==7 && resets==3,"Unexpected reset-archive RESET");
+        return null;
+    }
+
+    private static void requireResetFaultGates() {
+        require(Boolean.getBoolean("mapart.test.inspect") && Boolean.getBoolean("mapart.test.inspect.acceptance")
+                && System.getProperty("fabric.client.gametest")==null
+                && "reset-archive".equals(System.getProperty("mapart.test.inspect.acceptance.case")),"Reset fault gates changed/unavailable");
+    }
+
+    private boolean resetFaultPredecessor(Operation operation) {
+        if(operation.ordinal()==1) return resetOrdinal==0 && inspectLast==null && previous==null && runs.isEmpty() && countedStarts==0;
+        var retained=watch.retained();
+        return operation.ordinal()==5 && inspectLast!=null && inspectLast.ordinal()==4 && inspectLast.command()==Command.RUN
+                && inspectLast.sessionId().equals(invocation) && inspectLast.verdict().equals("PASS") && inspectLast.failure()==null
+                && inspectLast.evidenceComplete() && inspectLast.cleanupSettled() && inspectLast.cleanupStatus().equals("RELEASED")
+                && previous!=null && inspectLast.runId().filter(previous.runId()::equals).isPresent()
+                && previous.artifacts().equals(inspectLast.evidenceDirectory()) && assertedSuccesses.stream().anyMatch(r -> r==previous)
+                && priorCountedSuccess==previous && retained.binding()!=null
+                && retained.binding().context().runId().equals(previous.runId()) && !retained.samples().isEmpty() && !retained.witnesses().isEmpty();
+    }
+
+    private ResetFault selectResetFault() {
+        return selectResetFault(inspectMode,System.getProperty("mapart.test.inspect"),System.getProperty("mapart.test.inspect.acceptance"),
+                System.getProperty("fabric.client.gametest"),System.getProperty("mapart.test.inspect.acceptance.case","baseline"),
+                inspectOperation==null?Command.RESET:inspectOperation.command(),inspectOperation==null?0:inspectOperation.ordinal(),resetOrdinal,
+                inspectOperation!=null && resetFaultPredecessor(inspectOperation));
+    }
+
+    private ResetIdentity resetIdentity(ScenarioDefinition definition,Scope work,Path stage) {
+        return new ResetIdentity(inspectOperation,work,invocation,profileDefinition,definition,save,server,serverWorld,serverPlayer,
+                clientWorld,clientPlayer,handler,connection,resetOrdinal,stage);
+    }
+
+    // One exact-operation diagnostic snapshot, never an arm or callback. Watch remains the mutable history owner.
+    // Entered finalization/abandonment clears it. A pre-callback transport failure leaves it inert in a terminal session.
+    private ResetDiagnostic inspectResetDiagnostic;
+    private record ResetDiagnostic(Operation operation,SimulatedInspectResetFailure failure,Path stage,int resetOrdinal,
+                                   Prior prior,InspectIdleObservation observer,BuildPlan plan,GridPos origin,BuildEngine.Settings settings,
+                                   ScenarioDefinition admitted,Checkpoint stable,String observedHash,String client,String server,String checkpoint) { }
+
+    private void captureResetDiagnostic(ResetToken token,Prior prior) {
+        require(inspectResetDiagnostic==null,"Stale reset diagnostic");
+        String client=null,remote=null;
+        if(token.point==ResetFault.ARCHIVE_BEFORE_COMMITTED) {
+            client=host.computeOnClient(c -> { requireClient(c); return readClient(c,false).state.toString(); });
+            remote=host.computeOnServer(s -> { requireServer(s); return readPlayer(serverPlayer,false,s.getTicks()).state.toString(); });
+        }
+        inspectResetDiagnostic=new ResetDiagnostic(inspectOperation,token.failure,token.identity.stage,resetOrdinal,prior,
+                new InspectIdleObservation(prior.observer),plan,origin,settings,admitted,stable,observedHash,client,remote,stable==null?null:evidence(stable).toString());
+    }
+
+    private void fireResetFault(ResetToken token,ResetFault point,ScenarioDefinition definition,Path stage) {
+        if(token==null) return;
+        var work=requireInspectWork(Command.RESET,Command.RESET);
+        token.check(resetIdentity(definition,work,stage),token.point);
+        if(token.point!=point) return;
+        require(selectResetFault(inspectMode,System.getProperty("mapart.test.inspect"),System.getProperty("mapart.test.inspect.acceptance"),
+                System.getProperty("fabric.client.gametest"),System.getProperty("mapart.test.inspect.acceptance.case","baseline"),
+                inspectOperation.command(),inspectOperation.ordinal(),resetOrdinal-1,
+                point==ResetFault.RESET_AFTER_RESTORE_BEFORE_READINESS
+                        ? inspectLast==null && previous==null && runs.isEmpty() && countedStarts==0 : resetFaultPredecessor(inspectOperation))==point,
+                "Reset fault predecessor changed");
+        preflight(definition); // Real client/server guards execute under Host's captured scope; no WORK enters a native callback.
+        require(requireInspectWork(Command.RESET,Command.RESET)==work,"Reset fault WORK changed");
+        require(!ready && inspectRun==null,"Reset fault requires unavailable readiness/no current run");
+        requireResetFaultStage(roots,inspectOperation,stage,resetOrdinal,point);
+        if(point==ResetFault.RESET_AFTER_RESTORE_BEFORE_READINESS)
+            require(admitted==definition && plan!=null && origin!=null && settings!=null,"Reset fault requires actual imported request");
+        token.fire(resetIdentity(definition,work,stage),point);
+    }
+
+    static void requireResetFaultStage(Roots roots,Operation operation,Path stage,int ordinal,ResetFault point) {
+        require(stage.equals(operation.evidenceDirectory().resolve("reset-"+ordinal)) && real(stage).equals(stage),"Foreign reset fault stage");
+        checkRoots(roots);
+        boolean restored=point==ResetFault.RESET_AFTER_RESTORE_BEFORE_READINESS;
+        requireResetStageFile(stage.resolve("COMMITTED"),restored);
+        requireResetStageFile(stage.resolve("retained-source.schem"),restored);
+        requireResetStageFile(stage.resolve("imported-plan.txt"),restored);
+        try(var files=Files.list(stage)) {
+            require(files.noneMatch(file -> file.getFileName().toString().startsWith("readiness-")
+                    || file.getFileName().toString().equals("stable-start.json")),"Reset fault reached readiness");
+        } catch(IOException error) { throw new UncheckedIOException(error); }
+    }
+
+    private static void requireResetStageFile(Path file,boolean required) {
+        require(required ? Files.isRegularFile(file,LinkOption.NOFOLLOW_LINKS) && real(file).equals(file)
+                : !Files.exists(file,LinkOption.NOFOLLOW_LINKS),"Wrong reset stage artifact: "+file.getFileName());
+    }
+
+    private void verifyResetFault(Operation operation,Scope cleanup,Throwable primary) {
+        var diagnostic=inspectResetDiagnostic;
+        require(primary instanceof SimulatedInspectResetFailure && diagnostic!=null && diagnostic.operation==operation
+                && diagnostic.failure==primary && diagnostic.resetOrdinal==resetOrdinal,"Missing/foreign simulated reset diagnostic");
+        require(((Inspect)host).requireScope(operation,Kind.CLEANUP)==cleanup,"Reset proof requires current CLEANUP");
+        var fault=ResetFault.valueOf(diagnostic.failure.facts.point());
+        preflight(admitted==null?profileDefinition:admitted);
+        require(!ready && inspectRun==null,"Reset fault cleanup cannot grant readiness/run UUID");
+        requireResetFaultStage(roots,operation,diagnostic.stage,resetOrdinal,fault);
+        var client=host.computeOnClient(c -> { requireClient(c); return readClient(c,false); });
+        var remote=host.computeOnServer(s -> { requireServer(s); return readPlayer(serverPlayer,false,s.getTicks()); });
+        if(fault==ResetFault.ARCHIVE_BEFORE_COMMITTED) {
+            require(diagnostic.observer.equals(new InspectIdleObservation(watch.retained())),"Archive fault discarded retained Watch/failure");
+            require(plan==diagnostic.plan && origin==diagnostic.origin && settings==diagnostic.settings && admitted==diagnostic.admitted
+                    && stable==diagnostic.stable && Objects.equals(observedHash,diagnostic.observedHash)
+                    && Objects.equals(diagnostic.checkpoint,stable==null?null:evidence(stable).toString()),"Archive fault changed retained request/checkpoint");
+            requirePreservedOwnedState(diagnostic.client,client.state.toString());
+            requirePreservedOwnedState(diagnostic.server,remote.state.toString());
+            verifyInspectPriorEvidence();
+        } else {
+            require(admitted!=null && admitted.definitionHash().equals(diagnostic.failure.facts.definitionHash())
+                    && plan!=null && origin!=null && settings!=null && stable==diagnostic.stable
+                    && Objects.equals(observedHash,diagnostic.observedHash),"Missing restored/imported request or unexpected readiness acceptance");
+            try { require(admitted.sourceMatches(Files.readAllBytes(diagnostic.stage.resolve("retained-source.schem"))),"Changed imported source"); }
+            catch(IOException error) { throw new UncheckedIOException(error); }
+        }
+        var proof=new JsonObject(); proof.add("operation",operationIdentity(operation));
+        proof.add("fault",new Gson().toJsonTree(diagnostic.failure.facts));
+        proof.addProperty("ready",ready); proof.addProperty("runId",(String)null);
+        proof.addProperty("verification","actual current CLEANUP; stage and native owned state checked; no readiness or rollback");
+        proof.add("client",client.state); proof.add("server",remote.state);
+        proof.add("clientProblems",new Gson().toJsonTree(client.problems)); proof.add("serverProblems",new Gson().toJsonTree(remote.problems));
+        proof.addProperty("clientAge",client.age); proof.addProperty("clientWorldTime",client.time);
+        proof.addProperty("serverAge",remote.age); proof.addProperty("serverWorldTime",remote.time); proof.addProperty("serverTick",remote.serverTick);
+        proof.addProperty("cleanupKind",cleanup.kind().name()); proof.addProperty("cleanupDeadlineNanos",cleanup.deadlineNanos());
+        proof.addProperty("retainedWatchCompared",fault==ResetFault.ARCHIVE_BEFORE_COMMITTED);
+        proof.addProperty("ownedBlocksInventoryCompared",fault==ResetFault.ARCHIVE_BEFORE_COMMITTED);
+        if(diagnostic.client!=null) { proof.add("beforeClient",JsonParser.parseString(diagnostic.client)); proof.add("beforeServer",JsonParser.parseString(diagnostic.server)); }
+        require(((Inspect)host).requireScope(operation,Kind.CLEANUP)==cleanup,"Reset proof CLEANUP changed");
+        writeNew(roots,artifacts.resolve("simulated-reset-fault-verification.json"),proof.toString());
+    }
+
+    static void requirePreservedOwnedState(String before,String after) {
+        var a=JsonParser.parseString(before).getAsJsonObject(); var b=JsonParser.parseString(after).getAsJsonObject();
+        for(var key:List.of("blocks","inventory","containers"))
+            require(a.has(key) && b.has(key) && a.get(key).equals(b.get(key)),"Archive fault changed owned "+key);
+    }
+
     private Scope requireInspectWork(Command first, Command second) {
         if(!inspectMode) return null;
         require(inspectAdmissionFailure==null && inspectStartupFailure==null && inspectUnresolvedCleanupFailure==null
@@ -457,6 +665,7 @@ final class ScenarioRunner implements AutoCloseable {
     }
 
     InspectCompletion finishInspectOperation(Operation operation, Scope cleanup, Throwable primary) {
+        try {
         require(inspectMode && inspectAdmissionFailure==null && inspectStartupFailure==null && operation==inspectOperation
                         && operation.command()!=Command.STARTUP && !inspectFinalizing,
                 "Foreign, failed-admission or already finalized operation");
@@ -507,6 +716,10 @@ final class ScenarioRunner implements AutoCloseable {
             }
             catch(RuntimeException | Error error) { cleanupStatus="FAILED"; failure=retain(failure,error); }
         }
+        if(failure instanceof SimulatedInspectResetFailure) {
+            try { verifyResetFault(operation,cleanup,failure); }
+            catch(RuntimeException | Error error) { inspectEvidenceIncomplete=true; failure=retain(failure,error); }
+        }
         // Transport settlement cannot resolve an unverified release/freeze owned by this Runner.
         if(cleanupStatus.equals("FAILED")) inspectUnresolvedCleanupFailure=failure;
         ready=ready && failure==null && operation.command()==Command.RESET;
@@ -551,6 +764,7 @@ final class ScenarioRunner implements AutoCloseable {
                 Optional.ofNullable(inspectRun),failure==null?"PASS":"FAIL",failure,artifacts,complete,cleanupStatus,true,summary);
         inspectLast=completion; inspectLastSummaryHash=summaryHash; inspectOperation=null;
         return completion;
+        } finally { inspectResetDiagnostic=null; }
     }
 
     private static boolean timeoutFailure(Throwable failure) {
@@ -918,9 +1132,10 @@ final class ScenarioRunner implements AutoCloseable {
     }
 
     void reset(ScenarioDefinition definition) {
-        requireInspectWork(Command.RESET,Command.RERUN);
+        var resetWork=requireInspectWork(Command.RESET,Command.RERUN);
         require(!inspectMode || worldCreated,"Inspect startup must create and bind the owned world before reset");
         preflight(definition); // Stale authority cannot invalidate readiness, stop, or archive.
+        var resetFault=selectResetFault();
         require(baseline() || compactArchiveFailure==null,"Reset refuses an earlier failed compact archive");
         require(baseline() || outputs.failure().isEmpty() && (resetOrdinal==0 || capture!=null),
                 "Reset refuses failed output or renewal of an unadopted compact budget");
@@ -961,8 +1176,23 @@ final class ScenarioRunner implements AutoCloseable {
                     PredictionFaults.snapshot(), PredictionFaults.stateSnapshot(),sealed,retained);
         });
         var stage = artifacts.resolve("reset-" + (++resetOrdinal));
+        if(resetFault!=null) {
+            preflight(definition);
+            require(requireInspectWork(Command.RESET,Command.RESET)==resetWork,"Reset arm WORK changed");
+            require(resetFault==ResetFault.RESET_AFTER_RESTORE_BEFORE_READINESS
+                    ? inspectLast==null && previous==null && runs.isEmpty() && countedStarts==0 : resetFaultPredecessor(inspectOperation),
+                    "Reset arm predecessor changed");
+        }
+        ResetToken token=resetFault==null?null:new ResetToken(resetFault,resetIdentity(definition,resetWork,stage));
+        try {
+        if(token!=null) {
+            preflight(definition);
+            require(requireInspectWork(Command.RESET,Command.RESET)==resetWork,"Reset arm WORK changed");
+            token.check(resetIdentity(definition,resetWork,stage),resetFault);
+            captureResetDiagnostic(token,prior);
+        }
         archiveThenRestore(() -> {
-            if(baseline() || capture!=null) archive(stage,prior);
+            if(baseline() || capture!=null) archive(stage,prior,token);
             else {
                 checkedDirectory(roots,stage);
                 scalar("initial-reset.txt","New owned world; no prior owned run/trace to discard; constructor budget remains open for actual start");
@@ -995,9 +1225,11 @@ final class ScenarioRunner implements AutoCloseable {
             settings = new BuildEngine.Settings(i(s,"halfWidth"), i(s,"stride"), b(s,"constantSprint"), i(s,"reservedHotbarSlots"));
             admitted = definition;
             if(!baseline()) finalTargets=TraversalAssertions.expectedWorldTargets(definition,plan.targets());
+            fireResetFault(token,ResetFault.RESET_AFTER_RESTORE_BEFORE_READINESS,definition,stage);
             awaitStable(stage,consumed);
             ready = true; // Only two independent advancing post-physics checkpoints grant start authority.
         });
+        } finally { if(token!=null) token.retire(); }
     }
 
     private UUID start(ScenarioDefinition definition, boolean counted) {
@@ -3757,7 +3989,9 @@ final class ScenarioRunner implements AutoCloseable {
                 && real(roots.saves).equals(roots.saves) && save.getParent().equals(roots.saves), "Save authority redirected");
     }
 
-    private void archive(Path stage, Prior prior) {
+    private void archive(Path stage, Prior prior) { archive(stage,prior,null); }
+
+    private void archive(Path stage, Prior prior,ResetToken token) {
         preflight(admitted == null ? profileDefinition : admitted);
         checkedDirectory(roots, stage);
         if(!baseline()) { archiveCompact(stage,prior.traversal); return; }
@@ -3775,6 +4009,7 @@ final class ScenarioRunner implements AutoCloseable {
         Path screenshot = takeScreenshot(stage,"before-reset");
         require(real(screenshot).startsWith(real(stage)) && Files.isRegularFile(screenshot), "Archive screenshot absent/escaped");
         copyNew(roots, roots.game.resolve("logs/latest.log"), stage.resolve("minecraft-latest.log"));
+        fireResetFault(token,ResetFault.ARCHIVE_BEFORE_COMMITTED,token==null?profileDefinition:token.identity.definition,stage);
         // COMMITTED is last; any archive exception leaves observer/fault/world untouched after stop.
         writeNew(roots, stage.resolve("COMMITTED"), "archive complete; invocation=" + invocation);
     }
@@ -4165,6 +4400,7 @@ final class ScenarioRunner implements AutoCloseable {
     }
 
     private void closeInspect() {
+        try {
         require(inspectUnresolvedCleanupFailure==null,"Owned inspect cleanup is unresolved; cannot renew its cleanup scope");
         var transport=(Inspect)host;
         if(inspectAdmissionFailure!=null) {
@@ -4176,9 +4412,11 @@ final class ScenarioRunner implements AutoCloseable {
             var cleanup=transport.requireScope(inspectOperation,Kind.CLEANUP);
             closeInspectOwned(inspectOperation,cleanup);
         }
+        } finally { inspectResetDiagnostic=null; }
     }
 
     private void closeInspectOwned(Operation operation, Scope cleanup) {
+        try {
         require(((Inspect)host).requireScope(operation,Kind.CLEANUP)==cleanup,"Wrong shutdown cleanup scope");
         // Damaged admission cannot gate freshly authorized release or cause writes into prior closed evidence.
         Throwable failure=null;
@@ -4223,6 +4461,7 @@ final class ScenarioRunner implements AutoCloseable {
             if(failure instanceof Error fatal) throw fatal;
             if(failure!=null) throw (RuntimeException)failure;
         }
+        } finally { inspectResetDiagnostic=null; }
     }
 
     private void closeCompact() {

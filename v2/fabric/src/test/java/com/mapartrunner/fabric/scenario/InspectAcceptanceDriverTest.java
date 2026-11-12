@@ -20,6 +20,76 @@ import static org.junit.jupiter.api.Assertions.*;
 
 /** Simulated input/clock policy checks. These do not establish native keyboard or gameplay acceptance. */
 class InspectAcceptanceDriverTest {
+    @Test void resetArchiveSelectionStartsWithExplicitResetWithoutDisplacementOrIdle() {
+        var previous = System.getProperty("mapart.test.inspect.acceptance.case");
+        try {
+            System.setProperty("mapart.test.inspect.acceptance.case", "reset-archive");
+            var f = new Fixture(); f.send();
+            assertEquals(List.of("/maparttest reset grounded-two-lane"), f.input.commands, f.logs.toString());
+            assertEquals(0, f.input.stops); assertEquals(0, f.idleReads);
+        } finally {
+            if (previous == null) System.clearProperty("mapart.test.inspect.acceptance.case");
+            else System.setProperty("mapart.test.inspect.acceptance.case", previous);
+        }
+    }
+
+    @Test void resetArchiveProgramHasEightSettledMutationsFourLastsAndTwoDistinctRecoveryRuns() {
+        resetArchive(f -> {
+            for(int ordinal=1;ordinal<=8;ordinal++) {
+                f.send(); var result=f.completion(ordinal);
+                f.observation=new InspectObservation(true,true,false,Optional.of(result)); f.tick(3);
+                assertEquals(ordinal,f.input.commands.stream().filter(c -> !c.equals("/maparttest last")).count());
+                f.observation=idle(result); f.tick();
+                if(Set.of(1,4,5,8).contains(ordinal)) { f.send(); f.tick(); }
+            }
+            f.tick(3);
+            assertEquals(List.of("/maparttest reset grounded-two-lane","/maparttest last","/maparttest run grounded-two-lane",
+                    "/maparttest reset grounded-two-lane","/maparttest run grounded-two-lane","/maparttest last",
+                    "/maparttest reset grounded-two-lane","/maparttest last","/maparttest run grounded-two-lane",
+                    "/maparttest reset grounded-two-lane","/maparttest run grounded-two-lane","/maparttest last"),f.input.commands);
+            assertEquals(1,f.input.stops); assertEquals(0,f.idleReads); assertFalse(f.input.pressed);
+            assertTrue(f.input.events.stream().noneMatch(e -> e.startsWith("87")));
+            assertTrue(f.logs.stream().noneMatch(e -> e.contains("DRIVER_FAIL") || e.startsWith("INSPECT_ACCEPTANCE_IDLE")),f.logs.toString());
+            assertNotEquals(f.completion(4).runId(),f.completion(8).runId());
+        });
+    }
+
+    @Test void resetArchiveRejectsReclassifiedFaultsNoReadinessAndInvalidEvidenceBeforeSuccessorInput() {
+        for(int ordinal:List.of(1,2,3,4,5,6,7,8)) for(String bad:List.of("class","message","PASS","run","complete","settled")) resetArchive(f -> {
+            for(int prior=1;prior<ordinal;prior++) {
+                f.sendCompletion(prior);
+                if(Set.of(1,4,5).contains(prior)) { f.send(); f.tick(); }
+            }
+            f.send(); var c=f.completion(ordinal);
+            var failure=c.failure().orElse(new FailureObservation("unexpected","unexpected"));
+            f.observation=idle(new PublishedCompletion(c.sessionId(),c.operationId(),c.ordinal(),c.command(),
+                    bad.equals("run") ? c.runId().isPresent()?Optional.empty():Optional.of(UUID.randomUUID()) : c.runId(),
+                    bad.equals("PASS")?c.verdict().equals("PASS")?"FAIL":"PASS":c.verdict(),!bad.equals("complete"),"RELEASED",!bad.equals("settled"),
+                    c.evidenceDirectory(),c.summaryPath(), bad.equals("class") || bad.equals("message") ? Optional.of(new FailureObservation(
+                    bad.equals("class")?"wrong":failure.className(),bad.equals("message")?"wrong":failure.message())):c.failure()));
+            f.tick(); f.assertFailed("completion");
+            assertEquals(ordinal,f.input.commands.stream().filter(command -> !command.equals("/maparttest last")).count());
+        });
+        resetArchive(f -> {
+            for(int ordinal=1;ordinal<8;ordinal++) { f.sendCompletion(ordinal); if(Set.of(1,4,5).contains(ordinal)) { f.send(); f.tick(); } }
+            f.runs[7]=f.runs[3]; f.sendCompletion(8); f.assertFailed("completion");
+        });
+    }
+
+    @Test void changedResetArchiveCaseStopsBeforeFurtherInput() {
+        resetArchive(f -> {
+            f.sendCompletion(1); int events=f.input.events.size();
+            System.setProperty("mapart.test.inspect.acceptance.case","baseline"); f.tick();
+            f.assertFailed("acceptance case changed"); assertEquals(events,f.input.events.size());
+        });
+    }
+
+    private static void resetArchive(java.util.function.Consumer<Fixture> test) {
+        var previous=System.getProperty("mapart.test.inspect.acceptance.case");
+        try { System.setProperty("mapart.test.inspect.acceptance.case","reset-archive"); var f=new Fixture(); f.resetArchive=true; test.accept(f); }
+        finally { if(previous==null) System.clearProperty("mapart.test.inspect.acceptance.case"); else System.setProperty("mapart.test.inspect.acceptance.case",previous); }
+    }
+
     @Test void settledFailureBWaitsWithoutChatInputOrStop() {
         displaced(f -> {
             f.beginForward(); f.input.x = 0.5; f.tick(); f.sendCompletion(3);
@@ -507,8 +577,8 @@ class InspectAcceptanceDriverTest {
     private static final class Fixture {
         final AtomicLong now = new AtomicLong(); final SimulatedChat input = new SimulatedChat();
         final List<String> logs = new ArrayList<>(); final UUID session = UUID.randomUUID();
-        final UUID[] operations = new UUID[5], runs = new UUID[5];
-        InspectObservation observation = idle(null); boolean enabled = true, displaced; String guardFailure;
+        final UUID[] operations = new UUID[8], runs = new UUID[8];
+        InspectObservation observation = idle(null); boolean enabled = true, displaced, resetArchive; String guardFailure;
         String boundaryFailure; int idleReads;
         ScenarioRunner.InspectIdleObservation retainedObserver = new ScenarioRunner.InspectIdleObservation(new ScenarioObserver.Watch().retained());
         final InspectAcceptanceDriver driver = new InspectAcceptanceDriver(() -> observation, input, now::get, () -> enabled, logs::add,
@@ -531,6 +601,12 @@ class InspectAcceptanceDriverTest {
             assertTrue(logs.stream().allMatch(s -> s.length() <= 4096));
         }
         PublishedCompletion completion(int ordinal) {
+            if(resetArchive) return new PublishedCompletion(session,operations[ordinal-1],ordinal,ordinal%2==1?Command.RESET:Command.RUN,
+                    ordinal==4 || ordinal==8?Optional.of(runs[ordinal-1]):Optional.empty(),Set.of(1,2,5,6).contains(ordinal)?"FAIL":"PASS",
+                    true,"RELEASED",true,"operation-"+ordinal,"operation-"+ordinal+"/summary.json",
+                    ordinal==1 || ordinal==5 ? Optional.of(new FailureObservation("com.mapartrunner.fabric.scenario.ScenarioRunner$SimulatedInspectResetFailure",
+                    ordinal==1?"SIMULATED_INSPECT_RESET_AFTER_RESTORE_BEFORE_READINESS":"SIMULATED_INSPECT_ARCHIVE_BEFORE_COMMITTED"))
+                    : ordinal==2 || ordinal==6 ? Optional.of(new FailureObservation("java.lang.AssertionError","Run requires this invocation's successful reset")):Optional.empty());
             return new PublishedCompletion(session, operations[ordinal - 1], ordinal,
                     ordinal == 2 || displaced && ordinal == 4 ? Command.RESET : displaced || ordinal < 4 ? Command.RUN : Command.RERUN,
                     (displaced ? ordinal == 5 : ordinal > 2) ? Optional.of(runs[ordinal - 1]) : Optional.empty(), ordinal == 1 || displaced && ordinal == 3 ? "FAIL" : "PASS",

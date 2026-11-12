@@ -28,6 +28,243 @@ class ScenarioInspectLifecycleTest {
     }
     @TempDir Path directory;
 
+    @Test void resetFaultSelectionRequiresOrdinaryGatesExactCounterAndRealPredecessorPolicy() {
+        for(String inspect:java.util.Arrays.asList(null,"false","true"))
+            for(String acceptance:java.util.Arrays.asList(null,"false","true"))
+                for(String automatic:java.util.Arrays.asList(null,"false","true")) {
+                    var point=ScenarioRunner.selectResetFault(true,inspect,acceptance,automatic,"reset-archive",Command.RESET,1,0,true);
+                    assertEquals("true".equals(inspect) && "true".equals(acceptance) && automatic==null,
+                            point==ScenarioRunner.ResetFault.RESET_AFTER_RESTORE_BEFORE_READINESS);
+                }
+        assertNull(ScenarioRunner.selectResetFault(false,"true","true",null,"reset-archive",Command.RESET,1,0,true));
+        for(String selection:List.of("baseline","displaced")) assertNull(ScenarioRunner.selectResetFault(true,"true","true",null,selection,Command.RESET,1,0,false));
+        assertThrows(AssertionError.class,() -> ScenarioRunner.selectResetFault(true,"true","true",null,"unknown",Command.RESET,1,0,true));
+        for(Command command:List.of(Command.RUN,Command.RERUN,Command.STARTUP,Command.CLOSE))
+            assertNull(ScenarioRunner.selectResetFault(true,"true","true",null,"reset-archive",command,1,0,true));
+        for(int ordinal:List.of(1,5)) {
+            int resets=ordinal==1?0:2;
+            assertNotNull(ScenarioRunner.selectResetFault(true,"true","true",null,"reset-archive",Command.RESET,ordinal,resets,true));
+            assertThrows(AssertionError.class,() -> ScenarioRunner.selectResetFault(true,"true","true",null,"reset-archive",Command.RESET,ordinal,resets,false));
+            assertThrows(AssertionError.class,() -> ScenarioRunner.selectResetFault(true,"true","true",null,"reset-archive",Command.RESET,ordinal,resets+1,true));
+        }
+        assertNull(ScenarioRunner.selectResetFault(true,"true","true",null,"reset-archive",Command.RESET,3,1,false));
+        assertNull(ScenarioRunner.selectResetFault(true,"true","true",null,"reset-archive",Command.RESET,7,3,false));
+        assertThrows(AssertionError.class,() -> ScenarioRunner.selectResetFault(true,"true","true",null,"reset-archive",Command.RESET,2,1,true));
+    }
+
+    @Test void resetTokenConsumesBeforeThrowRetiresAndHasDetachedDiagnostics() throws Exception {
+        resetFaultProperties(() -> {
+            for(var point:ScenarioRunner.ResetFault.values()) {
+                var identity=resetIdentity(point==ScenarioRunner.ResetFault.ARCHIVE_BEFORE_COMMITTED?5:1);
+                var token=new ResetTokenProbe(point,identity);
+                var failure=assertThrows(ScenarioRunner.SimulatedInspectResetFailure.class,() -> token.fire(identity,point));
+                assertEquals(point==ScenarioRunner.ResetFault.ARCHIVE_BEFORE_COMMITTED?"SIMULATED_INSPECT_ARCHIVE_BEFORE_COMMITTED"
+                        :"SIMULATED_INSPECT_RESET_AFTER_RESTORE_BEFORE_READINESS",failure.getMessage());
+                assertEquals("CONSUMED",token.state());
+                assertThrows(AssertionError.class,() -> token.fire(identity,point)); assertEquals("RETIRED",token.state());
+                token.retire(); assertThrows(AssertionError.class,() -> token.check(identity,point));
+                assertNull(failure.getCause()); assertEquals(0,failure.getSuppressed().length);
+                for(var field:failure.getClass().getDeclaredFields()) {
+                    field.setAccessible(true); var facts=field.get(failure);
+                    assertTrue(facts.getClass().isRecord());
+                    for(var component:facts.getClass().getRecordComponents())
+                        assertTrue(Set.of(String.class,UUID.class,int.class,long.class).contains(component.getType()),component::toString);
+                }
+            }
+        });
+    }
+
+    @Test void resetTokenRefusesEveryChangedIdentityPointAndGateAndRetiresOnEarlierUnwind() throws Exception {
+        resetFaultProperties(() -> {
+            var original=resetIdentity(1); var point=ScenarioRunner.ResetFault.RESET_AFTER_RESTORE_BEFORE_READINESS;
+            for(var component:original.getClass().getRecordComponents()) {
+                Object changed=switch(component.getName()) {
+                    case "operation" -> new Operation(original.invocation(),1,original.operation().operationId(),Command.RESET,original.operation().evidenceDirectory());
+                    case "work" -> new Scope(original.operation(),Kind.WORK,original.work().deadlineNanos());
+                    case "invocation" -> UUID.randomUUID();
+                    case "profile","definition" -> ScenarioDefinition.load();
+                    case "save","stage" -> directory.resolve("foreign");
+                    case "resetOrdinal" -> 2;
+                    default -> new Object();
+                };
+                var candidate=changedResetIdentity(original,component.getName(),changed);
+                var token=new ResetTokenProbe(point,original);
+                assertThrows(AssertionError.class,() -> token.check(candidate,point),component.getName());
+                assertThrows(AssertionError.class,() -> token.fire(original,point));
+            }
+            var wrongPoint=new ResetTokenProbe(point,original);
+            assertThrows(AssertionError.class,() -> wrongPoint.fire(original,ScenarioRunner.ResetFault.ARCHIVE_BEFORE_COMMITTED));
+            for(String property:List.of("mapart.test.inspect","mapart.test.inspect.acceptance","fabric.client.gametest","mapart.test.inspect.acceptance.case")) {
+                var token=new ResetTokenProbe(point,original); var old=System.getProperty(property);
+                System.setProperty(property,"false");
+                assertThrows(AssertionError.class,() -> token.fire(original,point));
+                if(old==null) System.clearProperty(property); else System.setProperty(property,old);
+                assertThrows(AssertionError.class,() -> token.fire(original,point));
+            }
+            for(boolean earlyFailure:List.of(false,true)) {
+                var token=new ResetTokenProbe(point,original);
+                try { if(earlyFailure) throw new IllegalStateException("earlier archive/cancel/expiry"); }
+                catch(IllegalStateException expected) { assertEquals("earlier archive/cancel/expiry",expected.getMessage()); }
+                finally { token.retire(); }
+                assertThrows(AssertionError.class,() -> token.fire(original,point));
+            }
+            assertThrows(AssertionError.class,() -> new ResetTokenProbe(point,changedResetIdentity(original,"work",new Scope(original.operation(),Kind.CLEANUP,99))));
+        });
+    }
+
+    @Test void resetStageProofRejectsMissingForeignCommittedImportAndReadinessStages() throws Exception {
+        var roots=roots(); var operation=new Operation(UUID.randomUUID(),1,UUID.randomUUID(),Command.RESET,roots.evidence().resolve("operation"));
+        var stage=Files.createDirectories(operation.evidenceDirectory().resolve("reset-1"));
+        var archive=ScenarioRunner.ResetFault.ARCHIVE_BEFORE_COMMITTED; var restored=ScenarioRunner.ResetFault.RESET_AFTER_RESTORE_BEFORE_READINESS;
+        ScenarioRunner.requireResetFaultStage(roots,operation,stage,1,archive);
+        assertThrows(AssertionError.class,() -> ScenarioRunner.requireResetFaultStage(roots,operation,stage,1,restored));
+        for(String name:List.of("COMMITTED","retained-source.schem","imported-plan.txt")) Files.writeString(stage.resolve(name),"actual temporary stage fixture");
+        ScenarioRunner.requireResetFaultStage(roots,operation,stage,1,restored);
+        assertThrows(AssertionError.class,() -> ScenarioRunner.requireResetFaultStage(roots,operation,stage,1,archive));
+        for(String name:List.of("readiness-1.json","stable-start.json")) {
+            Files.writeString(stage.resolve(name),"must reject");
+            assertThrows(AssertionError.class,() -> ScenarioRunner.requireResetFaultStage(roots,operation,stage,1,restored));
+            Files.delete(stage.resolve(name));
+        }
+        assertThrows(AssertionError.class,() -> ScenarioRunner.requireResetFaultStage(roots,operation,stage,2,restored));
+        var foreign=new Operation(operation.sessionId(),1,UUID.randomUUID(),Command.RESET,operation.evidenceDirectory().resolve("other"));
+        assertThrows(AssertionError.class,() -> ScenarioRunner.requireResetFaultStage(roots,foreign,stage,1,restored));
+    }
+
+    @Test void archiveOwnedComparisonIgnoresPhysicsTimeButRejectsChangedOrMissingBlocksAndInventory() {
+        String before="{\"blocks\":[\"stone\"],\"inventory\":[9],\"containers\":[],\"age\":1,\"hunger\":20,\"x\":1}";
+        String after="{\"blocks\":[\"stone\"],\"inventory\":[9],\"containers\":[],\"age\":99,\"hunger\":19,\"x\":2}";
+        ScenarioRunner.requirePreservedOwnedState(before,after);
+        for(String changed:List.of(after.replace("stone","air"),after.replace("[9]","[8]"),"{\"blocks\":[],\"inventory\":[9]}"))
+            assertThrows(AssertionError.class,() -> ScenarioRunner.requirePreservedOwnedState(before,changed));
+    }
+
+    @Test void simulatedFailureWithoutNativeProofStaysOriginalIncompleteAndClearsEnteredFinalization() throws Exception {
+        for(String boundary:List.of("missing","proof","guard","settlement","abandon","admission")) {
+            var host=new InspectTransport(); var runner=runner(host); var operation=runner.beginInspectOperation(Command.RESET);
+            var work=host.beginWork(operation);
+            var failure=new ScenarioRunner.SimulatedInspectResetFailure(new ScenarioRunner.ResetFailureFacts("RESET_AFTER_RESTORE_BEFORE_READINESS",
+                    operation.sessionId(),operation.operationId(),1,1,ScenarioDefinition.load().definitionHash(),operation.evidenceDirectory().resolve("reset-1").toString(),work.deadlineNanos()));
+            if(!boundary.equals("missing")) setResetDiagnostic(runner,operation,failure);
+            var cleanup=host.beginCleanup(work,failure);
+            if(boundary.equals("guard")) {
+                var foreign=new Operation(operation.sessionId(),1,operation.operationId(),Command.RESET,operation.evidenceDirectory());
+                assertThrows(AssertionError.class,() -> host.inScope(cleanup,() -> runner.finishInspectOperation(foreign,cleanup,failure)));
+            } else if(boundary.equals("admission")) {
+                runner.failInspectAdmission(operation,failure);
+            } else if(boundary.equals("abandon")) {
+                assertThrows(AssertionError.class,() -> host.inScope(cleanup,runner::close));
+            } else if(boundary.equals("settlement")) {
+                host.settlementFailure=new IllegalStateException("settlement unavailable");
+                assertSame(failure,assertThrows(ScenarioRunner.SimulatedInspectResetFailure.class,
+                        () -> host.inScope(cleanup,() -> runner.finishInspectOperation(operation,cleanup,failure))));
+                assertTrue(failure.getSuppressed().length>0);
+            } else {
+                var completion=host.inScope(cleanup,() -> runner.finishInspectOperation(operation,cleanup,failure));
+                assertSame(failure,completion.failure()); assertEquals("FAIL",completion.verdict());
+                assertFalse(completion.evidenceComplete()); assertTrue(completion.runId().isEmpty());
+                assertFalse(Files.exists(operation.evidenceDirectory().resolve("simulated-reset-fault-verification.json")));
+            }
+            assertNull(runnerField("inspectResetDiagnostic").get(runner));
+        }
+    }
+
+    /** Reflection reaches the actual private one-shot implementation; no token behavior is doubled. */
+    private static final class ResetTokenProbe {
+        final Object token;
+        ResetTokenProbe(ScenarioRunner.ResetFault point,ScenarioRunner.ResetIdentity identity) {
+            try {
+                var type=Class.forName(ScenarioRunner.class.getName()+"$ResetToken");
+                var constructor=type.getDeclaredConstructor(ScenarioRunner.ResetFault.class,ScenarioRunner.ResetIdentity.class); constructor.setAccessible(true);
+                token=constructor.newInstance(point,identity);
+            } catch(java.lang.reflect.InvocationTargetException error) { throw tokenError(error); }
+            catch(ReflectiveOperationException error) { throw new AssertionError(error); }
+        }
+        void check(ScenarioRunner.ResetIdentity identity,ScenarioRunner.ResetFault point) { invoke("check",identity,point); }
+        void fire(ScenarioRunner.ResetIdentity identity,ScenarioRunner.ResetFault point) { invoke("fire",identity,point); }
+        void retire() { invoke("retire"); }
+        String state() throws Exception { var field=token.getClass().getDeclaredField("state"); field.setAccessible(true); return field.get(token).toString(); }
+        private void invoke(String name,Object... args) {
+            try {
+                var types=java.util.Arrays.stream(args).map(Object::getClass).toArray(Class<?>[]::new);
+                var method=token.getClass().getDeclaredMethod(name,types); method.setAccessible(true); method.invoke(token,args);
+            } catch(java.lang.reflect.InvocationTargetException error) { throw tokenError(error); }
+            catch(ReflectiveOperationException error) { throw new AssertionError(error); }
+        }
+        private static RuntimeException tokenError(java.lang.reflect.InvocationTargetException error) {
+            if(error.getCause() instanceof Error fatal) throw fatal;
+            return (RuntimeException)error.getCause();
+        }
+    }
+
+    @Test void resetFaultPredecessorUsesActualRetainedCompletionSuccessAndNonemptyBoundHistory() throws Exception {
+        var host=new InspectTransport(); var runner=runner(host);
+        var first=runner.beginInspectOperation(Command.RESET);
+        assertTrue(resetPredecessor(runner,first));
+        runnerField("resetOrdinal").setInt(runner,1); assertFalse(resetPredecessor(runner,first));
+        runnerField("resetOrdinal").setInt(runner,0);
+        var work=host.beginWork(first); var cleanup=host.beginCleanup(work,new IllegalStateException("synthetic owner prelude"));
+        host.inScope(cleanup,() -> runner.finishInspectOperation(first,cleanup,new IllegalStateException("synthetic owner prelude")));
+        for(int i=2;i<=3;i++) {
+            var op=runner.beginInspectOperation(Command.RESET); var w=host.beginWork(op); var c=host.beginCleanup(w,null);
+            host.inScope(c,() -> runner.finishInspectOperation(op,c,new IllegalStateException("synthetic owner prelude")));
+        }
+        var run=runner.beginInspectOperation(Command.RUN); var runWork=host.beginWork(run);
+        var result=successfulOwnerState(runner,run,checkpoint(),"synthetic-start");
+        host.inScope(runWork,() -> runner.assertResult(result));
+        var runCleanup=host.beginCleanup(runWork,null);
+        var settled=host.inScope(runCleanup,() -> runner.finishInspectOperation(run,runCleanup,null));
+        assertEquals("NO_OWNED_WORLD",settled.cleanupStatus());
+        // Synthetic immutable predecessor facts test the policy; this is deliberately not a native RELEASED result.
+        runnerField("inspectLast").set(runner,new ScenarioRunner.InspectCompletion(settled.sessionId(),settled.operationId(),4,Command.RUN,
+                settled.runId(),"PASS",null,settled.evidenceDirectory(),true,"RELEASED",true,settled.summaryPath()));
+        var fifth=runner.beginInspectOperation(Command.RESET);
+        assertFalse(resetPredecessor(runner,fifth),"A successful completion alone cannot replace bound retained history");
+        var context=result.terminal().lifecycle().context().orElseThrow();
+        var watch=pairedWatch(context,witnessSamples(context),null,null); runnerField("watch").set(runner,watch);
+        assertTrue(resetPredecessor(runner,fifth));
+        var prior=runnerField("priorCountedSuccess").get(runner); runnerField("priorCountedSuccess").set(runner,null);
+        assertFalse(resetPredecessor(runner,fifth)); runnerField("priorCountedSuccess").set(runner,prior);
+        var completion=runner.lastInspectCompletion().orElseThrow();
+        runnerField("inspectLast").set(runner,new ScenarioRunner.InspectCompletion(UUID.randomUUID(),completion.operationId(),4,Command.RUN,
+                completion.runId(),"PASS",null,completion.evidenceDirectory(),true,"RELEASED",true,completion.summaryPath()));
+        assertFalse(resetPredecessor(runner,fifth));
+        assertEquals(0,host.effects,"Owner-state tests grant no native completion credit");
+    }
+
+    private static boolean resetPredecessor(ScenarioRunner runner,Operation operation) throws Exception {
+        var method=ScenarioRunner.class.getDeclaredMethod("resetFaultPredecessor",Operation.class); method.setAccessible(true);
+        return (boolean)method.invoke(runner,operation);
+    }
+
+    private static void setResetDiagnostic(ScenarioRunner runner,Operation operation,ScenarioRunner.SimulatedInspectResetFailure failure) throws Exception {
+        var holder=runnerField("inspectResetDiagnostic"); var constructor=holder.getType().getDeclaredConstructors()[0]; constructor.setAccessible(true);
+        holder.set(runner,constructor.newInstance(operation,failure,operation.evidenceDirectory().resolve("reset-1"),1,null,
+                new ScenarioRunner.InspectIdleObservation(new ScenarioObserver.Watch().retained()),null,null,null,null,null,null,null,null,null));
+    }
+
+    private ScenarioRunner.ResetIdentity resetIdentity(int ordinal) {
+        var operation=new Operation(UUID.randomUUID(),ordinal,UUID.randomUUID(),Command.RESET,directory.resolve("operation-"+ordinal));
+        var profile=ScenarioDefinition.load();
+        return new ScenarioRunner.ResetIdentity(operation,new Scope(operation,Kind.WORK,600_000_000_001L),operation.sessionId(),profile,
+                ScenarioDefinition.load(),directory.resolve("save"),new Object(),new Object(),new Object(),new Object(),new Object(),new Object(),new Object(),
+                ordinal==1?1:3,operation.evidenceDirectory().resolve("reset-"+(ordinal==1?1:3)));
+    }
+
+    private static ScenarioRunner.ResetIdentity changedResetIdentity(ScenarioRunner.ResetIdentity original,String name,Object replacement) throws Exception {
+        var fields=original.getClass().getRecordComponents(); var args=new Object[fields.length]; var types=new Class<?>[fields.length];
+        for(int i=0;i<fields.length;i++) { types[i]=fields[i].getType(); args[i]=fields[i].getName().equals(name)?replacement:fields[i].getAccessor().invoke(original); }
+        return original.getClass().getDeclaredConstructor(types).newInstance(args);
+    }
+
+    private interface ResetTest { void run() throws Exception; }
+    private static void resetFaultProperties(ResetTest test) throws Exception {
+        var names=List.of("mapart.test.inspect","mapart.test.inspect.acceptance","fabric.client.gametest","mapart.test.inspect.acceptance.case");
+        var old=new java.util.HashMap<String,String>(); names.forEach(name -> old.put(name,System.getProperty(name)));
+        try { System.setProperty(names.get(0),"true"); System.setProperty(names.get(1),"true"); System.clearProperty(names.get(2)); System.setProperty(names.get(3),"reset-archive"); test.run(); }
+        finally { names.forEach(name -> { if(old.get(name)==null) System.clearProperty(name); else System.setProperty(name,old.get(name)); }); }
+    }
+
     @Test void opaqueIdleValueComparesWholeHistoryBindingAndFirstFailureDespiteEqualCounts() {
         var context=witnessContext(); var watch=pairedWatch(context,witnessSamples(context),null,null);
         var retained=watch.retained(); var before=new ScenarioRunner.InspectIdleObservation(retained);

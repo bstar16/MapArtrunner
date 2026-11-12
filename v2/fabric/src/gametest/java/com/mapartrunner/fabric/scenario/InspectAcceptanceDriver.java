@@ -26,6 +26,7 @@ final class InspectAcceptanceDriver {
     private static final int ENTER = 257;
     private static final Command[] MUTATIONS = {Command.RUN, Command.RESET, Command.RUN, Command.RERUN, Command.RERUN};
     private static final Command[] DISPLACED = {Command.RUN, Command.RESET, Command.RUN, Command.RESET, Command.RUN};
+    private static final Command[] RESET_ARCHIVE = {Command.RESET, Command.RUN, Command.RESET, Command.RUN, Command.RESET, Command.RUN, Command.RESET, Command.RUN};
     private enum Stage { WAIT_STARTUP, NEXT_COMMAND, MOVING, OPEN_CHAT, WAIT_HANDOFF, WAIT_COMPLETION, IDLE, IDLE_FINISH_PENDING, STOPPED }
 
     // This driver alone owns its sequence and synthetic key. No Runner/Host state is changed here.
@@ -45,7 +46,8 @@ final class InspectAcceptanceDriver {
     private PublishedCompletion retained, pending;
     private UUID session;
     private boolean advancing, failed, stopRequested;
-    private boolean selected, displaced, moved, middleLast, carryInputDeadline;
+    private boolean selected, displaced, resetArchive, moved, middleLast, carryInputDeadline;
+    private int resetArchiveLast = -1;
     private int movementCallbacks;
     private Object heldForward;
     private Pose movementStart;
@@ -106,9 +108,10 @@ final class InspectAcceptanceDriver {
             require(enabled.getAsBoolean(), "Acceptance gate disabled during driver activity");
             if (!selected) {
                 var value = System.getProperty("mapart.test.inspect.acceptance.case", "baseline");
-                require(value.equals("baseline") || value.equals("displaced"), "Unknown acceptance case: " + value);
-                displaced = value.equals("displaced"); selected = true;
+                require(value.equals("baseline") || value.equals("displaced") || value.equals("reset-archive"), "Unknown acceptance case: " + value);
+                displaced = value.equals("displaced"); resetArchive = value.equals("reset-archive"); selected = true;
             }
+            if(resetArchive) require("reset-archive".equals(System.getProperty("mapart.test.inspect.acceptance.case")),"Reset-archive acceptance case changed");
             if (stage == Stage.STOPPED) { requestStop(current); return; }
             var observed = observations.get();
             require(!observed.restartRequired(), "Inspect session unavailable; restart required");
@@ -149,6 +152,9 @@ final class InspectAcceptanceDriver {
                     if (isLast()) {
                         requireUnchanged(observed); require(!observed.busy(), "Unexpected LAST admission");
                         marker("LAST submitted; response requires external retained CHAT check");
+                        if (resetArchive && index < RESET_ARCHIVE.length) {
+                            resetArchiveLast = index; stage = Stage.NEXT_COMMAND; return;
+                        }
                         if (displaced && index == 3 && !middleLast) {
                             middleLast = true; stage = Stage.NEXT_COMMAND; return;
                         }
@@ -265,10 +271,15 @@ final class InspectAcceptanceDriver {
                 && completion.evidenceComplete() && completion.cleanupSettled() && "RELEASED".equals(completion.cleanupStatus()),
                 "Invalid completion identity/evidence/cleanup");
         boolean expected;
-        if (index == 0 || displaced && index == 2) {
+        if (resetArchive && (index == 0 || index == 4)) {
+            expected = "FAIL".equals(completion.verdict()) && completion.runId().isEmpty()
+                    && completion.failure().filter(f -> "com.mapartrunner.fabric.scenario.ScenarioRunner$SimulatedInspectResetFailure".equals(f.className())
+                    && (index == 0 ? "SIMULATED_INSPECT_RESET_AFTER_RESTORE_BEFORE_READINESS"
+                    : "SIMULATED_INSPECT_ARCHIVE_BEFORE_COMMITTED").equals(f.message())).isPresent();
+        } else if (resetArchive && (index == 1 || index == 5) || !resetArchive && (index == 0 || displaced && index == 2)) {
             expected = "FAIL".equals(completion.verdict()) && completion.runId().isEmpty()
                     && completion.failure().filter(f -> "java.lang.AssertionError".equals(f.className())
-                    && (index == 0 ? "Run requires this invocation's successful reset" : "Start state changed without physics").equals(f.message())).isPresent();
+                    && (resetArchive || index == 0 ? "Run requires this invocation's successful reset" : "Start state changed without physics").equals(f.message())).isPresent();
         } else {
             expected = "PASS".equals(completion.verdict()) && completion.failure().isEmpty()
                     && (mutations()[index] == Command.RESET ? completion.runId().isEmpty() : completion.runId().filter(id -> !runs.contains(id)).isPresent());
@@ -397,8 +408,9 @@ final class InspectAcceptanceDriver {
                 + mutations()[index].name().toLowerCase(Locale.ROOT) + " grounded-two-lane";
     }
 
-    private Command[] mutations() { return displaced ? DISPLACED : MUTATIONS; }
-    private boolean isLast() { return index == mutations().length || displaced && index == 3 && !middleLast; }
+    private Command[] mutations() { return resetArchive ? RESET_ARCHIVE : displaced ? DISPLACED : MUTATIONS; }
+    private boolean isLast() { return index == mutations().length || displaced && index == 3 && !middleLast
+            || resetArchive && (index == 1 || index == 4 || index == 5) && resetArchiveLast != index; }
 
     private void marker(String detail) {
         var message = ("[mapart-inspect-acceptance] stage=" + stage + " command=" + commandText()
