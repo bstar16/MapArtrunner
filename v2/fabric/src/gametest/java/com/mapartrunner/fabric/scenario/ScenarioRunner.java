@@ -3191,6 +3191,17 @@ final class ScenarioRunner implements AutoCloseable {
             throw new AssertionError("Expiry pause returned without actual original WORK timeout");
         }
         UUID id = start(definition,true);
+        boolean atomicShiftPause=inspectMode && baseline() && supportCase==SupportCase.ORDINARY;
+        ScenarioObserver.Binding shiftBinding=null;
+        if(atomicShiftPause) {
+            var retained=watch.retained();
+            shiftBinding=retained.binding();
+            require(shiftBinding!=null && retained.failure()==null && shiftBinding.context().runId().equals(id)
+                    && shiftBinding.inspect()==host && shiftBinding.scope()==requireInspectWork(Command.RUN,Command.RERUN)
+                    && shiftBinding.currentScope(),"Missing original SHIFT observation binding/WORK");
+        }
+        // Run-local immutable data only: retained through pause, discarded when this run exits.
+        ScenarioObserver.ServerWitness shiftAnchor=null;
         boolean firstSuccess=inspectMode?assertedSuccesses.isEmpty():countedStarts==1;
         var stage=artifacts.resolve("success-"+countedStarts+"-"+id);
         checkedDirectory(roots,stage);
@@ -3230,7 +3241,6 @@ final class ScenarioRunner implements AutoCloseable {
         var profileText="fixture="+fixture+"; physicsRunTicks="+budget
                 +"; productionEligibleAllowance="+BuildEngine.runLimit(plan,settings)+"; targets="+plan.targets().size();
         if(baseline()) writeNew(roots,stage.resolve("fixture-profile.txt"),profileText); else scalar("fixture-profile.txt",profileText);
-        boolean atomicShiftPause=inspectMode && baseline() && supportCase==SupportCase.ORDINARY;
         for (int tick=0; physics==null?tick<budget:physics.consumed()<budget; tick++) {
             int outerOrdinal=physics==null?tick:physics.consumed();
             var anchorClocks=physics==null?null:PhysicsClocks.of(current);
@@ -3262,9 +3272,10 @@ final class ScenarioRunner implements AutoCloseable {
                 if(atomicShiftPause) {
                     // Worker owns the allowance; admission and action use this one already-charged request.
                     construction=constructionCapture(host,this::clientLive,
-                            c -> { requireClient(c); MapArtClient.pause(); requireReleased(c); },id,shiftStart,
+                            c -> { requireClient(c); MapArtClient.pause(); requireReleased(c); },id,shiftBinding,watch::retained,shiftAnchor,
                             firstSuccess && !paused,physics.constructionLimit-physics.consumed(),
                             () -> host.computeOnServer(s -> { requireServer(s); return readPlayer(serverPlayer,false,s.getTicks()); }));
+                    shiftAnchor=construction.anchor;
                     next=withServer(construction.before);
                 } else next=live();
                 if(physics!=null) {
@@ -3273,7 +3284,9 @@ final class ScenarioRunner implements AutoCloseable {
                     candidateInvariants=PhysicsInvariants.of(current,next,id);
                 }
                 current=next; checkpoints.add(current);
-                writeNew(roots,stage.resolve("physics-"+outerOrdinal+".txt"),current.toString());
+                writeNew(roots,stage.resolve("physics-"+outerOrdinal+".txt"),current.toString()
+                        +(construction==null?"":"\nconstructionAdmissionAnchor="+construction.anchor
+                            +"\nprobeBeforeClient="+construction.admissionProbe+"; physicsHoldTraversalCredit=0"));
                 requireRun(current.sample,id);
             } else {
                 poll=traversalPoll();
@@ -3589,27 +3602,63 @@ final class ScenarioRunner implements AutoCloseable {
     }
 
     record ClientTransition(Live before, Live after) { }
-    record ConstructionCapture(Live before,Optional<ClientTransition> transition,Side admissionProbe) { }
+    record ConstructionCapture(Live before,Optional<ClientTransition> transition,Side admissionProbe,ScenarioObserver.ServerWitness anchor) { }
 
     static ConstructionCapture constructionCapture(ScenarioHost host,Function<MinecraftClient,Live> capture,
-                                                   Consumer<MinecraftClient> pause,UUID id,Live shiftStart,
+                                                   Consumer<MinecraftClient> pause,UUID id,ScenarioObserver.Binding binding,
+                                                   Supplier<ScenarioObserver.Watch.Retained> history,ScenarioObserver.ServerWitness priorAnchor,
                                                    boolean pausePending,int remaining,Supplier<Side> readAdmissionServer) {
-        // This earlier independent probe is admission evidence only, never the causal checkpoint/hold baseline.
-        var probe=pausePending && shiftStart!=null?readAdmissionServer.get():null;
+        require(binding!=null && binding.inspect()==host && binding.scope()!=null
+                && binding.scope().kind()==Kind.WORK && binding.currentScope() && binding.context().runId().equals(id),
+                "Changed original SHIFT observation binding/WORK");
+        ScenarioObserver.ServerWitness selected=priorAnchor;
+        if(pausePending) {
+            var retained=history.get(); // One committed snapshot before the independent probe; never revisit this attempt.
+            require(retained.binding()==binding,"Changed original SHIFT observation binding");
+            var points=pairedPoints(id,retained);
+            if(selected!=null) {
+                var anchor=selected;
+                require(shiftAnchor(anchor) && points.stream().anyMatch(point -> point==anchor),"Missing exact retained SHIFT anchor");
+            } else {
+                selected=points.stream().filter(ScenarioRunner::shiftAnchor).findFirst().orElse(null);
+            }
+        }
+        final var anchor=selected;
+        // This independent probe is admission evidence only, never the checkpoint/hold baseline.
+        var probe=pausePending && anchor!=null?readAdmissionServer.get():null;
         return host.computeOnClient(c -> {
             var before=capture.apply(c);
             requireRun(before.sample,id);
-            if(pausePending && shiftStart!=null) {
-                requireRun(shiftStart.sample,id);
-                var admission=new Live(before.sample,before.client,probe,before.fault,before.pending,before.nativeSequence,before.nativeIdentities);
+            require(binding.currentScope() && before.sample.status().engine().lifecycle().context().filter(binding.context()::equals).isPresent(),
+                    "Changed current SHIFT context/WORK");
+            if(pausePending && anchor!=null) {
+                var historical=anchor.publication().sample();
+                var traversal=before.sample.status().engine().traversal().orElse(null);
+                var original=historical.status().engine().traversal().orElseThrow();
                 if(substage(before.sample,ForwardTraversal.Substage.SHIFT) && nativeForward(before.sample)
-                        && moved(shiftStart,admission,"z",.25,1)) {
+                        && before.sample.status().engine().lifecycle().activity().orElse(null)==Activity.SHIFT
+                        && traversal.pass()==original.pass() && traversal.laneIndex()==original.laneIndex()
+                        && traversal.entry().lane().equals(original.entry().lane()) && historical.tick()<before.sample.tick()
+                        && probe.serverTick>=anchor.reading().serverTick()
+                        && distance(historical.pose().z(),coordinate(before.client,"z"),.25,1)
+                        && distance(anchor.reading().z(),coordinate(probe,"z"),.25,1)) {
                     require(remaining>=20,"SHIFT pause would exceed the shared run physics budget");
-                    return new ConstructionCapture(before,Optional.of(pauseNow(c,capture,pause,id,before)),probe);
+                    return new ConstructionCapture(before,Optional.of(pauseNow(c,capture,pause,id,before)),probe,anchor);
                 }
             }
-            return new ConstructionCapture(before,Optional.empty(),probe);
+            return new ConstructionCapture(before,Optional.empty(),probe,anchor);
         });
+    }
+
+    private static boolean shiftAnchor(ScenarioObserver.ServerWitness point) {
+        var sample=point.publication().sample(); var pose=sample.pose(); var server=point.reading();
+        var traversal=sample.status().engine().traversal().orElse(null);
+        return sample.status().engine().lifecycle().phase()==Phase.RUNNING
+                && sample.status().engine().lifecycle().activity().orElse(null)==Activity.SHIFT && traversal!=null
+                && traversal.substage()==ForwardTraversal.Substage.SHIFT && traversal.pass()==ForwardTraversal.Pass.FORWARD
+                && traversal.laneIndex()==0 && traversal.entry().lane().direction().name().equals("SOUTH")
+                && pose!=null && Double.isFinite(pose.x()) && Double.isFinite(pose.y()) && Double.isFinite(pose.z())
+                && Double.isFinite(server.x()) && Double.isFinite(server.y()) && Double.isFinite(server.z());
     }
 
     static boolean ordinaryPhysics(boolean inspect,boolean baseline) { return inspect && baseline; }
@@ -3821,8 +3870,7 @@ final class ScenarioRunner implements AutoCloseable {
         TraversalProof { ordered=List.copyOf(ordered); }
     }
 
-    /** Pure oracle used by ordinary and automatic baseline; simulated unit pairs confer no native acceptance. */
-    static TraversalProof evaluateTraversal(UUID id, ScenarioObserver.Watch.Retained retained, Live resumed) {
+    private static List<ScenarioObserver.ServerWitness> pairedPoints(UUID id,ScenarioObserver.Watch.Retained retained) {
         var binding=retained.binding();
         require(binding!=null && binding.context().runId().equals(id) && retained.failure()==null,
                 "Missing/failed paired native observation binding: "+retained.failure());
@@ -3833,7 +3881,6 @@ final class ScenarioRunner implements AutoCloseable {
             if(sample.phase().equals("END")) nativeEnds.add(sample);
         }
         var points=retained.witnesses();
-        int east=-1,eastTravel=-1,endpoint=-1,shift=-1,south=-1,westEntry=-1,west=-1,westTravel=-1;
         long frame=-1,callback=-1,serverTick=-1;
         ScenarioObserver.ServerReading previousReading=null;
         for (int k=0;k<points.size();k++) {
@@ -3848,6 +3895,16 @@ final class ScenarioRunner implements AutoCloseable {
             previousReading=point.reading();
             require(Double.isFinite(publication.reach()) && publication.reach()>0
                     && Double.isFinite(point.reading().reach()) && point.reading().reach()>0,"Invalid actual native reach");
+        }
+        return points;
+    }
+
+    /** Pure oracle used by ordinary and automatic baseline; simulated unit pairs confer no native acceptance. */
+    static TraversalProof evaluateTraversal(UUID id, ScenarioObserver.Watch.Retained retained, Live resumed) {
+        var points=pairedPoints(id,retained);
+        int east=-1,eastTravel=-1,endpoint=-1,shift=-1,south=-1,westEntry=-1,west=-1,westTravel=-1;
+        for (int k=0;k<points.size();k++) {
+            var point=points.get(k); var publication=point.publication(); var sample=publication.sample();
             var traversal=sample.status().engine().traversal().orElse(null);
             if (traversal==null) continue;
             boolean walking=traversal.substage()==ForwardTraversal.Substage.LANE && traversal.entry().stage()==Stage.WALK
