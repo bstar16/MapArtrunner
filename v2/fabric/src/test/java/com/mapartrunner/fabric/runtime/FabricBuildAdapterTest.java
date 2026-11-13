@@ -380,7 +380,7 @@ class FabricBuildAdapterTest {
         assertEquals(Phase.TERMINAL, h.adapter.status().engine().lifecycle().phase());
     }
 
-    @ParameterizedTest @ValueSource(strings = {"pause", "stop", "terminal"})
+    @ParameterizedTest @ValueSource(strings = {"pause", "stop", "native-hold", "terminal"})
     void cleanupErrorStillClearsOwnedStateAndRetainsTrace(String path) {
         var h = new Harness(12); h.start(); h.walk();
         var error = new IllegalStateException("release failed");
@@ -388,6 +388,7 @@ class FabricBuildAdapterTest {
         Runnable action = switch (path) {
             case "pause" -> h.adapter::pause;
             case "stop" -> h.adapter::stop;
+            case "native-hold" -> { h.ui(true, true); yield h.adapter::tick; }
             default -> {
                 h.pose = new PlayerObservation(100, 1, 2.5, -90);
                 yield h.adapter::tick;
@@ -399,6 +400,7 @@ class FabricBuildAdapterTest {
         assertEquals(path.equals("terminal") ? Outcome.FAILED : Outcome.CANCELLED,
                 h.adapter.status().engine().lifecycle().outcome().orElseThrow());
         assertTrue(h.adapter.status().failure().orElseThrow().trace().orElseThrow().contains("release failed"));
+        h.ui(false, false);
         h.start(); assertTrue(h.adapter.status().failure().isEmpty());
     }
 
@@ -410,14 +412,14 @@ class FabricBuildAdapterTest {
         assertTrue(h.adapter.status().failure().orElseThrow().detail().contains("unavailable"));
     }
 
-    @ParameterizedTest @ValueSource(strings = {"pause", "stop", "screen", "shutdown", "world", "disconnect"})
+    @ParameterizedTest @ValueSource(strings = {"pause", "stop", "native-hold", "shutdown", "world", "disconnect"})
     void everyLifecycleReleasePathReleasesBeforeReturning(String path) {
         var h = new Harness(12); h.start(); h.walk(); h.events.clear();
         var bound = h.state;
         switch (path) {
             case "pause" -> h.adapter.pause();
             case "stop" -> h.adapter.stop();
-            case "screen" -> h.adapter.onScreenOpened();
+            case "native-hold" -> { h.ui(true, true); h.adapter.tick(); }
             case "shutdown" -> h.adapter.onClientStopping();
             case "world" -> h.adapter.worldChanged(new Object());
             case "disconnect" -> h.adapter.disconnected(bound.handler(), bound.connection());
@@ -425,7 +427,7 @@ class FabricBuildAdapterTest {
         assertEquals(NONE, h.adapter.status().controlOwner()); h.assertNoTranslation();
         assertEquals(9, h.events.stream().filter(e -> e.startsWith("key:")).count());
         assertTrue(h.events.contains("release"));
-        assertEquals(path.equals("pause") || path.equals("screen") ? Phase.PAUSED : Phase.TERMINAL,
+        assertEquals(path.equals("pause") ? Phase.PAUSED : path.equals("native-hold") ? Phase.RUNNING : Phase.TERMINAL,
                 h.adapter.status().engine().lifecycle().phase());
     }
 
@@ -463,23 +465,128 @@ class FabricBuildAdapterTest {
         assertEquals(captures, h.captures); assertEquals(NONE, h.adapter.status().controlOwner());
     }
 
-    @ParameterizedTest @ValueSource(booleans = {false, true})
-    void gamePauseOrScreenFreezesBudgetsAndNeedsManualResume(boolean screen) {
-        var h = new Harness(2); h.start(); h.walk();
-        h.state = new ClientState(h.state.world(), h.state.handler(), h.state.connection(), h.state.player(),
-                h.state.dimension(), true, !screen, screen);
-        h.adapter.tick(); var paused = h.adapter.status().engine();
+    @Test void nonPausingScreenContinuesMovementAndPlacementOnTheSameRun() {
+        var h = new Harness(12); var id = h.start(); h.walk(); h.events.clear();
+        h.ui(false, true); h.ready = READY;
+        long ticks = h.adapter.status().engine().eligibleTicks();
+        h.adapter.tick();
+        assertEquals(Phase.RUNNING, h.adapter.status().engine().lifecycle().phase());
+        assertEquals(id, h.adapter.status().engine().lifecycle().context().orElseThrow().runId());
+        assertEquals(ticks + 1, h.adapter.status().engine().eligibleTicks());
+        assertTrue(h.events.contains("interact")); assertTrue(h.keys.get(ControlArbiter.Control.FORWARD));
+        assertEquals(NATIVE, h.adapter.status().controlOwner());
+        h.ui(false, false); h.adapter.tick();
+        assertEquals(Phase.RUNNING, h.adapter.status().engine().lifecycle().phase());
+        assertEquals(ticks + 2, h.adapter.status().engine().eligibleTicks());
+    }
+
+    @Test void nativePauseHoldsAllCoreDataAndFeedbackThenContinuesAutomatically() {
+        var h = new Harness(12); h.ready = READY; var id = h.start(); h.adapter.tick();
+        var before = h.adapter.status().engine(); int captures = h.captures;
+        var intent = h.intent;
+        h.ui(true, true); h.events.clear();
         for (int i = 0; i < 1300; i++) h.adapter.tick();
+        assertEquals(before, h.adapter.status().engine());
+        assertEquals(captures, h.captures);
+        assertEquals(NONE, h.adapter.status().controlOwner()); h.assertAllReleased();
+        assertFalse(h.events.contains("capture")); assertFalse(h.events.contains("yaw"));
+        assertFalse(h.events.contains("interact"));
+        assertEquals(9, h.events.stream().filter(e -> e.startsWith("key:")).count());
+        h.ui(false, false); h.adapter.tick();
+        var continued = h.adapter.status().engine();
+        assertEquals(id, continued.lifecycle().context().orElseThrow().runId());
+        assertEquals(Phase.RUNNING, continued.lifecycle().phase());
+        assertEquals(before.eligibleTicks() + 1, continued.eligibleTicks());
+        assertEquals(List.of(new PlacementEffectResult(intent.runId(), intent.actionId(), intent.targetId(),
+                intent.tick(), EffectStatus.ACCEPTED)), continued.effectResults());
+        assertEquals(NATIVE, h.adapter.status().controlOwner());
+    }
+
+    @Test void explicitPauseDuringNativeHoldStillRequiresManualResume() {
+        var h = new Harness(12); h.start(); h.walk();
+        h.ui(true, true); h.adapter.tick(); h.adapter.pause();
+        var paused = h.adapter.status().engine();
+        assertEquals(Phase.PAUSED, paused.lifecycle().phase());
+        assertThrows(IllegalStateException.class, h.adapter::resume);
+        h.ui(false, false); h.adapter.tick();
         assertEquals(Phase.PAUSED, h.adapter.status().engine().lifecycle().phase());
         assertEquals(paused.eligibleTicks(), h.adapter.status().engine().eligibleTicks());
-        assertEquals(paused.verifyTicks(), h.adapter.status().engine().verifyTicks());
-        assertEquals(paused.laneEntry(), h.adapter.status().engine().laneEntry());
-        assertThrows(IllegalStateException.class, h.adapter::resume);
-        h.state = new ClientState(h.state.world(), h.state.handler(), h.state.connection(), h.state.player(),
-                h.state.dimension(), true, false, false);
-        h.adapter.tick(); assertEquals(Phase.PAUSED, h.adapter.status().engine().lifecycle().phase());
-        h.adapter.resume(); h.sample(1.5, 2.5, 90);
+        assertEquals(NONE, h.adapter.status().controlOwner()); h.assertAllReleased();
+        h.adapter.resume(); h.adapter.tick();
+        assertEquals(Phase.RUNNING, h.adapter.status().engine().lifecycle().phase());
         assertEquals(paused.eligibleTicks() + 1, h.adapter.status().engine().eligibleTicks());
+    }
+
+    @Test void nativePauseDuringCaptureDefersFeedbackAndDoesNotSpendSampleTime() {
+        var h = new Harness(12); h.ready = READY; h.start(); h.adapter.tick();
+        var before = h.adapter.status().engine(); var issued = h.intent;
+        h.hooks.put("capture", () -> h.ui(true, true)); h.events.clear();
+        h.adapter.tick();
+        assertEquals(before, h.adapter.status().engine());
+        assertFalse(h.events.contains("yaw")); assertFalse(h.events.contains("interact"));
+        assertEquals(NONE, h.adapter.status().controlOwner()); h.assertAllReleased();
+        h.ui(false, false); h.adapter.tick();
+        assertEquals(List.of(new PlacementEffectResult(issued.runId(), issued.actionId(), issued.targetId(),
+                issued.tick(), EffectStatus.ACCEPTED)), h.adapter.status().engine().effectResults());
+        assertEquals(before.eligibleTicks() + 1, h.adapter.status().engine().eligibleTicks());
+        assertEquals(List.of(0L, 1L, 1L), h.captureTicks);
+    }
+
+    @ParameterizedTest @ValueSource(strings = {"acquire", "yaw", "inspect", "slot", "interact"})
+    void nativePauseDuringEffectsReleasesAndDefersOnlyCurrentFeedback(String at) {
+        var h = new Harness(12); h.ready = READY; var id = h.start();
+        h.hooks.put(at, () -> h.ui(true, true)); h.adapter.tick();
+        var held = h.adapter.status().engine();
+        assertEquals(Phase.RUNNING, held.lifecycle().phase());
+        assertEquals(id, held.lifecycle().context().orElseThrow().runId());
+        assertEquals(NONE, h.adapter.status().controlOwner()); h.assertAllReleased();
+        assertFalse(h.events.contains("key:FORWARD:true"));
+        if (!at.equals("interact")) assertFalse(h.events.contains("interact"));
+        if (at.equals("acquire")) assertFalse(h.events.contains("yaw"));
+        if (at.equals("yaw") || at.equals("inspect")) assertFalse(h.events.contains("slot"));
+        assertFalse(h.lastGuard != null && h.lastGuard.getAsBoolean());
+        h.events.clear(); h.adapter.tick(); assertTrue(h.events.isEmpty());
+        assertEquals(held, h.adapter.status().engine());
+        h.ui(false, false);
+        assertFalse(h.lastGuard != null && h.lastGuard.getAsBoolean(), "Held envelope stays consumed after unpause");
+        h.adapter.tick();
+        if (at.equals("interact") || at.equals("inspect") || at.equals("slot")) {
+            var result = h.adapter.status().engine().effectResults().getFirst();
+            assertEquals(at.equals("interact") ? EffectStatus.ACCEPTED : EffectStatus.STALE, result.status());
+            assertEquals(id, result.runId());
+        }
+        assertEquals(NATIVE, h.adapter.status().controlOwner());
+    }
+
+    @ParameterizedTest @ValueSource(strings = {"stop", "world", "player", "disconnect"})
+    void nativeHoldCannotResumeAfterTerminalBindingLoss(String path) {
+        var h = new Harness(12); h.ready = READY; h.start(); h.adapter.tick();
+        h.ui(true, true); h.adapter.tick();
+        switch (path) {
+            case "stop" -> h.adapter.stop();
+            case "world" -> { h.state = h.withWorld(new Object()); h.ui(true, true); h.adapter.tick(); }
+            case "player" -> {
+                h.state = new ClientState(h.state.world(), h.state.handler(), h.state.connection(), new Object(),
+                        h.state.dimension(), true, true, true);
+                h.adapter.tick();
+            }
+            case "disconnect" -> h.adapter.disconnected(h.state.handler(), h.state.connection());
+        }
+        h.ui(false, false); h.events.clear(); h.adapter.tick();
+        assertEquals(Outcome.CANCELLED, h.adapter.status().engine().lifecycle().outcome().orElseThrow());
+        assertEquals(NONE, h.adapter.status().controlOwner()); h.assertAllReleased();
+        assertTrue(h.events.isEmpty()); assertThrows(IllegalStateException.class, h.adapter::resume);
+    }
+
+    @Test void nonPausingUiAllowsStartAndManualResumeButNativePauseDoesNot() {
+        var h = new Harness(12); h.ui(true, true);
+        assertThrows(IllegalStateException.class, h::start);
+        h.ui(false, true); var id = h.start(); h.adapter.tick(); h.adapter.pause();
+        h.ui(true, true); assertThrows(IllegalStateException.class, h.adapter::resume);
+        h.ui(false, true); h.adapter.resume(); h.adapter.tick();
+        assertEquals(id, h.adapter.status().engine().lifecycle().context().orElseThrow().runId());
+        assertEquals(Phase.RUNNING, h.adapter.status().engine().lifecycle().phase());
+        assertEquals(NATIVE, h.adapter.status().controlOwner());
     }
 
     @Test void absentPlayerConsumesActiveCallbacksToRunTimeoutWithoutEffects() {
@@ -529,17 +636,20 @@ class FabricBuildAdapterTest {
         var h = new Harness(12); var sticky = new ScreenKey();
         sticky.setPressed(true); sticky.screenReset(); h.sticky = sticky;
         h.keys.put(ControlArbiter.Control.FORWARD, true);
-        h.adapter.tick(); h.adapter.pause(); h.adapter.stop(); h.adapter.onScreenOpened(); h.adapter.onClientStopping();
+        h.ui(false, true); h.adapter.tick(); h.adapter.pause(); h.adapter.stop(); h.adapter.onClientStopping();
         h.adapter.worldChanged(new Object()); h.adapter.disconnected(new Object(), new Object());
         assertTrue(h.events.isEmpty()); assertTrue(h.keys.get(ControlArbiter.Control.FORWARD));
         assertTrue(sticky.shouldRestoreOnScreenClose());
     }
 
-    @Test void ownedScreenPauseConsumesSavedRestorationEvenIfScreenClosesBetweenTicks() {
+    @Test void ownedReleaseConsumesSavedScreenRestorationWhileLiveUiReappliesKeys() {
         var h = new Harness(12); var sticky = new ScreenKey(); h.sticky = sticky;
         h.start(); h.walk(); assertTrue(sticky.isPressed());
         sticky.screenReset(); assertFalse(sticky.isPressed());
-        h.adapter.onScreenOpened();
+        h.ui(false, true); h.adapter.tick();
+        assertEquals(Phase.RUNNING, h.adapter.status().engine().lifecycle().phase());
+        assertTrue(sticky.isPressed());
+        sticky.screenReset(); h.adapter.pause();
         assertFalse(sticky.shouldRestoreOnScreenClose());
         h.adapter.tick(); assertEquals(Phase.PAUSED, h.adapter.status().engine().lifecycle().phase());
         assertFalse(sticky.isPressed());
@@ -596,6 +706,7 @@ class FabricBuildAdapterTest {
     private static final class Harness implements FabricBuildAdapter.Access, ControlArbiter.Sink {
         final List<String> events = new ArrayList<>();
         final List<ControlOwner> acquiredOwners = new ArrayList<>();
+        final List<Long> captureTicks = new ArrayList<>();
         final Map<String, Runnable> hooks = new HashMap<>();
         final EnumMap<ControlArbiter.Control, Boolean> keys = new EnumMap<>(ControlArbiter.Control.class);
         final ControlArbiter arbiter = new ControlArbiter(this);
@@ -637,6 +748,10 @@ class FabricBuildAdapterTest {
         }
         void fire(String event) { events.add(event); var hook = hooks.remove(event); if (hook != null) hook.run(); }
         ClientState withWorld(Object world) { return new ClientState(world, state.handler(), state.connection(), state.player(), state.dimension(), true, false, false); }
+        void ui(boolean paused, boolean open) {
+            state = new ClientState(state.world(), state.handler(), state.connection(), state.player(),
+                    state.dimension(), state.connected(), paused, open);
+        }
         void assertNoTranslation() {
             for (var c : List.of(ControlArbiter.Control.FORWARD, ControlArbiter.Control.BACK, ControlArbiter.Control.LEFT, ControlArbiter.Control.RIGHT)) assertFalse(keys.get(c), c.name());
         }
@@ -650,7 +765,7 @@ class FabricBuildAdapterTest {
             return state;
         }
         @Override public Facts capture(BuildPlan plan, RunLifecycle.Context run, Settings settings, ClientState bound, long tick) {
-            this.run = run; captures++; fire("capture");
+            this.run = run; captures++; captureTicks.add(tick); fire("capture");
             var evidence = observed == null ? Evidence.UNKNOWN : Evidence.OBSERVED;
             var samples = new HashMap<GridPos, SupportSample>();
             var observations = new ArrayList<PlacementObservation>();

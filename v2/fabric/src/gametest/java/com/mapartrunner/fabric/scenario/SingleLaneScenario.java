@@ -15,7 +15,7 @@ import net.fabricmc.fabric.api.client.gametest.v1.context.TestSingleplayerContex
 import net.fabricmc.fabric.api.client.gametest.v1.screenshot.TestScreenshotOptions;
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.block.Blocks;
-import net.minecraft.client.gui.screen.GameMenuScreen;
+import net.minecraft.client.gui.screen.ingame.InventoryScreen;
 import net.minecraft.client.world.ClientWorld;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.network.ClientPlayerEntity;
@@ -900,15 +900,34 @@ final class SingleLaneScenario {
                 && paused.laneEntry().equals(before.laneEntry()), "Pause lost traversal/counters");
         context.runOnClient(client -> MapArtClient.resume());
         await(s -> s.client().keys().getFirst(), WAIT, "manual resume controls");
-        context.setScreen(() -> new GameMenuScreen(false));
-        require(context.computeOnClient(client -> MapArtClient.status().engine().lifecycle().phase())==Phase.PAUSED, "Screen did not pause production");
-        var screenPause=context.computeOnClient(client -> watch.sample(client,"SCREEN_OPEN_RELEASE"));
-        released(screenPause,"screen open"); note(screenPause.line());
-        context.setScreen(() -> null);
-        context.waitFor(client -> !client.isPaused(), WAIT);
-        idlePhysics("closed screen manual-resume hold",20);
-        require(read().client().status().engine().lifecycle().phase()==Phase.PAUSED, "Screen close auto-resumed run");
-        context.runOnClient(client -> MapArtClient.resume());
+        context.setScreen(() -> new InventoryScreen(MinecraftClient.getInstance().player));
+        try {
+            var inventoryBefore=read();
+            require(context.computeOnClient(client -> client.currentScreen instanceof InventoryScreen && !client.isPaused()),
+                    "Inventory did not leave native simulation live");
+            var missing=new ArrayList<Integer>();
+            for(int i=0;i<PLAN.targets().size();i++) if(!inventoryBefore.server().blocks().get(i)
+                    && !inventoryBefore.client().status().engine().pendingTargetIds().contains(PLAN.targets().get(i).id())) missing.add(i);
+            require(!missing.isEmpty(),"No independent unplaced target remained at inventory entry");
+            var inventoryAfter=await(s -> {
+                require(context.computeOnClient(client -> client.currentScreen instanceof InventoryScreen && !client.isPaused()),
+                        "Inventory closed or simulation paused during live UI assertion");
+                var engine=s.client().status().engine();
+                require(engine.lifecycle().phase()==Phase.RUNNING && engine.lifecycle().context().orElseThrow().runId().equals(runId),
+                        "Inventory changed active run/lifecycle");
+                return engine.eligibleTicks()>inventoryBefore.client().status().engine().eligibleTicks()
+                        && s.client().pose().x()>inventoryBefore.client().pose().x()+.25
+                        && s.server().x()>inventoryBefore.server().x()+.25
+                        && s.client().pose().age()>inventoryBefore.client().pose().age()
+                        && s.client().pose().worldTime()>inventoryBefore.client().pose().worldTime()
+                        && s.server().age()>inventoryBefore.server().age() && s.server().tick()>inventoryBefore.server().tick()
+                        && missing.stream().anyMatch(i -> s.server().blocks().get(i)
+                                && evidence(s.client(),PLAN.targets().get(i).id(),OBSERVED));
+            },WAIT,"inventory-open native motion and independently observed placement");
+            require(inventoryAfter.client().status().controlOwner()==BuildEngine.ControlOwner.NATIVE,
+                    "Inventory progress lacked native ownership");
+            note("INVENTORY CONTINUATION first="+inventoryBefore+"; later="+inventoryAfter);
+        } finally { context.setScreen(() -> null); }
         await(s -> s.client().status().engine().lifecycle().phase()==Phase.TERMINAL,1200,"full native build");
         var done=read(); var engine=done.client().status().engine();
         require(engine.lifecycle().outcome().orElseThrow()==Outcome.SUCCESS && done.client().status().failure().isEmpty()

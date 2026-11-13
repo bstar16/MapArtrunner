@@ -8,7 +8,6 @@ import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientWorldEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
-import net.fabricmc.fabric.api.client.screen.v1.ScreenEvents;
 import net.minecraft.client.MinecraftClient;
 
 import java.util.UUID;
@@ -29,7 +28,6 @@ public final class MapArtClient implements ClientModInitializer {
             else client.execute(() -> adapter.onDisconnect(handler, connection));
         });
         ClientLifecycleEvents.CLIENT_STOPPING.register(client -> adapter.onClientStopping());
-        ScreenEvents.BEFORE_INIT.register((client, screen, width, height) -> adapter.onScreenOpened());
     }
 
     public static UUID start(BuildPlan plan, BuildPlan.GridPos origin, BuildEngine.Settings settings) {
