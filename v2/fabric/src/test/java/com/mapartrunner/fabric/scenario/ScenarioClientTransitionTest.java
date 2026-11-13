@@ -75,8 +75,256 @@ class ScenarioClientTransitionTest {
         });
     }
 
+    @Test void committedEarlyPairPausesDespiteSimulatedLateAnchorProbe() {
+        var h=new QueueFixture();
+        var early=h.publishEnd(); h.commit(h.watch.beginServerRead(),2.7073187067667144,100);
+        var paired=h.watch.retained().witnesses().getFirst();
+        assertSame(early,paired.publication().sample());
+        h.player=new PlayerObservation(11.5,1,2.879906705779667,0); h.step();
+        var sparse=h.sample();
+        var late=new ScenarioRunner.Live(sparse.sample(),sparse.client(),side(4.124400213160213,101,101,101),
+                sparse.fault(),sparse.pending(),sparse.nativeSequence(),sparse.nativeIdentities());
+        assertEquals(4.124400213160213,late.server().state().get("z").getAsDouble());
+        h.player=new PlayerObservation(11.5,1,5.418212386981042,0); h.step();
+        var events=new ArrayList<String>(); var captures=new AtomicInteger(); var pauses=new AtomicInteger();
+        // Explicitly SIMULATED equality to the late anchor; RUN5's actual rejected probe is unknown.
+        var probe=side(4.124400213160213,102,102,102);
+        h.host.inScope(h.scope,() -> {
+            var selected=ScenarioRunner.constructionCapture(h.host,c -> {
+                events.add(captures.getAndIncrement()==0?"before":"after");
+                var current=h.sample();
+                if(captures.get()==1) h.queue.add(() -> { h.player=new PlayerObservation(11.5,1,6.713331235506347,0); h.step(); });
+                return current;
+            },c -> { events.add("pause"); pauses.incrementAndGet(); h.engine.pause(); },h.context.runId(),h.binding,h.watch::retained,null,true,20,
+                    () -> h.host.computeOnServer(server -> { events.add("probe"); return probe; }));
+            var saved=selected.toString();
+            var checkpoint=h.host.computeOnServer(server -> side(6.065759008443429,103,103,103));
+            assertEquals(6.065759008443429,checkpoint.state().get("z").getAsDouble());
+            assertEquals(saved,selected.toString());
+            if(selected.transition().isEmpty()) {
+                var exited=ScenarioRunner.constructionCapture(h.host,c -> h.sample(),c -> fail("Already left SHIFT"),
+                        h.context.runId(),h.binding,h.watch::retained,null,true,20,() -> side(6.713331235506347,104,104,104));
+                assertEquals(ForwardTraversal.Substage.NEXT_ENTRY,exited.before().sample().status().engine().traversal().orElseThrow().substage());
+                assertTrue(exited.transition().isEmpty());
+            }
+            assertTrue(selected.transition().isPresent(),"First success never reached the required actual SHIFT pause");
+            assertEquals(List.of("probe","before","pause","after"),events);
+            var transition=selected.transition().orElseThrow();
+            assertEquals(transition.before().sample().tick(),transition.after().sample().tick());
+            assertTrue(ScenarioRunner.retainedProgress(transition.before().sample().status().engine(),transition.after().sample().status().engine()));
+            assertEquals(transition.before().nativeSequence(),transition.after().nativeSequence());
+            assertSame(paired,selected.anchor()); assertSame(probe,selected.admissionProbe()); assertEquals(1,pauses.get());
+        });
+    }
+
+    @Test void onlyCommittedHistoryCanSupplyAnAnchorOnALaterChargedAttempt() {
+        var h=new QueueFixture(); var captures=new AtomicInteger(); var waits=new ScenarioRunner.PhysicsAllowance(1200);
+        h.host.inScope(h.scope,() -> {
+            java.util.function.Supplier<ScenarioRunner.ConstructionCapture> unavailable=() -> {
+                waits.waitTick(false,() -> { });
+                var result=ScenarioRunner.constructionCapture(h.host,c -> { captures.incrementAndGet(); return h.sample(); },
+                        c -> fail("Unpaired history"),h.context.runId(),h.binding,h.watch::retained,null,true,
+                        waits.constructionLimit-waits.consumed(),() -> fail("No committed anchor means no probe"));
+                assertTrue(result.transition().isEmpty()); assertNull(result.anchor()); assertNull(result.admissionProbe());
+                return result;
+            };
+            unavailable.get(); h.publishEnd(); unavailable.get();
+            var claim=h.watch.beginServerRead(); assertNotNull(claim); unavailable.get();
+            h.player=new PlayerObservation(11.5,1,3.5,0); h.step();
+            var later=h.publishEnd(); // Published during the first outside-gate read: not part of that claim.
+            h.commit(claim,2.5,100);
+            assertEquals(1,h.watch.retained().witnesses().size());
+            var laterClaim=h.watch.beginServerRead(); assertNotNull(laterClaim);
+            assertSame(later,laterClaim.publications().getFirst().sample());
+            waits.waitTick(false,() -> { });
+            var result=ScenarioRunner.constructionCapture(h.host,c -> { captures.incrementAndGet(); return h.sample(); },
+                    c -> h.engine.pause(),h.context.runId(),h.binding,h.watch::retained,null,true,
+                    waits.constructionLimit-waits.consumed(),() -> side(3.5,101,101,101));
+            assertTrue(result.transition().isPresent()); assertSame(claim.publications().getFirst().sample(),result.anchor().publication().sample());
+            assertEquals(4,waits.consumed()); assertEquals(5,captures.get());
+            assertEquals(1,h.watch.retained().witnesses().size());
+            h.commit(laterClaim,3.5,102); assertEquals(2,h.watch.retained().witnesses().size());
+            assertSame(claim.publications().getFirst().sample(),result.anchor().publication().sample());
+        });
+    }
+
+    @Test void preProbeSnapshotIsReadOnceAndCommittedLaterPairsCannotReplaceAcceptedAnchor() {
+        var h=new QueueFixture(); var first=h.anchor(); h.step(); h.publishEnd(); var pending=h.watch.beginServerRead();
+        h.player=new PlayerObservation(11.5,1,3.5,0); h.step(); var reads=new AtomicInteger();
+        h.host.inScope(h.scope,() -> {
+            var refused=ScenarioRunner.constructionCapture(h.host,c -> h.sample(),c -> fail("Equal server position"),
+                    h.context.runId(),h.binding,() -> { reads.incrementAndGet(); return h.watch.retained(); },null,true,20,
+                    () -> { h.commit(pending,2.6,100); return side(2.5,101,101,101); });
+            assertSame(first,refused.anchor()); assertTrue(refused.transition().isEmpty()); assertEquals(1,reads.get());
+            var accepted=ScenarioRunner.constructionCapture(h.host,c -> h.sample(),c -> h.engine.pause(),
+                    h.context.runId(),h.binding,() -> { reads.incrementAndGet(); return h.watch.retained(); },refused.anchor(),true,20,
+                    () -> side(3.5,101,101,101));
+            assertSame(first,accepted.anchor()); assertTrue(accepted.transition().isPresent()); assertEquals(2,reads.get());
+        });
+        var exited=new QueueFixture(); exited.publishEnd(); var claim=exited.watch.beginServerRead();
+        exited.player=new PlayerObservation(11.5,1,6.713331235506347,0); exited.step();
+        exited.commit(claim,2.5,100);
+        exited.host.inScope(exited.scope,() -> {
+            var result=ScenarioRunner.constructionCapture(exited.host,c -> exited.sample(),c -> fail("Pair committed after SHIFT exit"),
+                    exited.context.runId(),exited.binding,exited.watch::retained,null,true,20,() -> side(4,101,101,101));
+            assertNotNull(result.anchor()); assertTrue(result.transition().isEmpty());
+            assertEquals(ForwardTraversal.Substage.NEXT_ENTRY,result.before().sample().status().engine().traversal().orElseThrow().substage());
+        });
+    }
+
+    @Test void aPairCommittedAfterTheSnapshotWaitsForTheNextChargedCapture() {
+        var h=new QueueFixture(); h.publishEnd(); var claim=h.watch.beginServerRead();
+        h.player=new PlayerObservation(11.5,1,3.5,0); h.step(); var reads=new AtomicInteger();
+        h.host.inScope(h.scope,() -> {
+            var unavailable=ScenarioRunner.constructionCapture(h.host,c -> h.sample(),c -> fail("Commit was after snapshot"),
+                    h.context.runId(),h.binding,() -> {
+                        reads.incrementAndGet(); var snapshot=h.watch.retained(); h.commit(claim,2.5,100); return snapshot;
+                    },null,true,20,() -> fail("No probe for the frozen unpaired snapshot"));
+            assertNull(unavailable.anchor()); assertNull(unavailable.admissionProbe()); assertTrue(unavailable.transition().isEmpty());
+            var later=ScenarioRunner.constructionCapture(h.host,c -> h.sample(),c -> h.engine.pause(),h.context.runId(),h.binding,
+                    () -> { reads.incrementAndGet(); return h.watch.retained(); },unavailable.anchor(),true,20,() -> side(3.5,101,101,101));
+            assertTrue(later.transition().isPresent()); assertEquals(2,reads.get());
+        });
+    }
+
+    @Test void earliestShiftEndMayHaveReleasedControlsAndAliasedReadingIsStillOneAnchor() {
+        var h=new QueueFixture(); var s=h.sample().sample();
+        var idle=new ScenarioObserver.Sample(s.tick(),"END",s.worldIdentity(),true,s.pose(),Collections.nCopies(9,false),false,
+                new FabricBuildAdapter.Status(s.status().engine(),ControlOwner.NONE,Optional.empty()),List.of());
+        h.watch.append(h.binding,idle,h.binding.client(),4.5); h.step(); var second=h.publishEnd();
+        h.commit(h.watch.beginServerRead(),2.5,100);
+        var points=h.watch.retained().witnesses(); assertSame(points.getFirst().reading(),points.getLast().reading());
+        assertSame(second,points.getLast().publication().sample());
+        h.player=new PlayerObservation(11.5,1,3.5,0); h.step();
+        h.host.inScope(h.scope,() -> {
+            var result=ScenarioRunner.constructionCapture(h.host,c -> h.sample(),c -> h.engine.pause(),h.context.runId(),h.binding,
+                    h.watch::retained,null,true,20,() -> side(3.5,101,101,101));
+            assertSame(points.getFirst(),result.anchor()); assertSame(idle,result.anchor().publication().sample());
+            assertTrue(result.transition().isPresent());
+        });
+    }
+
+    @Test void clientAndIndependentServerMustBothStrictlyExceedQuarterBlockFromPairedAnchor() {
+        for(boolean clientBoundary:List.of(false,true)) {
+            for(double z:new double[]{Math.nextDown(2.75),2.75,Math.nextUp(2.75),Double.NaN,Double.POSITIVE_INFINITY,Double.NEGATIVE_INFINITY}) {
+                var h=new QueueFixture(); h.anchor(); h.player=new PlayerObservation(11.5,1,3.5,0); h.step();
+                var current=h.sample();
+                var positioned=new ScenarioRunner.Live(current.sample(),side(clientBoundary?z:3.5,101,101,0),current.server(),
+                        current.fault(),current.pending(),current.nativeSequence(),current.nativeIdentities());
+                h.host.inScope(h.scope,() -> {
+                    var result=ScenarioRunner.constructionCapture(h.host,c -> h.engine.snapshot().lifecycle().phase()==Phase.PAUSED?h.sample():positioned,
+                            c -> h.engine.pause(),h.context.runId(),h.binding,h.watch::retained,null,true,20,
+                            () -> side(clientBoundary?3.5:z,101,101,101));
+                    assertEquals(z==Math.nextUp(2.75),result.transition().isPresent(),"clientBoundary="+clientBoundary+" z="+z);
+                });
+            }
+        }
+    }
+
+    @Test void historyCannotAuthorizeEqualFrameOrRegressedServerTickOrCurrentNonNativeState() {
+        for(String bad:List.of("sameFrame","serverTick","owner","forward","back","jump","sneak","paused","reverse","activity","context")) {
+            var h=new QueueFixture(); var anchor=h.anchor();
+            if(!bad.equals("sameFrame")) { h.player=new PlayerObservation(11.5,1,3.5,0); h.step(); }
+            var current=h.sample(); var snapshot=current.sample().status().engine();
+            if(bad.equals("sameFrame")) current=new ScenarioRunner.Live(current.sample(),side(3.5,100,100,0),current.server(),
+                    current.fault(),current.pending(),current.nativeSequence(),current.nativeIdentities());
+            if(bad.equals("context")) {
+                var run=h.context; var changed=new Context(run.runId(),run.connectionId(),run.worldId(),run.dimension(),run.planFingerprint(),
+                        new GridPos(1,65,0),run.settingsFingerprint());
+                current=state(current,new com.mapartrunner.core.run.RunLifecycle.Snapshot(Phase.RUNNING,Optional.of(changed),Optional.of(Activity.SHIFT),Optional.empty()),null,null,null);
+            } else if(bad.equals("activity")) {
+                current=state(current,new com.mapartrunner.core.run.RunLifecycle.Snapshot(Phase.RUNNING,Optional.of(h.context),Optional.of(Activity.BUILD),Optional.empty()),null,null,null);
+            } else if(bad.equals("paused")) {
+                current=state(current,new com.mapartrunner.core.run.RunLifecycle.Snapshot(Phase.PAUSED,Optional.of(h.context),Optional.of(Activity.SHIFT),Optional.empty()),null,null,null);
+            } else if(bad.equals("reverse")) {
+                var t=snapshot.traversal().orElseThrow();
+                current=state(current,null,null,null,new ForwardTraversal.Snapshot(t.laneIndex(),t.substage(),t.entry(),t.transitionTicks(),t.transitionRegion(),ForwardTraversal.Pass.REVERSE,t.walkNoProgressTicks()));
+            } else if(bad.equals("owner")) {
+                current=sample(current,new FabricBuildAdapter.Status(snapshot,ControlOwner.NONE,Optional.empty()),current.sample().keys(),false,true,current.nativeSequence());
+            } else if(List.of("forward","back","jump","sneak").contains(bad)) {
+                var keys=new ArrayList<>(current.sample().keys()); keys.set(switch(bad) { case "back" -> 1; case "jump" -> 4; case "sneak" -> 6; default -> 0; },!bad.equals("forward"));
+                current=sample(current,current.sample().status(),keys,false,true,current.nativeSequence());
+            }
+            var candidate=current;
+            h.host.inScope(h.scope,() -> {
+                java.util.function.Supplier<ScenarioRunner.ConstructionCapture> action=() -> ScenarioRunner.constructionCapture(h.host,c -> candidate,
+                        c -> fail("Invalid current state: "+bad),h.context.runId(),h.binding,h.watch::retained,null,true,20,
+                        () -> side(4,100,100,bad.equals("serverTick")?anchor.reading().serverTick()-1:100));
+                if(bad.equals("context")) assertEquals("Changed current SHIFT context/WORK",assertThrows(AssertionError.class,action::get).getMessage());
+                else assertTrue(action.get().transition().isEmpty(),bad);
+            });
+        }
+    }
+
+    @Test void malformedOrReconstructedHistoryFailsBeforeProbeWithoutSparseFallback() {
+        var h=new QueueFixture(); var anchor=h.anchor(); h.player=new PlayerObservation(11.5,1,3.5,0); h.step();
+        var good=h.watch.retained(); var end=anchor.publication().sample(); var reading=anchor.reading();
+        var copy=new ScenarioObserver.Sample(end.tick(),end.phase(),end.worldIdentity(),end.originalWorld(),end.pose(),end.keys(),end.paused(),end.status(),end.observations());
+        var binding=h.binding;
+        var copiedBinding=new ScenarioObserver.Binding(binding.generation(),binding.context(),binding.client(),binding.server(),binding.inspect(),binding.scope());
+        var foreignServer=new ScenarioObserver.ServerBinding(new Object(),reading.binding().world(),reading.binding().player(),reading.binding().playerId(),reading.binding().dimension(),true,true);
+        var invalid=new ArrayList<ScenarioObserver.Watch.Retained>();
+        invalid.add(new ScenarioObserver.Watch.Retained(good.samples(),null,null,good.witnesses()));
+        invalid.add(new ScenarioObserver.Watch.Retained(good.samples(),null,copiedBinding,good.witnesses()));
+        invalid.add(new ScenarioObserver.Watch.Retained(good.samples(),new IllegalStateException("latched"),binding,good.witnesses()));
+        invalid.add(new ScenarioObserver.Watch.Retained(List.of(copy),null,binding,good.witnesses()));
+        var wrongContext=new Context(h.context.runId(),h.context.connectionId(),h.context.worldId(),h.context.dimension(),
+                h.context.planFingerprint(),new GridPos(1,65,0),h.context.settingsFingerprint());
+        var foreign=state(h.sample(),new com.mapartrunner.core.run.RunLifecycle.Snapshot(Phase.RUNNING,Optional.of(wrongContext),Optional.of(Activity.SHIFT),Optional.empty()),null,null,null).sample();
+        invalid.add(new ScenarioObserver.Watch.Retained(List.of(foreign),null,binding,good.witnesses()));
+        var nonEnd=new ScenarioObserver.Sample(end.tick(),"START",end.worldIdentity(),true,end.pose(),end.keys(),false,end.status(),end.observations());
+        invalid.add(new ScenarioObserver.Watch.Retained(List.of(nonEnd),null,binding,
+                List.of(new ScenarioObserver.ServerWitness(new ScenarioObserver.EndPublication(binding,nonEnd,4.5),anchor.callback(),reading))));
+        var publications=List.of(new ScenarioObserver.EndPublication(copiedBinding,end,4.5),new ScenarioObserver.EndPublication(binding,copy,4.5),
+                new ScenarioObserver.EndPublication(binding,end,Double.NaN),new ScenarioObserver.EndPublication(binding,end,0));
+        for(var publication:publications) invalid.add(new ScenarioObserver.Watch.Retained(good.samples(),null,binding,
+                List.of(new ScenarioObserver.ServerWitness(publication,anchor.callback(),reading))));
+        for(var badReading:List.of(new ScenarioObserver.ServerReading(foreignServer,11.5,1,2.5,4.5,1,1,1),
+                new ScenarioObserver.ServerReading(binding.server(),11.5,1,2.5,Double.POSITIVE_INFINITY,1,1,1)))
+            invalid.add(new ScenarioObserver.Watch.Retained(good.samples(),null,binding,List.of(new ScenarioObserver.ServerWitness(anchor.publication(),anchor.callback(),badReading))));
+        invalid.add(new ScenarioObserver.Watch.Retained(good.samples(),null,binding,List.of(anchor,anchor)));
+        invalid.add(new ScenarioObserver.Watch.Retained(good.samples(),null,binding,List.of(new ScenarioObserver.ServerWitness(anchor.publication(),0,reading))));
+        h.host.inScope(h.scope,() -> {
+            for(var retained:invalid) {
+                var error=assertThrows(AssertionError.class,() -> ScenarioRunner.constructionCapture(h.host,c -> fail("Malformed history must fail before capture"),
+                        c -> fail("No fallback"),h.context.runId(),binding,() -> retained,null,true,20,() -> fail("Malformed history must fail before probe")));
+                assertTrue(List.of("Changed original SHIFT observation binding","Missing/failed paired native observation binding",
+                        "Changed full native context","Foreign publication/generation/native binding","Invalid actual native reach",
+                        "Duplicate/reordered native frame/server callback/tick").stream().anyMatch(error.getMessage()::startsWith),error.getMessage());
+            }
+            var reconstructed=new ScenarioObserver.ServerWitness(anchor.publication(),anchor.callback(),anchor.reading());
+            assertEquals("Missing exact retained SHIFT anchor",assertThrows(AssertionError.class,() -> ScenarioRunner.constructionCapture(h.host,c -> fail("Reconstructed anchor"),c -> fail("No pause"),
+                    h.context.runId(),binding,h.watch::retained,reconstructed,true,20,() -> fail("No probe"))).getMessage());
+        });
+        h.watch.clear(); h.watch.bind(copiedBinding); // Same Context/generation value, different exact arm.
+        h.host.inScope(h.scope,() -> assertEquals("Changed original SHIFT observation binding",assertThrows(AssertionError.class,() -> ScenarioRunner.constructionCapture(h.host,c -> fail("Replaced arm"),c -> fail("No pause"),
+                h.context.runId(),binding,h.watch::retained,null,true,20,() -> fail("No probe"))).getMessage()));
+    }
+
+    @Test void nonEndOrNonShiftAndNonfiniteHistoricalCoordinatesNeverSupplyAnAnchor() {
+        for(String bad:List.of("START","nonShift","clientNaN","serverNaN")) {
+            var h=new QueueFixture(); var s=h.sample().sample();
+            if(bad.equals("START")) h.watch.append(h.binding,new ScenarioObserver.Sample(s.tick(),"START",s.worldIdentity(),true,s.pose(),s.keys(),false,s.status(),List.of()),h.binding.client(),4.5);
+            else {
+                if(bad.equals("nonShift")) {
+                    var t=s.status().engine().traversal().orElseThrow();
+                    s=state(h.sample(),null,null,null,new ForwardTraversal.Snapshot(t.laneIndex(),ForwardTraversal.Substage.ENDPOINT,t.entry(),t.transitionTicks(),t.transitionRegion(),t.pass(),t.walkNoProgressTicks())).sample();
+                }
+                var p=s.pose();
+                if(bad.equals("clientNaN")) p=new ScenarioObserver.Pose(p.x(),p.y(),Double.NaN,p.velocity(),p.eyes(),p.age(),p.worldTime(),p.yaw(),p.headYaw(),p.bodyYaw(),p.flying(),p.sprinting(),p.selectedSlot(),p.reserved(),p.usable());
+                var end=new ScenarioObserver.Sample(s.tick(),"END",s.worldIdentity(),true,p,s.keys(),false,s.status(),List.of());
+                h.watch.append(h.binding,end,h.binding.client(),4.5); h.commit(h.watch.beginServerRead(),bad.equals("serverNaN")?Double.NaN:2.5,100);
+            }
+            h.player=new PlayerObservation(11.5,1,3.5,0); h.step();
+            h.host.inScope(h.scope,() -> {
+                var result=ScenarioRunner.constructionCapture(h.host,c -> h.sample(),c -> fail(bad),h.context.runId(),h.binding,h.watch::retained,null,true,20,() -> fail("No finite SHIFT pair: "+bad));
+                assertNull(result.anchor()); assertTrue(result.transition().isEmpty());
+            });
+        }
+    }
+
     @Test void constructionSelectionPausesBeforeTheQueuedShiftExit() {
-        var h=new QueueFixture(); var anchor=h.sample();
+        var h=new QueueFixture(); var anchor=h.anchor();
         h.player=new PlayerObservation(11.5,1,3.5,0); h.step();
         var events=new ArrayList<String>(); var pauses=new AtomicInteger(); var captures=new AtomicInteger();
         var probe=side(3.25,41,42,43);
@@ -86,7 +334,7 @@ class ScenarioClientTransitionTest {
                 var selected=h.sample();
                 if(captures.get()==1) h.queue.add(() -> { h.player=new PlayerObservation(11.5,1,7.5,0); h.step(); });
                 return selected;
-            },c -> { events.add("pause"); pauses.incrementAndGet(); h.engine.pause(); },h.context.runId(),anchor,true,20,
+            },c -> { events.add("pause"); pauses.incrementAndGet(); h.engine.pause(); },h.context.runId(),h.binding,h.watch::retained,anchor,true,20,
                     () -> h.host.computeOnServer(server -> { assertFalse(h.onClient); events.add("probe"); return probe; }));
             var transition=result.transition().orElseThrow();
             assertEquals(List.of("probe","before","pause","after"),events);
@@ -107,28 +355,28 @@ class ScenarioClientTransitionTest {
     }
 
     @Test void constructionIneligibilityDoesNotAdmitPauseOrReplaceTheOriginalAnchor() {
-        var h=new QueueFixture(); var anchor=h.sample();
+        var h=new QueueFixture(); var anchor=h.anchor();
         h.player=new PlayerObservation(11.5,1,3.5,0); h.step();
         h.host.inScope(h.scope,() -> {
             for(double z:new double[]{2.5,2.7,2.75,Double.NaN,Double.POSITIVE_INFINITY,Double.NEGATIVE_INFINITY}) {
                 var rejected=ScenarioRunner.constructionCapture(h.host,c -> h.sample(),c -> fail("Server displacement did not qualify"),
-                        h.context.runId(),anchor,true,20,() -> side(z,20,20,20));
+                        h.context.runId(),h.binding,h.watch::retained,anchor,true,20,() -> side(z,20,20,20));
                 assertTrue(rejected.transition().isEmpty());
             }
             // Failed samples are not anchors: +.5 from original qualifies, although latest client was already at3.5.
             var accepted=ScenarioRunner.constructionCapture(h.host,c -> h.sample(),c -> h.engine.pause(),
-                    h.context.runId(),anchor,true,20,() -> side(3,20,20,20));
+                    h.context.runId(),h.binding,h.watch::retained,anchor,true,20,() -> side(3,20,20,20));
             assertTrue(accepted.transition().isPresent());
         });
         for(double z:new double[]{2.5,2.7,2.75,Double.NaN,Double.POSITIVE_INFINITY,Double.NEGATIVE_INFINITY}) {
-            var client=new QueueFixture(); var start=client.sample();
+            var client=new QueueFixture(); var start=client.anchor(); client.step();
             // Simulate Side data (including malformed positions) without inventing a nonfinite core PlayerObservation.
             var candidate=client.sample();
             var positioned=new ScenarioRunner.Live(candidate.sample(),side(z,20,20,0),candidate.server(),candidate.fault(),
                     candidate.pending(),candidate.nativeSequence(),candidate.nativeIdentities());
             client.host.inScope(client.scope,() -> {
                 var result=ScenarioRunner.constructionCapture(client.host,c -> positioned,c -> fail("Client displacement did not qualify"),
-                        client.context.runId(),start,true,20,() -> side(4,20,20,20));
+                        client.context.runId(),client.binding,client.watch::retained,start,true,20,() -> side(4,20,20,20));
                 assertTrue(result.transition().isEmpty());
             });
         }
@@ -136,18 +384,18 @@ class ScenarioClientTransitionTest {
 
     @Test void constructionSkipsProbeWithoutPendingAnchorAndRefusesAlreadyExitedShift() {
         for(boolean pending:List.of(false,true)) {
-            var h=new QueueFixture(); var anchor=h.sample();
+            var h=new QueueFixture(); var anchor=pending?null:h.anchor();
             h.host.inScope(h.scope,() -> {
                 var result=ScenarioRunner.constructionCapture(h.host,c -> h.sample(),c -> fail("No admission"),
-                        h.context.runId(),pending?null:anchor,pending,20,() -> fail("No prior pending anchor"));
+                        h.context.runId(),h.binding,h.watch::retained,anchor,pending,20,() -> fail("No prior pending anchor"));
                 assertTrue(result.transition().isEmpty()); assertNull(result.admissionProbe());
             });
         }
-        var h=new QueueFixture(); var anchor=h.sample();
+        var h=new QueueFixture(); var anchor=h.anchor();
         h.player=new PlayerObservation(11.5,1,7.5,0); h.queue.add(h::step);
         h.host.inScope(h.scope,() -> {
             var result=ScenarioRunner.constructionCapture(h.host,c -> h.sample(),c -> fail("Already NEXT_ENTRY"),
-                    h.context.runId(),anchor,true,20,() -> side(4,20,20,20));
+                    h.context.runId(),h.binding,h.watch::retained,anchor,true,20,() -> side(4,20,20,20));
             assertTrue(result.transition().isEmpty());
             assertEquals(ForwardTraversal.Substage.NEXT_ENTRY,result.before().sample().status().engine().traversal().orElseThrow().substage());
         });
@@ -155,37 +403,37 @@ class ScenarioClientTransitionTest {
 
     @Test void constructionProbeAndAuthorityFailuresPropagateEvenBeforeAdmission() {
         var probeFailure=new IllegalStateException("server authority sentinel");
-        var h=new QueueFixture(); var anchor=h.sample();
+        var h=new QueueFixture(); var anchor=h.anchor();
         h.host.inScope(h.scope,() -> assertSame(probeFailure,assertThrows(IllegalStateException.class,
                 () -> ScenarioRunner.constructionCapture(h.host,c -> fail("Capture after failed probe"),c -> fail("No pause"),
-                        h.context.runId(),anchor,true,20,() -> h.host.computeOnServer(server -> { throw probeFailure; })))));
+                        h.context.runId(),h.binding,h.watch::retained,anchor,true,20,() -> h.host.computeOnServer(server -> { throw probeFailure; })))));
         var foreign=new Context(UUID.randomUUID(),h.context.connectionId(),h.context.worldId(),h.context.dimension(),
                 h.context.planFingerprint(),h.context.origin(),h.context.settingsFingerprint());
-        var bad=new ArrayList<ScenarioRunner.Live>();
-        bad.add(state(anchor,new com.mapartrunner.core.run.RunLifecycle.Snapshot(Phase.RUNNING,Optional.of(foreign),Optional.of(Activity.SHIFT),Optional.empty()),null,null,null));
-        bad.add(sample(anchor,anchor.sample().status(),anchor.sample().keys(),false,false,anchor.nativeSequence()));
-        bad.add(sample(anchor,new FabricBuildAdapter.Status(anchor.sample().status().engine(),ControlOwner.NATIVE,
+        var bad=new ArrayList<ScenarioRunner.Live>(); var original=h.sample();
+        bad.add(state(original,new com.mapartrunner.core.run.RunLifecycle.Snapshot(Phase.RUNNING,Optional.of(foreign),Optional.of(Activity.SHIFT),Optional.empty()),null,null,null));
+        bad.add(sample(original,original.sample().status(),original.sample().keys(),false,false,original.nativeSequence()));
+        bad.add(sample(original,new FabricBuildAdapter.Status(original.sample().status().engine(),ControlOwner.NATIVE,
                 Optional.of(new FabricBuildAdapter.Failure(h.context.runId(),101,"sentinel-adapter","failure",Optional.empty()))),
-                anchor.sample().keys(),false,true,anchor.nativeSequence()));
+                original.sample().keys(),false,true,original.nativeSequence()));
         for(var invalid:bad) h.host.inScope(h.scope,() -> {
             var error=assertThrows(AssertionError.class,() -> ScenarioRunner.constructionCapture(h.host,c -> invalid,c -> fail("Invalid authority"),
-                    h.context.runId(),null,false,20,() -> fail("Not pending")));
+                    h.context.runId(),h.binding,h.watch::retained,null,false,20,() -> fail("Not pending")));
             assertTrue(error.getMessage().startsWith("Foreign run/world or adapter failure"));
         });
         var captureFailure=new IllegalStateException("client binding/save sentinel");
         h.host.inScope(h.scope,() -> assertSame(captureFailure,assertThrows(IllegalStateException.class,
                 () -> ScenarioRunner.constructionCapture(h.host,c -> { throw captureFailure; },c -> fail("No pause"),
-                        h.context.runId(),null,false,20,() -> fail("Not pending")))));
+                        h.context.runId(),h.binding,h.watch::retained,null,false,20,() -> fail("Not pending")))));
     }
 
     @Test void constructionUsesOriginalRemainingRequestsAndNeverRetriesAdmittedFailures() {
         for(int remaining:List.of(19,20)) {
-            var h=new QueueFixture(); var anchor=h.sample(); h.player=new PlayerObservation(11.5,1,3.5,0); h.step();
+            var h=new QueueFixture(); var anchor=h.anchor(); h.player=new PlayerObservation(11.5,1,3.5,0); h.step();
             var waits=new ScenarioRunner.PhysicsAllowance(remaining+1); var requests=new AtomicInteger(); var pauses=new AtomicInteger();
             waits.waitTick(false,requests::incrementAndGet);
             h.host.inScope(h.scope,() -> {
                 java.util.function.Supplier<ScenarioRunner.ConstructionCapture> attempt=() -> ScenarioRunner.constructionCapture(h.host,c -> h.sample(),
-                        c -> { pauses.incrementAndGet(); h.engine.pause(); },h.context.runId(),anchor,true,
+                        c -> { pauses.incrementAndGet(); h.engine.pause(); },h.context.runId(),h.binding,h.watch::retained,anchor,true,
                         waits.constructionLimit-waits.consumed(),() -> side(4,20,20,20));
                 if(remaining==19) assertEquals("SHIFT pause would exceed the shared run physics budget",assertThrows(AssertionError.class,attempt::get).getMessage());
                 else assertTrue(attempt.get().transition().isPresent());
@@ -193,7 +441,7 @@ class ScenarioClientTransitionTest {
             });
         }
         for(String failure:List.of("action","afterCapture","afterState","postServer","postEvidence")) {
-            var h=new QueueFixture(); var anchor=h.sample(); h.player=new PlayerObservation(11.5,1,3.5,0); h.step();
+            var h=new QueueFixture(); var anchor=h.anchor(); h.player=new PlayerObservation(11.5,1,3.5,0); h.step();
             var sentinel=new IllegalStateException(failure); var pauses=new AtomicInteger(); var captures=new AtomicInteger();
             h.host.inScope(h.scope,() -> {
                 Class<? extends Throwable> expected=failure.equals("afterState")?AssertionError.class:IllegalStateException.class;
@@ -202,7 +450,7 @@ class ScenarioClientTransitionTest {
                         if(captures.incrementAndGet()==2 && failure.equals("afterCapture")) throw sentinel;
                         return h.sample();
                     },c -> { pauses.incrementAndGet(); if(failure.equals("action")) throw sentinel;
-                        if(!failure.equals("afterState")) h.engine.pause(); },h.context.runId(),anchor,true,20,() -> side(4,20,20,20));
+                        if(!failure.equals("afterState")) h.engine.pause(); },h.context.runId(),h.binding,h.watch::retained,anchor,true,20,() -> side(4,20,20,20));
                     assertTrue(result.transition().isPresent());
                     // Attachment/evidence are worker work after the exact returned pair; failure must leave cleanup in charge.
                     assertFalse(h.onClient);
@@ -219,7 +467,7 @@ class ScenarioClientTransitionTest {
 
     @Test void constructionPreservesHostCancellationAndScopeExpiryBeforeAndAfterAdmission() {
         for(boolean expire:List.of(false,true)) for(boolean after:List.of(false,true)) {
-            var h=new QueueFixture(); var anchor=h.sample(); h.player=new PlayerObservation(11.5,1,3.5,0); h.step();
+            var h=new QueueFixture(); var anchor=h.anchor(); h.player=new PlayerObservation(11.5,1,3.5,0); h.step();
             var sentinel=new IllegalStateException("cancel sentinel"); var pauses=new AtomicInteger();
             Runnable invalidate=() -> { if(expire) h.now=h.scope.deadlineNanos(); else h.host.cancelSession(sentinel); };
             h.host.inScope(h.scope,() -> {
@@ -228,7 +476,7 @@ class ScenarioClientTransitionTest {
                 var error=assertThrows(expected,
                         () -> ScenarioRunner.constructionCapture(h.host,c -> h.sample(),c -> {
                             pauses.incrementAndGet(); h.engine.pause(); invalidate.run();
-                        },h.context.runId(),anchor,true,20,() -> side(4,20,20,20)));
+                        },h.context.runId(),h.binding,h.watch::retained,anchor,true,20,() -> side(4,20,20,20)));
                 if(!expire) assertSame(sentinel,error);
                 assertEquals(after?1:0,pauses.get());
             });
@@ -236,12 +484,12 @@ class ScenarioClientTransitionTest {
     }
 
     @Test void admittedAtomicPairAndProbeEarnNoCreditBeforeTwentyAdvancingHolds() {
-        var h=new QueueFixture(); var anchor=h.sample(); h.player=new PlayerObservation(11.5,1,3.5,0); h.step();
+        var h=new QueueFixture(); h.anchor(); h.player=new PlayerObservation(11.5,1,3.5,0); h.step();
         var waits=new ScenarioRunner.PhysicsAllowance(22); var requests=new AtomicInteger();
         waits.waitTick(false,requests::incrementAndGet);
         h.host.inScope(h.scope,() -> {
             var result=ScenarioRunner.constructionCapture(h.host,c -> h.sample(),c -> h.engine.pause(),
-                    h.context.runId(),anchor,true,21,() -> side(4,100,100,100));
+                    h.context.runId(),h.binding,h.watch::retained,null,true,21,() -> side(4,100,100,100));
             var paused=result.transition().orElseThrow().after();
             var held=clocks(paused,100,100,100,100,100,100);
             var queue=new ArrayDeque<ScenarioRunner.Live>(); queue.add(held);
@@ -512,6 +760,8 @@ class ScenarioClientTransitionTest {
         final ArrayDeque<Runnable> queue=new ArrayDeque<>();
         final InspectScenarioHost host;
         final ScenarioHost.Scope scope;
+        final ScenarioObserver.Watch watch=new ScenarioObserver.Watch();
+        final ScenarioObserver.Binding binding;
         PlayerObservation player=new PlayerObservation(.5,1,2.5,-90);
         TickDecision decision;
         long tick;
@@ -535,6 +785,27 @@ class ScenarioClientTransitionTest {
                 onServer=true; try { action.run(); } finally { onServer=false; }
             },null);
             scope=host.beginWork(new ScenarioHost.Operation(UUID.randomUUID(),1,UUID.randomUUID(),ScenarioHost.Command.RUN,Path.of("simulated")));
+            var playerId=UUID.randomUUID();
+            binding=new ScenarioObserver.Binding(UUID.randomUUID(),context,
+                    new ScenarioObserver.ClientBinding(new Object(),new Object(),new Object(),new Object(),playerId,context.dimension(),true,true,true),
+                    new ScenarioObserver.ServerBinding(new Object(),new Object(),new Object(),playerId,context.dimension(),true,true),host,scope);
+            watch.bind(binding);
+        }
+
+        ScenarioObserver.ServerWitness anchor() {
+            publishEnd(); commit(watch.beginServerRead(),player.z(),(int)tick);
+            return watch.retained().witnesses().getLast();
+        }
+
+        ScenarioObserver.Sample publishEnd() {
+            var s=sample().sample();
+            var end=new ScenarioObserver.Sample(s.tick(),"END",s.worldIdentity(),s.originalWorld(),s.pose(),s.keys(),s.paused(),s.status(),s.observations());
+            watch.append(binding,end,binding.client(),4.5);
+            return end;
+        }
+
+        void commit(ScenarioObserver.ServerRead claim,double z,int serverTick) {
+            watch.commitServer(claim,new ScenarioObserver.ServerReading(binding.server(),player.x(),player.y(),z,4.5,serverTick,serverTick,serverTick));
         }
 
         void step() {
