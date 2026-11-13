@@ -343,6 +343,94 @@ try {
         Reject { Invoke-V2Supervisor -RequireGame -Request $request -InternalSupportCase controlled -EvidenceRoot $refused -WorkingDirectory $repo } 'controlled inspect supervisor accepted'
         Assert (!(Test-Path -LiteralPath $refused)) 'refused support created filesystem state'
     }
+    Run 'synthetic CIM timeout retains held identity and inner cause without retry or fabricated records' {
+        $existingCim=Get-Item Function:Get-CimInstance -ErrorAction SilentlyContinue
+        $selected=[Diagnostics.Process]::GetProcessById($PID)
+        try {
+            $expectedStarted=$selected.StartTime.ToUniversalTime().ToString('o')
+            foreach ($vanished in $false,$true) {
+                $cause=[TimeoutException]::new('Synthetic CIM provider timeout')
+                $probe=@{Queries=0;Handle=$null;Filter=$null;Timeout=$null;ClassName=$null;ErrorAction=$null}
+                Set-Item Function:Get-CimInstance -Value {
+                    param($ClassName,$Filter,$OperationTimeoutSec,$ErrorAction)
+                    $probe.Queries++; $probe.Filter=$Filter; $probe.Timeout=$OperationTimeoutSec
+                    $probe.ClassName=$ClassName; $probe.ErrorAction=$ErrorAction; $probe.Handle=$process.SafeHandle
+                    throw $cause
+                }
+                # Synthetic job membership around a real held PID; the second snapshot controls disappearance.
+                $owned=[pscustomobject]@{Pid=$PID;Calls=0;Vanished=$vanished}
+                $owned | Add-Member ScriptMethod Pids { $this.Calls++; if (!$this.Vanished -or $this.Calls -eq 1) { @($this.Pid) } }
+                $records=[Collections.Generic.List[object]]::new(); $handles=[Collections.Generic.List[object]]::new(); $failure=$null
+                try { Update-V2Processes $owned $records $handles } catch { $failure=$_ }
+                Assert ($probe.Queries -eq 1 -and $probe.Filter -ceq "ProcessId=$PID" -and $probe.ClassName -ceq 'Win32_Process' -and $probe.Timeout -eq 1 -and $probe.ErrorAction -ceq 'Stop') 'CIM failure changed the query contract or retried'
+                Assert (!$records.Count -and !$handles.Count -and $probe.Handle.IsClosed -and $owned.Calls -eq 2) 'CIM failure fabricated identity, leaked the tentative handle or skipped membership recheck'
+                if ($vanished) {
+                    Assert (!$failure) 'post-query vanished member was treated as a still-owned failure'
+                } else {
+                    $inner=$failure.Exception
+                    while ($inner -and ![object]::ReferenceEquals($inner,$cause)) { $inner=$inner.InnerException }
+                    Assert ($failure -and $failure.Exception.Message.Contains("PID $PID") -and $failure.Exception.Message.Contains($expectedStarted) -and $inner -and ![object]::ReferenceEquals($failure.Exception,$cause)) "CIM timeout lost selected PID $PID, exact UTC creation time $expectedStarted or original inner cause: $($failure.Exception)"
+                }
+            }
+        } finally {
+            $selected.Dispose()
+            if ($existingCim) { Set-Item Function:Get-CimInstance -Value $existingCim.ScriptBlock }
+            else { Remove-Item Function:Get-CimInstance }
+        }
+    }
+    Run 'synthetic after-gate CIM timeout propagates before READY and Fast cleanup stays CIM-free' {
+        $originalUpdate=${function:Update-V2Processes}; $cimCommand=Get-Command Get-CimInstance
+        $existingCim=Get-Item Function:Get-CimInstance -ErrorAction SilentlyContinue
+        $cause=[TimeoutException]::new('Synthetic after-gate CIM provider timeout')
+        $phase=@{Injected=$false;Queries=0;FastCalls=0;FastCimCalls=0;Fast=$false;Pid=$null;StartedUtc=$null}
+        try {
+            Set-Item Function:Get-CimInstance -Value {
+                param($ClassName,$Filter,$OperationTimeoutSec,$ErrorAction)
+                if ($phase.Fast) { $phase.FastCimCalls++; throw 'Fast cleanup unexpectedly queried CIM' }
+                if ($phase.Injected -and $Filter -ceq "ProcessId=$($phase.Pid)") { $phase.Queries++; throw $cause }
+                & $cimCommand @PSBoundParameters
+            }
+            Set-Item Function:Update-V2Processes -Value {
+                param($Job,$Records,$Handles,[switch]$Fast)
+                $phase.Fast=[bool]$Fast
+                if ($Fast) { $phase.FastCalls++ }
+                elseif (!$phase.Injected -and (Test-Path -LiteralPath $gate)) {
+                    $pidFile=Join-Path $evidence 'cim-child.pid'; $handshake=[Diagnostics.Stopwatch]::StartNew()
+                    while (!(Test-Path -LiteralPath $pidFile)) {
+                        if ($handshake.ElapsedMilliseconds -ge 5000) { throw 'Synthetic CIM child handshake did not arrive' }
+                        Start-Sleep -Milliseconds 10
+                    }
+                    $phase.Pid=[int](Get-Content -LiteralPath $pidFile -Raw)
+                    Assert ($Job.Pids() -contains $phase.Pid) 'synthetic CIM child was not in the owned job'
+                    $child=[Diagnostics.Process]::GetProcessById($phase.Pid)
+                    try { $phase.StartedUtc=$child.StartTime.ToUniversalTime().ToString('o') } finally { $child.Dispose() }
+                    Assert (!$result.StartIdentity -and !$result.StartReceipt) 'synthetic CIM injection occurred after READY'
+                    $phase.Injected=$true
+                }
+                & $originalUpdate $Job $Records $Handles -Fast:$Fast
+            }
+            $worker={
+                $child=Start-Process -FilePath (Join-Path $PSHOME pwsh.exe) -WindowStyle Hidden -ArgumentList '-NoProfile','-Command','Start-Sleep -Seconds 30' -PassThru
+                Set-Content -LiteralPath (Join-Path $env:MAPART_TEST_LAUNCH_DIR 'cim-child.pid') $child.Id
+                Start-Sleep -Seconds 30
+            }
+            $outcome=Invoke-V2Supervisor -Worker $worker -Request ([pscustomobject]@{Mode='inspect';Scenario='grounded-two-lane'}) -EvidenceRoot $testRoot -WorkingDirectory $repo -TimeoutMilliseconds 10000 -StartupMilliseconds 10000
+        } finally {
+            Set-Item Function:Update-V2Processes -Value $originalUpdate
+            if ($existingCim) { Set-Item Function:Get-CimInstance -Value $existingCim.ScriptBlock }
+            else { Remove-Item Function:Get-CimInstance }
+        }
+        if ($outcome.CleanupStatus -cne 'settled') { throw 'HOLD: synthetic CIM owned cleanup unresolved; no more launches.' }
+        $saved=Get-Content -LiteralPath (Join-Path $outcome.Evidence 'outcome.json') -Raw | ConvertFrom-Json
+        Assert ($phase.Injected -and $phase.Queries -eq 1 -and $phase.FastCalls -gt 0 -and !$phase.FastCimCalls) 'synthetic query failure or CIM-free Fast cleanup was not exercised'
+        Assert ($saved.SupervisorError.Contains("PID $($phase.Pid)") -and $saved.SupervisorError.Contains($phase.StartedUtc) -and $saved.SupervisorError.Contains('System.TimeoutException: Synthetic after-gate CIM provider timeout')) 'retained supervisor outcome lost the selected identity or inner cause'
+        Assert ($saved.ExitCode -eq 125 -and $saved.WorkerExitCode -eq 125 -and $saved.TerminationRequested -and !$saved.TimedOut -and !$saved.PrimaryFailure -and !$saved.ObservedFailures.Count) 'forced cleanup125 replaced the original discovery failure'
+        Assert ($saved.ReceiptStatus -ceq 'Missing' -and !$saved.StartReceipt -and !$saved.StartIdentity -and !$saved.StartupAcceptedElapsedMilliseconds -and !$saved.NativeGameExitCodes.Count) 'synthetic CIM failure fabricated READY or native identity'
+        $failedRecord=@($saved.Processes | Where-Object Pid -EQ $phase.Pid)
+        Assert ($failedRecord.Count -eq 1 -and !$failedRecord[0].IdentityVerified -and !$failedRecord[0].IsGame -and @($saved.Processes | Where-Object { $null -eq $_.ExitCode }).Count -eq 0) 'Fast cleanup fabricated verified/native identity or lost held exits'
+        Assert ($saved.CleanupStatus -ceq 'settled' -and $saved.ArchiveStatus -ceq 'retained' -and (Get-Item -LiteralPath (Join-Path $testRoot 'supervisor.lock')).Length -eq 0) 'synthetic CIM outcome/archive/ownership did not settle'
+        @{SyntheticInjection=$true;Phase=$phase;Outcome=$saved}|ConvertTo-Json -Depth 14|Set-Content (Join-Path $testRoot 'cim-context-propagation-proof.json')
+    }
     Run 'vanished owned PID tolerates stale enumeration without hiding other inventory failures' {
         $originalUpdate=${function:Update-V2Processes}; $capture=@{Process=$null}; $proof=@{}
         try {
@@ -389,6 +477,7 @@ try {
                     $failure=$null
                     try { Update-V2Processes $live $records ([Collections.Generic.List[object]]::new()) } catch { $failure=$_ }
                     Assert ($failure -and !$records.Count) "non-lookup inventory failure was swallowed: $fault"
+                    if ($fault -ceq 'identity') { Assert ($failure.Exception.Message -ceq "Identity unavailable for owned PID $PID") 'creation mismatch was wrapped as a CIM query failure' }
                     $failures.Add(@{Case=$fault;Type=$failure.Exception.GetType().FullName;Message=$failure.Exception.Message})
                 }
             } finally {

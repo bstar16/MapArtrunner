@@ -678,7 +678,8 @@ function Update-V2Processes {
             $started=$process.StartTime.ToUniversalTime().ToString('o')
             $cim=$null
             if (!$Fast) {
-                $cim=Get-CimInstance Win32_Process -Filter "ProcessId=$ownedId" -OperationTimeoutSec 1 -ErrorAction Stop
+                try { $cim=Get-CimInstance Win32_Process -Filter "ProcessId=$ownedId" -OperationTimeoutSec 1 -ErrorAction Stop }
+                catch { throw [InvalidOperationException]::new("CIM query failed for owned PID $ownedId (creation UTC $started).",$_.Exception) }
                 if (!$cim -or [Math]::Abs(($cim.CreationDate.ToUniversalTime() - $process.StartTime.ToUniversalTime()).TotalMilliseconds) -gt 10) { throw "Identity unavailable for owned PID $ownedId" }
             }
             $record=[pscustomobject]@{ Pid=$ownedId; ParentPid=$(if ($cim) {[int]$cim.ParentProcessId} else {$null}); StartedUtc=$started
