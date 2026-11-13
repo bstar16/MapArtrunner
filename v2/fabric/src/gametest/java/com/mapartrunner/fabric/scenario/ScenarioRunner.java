@@ -736,7 +736,7 @@ final class ScenarioRunner implements AutoCloseable {
     static ResetFault selectResetFault(boolean inspect, String inspectGate, String acceptance, String automatic,
                                        String selection, Command command, int ordinal, int resets, boolean predecessor) {
         if(!inspect || !Boolean.parseBoolean(inspectGate) || !Boolean.parseBoolean(acceptance) || automatic!=null) return null;
-        require(Set.of("baseline","displaced","reset-archive","foreign-world","work-expiry","n1-header","n1-post-link").contains(selection),"Unknown acceptance case: "+selection);
+        require(Set.of("baseline","displaced","reset-archive","foreign-world","work-expiry","n1-header","n1-post-link","stuck-cleanup").contains(selection),"Unknown acceptance case: "+selection);
         if(!selection.equals("reset-archive") || command!=Command.RESET) return null;
         if(ordinal==1 || ordinal==5) {
             require(resets==(ordinal==1?0:2) && predecessor,"Invalid reset fault counter/predecessor");
