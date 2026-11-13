@@ -57,8 +57,8 @@ public final class FabricBuildAdapter {
         Objects.requireNonNull(settings, "settings");
         if (active()) throw new IllegalStateException("Stop the current run before starting another");
         var state = access.state();
-        if (!usable(state) || state.player() == null || suspended(state)) {
-            throw new IllegalStateException("Start requires a connected world/player without a screen or simulation pause");
+        if (!usable(state) || state.player() == null || state.simulationPaused()) {
+            throw new IllegalStateException("Start requires a connected world/player and live simulation");
         }
         var run = new RunLifecycle.Context(UUID.randomUUID(), UUID.randomUUID().toString(), UUID.randomUUID().toString(),
                 state.dimension(), plan.fingerprint(), origin, settings.fingerprint());
@@ -103,7 +103,7 @@ public final class FabricBuildAdapter {
             terminate("resume", "Changed world/session requires a fresh run", null);
             throw new IllegalStateException("Changed world/session requires a fresh run");
         }
-        if (suspended(state)) throw new IllegalStateException("Close the screen and unpause before resuming");
+        if (state.simulationPaused()) throw new IllegalStateException("Unpause simulation before resuming");
         try {
             engine.resume(run);
             binding = arbiter.bindRun(run.runId());
@@ -141,11 +141,6 @@ public final class FabricBuildAdapter {
         }
     }
 
-    public void onScreenOpened() {
-        // shortcut: all screens require manual resume; integrate preserved chat/config/refill screens before their parity gates.
-        pause();
-    }
-
     public void onClientStopping() {
         access.requireClientThread();
         if (context != null) terminate("shutdown", "Client is stopping", null);
@@ -164,12 +159,14 @@ public final class FabricBuildAdapter {
         Envelope envelope = null;
         String stage = "snapshot";
         try {
-            long tick = sampleTick = Math.incrementExact(sampleTick);
             if (!checkLive()) return;
-            var previous = feedback == null ? List.<PlacementEffectResult>of() : List.of(feedback);
-            feedback = null;
+            long tick = Math.incrementExact(sampleTick);
             var facts = access.capture(capturedPlan, run, capturedSettings, capturedBound, tick);
             if (context != run || !checkLive()) return;
+            // Consume feedback and sample time only when this invocation can actually advance core.
+            var previous = feedback == null ? List.<PlacementEffectResult>of() : List.of(feedback);
+            feedback = null;
+            sampleTick = tick;
             stage = "core";
             var decision = engine.tick(new TickInput(run.runId(), tick, Optional.of(run), facts.player(),
                     facts.support(), facts.observations(), facts.availability(),
@@ -204,8 +201,10 @@ public final class FabricBuildAdapter {
                 var claimed = envelope;
                 var result = access.place(capturedPlan, run, capturedSettings, decision.placement().orElseThrow(),
                         arbiter, capturedBinding, () -> current(claimed, true));
+                // A native hold may start inside placement; retain its result for the next live sample.
+                if (context == run && binding == capturedBinding && phase() == Phase.RUNNING
+                        && arbiter.isCurrent(capturedBinding)) feedback = result.effect();
                 if (!current(envelope, true)) { releaseIfInactive(envelope); return; }
-                feedback = result.effect();
             }
             stage = "controls";
             if (decision.owner() == ControlOwner.NATIVE) {
@@ -229,17 +228,26 @@ public final class FabricBuildAdapter {
                 || !arbiter.isCurrent(envelope.binding()) || envelope.decision().tick() != sampleTick
                 || !envelope.decision().runId().orElseThrow().equals(context.runId())) return false;
         var state = access.state();
-        return matches(state) && state.player() == bound.player() && !suspended(state)
+        if (applying != envelope || binding != envelope.binding()) return false;
+        return checkLive(state) && state.player() == bound.player()
                 && (!ownerEstablished || arbiter.owner() == envelope.decision().owner());
     }
 
     private boolean checkLive() {
-        var state = access.state();
+        return checkLive(access.state());
+    }
+
+    private boolean checkLive(ClientState state) {
         if (!matches(state)) {
             terminate("binding", "Current world/session/player binding was lost", null);
             return false;
         }
-        if (suspended(state)) pause();
+        if (state.simulationPaused()) {
+            // Native pause holds the same run/binding/feedback; consume its envelope before releasing keys.
+            applying = null;
+            releaseLease();
+            return false;
+        }
         return true;
     }
 
@@ -258,7 +266,6 @@ public final class FabricBuildAdapter {
         return state.connected() && state.world() != null && state.handler() != null && state.connection() != null;
     }
 
-    private static boolean suspended(ClientState state) { return state.simulationPaused() || state.screenOpen(); }
     private Phase phase() { return engine.snapshot().lifecycle().phase(); }
     private boolean active() { return phase() == Phase.RUNNING || phase() == Phase.PAUSED; }
 

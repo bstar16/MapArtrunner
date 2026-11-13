@@ -248,7 +248,7 @@ public final class FabricPlacementEffects {
             var expected = expectedState(target.block());
             if (expected.isEmpty()) return unavailable(UNSUPPORTED, "Unknown or incomplete expected block state");
             if (!isCurrent() || !player.isAlive() || player.isSpectator() || player.isUsingItem()
-                    || manager.isBreakingBlock() || client.currentScreen != null) {
+                    || manager.isBreakingBlock()) {
                 return unavailable(NO_VALID_HIT, "Client player or interaction is unavailable");
             }
             var state = expected.orElseThrow();
