@@ -15,11 +15,15 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 
 import static com.mapartrunner.fabric.scenario.ScenarioCommands.*;
+import static com.mapartrunner.fabric.scenario.ScenarioRunner.*;
 import static com.mapartrunner.fabric.scenario.ScenarioHost.Command;
 import static org.junit.jupiter.api.Assertions.*;
 
 /** Simulated input/clock policy checks. These do not establish native keyboard or gameplay acceptance. */
 class InspectAcceptanceDriverTest {
+    @org.junit.jupiter.api.BeforeAll static void bootstrapN1SourceFixtures() {
+        net.minecraft.SharedConstants.createGameVersion(); net.minecraft.Bootstrap.initialize();
+    }
     @Test void foreignCodecErrorsAndOutputFailureCannotProduceAnAcknowledgement() {
         assertEquals(1,InspectAcceptanceDriver.checkedEncode(com.mojang.serialization.Codec.intRange(0,1),com.mojang.serialization.JsonOps.INSTANCE,1).getAsInt());
         assertThrows(IllegalStateException.class,() -> InspectAcceptanceDriver.checkedEncode(com.mojang.serialization.Codec.intRange(0,1),com.mojang.serialization.JsonOps.INSTANCE,2));
@@ -1160,6 +1164,387 @@ class InspectAcceptanceDriverTest {
         }
         void assertHealthy() { assertTrue(logs.stream().noneMatch(s -> s.contains("DRIVER_FAIL")),logs.toString()); assertEquals(0,input.stops); }
         void assertFailed() { assertEquals(1,logs.stream().filter(s -> s.contains("DRIVER_FAIL")).count(),logs.toString()); }
+    }
+
+    @ParameterizedTest @ValueSource(strings={"n1-header","n1-post-link"})
+    void n1FixedSevenChatsRetainTwoPositiveCompletionsAndStopOnlyAfterLastHandoff(String selected) {
+        n1(selected,f -> {
+            f.start(); f.settle();
+            f.until(() -> f.input.commands.size()==7);
+            assertEquals(0,f.input.stops); f.tick(); assertEquals(0,f.input.stops);
+            f.tick(); assertEquals(1,f.input.stops); f.tick(5);
+            assertEquals(List.of("/maparttest reset grounded-two-lane","/maparttest run grounded-two-lane","/maparttest reset grounded-two-lane",
+                    "/maparttest reset grounded-two-lane","/maparttest run grounded-two-lane","/maparttest rerun grounded-two-lane","/maparttest last"),f.input.commands);
+            assertEquals(2,f.logs.stream().filter(s -> s.contains("RESULT command=")).count());
+            assertTrue(f.logs.stream().noneMatch(s -> s.contains("ordinal=3") || s.contains("DRIVER_FAIL")),f.logs.toString());
+            assertEquals(f.run,f.observation.last().orElseThrow());
+        });
+    }
+
+    @ParameterizedTest @ValueSource(strings={"n1-header","n1-post-link"})
+    void n1AuthenticatesEveryDetachedFieldBeforeAndAfterTheFirstSnapshot(String selected) {
+        var fields=List.of("absent","state","admission","intent","close","outputAttempted","outputSucceeded","case","session","operation","reusedOperation",
+                "directory","reusedDirectory","longDirectory","reserved","reset","starts","trigger","attempts","collision","header","link","host","scope","absentScope","cancelled","hostOrdinal",
+                "prior","priorOperation","priorRun","hash","files","lastSame","watch","samples","witnesses","failure","class","cause","diagnostics","primary");
+        for(boolean changed:List.of(false,true)) for(var field:fields) n1(selected,f -> {
+            f.start(); f.settle(); if(changed) f.tick();
+            f.projection=corruptN1(f.projection,field,f);
+            f.tick(5); f.failed(); assertEquals(3,f.input.commands.size(),field+" changed="+changed); assertEquals(1,f.input.stops);
+        });
+        for(var field:List.of("hashChanged","messageChanged","causeMessageChanged","timeChanged","newOperation","newDirectory")) n1(selected,f -> {
+            f.start(); f.settle(); f.tick(); f.projection=corruptN1(f.projection,field,f);
+            f.tick(); f.failed(); assertEquals(3,f.input.commands.size(),field);
+        });
+    }
+
+    private static final String SYNTHETIC_N1_PREFIX="[source-fixture/INFO]: ";
+    private static final String N1_COMMON="schema:s,event:s,seq:i,case:s,sessionId:u,operationId:u,ordinal:i,command:s,occurredNanos:t,emittedNanos:t,diagnosticsComplete:b";
+    private static final Map<String,String> N1_SHAPES=Map.ofEntries(
+            Map.entry("ADMISSION_FAILED",N1_COMMON+",operationDirectory:p,reservedOrdinal:i,resetOrdinal:i,countedStarts:i,trigger:trigger,host:host,prior:prior,failure:failure,primaryIdentityRetained:b"),
+            Map.entry("EXIT_REQUESTED",N1_COMMON+",workerIdleAtIntent:b,exitDeadlineNanos:t,primaryIdentityRetained:b"),
+            Map.entry("CLOSE_FINAL",N1_COMMON+",intentNanos:t,exitDeadlineNanos:t,cleanupIssuedNanos:?t,cleanupDeadlineNanos:?t,shutdown:shutdown,reservedOrdinal:i,resetOrdinal:i,countedStarts:i,retainedLastSame:b,primaryIdentityRetained:b,release:release,freeze:freeze,options:options,close:close,failure:failure,priorRowsOutputChecked:b"),
+            Map.entry("trigger","attempts:i,collisionCreated:b,headerWriteEntered:b,afterLinkReached:b"),
+            Map.entry("host","ordinaryScopeIssued:b,currentScopeAbsent:b,cancelled:b,lastOrdinal:i"),
+            Map.entry("prior","operationId:u,runId:u,summarySha256:h,closedFilesVerified:b,lastSame:b,watchSame:b,samples:i,witnesses:i"),
+            Map.entry("failure","className:c,message:?m,causeClassName:?c,causeMessage:?m"),
+            Map.entry("shutdown","operationId:?u,kind:?s,issues:i"),
+            Map.entry("release","invocations:i,guard:g,beforeKeys:?i,afterKeys:?i,beforeOwner:?s,afterOwner:?s,error:?failure"),
+            Map.entry("freeze","invocations:i,guard:g,watchSame:?b,error:?failure"),
+            Map.entry("options","helperInvocations:i,autoJumpSetCalls:i,viewDistanceSetCalls:i,settingsSendCalls:i,guard:g,ownedBefore:?b,ownedAfter:?b,savedAutoJump:?b,savedViewDistance:?j,beforeAutoJump:?b,afterAutoJump:?b,beforeViewDistance:?j,afterViewDistance:?j,error:?failure"),
+            Map.entry("close","invocations:i,guard:g,serverCheckpoint:g,returned:b,worldCleared:b,error:?failure"));
+
+    @ParameterizedTest @ValueSource(strings={"n1-header","n1-post-link"})
+    void n1SourceReconstructionJoinsExactFixedSchemasAndSignedLongTimes(String selected) {
+        n1(selected,f -> {
+            for(long start:new long[]{9_007_199_254_740_993L,Long.MAX_VALUE-2,Long.MIN_VALUE}) {
+                var wire=n1Wire(f,start); var records=n1Records(wire);
+                var reconstructed=reconstructN1(records,f.run);
+                assertEquals(wire,reconstructed);
+                var crlf=records.stream().map(bytes -> new String(bytes,java.nio.charset.StandardCharsets.UTF_8).replace("\n","\r\n").getBytes(java.nio.charset.StandardCharsets.UTF_8)).toList();
+                assertEquals(wire,reconstructN1(crlf,f.run));
+                assertTrue(ScenarioRunner.n1Positive(reconstructed.admission(),reconstructed.intent(),reconstructed.close(),start+4));
+                var finalRow=readN1Record(records.get(2),"CLOSE_FINAL");
+                assertTrue(finalRow.get("priorRowsOutputChecked").getAsBoolean());
+                assertFalse(finalRow.has("finalOutputChecked"),"Previous rows never attest to the final flush");
+            }
+        });
+    }
+
+    @ParameterizedTest @ValueSource(strings={"n1-header","n1-post-link"})
+    void n1SourceReconstructionRejectsMissingRepeatedReorderedMalformedAndIncompatiblePhysicalRecords(String selected) {
+        n1(selected,f -> {
+            var wire=n1Wire(f,9_007_199_254_740_993L); var records=n1Records(wire);
+            var badSets=new ArrayList<List<byte[]>>();
+            badSets.add(records.subList(0,2)); badSets.add(List.of(records.get(0),records.get(1),records.get(2),records.get(2)));
+            badSets.add(List.of(records.get(0),records.get(0),records.get(2))); badSets.add(List.of(records.get(1),records.get(0),records.get(2)));
+            var source=new String(records.getFirst(),java.nio.charset.StandardCharsets.UTF_8);
+            for(var changed:List.of(
+                    source.replace("\"schema\":","\"schema\":\"duplicate\",\"schema\":"),
+                    source.replace("\"schema\":","\"unknown\":null,\"schema\":"),
+                    source.replace("\"seq\":1,",""),source.replace("\"seq\":1","\"seq\":\"1\""),source.replace("\"seq\":1","\"seq\":1.0"),
+                    source.replace("\"ordinal\":3","\"ordinal\":2147483648"),source.replace("\"diagnosticsComplete\":true","\"diagnosticsComplete\":\"true\""),
+                    source.replace("\"causeMessage\":", "\"causeMessage\":false,\"unused\":"),
+                    source.replace("\"9007199254740993\"","9007199254740993"),source.replace("\"9007199254740993\"","\"9223372036854775808\""),
+                    source.replace("\"9007199254740993\"","\"+9007199254740993\""),source.replace("\"9007199254740993\"","\"09007199254740993\""),
+                    source.replace("\"9007199254740993\"","\"-0\""),source.replace("\"reservedOrdinal\":3","\"reservedOrdinal\":4"),
+                    source.replace("\"attempts\":1","\"attempts\":2"),source.replace("\"headerWriteEntered\":true","\"headerWriteEntered\":false"),
+                    source.replace("\"closedFilesVerified\":true","\"closedFilesVerified\":false"),source.replace("\"failure\":{","\"failure\":null,\"extra\":{"),
+                    source.replace("\"case\":\""+selected+"\"","\"case\":\"baseline\""),source.replace("\"operationId\":\""+wire.admission().operationId(),"\"operationId\":\""+UUID.randomUUID()),
+                    source.replace("\"sessionId\":\""+f.session,"\"sessionId\":\""+UUID.randomUUID()),source.replace("\"command\":\"RESET\"","\"command\":\"RUN\""),
+                    source.replace("MAPART_N1_V1 ","[CHAT] MAPART_N1_V1 "),source.replace(SYNTHETIC_N1_PREFIX,"[unverified/INFO]: "),
+                    source.replace("MAPART_N1_V1 ","\"MAPART_N1_V1 "),source.replace("MAPART_N1_V1 ","\uFEFFMAPART_N1_V1 "),
+                    source.substring(0,source.length()-2)+"\n",source.substring(0,source.length()-1),source.replace("{", "{\n"),source+source,
+                    source.replace(SYNTHETIC_N1_PREFIX,"x".repeat(1025)),source+"x".repeat(10241))) {
+                badSets.add(List.of(changed.getBytes(java.nio.charset.StandardCharsets.UTF_8),records.get(1),records.get(2)));
+            }
+            byte[] invalid=records.getFirst().clone(); invalid[invalid.length-5]=(byte)0xc3; invalid[invalid.length-4]=(byte)0x28;
+            badSets.add(List.of(invalid,records.get(1),records.get(2)));
+            int split=records.getFirst().length/2;
+            badSets.add(List.of(Arrays.copyOfRange(records.getFirst(),0,split),Arrays.copyOfRange(records.getFirst(),split,records.getFirst().length),records.get(1),records.get(2)));
+            for(var bad:badSets) assertThrows(AssertionError.class,() -> reconstructN1(bad,f.run));
+            var finalSource=new String(records.get(2),java.nio.charset.StandardCharsets.UTF_8);
+            for(var changed:List.of(finalSource.replace("\"diagnosticsComplete\":true","\"diagnosticsComplete\":false"),
+                    finalSource.replace("\"afterKeys\":0","\"afterKeys\":null"),
+                    finalSource.replace("\"cleanupIssuedNanos\":\"9007199254740995\"","\"cleanupIssuedNanos\":null"),
+                    finalSource.replace("\"error\":null","\"error\":{\"className\":\"java.lang.Error\",\"message\":null,\"causeClassName\":null,\"causeMessage\":null}"))) {
+                assertNotEquals(finalSource,changed);
+                assertThrows(AssertionError.class,() -> reconstructN1(List.of(records.get(0),records.get(1),changed.getBytes(java.nio.charset.StandardCharsets.UTF_8)),f.run));
+            }
+            for(var target:List.of("\"guard\":\"PASSED\"","\"returned\":true","\"afterKeys\":0","\"ownedAfter\":false","\"priorRowsOutputChecked\":true")) {
+                var end=new String(records.get(2),java.nio.charset.StandardCharsets.UTF_8);
+                var changed=end.replace(target,target.contains("PASSED")?"\"guard\":\"REFUSED\"":target.contains("afterKeys")?"\"afterKeys\":1":target.replace("true","false").replace("ownedAfter\":false","ownedAfter\":true"));
+                assertNotEquals(end,changed); assertThrows(AssertionError.class,() -> reconstructN1(List.of(records.get(0),records.get(1),changed.getBytes(java.nio.charset.StandardCharsets.UTF_8)),f.run));
+            }
+        });
+    }
+
+    private static List<byte[]> n1Records(N1Wire w) {
+        var output=new java.io.ByteArrayOutputStream(); var errors=new java.io.ByteArrayOutputStream();
+        assertTrue(ScenarioRunner.emitN1Rows(w.admission(),w.intent(),w.close(),new java.io.PrintStream(output),new java.io.PrintStream(errors),() -> w.close().occurredNanos()+1));
+        assertEquals(0,errors.size());
+        return output.toString(java.nio.charset.StandardCharsets.UTF_8).lines().map(row -> (SYNTHETIC_N1_PREFIX+row+"\n").getBytes(java.nio.charset.StandardCharsets.UTF_8)).toList();
+    }
+
+    /** Exactly the published three schemas in a synthetic known envelope; never a runtime log reader. */
+    private static JsonObject readN1Record(byte[] physical,String event) {
+        try {
+            assertTrue(physical.length<=10240); assertTrue(SYNTHETIC_N1_PREFIX.getBytes(java.nio.charset.StandardCharsets.UTF_8).length<=1024);
+            var decoder=java.nio.charset.StandardCharsets.UTF_8.newDecoder().onMalformedInput(java.nio.charset.CodingErrorAction.REPORT).onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT);
+            var text=decoder.decode(java.nio.ByteBuffer.wrap(physical)).toString();
+            assertTrue(text.startsWith(SYNTHETIC_N1_PREFIX+"MAPART_N1_V1 ")); assertTrue(text.endsWith("\n"));
+            var row=text.substring(SYNTHETIC_N1_PREFIX.length()); if(row.endsWith("\r\n")) row=row.substring(0,row.length()-2)+"\n"; assertTrue(row.getBytes(java.nio.charset.StandardCharsets.UTF_8).length<=8192);
+            assertEquals(1,row.chars().filter(c -> c=='\n').count()); assertFalse(row.contains("\r"));
+            var reader=new com.google.gson.stream.JsonReader(new java.io.StringReader(row.substring("MAPART_N1_V1 ".length(),row.length()-1)));
+            reader.setStrictness(com.google.gson.Strictness.STRICT); var result=readN1Object(reader,event); assertEquals(com.google.gson.stream.JsonToken.END_DOCUMENT,reader.peek());
+            assertEquals("mapartrunner-n1-native-proof-v1",result.get("schema").getAsString()); assertEquals(event,result.get("event").getAsString());
+            assertEquals(3,result.get("ordinal").getAsInt()); assertEquals("RESET",result.get("command").getAsString());
+            assertTrue(Set.of("n1-header","n1-post-link").contains(result.get("case").getAsString()));
+            return result;
+        } catch(java.io.IOException | IllegalArgumentException | IllegalStateException failure) { throw new AssertionError("Invalid synthetic N1 record",failure); }
+    }
+
+    private static JsonObject readN1Object(com.google.gson.stream.JsonReader reader,String shape) throws java.io.IOException {
+        reader.beginObject(); var result=new JsonObject();
+        for(var declaration:N1_SHAPES.get(shape).split(",")) {
+            var pair=declaration.split(":"); String key=pair[0],type=pair[1]; assertTrue(reader.hasNext()); assertEquals(key,reader.nextName());
+            boolean nullable=type.startsWith("?"); if(nullable) type=type.substring(1);
+            var token=reader.peek();
+            if(nullable && token==com.google.gson.stream.JsonToken.NULL) { reader.nextNull(); result.add(key,com.google.gson.JsonNull.INSTANCE); }
+            else if(N1_SHAPES.containsKey(type)) result.add(key,readN1Object(reader,type));
+            else if(type.equals("b")) { assertEquals(com.google.gson.stream.JsonToken.BOOLEAN,token); result.addProperty(key,reader.nextBoolean()); }
+            else if(type.equals("i") || type.equals("j")) {
+                assertEquals(com.google.gson.stream.JsonToken.NUMBER,token); var text=reader.nextString(); assertTrue(text.matches("-?(0|[1-9][0-9]*)") && !text.equals("-0"));
+                int value=Integer.parseInt(text); if(type.equals("i")) assertTrue(value>=0); result.addProperty(key,value);
+            } else {
+                assertEquals(com.google.gson.stream.JsonToken.STRING,token); var text=reader.nextString();
+                ScenarioRunner.n1Text(text,type.equals("p")?1024:type.equals("c")?256:type.equals("m")?512:type.equals("u")?36:64);
+                if(type.equals("u")) assertEquals(UUID.fromString(text).toString(),text);
+                if(type.equals("t")) assertEquals(Long.toString(Long.parseLong(text)),text);
+                if(type.equals("h")) assertTrue(text.matches("[0-9a-fA-F]{64}"));
+                if(key.equals("beforeOwner") || key.equals("afterOwner")) ControlOwner.valueOf(text);
+                if(type.equals("g")) assertTrue(Set.of("UNOBSERVED","PASSED","REFUSED").contains(text));
+                result.addProperty(key,text);
+            }
+        }
+        assertFalse(reader.hasNext(),"Unknown, repeated or reordered key"); reader.endObject(); return result;
+    }
+
+    private static N1Wire reconstructN1(List<byte[]> records,PublishedCompletion prior) {
+        assertEquals(3,records.size());
+        var a=readN1Record(records.get(0),"ADMISSION_FAILED"); var i=readN1Record(records.get(1),"EXIT_REQUESTED"); var c=readN1Record(records.get(2),"CLOSE_FINAL");
+        var rows=List.of(a,i,c); var gson=new com.google.gson.Gson();
+        for(int n=0;n<3;n++) {
+            var row=rows.get(n); assertEquals(n+1,row.get("seq").getAsInt()); assertTrue(row.get("diagnosticsComplete").getAsBoolean());
+            for(var key:List.of("case","sessionId","operationId","ordinal","command")) assertEquals(a.get(key),row.get(key));
+        }
+        var admission=new N1Admission(a.get("case").getAsString(),UUID.fromString(a.get("sessionId").getAsString()),UUID.fromString(a.get("operationId").getAsString()),a.get("operationDirectory").getAsString(),time(a,"occurredNanos"),
+                a.get("reservedOrdinal").getAsInt(),a.get("resetOrdinal").getAsInt(),a.get("countedStarts").getAsInt(),gson.fromJson(a.get("trigger"),N1Trigger.class),gson.fromJson(a.get("host"),N1Host.class),gson.fromJson(a.get("prior"),N1Prior.class),gson.fromJson(a.get("failure"),N1Failure.class),a.get("primaryIdentityRetained").getAsBoolean(),true);
+        var intent=new N1Intent(admission.selected(),admission.sessionId(),admission.operationId(),time(i,"occurredNanos"),time(i,"exitDeadlineNanos"),i.get("workerIdleAtIntent").getAsBoolean());
+        var shutdown=c.getAsJsonObject("shutdown");
+        var issue=new N1Issue(shutdown.get("operationId").isJsonNull()?null:UUID.fromString(shutdown.get("operationId").getAsString()),shutdown.get("kind").isJsonNull()?null:shutdown.get("kind").getAsString(),shutdown.get("issues").getAsInt(),nullableTime(c,"cleanupIssuedNanos"),nullableTime(c,"cleanupDeadlineNanos"));
+        var close=new N1Final(time(c,"occurredNanos"),issue,c.get("reservedOrdinal").getAsInt(),c.get("resetOrdinal").getAsInt(),c.get("countedStarts").getAsInt(),c.get("retainedLastSame").getAsBoolean(),c.get("primaryIdentityRetained").getAsBoolean(),gson.fromJson(c.get("release"),N1Release.class),gson.fromJson(c.get("freeze"),N1Freeze.class),gson.fromJson(c.get("options"),N1Options.class),gson.fromJson(c.get("close"),N1Close.class),gson.fromJson(c.get("failure"),N1Failure.class),true);
+        assertEquals(prior.sessionId(),admission.sessionId()); assertNotEquals(prior.operationId(),admission.operationId());
+        assertEquals(prior.operationId(),admission.prior().operationId()); assertEquals(prior.runId().orElseThrow(),admission.prior().runId());
+        assertEquals(intent.intentNanos(),time(c,"intentNanos")); assertEquals(intent.deadlineNanos(),time(c,"exitDeadlineNanos"));
+        assertTrue(i.get("primaryIdentityRetained").getAsBoolean()); assertTrue(c.get("priorRowsOutputChecked").getAsBoolean());
+        for(int n=0;n<3;n++) {
+            assertTrue(ScenarioRunner.n1Positive(admission,intent,close,time(rows.get(n),"emittedNanos")));
+            var expected=(SYNTHETIC_N1_PREFIX+new String(ScenarioRunner.encodeN1Row(admission,intent,close,n+1,time(rows.get(n),"emittedNanos"),n==2),java.nio.charset.StandardCharsets.UTF_8)).getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            var original=records.get(n);
+            if(original.length>=2 && original[original.length-2]=='\r') expected=new String(expected,java.nio.charset.StandardCharsets.UTF_8).replace("\n","\r\n").getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            assertArrayEquals(expected,original,"Deterministic re-encoding rejects noncanonical or lost wire values");
+        }
+        return new N1Wire(admission,intent,close);
+    }
+    private static long time(JsonObject row,String key) { return Long.parseLong(row.get(key).getAsString()); }
+    private static Long nullableTime(JsonObject row,String key) { return row.get(key).isJsonNull()?null:time(row,key); }
+
+    private record N1Wire(N1Admission admission,N1Intent intent,N1Final close) { }
+    private static N1Wire n1Wire(N1Fixture f,long start) {
+        var a=f.admission();
+        a=new N1Admission(a.selected(),a.sessionId(),a.operationId(),a.operationDirectory(),start,3,1,1,a.trigger(),a.host(),a.prior(),a.failure(),true,true);
+        return new N1Wire(a,new N1Intent(a.selected(),a.sessionId(),a.operationId(),start+1,start+10_000_000_001L,true),
+                new N1Final(start+3,new N1Issue(a.operationId(),"CLEANUP",1,start+2,start+10_000_000_002L),3,1,1,true,true,
+                new N1Release(1,N1Guard.PASSED,0,0,"NONE","NONE",null),new N1Freeze(1,N1Guard.PASSED,true,null),
+                new N1Options(1,1,0,0,N1Guard.PASSED,true,false,true,12,false,true,12,12,null),
+                new N1Close(1,N1Guard.PASSED,N1Guard.PASSED,true,true,null),a.failure(),true));
+    }
+
+    private static N1Observation corruptN1(N1Observation o,String field,N1Fixture f) {
+        if(field.equals("absent")) return null;
+        var a=o.admission(); var t=a.trigger(); var h=a.host(); var p=a.prior(); var e=a.failure();
+        var admission=new N1Admission(field.equals("case")?"baseline":a.selected(),field.equals("session")?UUID.randomUUID():a.sessionId(),
+                field.equals("operation")?null:field.equals("reusedOperation")?f.run.operationId():field.equals("newOperation")?UUID.randomUUID():a.operationId(),
+                field.equals("directory")?" ":field.equals("reusedDirectory")?f.run.evidenceDirectory():field.equals("longDirectory")?"x".repeat(1025):field.equals("newDirectory")?"new3":a.operationDirectory(),
+                a.occurredNanos()+(field.equals("timeChanged")?1:0),field.equals("reserved")?4:a.reservedOrdinal(),field.equals("reset")?2:a.resetOrdinal(),field.equals("starts")?2:a.countedStarts(),
+                field.equals("trigger")?null:new N1Trigger(field.equals("attempts")?2:t.attempts(),field.equals("collision")?!t.collisionCreated():t.collisionCreated(),!field.equals("header"),field.equals("link")?!t.afterLinkReached():t.afterLinkReached()),
+                field.equals("host")?null:new N1Host(field.equals("scope"),!field.equals("absentScope"),!field.equals("cancelled"),field.equals("hostOrdinal")?3:2),
+                field.equals("prior")?null:new N1Prior(field.equals("priorOperation")?UUID.randomUUID():p.operationId(),field.equals("priorRun")?UUID.randomUUID():p.runId(),
+                field.equals("hash")?"bad":field.equals("hashChanged")?"b".repeat(64):p.summarySha256(),!field.equals("files"),!field.equals("lastSame"),!field.equals("watch"),field.equals("samples")?0:1,field.equals("witnesses")?0:1),
+                field.equals("failure")?null:new N1Failure(field.equals("class")?"java.lang.Error":e.className(),field.equals("messageChanged")?"changed":e.message(),
+                field.equals("cause")?f.selected.equals("n1-header")?null:"java.lang.Error":e.causeClassName(),field.equals("causeMessageChanged")?"changed":e.causeMessage()),!field.equals("primary"),!field.equals("diagnostics"));
+        return new N1Observation(field.equals("state")?"CLOSED":o.state(),field.equals("admission")?null:admission,
+                field.equals("intent")?new N1Intent(a.selected(),a.sessionId(),a.operationId(),1,10_000_000_001L,true):null,
+                field.equals("close")?n1Wire(f,1).close():null,field.equals("outputAttempted"),field.equals("outputSucceeded")?true:null);
+    }
+
+    @ParameterizedTest @ValueSource(strings={"n1-header","n1-post-link"})
+    void n1SeparatePublicationsAndNaturalClosureNeverSubstituteForWorkerSettlement(String selected) {
+        for(boolean screenFirst:List.of(false,true)) n1(selected,f -> {
+            f.keepScreen=true; f.start(); f.projection=new N1Observation("ADMISSION_FAILED",f.admission(),null,null,false,null);
+            f.observation=new InspectObservation(true,true,false,Optional.of(f.run)); f.tick(3);
+            assertEquals(3,f.input.commands.size()); assertEquals(0,f.input.stops);
+            f.observation=new InspectObservation(false,true,true,Optional.of(f.run));
+            if(screenFirst) f.input.screen=null;
+            f.tick(3); assertEquals(3,f.input.commands.size()); assertEquals(0,f.input.stops);
+            f.observation=new InspectObservation(false,false,true,Optional.of(f.run)); f.tick();
+            assertEquals(3,f.input.commands.size()); assertEquals(0,f.input.stops);
+            f.input.screen=null; f.keepScreen=false; f.until(() -> f.input.commands.size()==7); f.tick(2);
+            assertEquals(1,f.input.stops); f.healthy();
+        });
+    }
+
+    @ParameterizedTest @ValueSource(strings={"n1-header","n1-post-link"})
+    void n1OriginalReset3AndEachDistinctChatDeadlineCannotRenew(String selected) {
+        for(var point:List.of("resetOpen","resetType","resetHandoff","resetBusy","laterOpen","laterType","laterHandoff")) n1(selected,f -> {
+            f.until(() -> f.input.commands.size()==1); f.observation=idle(f.reset); f.tick();
+            f.until(() -> f.input.commands.size()==2); f.observation=idle(f.run); f.tick();
+            if(point.equals("resetOpen")) { f.now.set(11); f.tick(); f.input.screen=null; f.now.set(30_000_000_011L); }
+            else if(point.equals("resetType")) { f.now.set(11); f.tick(); f.onCharacter=() -> f.now.set(30_000_000_011L); }
+            else {
+                f.now.set(11); f.keepScreen=point.equals("resetHandoff"); f.until(() -> f.input.commands.size()==3); f.settle();
+                if(point.equals("resetBusy")) f.observation=new InspectObservation(false,true,true,Optional.of(f.run));
+                if(point.startsWith("reset")) { f.tick(); f.now.set(30_000_000_011L); }
+                else {
+                    f.tick(); f.now.set(101); f.tick();
+                    if(point.equals("laterOpen")) f.input.screen=null;
+                    else if(point.equals("laterType")) f.onCharacter=() -> f.now.set(30_000_000_101L);
+                    else { f.keepScreen=true; f.tick(); }
+                    if(!point.equals("laterType")) f.now.set(30_000_000_101L);
+                }
+            }
+            f.tick(3); f.failed(); assertTrue(f.logs.stream().anyMatch(s -> s.contains("deadline expired")),point+f.logs);
+        });
+    }
+
+    @ParameterizedTest @ValueSource(strings={"n1-header","n1-post-link"})
+    void n1PositiveRun2KeepsTheExistingWorkWaitAndReset3GetsItsOwnInputOrigin(String selected) {
+        n1(selected,f -> {
+            f.until(() -> f.input.commands.size()==1); f.observation=idle(f.reset); f.tick();
+            f.until(() -> f.input.commands.size()==2); f.observation=new InspectObservation(true,true,false,Optional.of(f.reset)); f.tick();
+            f.now.set(700_000_000_000L); f.tick(3); f.healthy(); assertEquals(2,f.input.commands.size());
+            f.observation=idle(f.run); f.tick(); f.until(() -> f.input.commands.size()==3); f.settle();
+            f.until(() -> f.input.commands.size()==7); f.tick(2); f.healthy(); assertEquals(1,f.input.stops);
+        });
+    }
+
+    @ParameterizedTest @ValueSource(strings={"n1-header","n1-post-link"})
+    void n1InputBoundariesRecheckGatesTerminalIdentityAndNativeGuards(String selected) {
+        for(var point:List.of("open","character","enter","handoff","stop")) for(var field:List.of("gate","case","busy","ready","restart","last","binding","entry","screen","draft","neutral")) n1(selected,f -> {
+            f.start(); f.settle(); f.tick();
+            if(point.equals("stop")) { f.until(() -> f.input.commands.size()==7); f.tick(); }
+            else if(!point.equals("open")) { f.tick(); if(point.equals("handoff")) f.tick(); }
+            Runnable change=() -> {
+                switch(field) {
+                    case "gate" -> f.enabled=false;
+                    case "case" -> System.setProperty("mapart.test.inspect.acceptance.case","baseline");
+                    case "busy" -> f.observation=new InspectObservation(false,true,true,Optional.of(f.run));
+                    case "ready" -> f.observation=new InspectObservation(true,false,true,Optional.of(f.run));
+                    case "restart" -> f.observation=new InspectObservation(false,false,false,Optional.of(f.run));
+                    case "last" -> f.observation=new InspectObservation(false,false,true,Optional.of(f.reset));
+                    case "binding" -> f.input.refusal="window/focus/pause/world binding refused";
+                    case "entry" -> f.input.entryRefusal="wrong client/thread";
+                    case "screen" -> f.input.screen=new Object();
+                    case "draft" -> { f.input.screen=f.input.chat; f.input.draft="foreign draft"; }
+                    case "neutral" -> f.input.neutral=false;
+                }
+            };
+            // Entry checks are callback boundaries; neutral checks belong to null-screen boundaries.
+            if((point.equals("character") || point.equals("enter")) && (field.equals("entry") || field.equals("neutral"))) return;
+            if(point.equals("character")) f.onCharacter=change;
+            else if(point.equals("enter")) f.onCharacter=() -> { if(f.input.draft.equals("/maparttest reset grounded-two-lane")) change.run(); };
+            else change.run();
+            int sent=f.input.commands.size(); f.tick(3); f.failed(); assertEquals(sent,f.input.commands.size(),point+"/"+field);
+        });
+    }
+
+    @ParameterizedTest @ValueSource(strings={"n1-header","n1-post-link"})
+    void n1CallbacksConsumeKeySendAndStopDebtBeforeReentrancyOrApplyThenThrow(String selected) {
+        for(var fault:List.of("char","257+","257-","84+","84-","stop","reenter","stopping")) n1(selected,f -> {
+            f.start(); f.settle(); f.tick();
+            f.input.reenter=() -> f.driver.tick(null);
+            if(fault.equals("stopping")) { f.driver.releaseOnStopping(null); f.tick(5); assertEquals(3,f.input.commands.size()); assertEquals(0,f.input.stops); return; }
+            if(fault.equals("stop")) f.stopThrows=true;
+            else if(!fault.equals("reenter")) f.input.throwAt=fault;
+            f.tick(30);
+            assertEquals(fault.startsWith("84") || fault.equals("char")?3:fault.startsWith("257")?4:7,f.input.commands.size(),fault);
+            assertEquals(1,f.input.stops,fault);
+            assertEquals(f.input.events.stream().filter(s -> s.equals("257+")).count(),f.input.events.stream().filter(s -> s.equals("257-")).count());
+            assertEquals(f.input.events.stream().filter(s -> s.equals("84+")).count(),f.input.events.stream().filter(s -> s.equals("84-")).count());
+            if(fault.equals("reenter")) f.healthy(); else f.failed();
+        });
+    }
+
+    @ParameterizedTest @ValueSource(strings={"n1-header","n1-post-link"})
+    void n1PreludeRejectsFailureAndPrematureTerminalSnapshotsAndRetainsPositiveBusyResults(String selected) {
+        for(int ordinal:List.of(1,2)) for(var change:List.of("fail","terminal","busy")) n1(selected,f -> {
+            f.until(() -> f.input.commands.size()==1);
+            if(ordinal==2) { f.observation=idle(f.reset); f.tick(); f.until(() -> f.input.commands.size()==2); }
+            var c=ordinal==1?f.reset:f.run;
+            if(change.equals("fail")) c=new PublishedCompletion(c.sessionId(),c.operationId(),c.ordinal(),c.command(),c.runId(),"FAIL",true,"RELEASED",true,c.evidenceDirectory(),c.summaryPath(),Optional.of(new FailureObservation("java.lang.AssertionError","Run requires this invocation's successful reset")));
+            f.projection=new N1Observation("ADMISSION_FAILED",f.admission(),null,null,false,null);
+            f.observation=new InspectObservation(!change.equals("terminal"),change.equals("busy"),change.equals("terminal"),Optional.of(c));
+            f.tick(3); assertEquals(ordinal,f.input.commands.size());
+            if(change.equals("busy")) { f.observation=idle(c); f.until(() -> f.input.commands.size()==ordinal+1); f.healthy(); }
+            else f.failed();
+        });
+    }
+
+    private static void n1(String selected,java.util.function.Consumer<N1Fixture> action) {
+        var old=System.getProperty("mapart.test.inspect.acceptance.case");
+        try { System.setProperty("mapart.test.inspect.acceptance.case",selected); action.accept(new N1Fixture(selected)); }
+        finally { if(old==null) System.clearProperty("mapart.test.inspect.acceptance.case"); else System.setProperty("mapart.test.inspect.acceptance.case",old); }
+    }
+
+    /** Detached synthetic source values only; no native owner or acceptance evidence is created. */
+    private static final class N1Fixture {
+        final String selected;
+        final AtomicLong now=new AtomicLong(1);
+        final UUID session=UUID.randomUUID(),operation=UUID.randomUUID();
+        final PublishedCompletion reset=new PublishedCompletion(session,UUID.randomUUID(),1,Command.RESET,Optional.empty(),"PASS",true,"RELEASED",true,"reset1","reset1/summary",Optional.empty());
+        final PublishedCompletion run=new PublishedCompletion(session,UUID.randomUUID(),2,Command.RUN,Optional.of(UUID.randomUUID()),"PASS",true,"RELEASED",true,"run2","run2/summary",Optional.empty());
+        InspectObservation observation=idle(null); N1Observation projection;
+        final List<String> logs=new ArrayList<>(); boolean enabled=true,keepScreen,stopThrows; Runnable onInput,onCharacter;
+        final SimulatedChat input=new SimulatedChat() {
+            @Override public void key(int code,boolean press,Object expected) {
+                super.key(code,press,expected);
+                if(code==84 && press) { screen=chat; draft=""; }
+                if(code==257 && press && keepScreen && commands.size()>=3) screen=chat;
+                if(onInput!=null) onInput.run();
+            }
+            @Override public void character(int c) { super.character(c); if(onCharacter!=null) onCharacter.run(); }
+            @Override public void stop() { super.stop(); if(stopThrows) throw new IllegalStateException("stop applied then threw"); }
+        };
+        final InspectAcceptanceDriver driver=new InspectAcceptanceDriver(() -> observation,input,now::get,() -> enabled,logs::add,
+                ignored -> { throw new AssertionError("N1 must not request acceptance idle authority"); },ignored -> { throw new AssertionError("No Watch seam"); },() -> projection);
+        N1Fixture(String selected) { this.selected=selected; input.now=now; }
+        void tick() { driver.tick(null); } void tick(int n) { for(int i=0;i<n;i++) tick(); }
+        void until(java.util.function.BooleanSupplier done) { for(int i=0;i<40 && !done.getAsBoolean();i++) tick(); assertTrue(done.getAsBoolean(),logs.toString()); }
+        void start() {
+            until(() -> input.commands.size()==1); observation=idle(reset); tick();
+            until(() -> input.commands.size()==2); observation=idle(run); tick();
+            until(() -> input.commands.size()==3);
+        }
+        N1Admission admission() {
+            boolean header=selected.equals("n1-header");
+            return new N1Admission(selected,session,operation,"reset3",now.get(),3,1,1,new N1Trigger(1,header,true,!header),new N1Host(false,true,true,2),
+                    new N1Prior(run.operationId(),run.runId().orElseThrow(),"a".repeat(64),true,true,true,1,1),
+                    header?new N1Failure("java.io.UncheckedIOException","platform header text","java.nio.file.FileSystemException","platform cause text")
+                    :new N1Failure("com.mapartrunner.fabric.scenario.ScenarioLaunchReceipt$SimulatedN1PostLinkFailure","SIMULATED_N1_AFTER_BEGIN_LINK_BEFORE_RETURN",null,null),true,true);
+        }
+        void settle() { projection=new N1Observation("ADMISSION_FAILED",admission(),null,null,false,null); observation=new InspectObservation(false,false,true,Optional.of(run)); }
+        void healthy() { assertTrue(logs.stream().noneMatch(s -> s.contains("DRIVER_FAIL")),logs.toString()); }
+        void failed() { assertEquals(1,logs.stream().filter(s -> s.contains("DRIVER_FAIL")).count(),logs.toString()); }
     }
 
     private static InspectObservation idle(PublishedCompletion completion) { return new InspectObservation(true, false, false, Optional.ofNullable(completion)); }
