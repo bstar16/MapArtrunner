@@ -38,6 +38,7 @@ class ScenarioInspectLifecycleTest {
                 }
         assertNull(ScenarioRunner.selectResetFault(false,"true","true",null,"reset-archive",Command.RESET,1,0,true));
         for(String selection:List.of("baseline","displaced")) assertNull(ScenarioRunner.selectResetFault(true,"true","true",null,selection,Command.RESET,1,0,false));
+        assertNull(ScenarioRunner.selectResetFault(true,"true","true",null,"stuck-cleanup",Command.RESET,1,0,true));
         assertThrows(AssertionError.class,() -> ScenarioRunner.selectResetFault(true,"true","true",null,"unknown",Command.RESET,1,0,true));
         for(Command command:List.of(Command.RUN,Command.RERUN,Command.STARTUP,Command.CLOSE))
             assertNull(ScenarioRunner.selectResetFault(true,"true","true",null,"reset-archive",command,1,0,true));

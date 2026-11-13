@@ -74,6 +74,7 @@ final class InspectAcceptanceDriver {
     private static final Command[] RESET_ARCHIVE = {Command.RESET, Command.RUN, Command.RESET, Command.RUN, Command.RESET, Command.RUN, Command.RESET, Command.RUN};
     private static final Command[] FOREIGN = {Command.RESET, Command.RUN, Command.RERUN};
     private static final Command[] WORK_EXPIRY = {Command.RESET, Command.RUN, Command.RESET};
+    private static final Command[] STUCK_CLEANUP = {Command.RESET};
     private enum Stage { WAIT_STARTUP, NEXT_COMMAND, MOVING, OPEN_CHAT, WAIT_HANDOFF, WAIT_COMPLETION, IDLE, IDLE_FINISH_PENDING, FOREIGN, STOPPED }
 
     // This driver alone owns its sequence and synthetic key. No Runner/Host state is changed here.
@@ -93,7 +94,7 @@ final class InspectAcceptanceDriver {
     private PublishedCompletion retained, pending;
     private UUID session;
     private boolean advancing, failed, stopRequested;
-    private boolean selected, displaced, resetArchive, foreignCase, workExpiry, moved, middleLast, carryInputDeadline;
+    private boolean selected, displaced, resetArchive, foreignCase, workExpiry, stuckCleanup, moved, middleLast, carryInputDeadline;
     private int resetArchiveLast = -1;
     private int movementCallbacks;
     private Object heldForward;
@@ -193,8 +194,8 @@ final class InspectAcceptanceDriver {
 
     void tick(MinecraftClient current) {
         if (advancing) return;
-        if (stopping && (workExpiry || n1Case!=null)) return;
-        if (!enabled.getAsBoolean() && heldForward == null && idle == null && foreign==null && !workExpiry && n1Case==null && !failed) return;
+        if (stopping && (workExpiry || stuckCleanup || n1Case!=null)) return;
+        if (!enabled.getAsBoolean() && heldForward == null && idle == null && foreign==null && !workExpiry && !stuckCleanup && n1Case==null && !failed) return;
         boolean validEntry = false;
         advancing = true;
         try {
@@ -202,12 +203,13 @@ final class InspectAcceptanceDriver {
             require(enabled.getAsBoolean(), "Acceptance gate disabled during driver activity");
             if (!selected) {
                 var value = System.getProperty("mapart.test.inspect.acceptance.case", "baseline");
-                require(Set.of("baseline","displaced","reset-archive","foreign-world","work-expiry","n1-header","n1-post-link").contains(value), "Unknown acceptance case: " + value);
-                displaced = value.equals("displaced"); resetArchive = value.equals("reset-archive"); foreignCase=value.equals("foreign-world"); workExpiry=value.equals("work-expiry"); n1Case=value.startsWith("n1-")?value:null; selected = true;
+                require(Set.of("baseline","displaced","reset-archive","foreign-world","work-expiry","stuck-cleanup","n1-header","n1-post-link").contains(value), "Unknown acceptance case: " + value);
+                displaced = value.equals("displaced"); resetArchive = value.equals("reset-archive"); foreignCase=value.equals("foreign-world"); workExpiry=value.equals("work-expiry"); stuckCleanup=value.equals("stuck-cleanup"); n1Case=value.startsWith("n1-")?value:null; selected = true;
             }
             if(resetArchive) require("reset-archive".equals(System.getProperty("mapart.test.inspect.acceptance.case")),"Reset-archive acceptance case changed");
             if(workExpiry) require("work-expiry".equals(System.getProperty("mapart.test.inspect.acceptance.case")),"Expiry acceptance case changed");
             if(n1Case!=null) requireN1Case();
+            if(stuckCleanup) requireStuckCase();
             if (stage == Stage.STOPPED) { requestStop(current); return; }
             var observed = observations.get();
             if(foreignCase) {
@@ -234,7 +236,7 @@ final class InspectAcceptanceDriver {
                 require(observed.last().isEmpty(), "Initial last must be absent");
                 input.captureBinding();
                 marker("ACTIVATED fixture-driven Keyboard callbacks; inspect=true acceptance=true automatic=absent");
-                beginInput(observed);
+                beginInput(current,observed);
                 return;
             }
             input.requireBinding();
@@ -250,10 +252,11 @@ final class InspectAcceptanceDriver {
                 if(expiry!=null) { expiry.tick(current,observed); return; }
             }
             switch (stage) {
-                case NEXT_COMMAND -> beginInput(observed);
+                case NEXT_COMMAND -> beginInput(current,observed);
                 case MOVING -> advanceMovement(observed);
                 case IDLE, IDLE_FINISH_PENDING -> advanceIdle(observed);
                 case OPEN_CHAT -> {
+                    if(stuckCleanup) requireStuckInput(current);
                     inputDeadline(); requireUnchanged(observed);
                     require(!observed.busy(), "Unexpected admission before Enter");
                     chat = input.screen();
@@ -265,17 +268,21 @@ final class InspectAcceptanceDriver {
                     var text = commandText();
                     for (int i = 0; i < text.length(); i++) {
                         if(n1Case!=null) requireN1PreludeInput();
+                        if(stuckCleanup) requireStuckInput(current);
                         inputDeadline(); input.requireChat(chat, text.substring(0, i));
                         input.character(text.charAt(i));
                     }
                     if(n1Case!=null) requireN1PreludeInput();
+                    if(stuckCleanup) requireStuckInput(current);
                     inputDeadline(); input.requireChat(chat, text);
                     pairedKey(ENTER, chat);
                     marker("ENTER delivered; awaiting natural handoff/admission");
                 }
                 case WAIT_HANDOFF -> {
                     inputDeadline();
+                    if(stuckCleanup && isLast()) requireStuckInput(current);
                     if (input.screen() != null) { input.requireChat(chat, commandText()); return; }
+                    if(stuckCleanup) input.requireNeutral();
                     if (isLast()) {
                         requireUnchanged(observed); require(!observed.busy(), "Unexpected LAST admission");
                         marker("LAST submitted; response requires external retained CHAT check");
@@ -285,7 +292,7 @@ final class InspectAcceptanceDriver {
                         if (displaced && index == 3 && !middleLast) {
                             middleLast = true; stage = Stage.NEXT_COMMAND; return;
                         }
-                        marker("SEQUENCE_COMPLETE; published results observed; normal close remains external");
+                        if(!stuckCleanup) marker("SEQUENCE_COMPLETE; published results observed; normal close remains external");
                         stage = Stage.STOPPED; requestStop(current);
                     } else {
                         var completion = nextCompletion(observed);
@@ -309,6 +316,19 @@ final class InspectAcceptanceDriver {
 
     private void requireN1Case() {
         require(enabled.getAsBoolean() && n1Case.equals(System.getProperty("mapart.test.inspect.acceptance.case")),"N1 gate/case changed");
+    }
+
+    private void requireStuckCase() {
+        require(enabled.getAsBoolean() && "stuck-cleanup".equals(System.getProperty("mapart.test.inspect.acceptance.case")),"Stuck-cleanup gate/case changed");
+    }
+
+    /** RESET1 stays absent until settled, then its exact value survives LAST and the stop request. */
+    private void requireStuckInput(MinecraftClient current) {
+        requireStuckCase(); input.requireClient(current); input.requireBinding();
+        var observed=observations.get(); requireUnchanged(observed);
+        require(observed.ready() && !observed.busy() && !observed.restartRequired(),"Stuck-cleanup input unavailable");
+        require(heldKey==-1 && heldForward==null,"Stuck-cleanup input debt remains");
+        if(retained!=null) idleGuard.accept(retained);
     }
 
     private void requireN1PreludeInput() {
@@ -403,7 +423,8 @@ final class InspectAcceptanceDriver {
         }
     }
 
-    private void beginInput(InspectObservation observed) {
+    private void beginInput(MinecraftClient current,InspectObservation observed) {
+        if(stuckCleanup) { requireStuckInput(current); input.requireNeutral(); }
         requireUnchanged(observed); require(!observed.busy(), "Unexpected busy before input");
         require(input.screen() == null, "Unexpected input screen");
         if(workExpiry && index>=2) require(expiryResult!=null && expiryResultMatches(expiryResult),"Expiry failed RUN2 result/proof not retained");
@@ -471,6 +492,9 @@ final class InspectAcceptanceDriver {
             if(foreign!=null) foreign.dispose();
             if(n1Case!=null) { n1Step=null; chat=null; stage=Stage.STOPPED; releaseKey(); }
             if(workExpiry) { if(expiry!=null) expiry.dispose(); stage=Stage.STOPPED; releaseKey(); }
+            if(stuckCleanup || !selected && "stuck-cleanup".equals(System.getProperty("mapart.test.inspect.acceptance.case"))) {
+                stuckCleanup=true; chat=null; pending=null; stage=Stage.STOPPED; releaseKey();
+            }
             releaseForward();
         }
         catch (RuntimeException | Error failure) { fail(failure, validEntry); }
@@ -501,7 +525,9 @@ final class InspectAcceptanceDriver {
                 && completion.evidenceComplete() && completion.cleanupSettled() && "RELEASED".equals(completion.cleanupStatus()),
                 "Invalid completion identity/evidence/cleanup");
         boolean expected;
-        if(n1Case!=null) {
+        if(stuckCleanup) {
+            expected="PASS".equals(completion.verdict()) && completion.failure().isEmpty() && completion.runId().isEmpty();
+        } else if(n1Case!=null) {
             expected="PASS".equals(completion.verdict()) && completion.failure().isEmpty()
                     && (index==0?completion.runId().isEmpty():completion.runId().filter(id -> !runs.contains(id)).isPresent());
         } else if (workExpiry) {
@@ -653,8 +679,15 @@ final class InspectAcceptanceDriver {
             try { releaseForward(); } catch (RuntimeException | Error failure) { fail(failure, true); }
             if (heldForward != null) return;
         }
+        if(stuckCleanup && !failed) {
+            requireStuckInput(current); input.requireNeutral();
+            require(index==1 && retained!=null,"Stuck-cleanup requires settled RESET1 and LAST handoff");
+        }
         stopRequested = true;
-        try { input.stop(); } catch (RuntimeException | Error failure) { fail(failure, true); }
+        try {
+            if(stuckCleanup && !failed) marker("STUCK_CLEANUP_EXIT_REQUESTED RESET1 retained; LAST submitted; negative native outcome remains external");
+            input.stop();
+        } catch (RuntimeException | Error failure) { fail(failure, true); }
     }
 
     private String commandText() {
@@ -663,7 +696,7 @@ final class InspectAcceptanceDriver {
                 + mutations()[index].name().toLowerCase(Locale.ROOT) + " grounded-two-lane";
     }
 
-    private Command[] mutations() { return n1Case!=null ? WORK_EXPIRY : workExpiry ? WORK_EXPIRY : foreignCase ? FOREIGN : resetArchive ? RESET_ARCHIVE : displaced ? DISPLACED : MUTATIONS; }
+    private Command[] mutations() { return stuckCleanup ? STUCK_CLEANUP : n1Case!=null ? WORK_EXPIRY : workExpiry ? WORK_EXPIRY : foreignCase ? FOREIGN : resetArchive ? RESET_ARCHIVE : displaced ? DISPLACED : MUTATIONS; }
     private boolean isLast() { return index == mutations().length || displaced && index == 3 && !middleLast
             || resetArchive && (index == 1 || index == 4 || index == 5) && resetArchiveLast != index; }
 

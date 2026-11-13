@@ -1547,6 +1547,203 @@ class InspectAcceptanceDriverTest {
         void failed() { assertEquals(1,logs.stream().filter(s -> s.contains("DRIVER_FAIL")).count(),logs.toString()); }
     }
 
+    @Test void stuckCleanupUsesOnlySettledReset1ThenNaturalLastHandoffAndOneStopIntent() {
+        stuck(f -> {
+            f.first(); assertEquals(List.of("/maparttest reset grounded-two-lane"),f.input.commands);
+            f.observation=new InspectObservation(true,true,false,Optional.of(f.reset)); f.tick(4);
+            assertEquals(1,f.input.commands.size()); assertEquals(0,f.input.stops);
+            assertEquals(0,f.logs.stream().filter(s -> s.contains("RESULT command=")).count());
+            f.observation=idle(f.reset); f.tick(); f.keepScreen=true;
+            f.until(() -> f.input.commands.size()==2); f.tick(3); f.healthy();
+            assertEquals(List.of("/maparttest reset grounded-two-lane","/maparttest last"),f.input.commands);
+            assertEquals(0,f.input.stops); assertEquals(0,f.intents());
+            f.input.screen=null; f.tick(); assertEquals(1,f.input.stops); assertEquals(1,f.intents());
+            f.tick(10); f.driver.releaseOnStopping(null); f.tick(3);
+            assertEquals(2,f.input.commands.size()); assertEquals(1,f.input.stops); assertEquals(1,f.intents());
+            assertEquals(1,f.logs.stream().filter(s -> s.contains("RESULT command=RESET ordinal=1 verdict=PASS")).count());
+            assertTrue(f.logs.stream().anyMatch(s -> s.contains("LAST submitted; response requires external retained CHAT check")));
+            assertTrue(f.logs.stream().noneMatch(s -> s.contains("SEQUENCE_COMPLETE") || s.contains("ordinal=2") || s.contains("ordinal=3")));
+            assertTrue(f.logs.stream().allMatch(s -> s.length()<=4096));
+            assertTrue(f.idleChecks>0);
+        });
+    }
+
+    @Test void stuckCleanupRejectsInvalidResetIdentityVerdictAndEvidence() {
+        for(var field:List.of("session","operation","ordinal","command","run","verdict","failure","directory","summary","complete","settled","cleanup")) stuck(f -> {
+            f.first(); f.observation=idle(f.changed(field)); f.tick(3); f.failed();
+            assertEquals(1,f.input.commands.size(),field); assertEquals(1,f.input.stops);
+        });
+    }
+
+    @Test void stuckCleanupBusyPublicationCannotRegressOrChangeBeforeSettlement() {
+        for(var change:List.of("absent","operation","directory","summary")) stuck(f -> {
+            f.first(); f.observation=new InspectObservation(true,true,false,Optional.of(f.reset)); f.tick(3); f.healthy();
+            var c=f.reset;
+            if(!change.equals("absent")) c=new PublishedCompletion(c.sessionId(),change.equals("operation")?UUID.randomUUID():c.operationId(),1,Command.RESET,
+                    Optional.empty(),"PASS",true,"RELEASED",true,change.equals("directory")?"changed":c.evidenceDirectory(),change.equals("summary")?"changed":c.summaryPath(),Optional.empty());
+            f.observation=idle(change.equals("absent")?null:c); f.tick(3); f.failed();
+            assertEquals(1,f.input.commands.size());
+        });
+    }
+
+    @Test void stuckCleanupInputBoundariesRecheckRetainedResetGatesAndNativeAuthority() {
+        for(var point:List.of("open","character","enter","handoff","stop"))
+            for(var field:List.of("gate","case","busy","ready","restart","last","binding","entry","screen","draft","neutral","idleGuard")) stuck(f -> {
+                f.settled();
+                // Neutrality is a null-screen boundary; character/Enter still authenticate the exact native chat.
+                if((point.equals("character") || point.equals("enter")) && field.equals("neutral")) return;
+                if(!point.equals("open")) f.tick();
+                if(point.equals("handoff")) f.tick();
+                Runnable change=() -> f.invalidate(field);
+                if(point.equals("character")) f.onCharacter=change;
+                else if(point.equals("enter")) f.onCharacter=() -> { if(f.input.draft.equals("/maparttest last")) change.run(); };
+                else if(point.equals("stop")) f.onLast=change;
+                else change.run();
+                int sent=f.input.commands.size(); f.tick(3); f.failed();
+                assertEquals(point.equals("stop")?2:sent,f.input.commands.size(),point+"/"+field);
+                f.input.entryRefusal=null; f.tick(3); assertEquals(1,f.input.stops,point+"/"+field);
+            });
+    }
+
+    @Test void stuckCleanupFirstResetInputAlsoRechecksNoPreviousCompletionAndReadiness() {
+        for(var point:List.of("open","character","enter")) for(var field:List.of("gate","case","busy","ready","restart","last","binding","entry","screen","draft")) stuck(f -> {
+            f.tick(); // Capture initial healthy binding and open RESET chat; no completion is authorized yet.
+            Runnable change=() -> f.invalidate(field);
+            if(point.equals("character")) f.onCharacter=change;
+            else if(point.equals("enter")) f.onCharacter=() -> { if(f.input.draft.equals("/maparttest reset grounded-two-lane")) change.run(); };
+            else change.run();
+            f.tick(3); f.failed(); assertTrue(f.input.commands.isEmpty(),point+"/"+field);
+            f.input.entryRefusal=null; f.tick(); assertEquals(1,f.input.stops);
+        });
+        stuck(f -> { f.observation=idle(f.reset); f.tick(); f.failed(); assertTrue(f.input.events.isEmpty()); });
+    }
+
+    @Test void stuckCleanupSuccessfulStopRevalidatesAfterLastMarkerBeforeRequest() {
+        stuck(f -> {
+            f.settled(); f.onLast=() -> f.observation=idle(null);
+            f.tick(5); f.failed(); assertEquals(2,f.input.commands.size()); assertEquals(1,f.input.stops);
+        });
+    }
+
+    @Test void stuckCleanupEachChatKeepsItsOriginalDeadlineButResetWorkUsesOwnerBudget() {
+        for(var point:List.of("resetOpen","resetType","resetEnter","resetHandoff","lastOpen","lastType","lastEnter","lastHandoff")) stuck(f -> {
+            boolean last=point.startsWith("last");
+            if(last) { f.settled(); f.now.set(900_000_000_000L); f.tick(); }
+            else f.tick();
+            long origin=f.now.get();
+            if(point.endsWith("Handoff")) f.tick();
+            if(point.endsWith("Type")) f.onCharacter=() -> f.now.set(origin+30_000_000_000L);
+            else if(point.endsWith("Enter")) f.onCharacter=() -> {
+                if(f.input.draft.equals(last?"/maparttest last":"/maparttest reset grounded-two-lane")) f.now.set(origin+30_000_000_000L);
+            };
+            else f.now.set(origin+30_000_000_000L);
+            f.tick(3); f.failed(); assertTrue(f.logs.stream().anyMatch(s -> s.contains("original 30000ms")),point);
+        });
+        stuck(f -> {
+            f.observation=new InspectObservation(false,true,false,Optional.empty()); f.now.set(800_000_000_000L); f.tick(3);
+            assertTrue(f.input.events.isEmpty()); f.observation=idle(null); f.first();
+            f.observation=new InspectObservation(true,true,false,Optional.empty()); f.tick();
+            f.now.addAndGet(600_000_000_000L); f.tick(3); f.healthy(); assertEquals(1,f.input.commands.size());
+            f.observation=idle(f.reset); f.tick(); f.until(() -> f.input.commands.size()==2); f.tick(); f.healthy(); assertEquals(1,f.input.stops);
+        });
+    }
+
+    @Test void stuckCleanupCallbacksCannotResendDoubleReleaseOrRetryStop() {
+        for(boolean last:List.of(false,true)) for(var fault:List.of("char","257+","257-","84+","84-","stop","reenter")) stuck(f -> {
+            if(last) f.settled();
+            f.input.reenter=() -> { f.driver.tick(null); f.driver.releaseOnStopping(null); };
+            f.input.reenterNeutral=true;
+            if(fault.equals("stop")) f.stopThrows=true;
+            else if(!fault.equals("reenter")) f.input.throwAt=fault;
+            f.tick(5);
+            if(!last && (fault.equals("stop") || fault.equals("reenter"))) { f.observation=idle(f.reset); f.tick(6); }
+            assertEquals(1,f.input.stops,fault); assertTrue(f.input.commands.size()<=2);
+            assertEquals(f.input.events.stream().filter(s -> s.equals("257+")).count(),f.input.events.stream().filter(s -> s.equals("257-")).count());
+            assertEquals(f.input.events.stream().filter(s -> s.equals("84+")).count(),f.input.events.stream().filter(s -> s.equals("84-")).count());
+            int sent=f.input.commands.size(); f.tick(5); assertEquals(sent,f.input.commands.size()); assertEquals(1,f.input.stops);
+            if(fault.equals("reenter")) { f.healthy(); assertEquals(1,f.intents()); }
+            else assertEquals(1,f.logs.stream().filter(s -> s.contains("DRIVER_FAIL")).count());
+        });
+    }
+
+    @Test void stuckCleanupStoppingRetiresEveryTransientStageWithoutMoreInputOrIntent() {
+        for(var point:List.of("resetOpen","resetHandoff","resetWork","lastOpen","lastHandoff")) stuck(f -> {
+            if(point.startsWith("last")) { f.settled(); f.tick(); }
+            else f.tick();
+            if(point.endsWith("Handoff") || point.equals("resetWork")) f.tick();
+            if(point.equals("resetWork")) { f.observation=new InspectObservation(true,true,false,Optional.of(f.reset)); f.tick(); }
+            int sent=f.input.commands.size(),events=f.input.events.size();
+            f.driver.releaseOnStopping(null); f.tick(5); f.driver.releaseOnStopping(null);
+            assertEquals(sent,f.input.commands.size()); assertEquals(events,f.input.events.size());
+            assertEquals(0,f.input.stops); assertEquals(0,f.intents());
+        });
+        stuck(f -> {
+            f.driver.releaseOnStopping(null); f.tick(5);
+            assertTrue(f.input.events.isEmpty()); assertTrue(f.input.commands.isEmpty()); assertEquals(0,f.input.stops);
+        });
+    }
+
+    private static void stuck(java.util.function.Consumer<StuckFixture> action) {
+        var old=System.getProperty("mapart.test.inspect.acceptance.case");
+        try { System.setProperty("mapart.test.inspect.acceptance.case","stuck-cleanup"); action.accept(new StuckFixture()); }
+        finally { if(old==null) System.clearProperty("mapart.test.inspect.acceptance.case"); else System.setProperty("mapart.test.inspect.acceptance.case",old); }
+    }
+
+    /** Detached RESET publication and simulated chat only; there is no native close/fault producer. */
+    private static final class StuckFixture {
+        final AtomicLong now=new AtomicLong(1);
+        final PublishedCompletion reset=new PublishedCompletion(UUID.randomUUID(),UUID.randomUUID(),1,Command.RESET,Optional.empty(),"PASS",true,"RELEASED",true,"reset1","reset1/summary",Optional.empty());
+        InspectObservation observation=idle(null);
+        final List<String> logs=new ArrayList<>(); boolean enabled=true,keepScreen,stopThrows; int idleChecks;
+        Runnable onCharacter,onInput,onLast; String guardFailure;
+        final SimulatedChat input=new SimulatedChat() {
+            @Override public void key(int code,boolean press,Object expected) {
+                super.key(code,press,expected);
+                if(code==84 && press) { screen=chat; draft=""; }
+                if(code==257 && press && keepScreen) screen=chat;
+                if(onInput!=null) onInput.run();
+            }
+            @Override public void character(int c) { super.character(c); if(onCharacter!=null) onCharacter.run(); }
+            @Override public void stop() { super.stop(); if(stopThrows) throw new IllegalStateException("stop applied then threw"); }
+        };
+        final InspectAcceptanceDriver driver=new InspectAcceptanceDriver(() -> observation,input,now::get,() -> enabled,
+                message -> { logs.add(message); if(message.contains("LAST submitted") && onLast!=null) onLast.run(); },
+                expected -> { idleChecks++; assertEquals(reset,expected); if(guardFailure!=null) throw new IllegalStateException(guardFailure); });
+        StuckFixture() { input.now=now; }
+        void tick() { driver.tick(null); } void tick(int n) { for(int i=0;i<n;i++) tick(); }
+        void until(java.util.function.BooleanSupplier done) { for(int i=0;i<20 && !done.getAsBoolean();i++) tick(); assertTrue(done.getAsBoolean(),logs.toString()); }
+        void first() { until(() -> input.commands.size()==1); healthy(); }
+        void settled() { first(); observation=idle(reset); tick(); healthy(); }
+        PublishedCompletion changed(String field) {
+            var c=reset;
+            return new PublishedCompletion(field.equals("session")?null:c.sessionId(),field.equals("operation")?null:c.operationId(),field.equals("ordinal")?2:1,
+                    field.equals("command")?Command.RUN:Command.RESET,field.equals("run")?Optional.of(UUID.randomUUID()):Optional.empty(),field.equals("verdict")?"FAIL":"PASS",
+                    !field.equals("complete"),field.equals("cleanup")?"UNRESOLVED":"RELEASED",!field.equals("settled"),
+                    field.equals("directory")?" ":c.evidenceDirectory(),field.equals("summary")?null:c.summaryPath(),
+                    field.equals("failure")?Optional.of(new FailureObservation("java.lang.AssertionError","Run requires this invocation's successful reset")):Optional.empty());
+        }
+        void invalidate(String field) {
+            switch(field) {
+                case "gate" -> enabled=false;
+                case "case" -> System.setProperty("mapart.test.inspect.acceptance.case","baseline");
+                case "busy" -> observation=new InspectObservation(true,true,false,observation.last());
+                case "ready" -> observation=new InspectObservation(false,false,false,observation.last());
+                case "restart" -> observation=new InspectObservation(true,false,true,observation.last());
+                case "last" -> observation=idle(observation.last().isEmpty()?reset:null);
+                case "binding" -> input.refusal="window/world/server/player/handler/connection/focus/pause binding refused";
+                case "entry" -> input.entryRefusal="wrong installed client/thread";
+                case "screen" -> input.screen=new Object();
+                case "draft" -> { input.screen=input.chat; input.draft="foreign draft"; }
+                case "neutral" -> input.neutral=false;
+                case "idleGuard" -> guardFailure="fresh owner idle guard refused";
+                default -> throw new AssertionError(field);
+            }
+        }
+        long intents() { return logs.stream().filter(s -> s.contains("STUCK_CLEANUP_EXIT_REQUESTED")).count(); }
+        void healthy() { assertTrue(logs.stream().noneMatch(s -> s.contains("DRIVER_FAIL")),logs.toString()); }
+        void failed() { assertEquals(1,logs.stream().filter(s -> s.contains("DRIVER_FAIL")).count(),logs.toString()); assertEquals(0,intents()); }
+    }
+
     private static InspectObservation idle(PublishedCompletion completion) { return new InspectObservation(true, false, false, Optional.ofNullable(completion)); }
 
     private static final class Fixture {
