@@ -77,6 +77,8 @@ final class InspectScenarioHost implements Inspect {
     private Operation n1Operation;
     private volatile ScenarioRunner.N1Issue n1Issue=ScenarioRunner.N1Issue.absent();
     private int n1Disconnects;
+    // Terminal for this Host's lifetime: issue, cleanup, cancellation and gate changes never rearm it.
+    private final AtomicBoolean stuckCleanupConsumed = new AtomicBoolean();
     boolean nativeN1Owner() { return client!=null && receipts!=null; }
     void armN1PostLink(Operation operation,UUID priorOperation,UUID priorRun) {
         rejectNativeWait(); lock.lock();
@@ -946,10 +948,44 @@ final class InspectScenarioHost implements Inspect {
     void disconnectOwnedWorld(Scope scope, Runnable beforeDisconnect, Runnable disconnectConnection, Runnable disconnectScreen) {
         check(clientThread.getAsBoolean() && scope.kind()==Kind.CLEANUP,"Native close requires client CLEANUP");
         beforeDisconnect.run(); valid(scope);
+        stuckCleanupFault(stuckCleanupConsumed,stuckCleanupSelected(client!=null && receipts!=null,lineage==Lineage.WORK,
+                System.getProperty("mapart.test.inspect"),System.getProperty("mapart.test.inspect.acceptance"),
+                System.getProperty("fabric.client.gametest"),System.getProperty("mapart.test.inspect.acceptance.case"),
+                scope.operation().command(),scope.operation().ordinal()),scope,() -> Thread.sleep(30_000L));
         // One owned teardown: vanilla's screen disconnect waits for the server logout caused by this connection close.
         // Expected DISCONNECT cancellation must retain this cleanup through the second half, without a live-connection recheck.
         disconnectConnection.run();
         disconnectScreen.run();
+    }
+    static boolean stuckCleanupSelected(boolean ordinaryNative,boolean ordinaryLineage,String inspect,String acceptance,
+                                        String automatic,String selection,Command command,int ordinal) {
+        return ordinaryNative && ordinaryLineage && Boolean.parseBoolean(inspect) && Boolean.parseBoolean(acceptance)
+                && automatic==null && "stuck-cleanup".equals(selection) && command==Command.CLOSE && ordinal==2;
+    }
+    @FunctionalInterface interface StuckCleanupBody { void run() throws InterruptedException; }
+    static void stuckCleanupFault(AtomicBoolean consumed,boolean selected,Scope cleanup,StuckCleanupBody body) {
+        check(!consumed.get(),"Stuck cleanup fault already consumed");
+        if(!selected) return;
+        check(consumed.compareAndSet(false,true),"Stuck cleanup fault already consumed");
+        var operation=cleanup.operation();
+        // UUIDs, numeric fields and fixed tags keep each line below 4096 characters; consume before any output.
+        String identity="case=stuck-cleanup; pid="+ProcessHandle.current().pid()+"; session="+operation.sessionId()
+                +"; operation="+operation.operationId()+"; ordinal="+operation.ordinal()+"; command="+operation.command()
+                +"; phase="+cleanup.kind()+"; deadlineNanos="+cleanup.deadlineNanos()+"; site=POST_NATIVE_GUARD_VALID_SCOPE";
+        try {
+            System.out.println("INSPECT_STUCK_CLEANUP ENTER; "+identity);
+            // Task4/8u negative fault only. This finite failure backstop grants no additional scope permission.
+            body.run();
+        } catch(InterruptedException failure) {
+            Thread.currentThread().interrupt();
+            System.out.println("INSPECT_STUCK_CLEANUP FAILED_INTERRUPTED; "+identity);
+            throw new IllegalStateException("Stuck cleanup fault interrupted",failure);
+        } catch(RuntimeException | Error failure) {
+            System.out.println("INSPECT_STUCK_CLEANUP FAILED_BODY; "+identity);
+            throw failure;
+        }
+        System.out.println("INSPECT_STUCK_CLEANUP FAILED_RETURN; "+identity);
+        throw new IllegalStateException("Stuck cleanup fault returned unexpectedly");
     }
     @Override public void awaitNeutralChat() {
         var scope = dispatchScope(); check(scope.kind() == Kind.WORK, "Neutral chat wait requires WORK");

@@ -570,6 +570,125 @@ class ScenarioHostTest {
         }
     }
 
+    @Test void stuckCleanupSelectionRequiresEveryOrdinaryNativeCloseGate() {
+        assertTrue(InspectScenarioHost.stuckCleanupSelected(true,true,"true","true",null,"stuck-cleanup",Command.CLOSE,2));
+        assertFalse(InspectScenarioHost.stuckCleanupSelected(false,true,"true","true",null,"stuck-cleanup",Command.CLOSE,2));
+        assertFalse(InspectScenarioHost.stuckCleanupSelected(true,false,"true","true",null,"stuck-cleanup",Command.CLOSE,2));
+        for(String disabled:new String[]{null,"false",""}) {
+            assertFalse(InspectScenarioHost.stuckCleanupSelected(true,true,disabled,"true",null,"stuck-cleanup",Command.CLOSE,2));
+            assertFalse(InspectScenarioHost.stuckCleanupSelected(true,true,"true",disabled,null,"stuck-cleanup",Command.CLOSE,2));
+        }
+        for(String automatic:List.of("true","false",""))
+            assertFalse(InspectScenarioHost.stuckCleanupSelected(true,true,"true","true",automatic,"stuck-cleanup",Command.CLOSE,2));
+        for(String selection:new String[]{null,"baseline","unknown","STUCK-CLEANUP","stuck-cleanup "})
+            assertFalse(InspectScenarioHost.stuckCleanupSelected(true,true,"true","true",null,selection,Command.CLOSE,2));
+        for(Command command:Command.values()) if(command!=Command.CLOSE)
+            assertFalse(InspectScenarioHost.stuckCleanupSelected(true,true,"true","true",null,"stuck-cleanup",command,2));
+        for(int ordinal:new int[]{0,1,3})
+            assertFalse(InspectScenarioHost.stuckCleanupSelected(true,true,"true","true",null,"stuck-cleanup",Command.CLOSE,ordinal));
+    }
+
+    @Test void stuckCleanupReturnConsumesOnceAndRefusesEvenAfterSelectionTurnsOff() {
+        var consumed=new AtomicBoolean(); var bodies=new AtomicInteger(); var effects=new AtomicInteger();
+        var close=new Operation(inspectSession,2,UUID.randomUUID(),Command.CLOSE,temporary.resolve("stuck"));
+        var cleanup=new Scope(close,Kind.CLEANUP,10_000_000_001L);
+        assertThrows(IllegalStateException.class,() -> {
+            InspectScenarioHost.stuckCleanupFault(consumed,true,cleanup,bodies::incrementAndGet);
+            effects.incrementAndGet();
+        });
+        assertTrue(consumed.get()); assertEquals(1,bodies.get()); assertEquals(0,effects.get());
+        for(boolean selected:List.of(true,false)) assertThrows(IllegalStateException.class,() -> {
+            InspectScenarioHost.stuckCleanupFault(consumed,selected,cleanup,bodies::incrementAndGet);
+            effects.incrementAndGet();
+        });
+        assertEquals(1,bodies.get()); assertEquals(0,effects.get());
+        assertSame(close,cleanup.operation()); assertEquals(10_000_000_001L,cleanup.deadlineNanos());
+        var inactive=new AtomicBoolean();
+        InspectScenarioHost.stuckCleanupFault(inactive,false,cleanup,() -> fail("inactive fault body"));
+        assertFalse(inactive.get());
+    }
+
+    @Test void stuckCleanupFailuresAndReentryNeverReachDisconnectContinuations() {
+        var cleanup=new Scope(new Operation(inspectSession,2,UUID.randomUUID(),Command.CLOSE,temporary.resolve("stuck")),
+                Kind.CLEANUP,10_000_000_001L);
+        for(Throwable original:List.of(new IllegalStateException("body failure"),new AssertionError("body error"))) {
+            var consumed=new AtomicBoolean(); var effects=new AtomicInteger();
+            assertSame(original,assertThrows(original.getClass(),() -> {
+                InspectScenarioHost.stuckCleanupFault(consumed,true,cleanup,() -> {
+                    if(original instanceof Error error) throw error;
+                    throw (RuntimeException)original;
+                });
+                effects.incrementAndGet();
+            }));
+            assertTrue(consumed.get()); assertEquals(0,effects.get());
+            assertThrows(IllegalStateException.class,() -> InspectScenarioHost.stuckCleanupFault(consumed,false,cleanup,
+                    () -> fail("failed fault rearmed")));
+        }
+        var consumed=new AtomicBoolean(); var effects=new AtomicInteger();
+        assertThrows(IllegalStateException.class,() -> {
+            InspectScenarioHost.stuckCleanupFault(consumed,true,cleanup,() -> {
+                assertTrue(consumed.get());
+                InspectScenarioHost.stuckCleanupFault(consumed,true,cleanup,() -> fail("reentrant body"));
+                effects.incrementAndGet();
+            });
+            effects.incrementAndGet();
+        });
+        assertTrue(consumed.get()); assertEquals(0,effects.get());
+    }
+
+    @Test void stuckCleanupInterruptionRetainsFlagAndTerminalConsumption() {
+        boolean interrupted=Thread.interrupted();
+        try {
+            var consumed=new AtomicBoolean(); var effects=new AtomicInteger(); var original=new InterruptedException("body interrupted");
+            var cleanup=new Scope(new Operation(inspectSession,2,UUID.randomUUID(),Command.CLOSE,temporary.resolve("stuck")),
+                    Kind.CLEANUP,10_000_000_001L);
+            var failure=assertThrows(IllegalStateException.class,() -> {
+                InspectScenarioHost.stuckCleanupFault(consumed,true,cleanup,() -> { throw original; });
+                effects.incrementAndGet();
+            });
+            assertSame(original,failure.getCause()); assertTrue(Thread.currentThread().isInterrupted());
+            assertTrue(consumed.get()); assertEquals(0,effects.get());
+            assertThrows(IllegalStateException.class,() -> InspectScenarioHost.stuckCleanupFault(consumed,false,cleanup,
+                    () -> fail("interrupted fault rearmed")));
+        } finally { Thread.interrupted(); if(interrupted) Thread.currentThread().interrupt(); }
+    }
+
+    @Test void selectedStuckCleanupCannotPromoteInjectedHostEvenWithFixtureReceipts() throws Exception {
+        String[] keys={"mapart.test.inspect","mapart.test.inspect.acceptance","fabric.client.gametest",
+                "mapart.test.inspect.acceptance.case"};
+        String[] prior=new String[keys.length];
+        for(int i=0;i<keys.length;i++) prior[i]=System.getProperty(keys[i]);
+        try {
+            System.setProperty(keys[0],"true"); System.setProperty(keys[1],"true");
+            System.clearProperty(keys[2]); System.setProperty(keys[3],"stuck-cleanup");
+            var evidence=Files.createDirectory(temporary.resolve("receipts")).toRealPath(); var launchId=UUID.randomUUID();
+            var launch=Files.createDirectory(evidence.resolve("launch-"+launchId)); var id=UUID.randomUUID();
+            var directory=Files.createDirectories(evidence.resolve("two-lane-"+inspectSession)
+                    .resolve("inspect-operations/op-2-"+id));
+            var receipts=new ScenarioLaunchReceipt(launchId.toString(),launch.toString(),null,evidence);
+            for(var publisher:new ScenarioLaunchReceipt[]{null,receipts}) try(var h=new DispatchHarness(publisher)) {
+                var close=new Operation(inspectSession,2,id,Command.CLOSE,directory);
+                var work=h.host.beginWork(close); var cleanup=h.host.beginCleanup(work,null); var calls=new ArrayList<String>();
+                assertThrows(IllegalStateException.class,() -> h.nativeCall(() -> h.host.disconnectOwnedWorld(work,
+                        () -> fail("WORK authority"),() -> fail("WORK connection"),() -> fail("WORK screen"))));
+                var foreign=new Scope(close,Kind.CLEANUP,cleanup.deadlineNanos());
+                assertThrows(IllegalStateException.class,() -> h.nativeCall(() -> h.host.disconnectOwnedWorld(foreign,
+                        () -> calls.add("foreign authority"),() -> fail("foreign connection"),() -> fail("foreign screen"))));
+                var closing=h.worker.submit(() -> h.host.inScope(cleanup,() -> h.host.runOnClient(client ->
+                        h.host.disconnectOwnedWorld(cleanup,() -> calls.add("authority"),
+                                () -> calls.add("connection"),() -> calls.add("screen")))));
+                var action=h.client.poll(2,TimeUnit.SECONDS); assertNotNull(action); h.nativeCall(action);
+                closing.get(2,TimeUnit.SECONDS);
+                assertEquals(List.of("foreign authority","authority","connection","screen"),calls);
+                assertSame(work.operation(),cleanup.operation()); assertEquals(work.deadlineNanos(),cleanup.deadlineNanos());
+                h.host.settleCleanup(cleanup,new FinalOutcome(close,Verdict.SUCCESS,CleanupStatus.SETTLED));
+                assertEquals(1,h.published.size());
+            }
+        } finally {
+            for(int i=0;i<keys.length;i++) if(prior[i]==null) System.clearProperty(keys[i]); else System.setProperty(keys[i],prior[i]);
+        }
+    }
+
     @Test void inspectCloseRequiresCleanupAndRechecksOwnerInActualDisconnectAction() throws Exception {
         try (var h=new DispatchHarness()) {
             var op=operation(1); var work=h.host.beginWork(op);
@@ -756,12 +875,16 @@ class ScenarioHostTest {
         final List<FinalOutcome> published = new CopyOnWriteArrayList<>();
         final AtomicReference<RuntimeException> publicationFailure = new AtomicReference<>();
         final AtomicReference<Runnable> publicationEffect = new AtomicReference<>(() -> { });
-        final InspectScenarioHost host = new InspectScenarioHost(now::get, clientThread::get, serverThread::get,
+        final InspectScenarioHost host;
+        DispatchHarness() { this(null); }
+        DispatchHarness(ScenarioLaunchReceipt receipts) {
+            host = new InspectScenarioHost(now::get, clientThread::get, serverThread::get,
                 action -> { client.add(action); }, action -> { server.add(action); }, outcome -> {
                     if (publicationFailure.get() != null) throw publicationFailure.get();
                     published.add(outcome);
                     publicationEffect.get().run();
-                });
+                },receipts,java.time.Instant::now);
+        }
         void nativeCall(Runnable action) { clientThread.set(true); try { action.run(); } finally { clientThread.remove(); } }
         @Override public void close() { worker.shutdownNow(); }
     }
