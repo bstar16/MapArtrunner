@@ -628,7 +628,7 @@ function Save-V2Artifacts {
     foreach ($folder in 'logs','crash-reports') {
         foreach ($link in @(Copy-V2Evidence (Join-Path $Game $folder) (Join-Path $Evidence $folder) $Game $Evidence)) { $links.Add($link) }
     }
-    if ($Context -and !($Context.Request.PSObject.Properties['Mode'] -and $Context.Request.Mode -ceq 'inspect')) {
+    if ($Context -and (!($Context.Request.PSObject.Properties['Mode'] -and $Context.Request.Mode -ceq 'inspect') -or $Context.CleanupStatus -ceq 'settled')) {
         ConvertTo-Json -InputObject $links.ToArray() -Depth 5 | Set-Content (Join-Path $Evidence 'reparse-points.json')
         # Only the existing finalizer can settle writers. Closure precedes outcome publication/lock release.
         if ($Context.CleanupStatus -cne 'settled' -or $Context.Evidence -cne $Evidence) { throw 'Automatic reference retention requires settled launch cleanup.' }
