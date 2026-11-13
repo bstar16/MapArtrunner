@@ -48,7 +48,8 @@ final class ScenarioCommands {
     private Throwable terminal;
     private Operation active;
     private ScenarioRunner.InspectCompletion last;
-    private final LongSupplier clock = System::nanoTime;
+    private LongSupplier clock = System::nanoTime;
+    private ScenarioRunner.N1Intent n1Intent;
     // First intent closes admission permanently; worker settlement or the fixed cutoff releases native stop.
     private enum Exit { OPEN, REQUESTED, RELEASE_NATIVE }
     private Exit exit = Exit.OPEN;
@@ -63,6 +64,9 @@ final class ScenarioCommands {
         this(worker,host);
         if(!Objects.requireNonNull(prepared).usesInspectHost(host)) throw new IllegalArgumentException("Foreign inspect Runner/Host");
         runner=prepared; ready=true;
+    }
+    ScenarioCommands(Executor worker,Inspect host,ScenarioRunner prepared,LongSupplier clock) {
+        this(worker,host,prepared); this.clock=Objects.requireNonNull(clock);
     }
 
     void register(CommandDispatcher<FabricClientCommandSource> dispatcher) {
@@ -223,6 +227,12 @@ final class ScenarioCommands {
     ExpiryObservation observeExpiryAcceptance() {
         return host instanceof InspectScenarioHost concrete?concrete.observeExpiryAcceptance():null;
     }
+    synchronized ScenarioRunner.N1Observation observeN1Acceptance() {
+        if(runner==null) return null;
+        var observed=runner.observeN1Acceptance();
+        return observed==null?null:new ScenarioRunner.N1Observation(observed.state(),observed.admission(),n1Intent,
+                observed.close(),observed.outputAttempted(),observed.outputSucceeded());
+    }
     synchronized boolean acknowledgeExpiryBusyProof(MinecraftClient client,ExpiryBusyAck ack) {
         if(!(queued && active!=null && last!=null && last.ordinal()==1 && last.command()==Command.RESET
                 && ack!=null && active.operationId().equals(ack.operationId()) && exit==Exit.OPEN && !cancelled && terminal==null
@@ -272,7 +282,12 @@ final class ScenarioCommands {
                 && runner.failedInspectAdmission().isPresent();
         if (cancelled || terminal != null && !damagedAdmission || !queued && !ready && !damagedAdmission) return false;
         exit = Exit.REQUESTED;
-        exitDeadline = clock.getAsLong() + 10_000_000_000L;
+        long intentNanos=clock.getAsLong();
+        exitDeadline = intentNanos + 10_000_000_000L;
+        var observed=runner==null?null:runner.observeN1Acceptance();
+        var admission=observed==null?null:observed.admission();
+        if(admission!=null) n1Intent=new ScenarioRunner.N1Intent(admission.selected(),admission.sessionId(),admission.operationId(),
+                intentNanos,exitDeadline,!queued);
         if (queued) {
             // STARTUP/WORK unwind into their original cleanup; CLEANUP retains only its remaining permission.
             cancel(new IllegalStateException("Inspect application exit requested"));
@@ -335,7 +350,10 @@ final class ScenarioCommands {
                 catch (RuntimeException | Error cleanup) { if (cleanup != failure) failure.addSuppressed(cleanup); }
             }
         }
-        finally { workerFinished(); }
+        finally {
+            try { if(runner!=null) runner.emitN1Acceptance(n1Intent); }
+            finally { workerFinished(); }
+        }
     }
 
     void checkWorld(MinecraftClient client) {

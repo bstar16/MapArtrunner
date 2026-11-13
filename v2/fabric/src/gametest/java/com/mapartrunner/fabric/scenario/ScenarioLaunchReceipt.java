@@ -25,6 +25,27 @@ final class ScenarioLaunchReceipt {
     private final Consumer<Path> afterLink;
     private final boolean requireWindowsBackend;
     private final Path fixtureEvidenceRoot;
+    // Armed by the existing native Host once; consumed only after its exact WORK3 final link and hook return.
+    private Operation n1Arm;
+    private UUID n1PriorOperation, n1PriorRun;
+    private boolean n1Armed, n1AfterLink;
+
+    synchronized void armN1PostLink(Operation operation, UUID priorOperation, UUID priorRun) {
+        require(ScenarioRunner.n1Selected("n1-post-link") && !n1Armed && operation.ordinal()==3
+                && operation.command()==Command.RESET && priorOperation!=null && priorRun!=null
+                && !priorOperation.equals(operation.operationId()), "Invalid N1 publisher arm");
+        n1Armed=true; n1Arm=operation; n1PriorOperation=priorOperation; n1PriorRun=priorRun;
+    }
+    synchronized boolean n1AfterLink(Operation operation) { return n1AfterLink && n1Arm==operation; }
+    private static final class SimulatedN1PostLinkFailure extends IllegalStateException {
+        private final UUID operationId;
+        SimulatedN1PostLinkFailure(Operation operation) {
+            super("SIMULATED_N1_AFTER_BEGIN_LINK_BEFORE_RETURN"); operationId=operation.operationId();
+        }
+    }
+    static boolean isN1PostLinkFailure(Throwable failure,Operation operation) {
+        return failure instanceof SimulatedN1PostLinkFailure n1 && n1.operationId.equals(operation.operationId());
+    }
 
     ScenarioLaunchReceipt(String launchId, String directory) {
         this(launchId, directory, null);
@@ -165,6 +186,12 @@ final class ScenarioLaunchReceipt {
                 require(launch.equals(launch.toRealPath()), "Launch directory redirected before publication");
                 Files.createLink(launch.resolve(filename), temporary);
                 if (afterLink != null) afterLink.accept(launch.resolve(filename));
+                if(n1Arm==operation && filename.equals("inspect-op-3.begin.json") && !n1AfterLink) {
+                    require(ScenarioRunner.n1Selected("n1-post-link") && n1PriorOperation!=null && n1PriorRun!=null,
+                            "N1 publisher gates changed");
+                    n1AfterLink=true;
+                    throw new SimulatedN1PostLinkFailure(operation);
+                }
             } catch (IOException | RuntimeException | Error failure) {
                 publicationFailure = failure;
                 throw failure;

@@ -103,6 +103,14 @@ final class InspectAcceptanceDriver {
     private Foreign foreign;
     private ExpiryClaims expiryClaims;
     private Expiry expiry;
+    private String n1Case;
+    private enum N1Step { WAIT_ADMISSION, NEXT_CHAT, OPEN_CHAT, WAIT_HANDOFF, STOP_READY }
+    private N1Step n1Step;
+    private int n1Chat;
+    private ScenarioRunner.N1Observation n1Proof;
+    private static final String[] N1_CHATS={"/maparttest reset grounded-two-lane","/maparttest run grounded-two-lane",
+            "/maparttest rerun grounded-two-lane","/maparttest last"};
+    private Supplier<ScenarioRunner.N1Observation> n1Observations = () -> null;
     // Keep RUN2's immutable result/proof after RESET3 replaces LAST. Only transient input/ack state retires.
     private PublishedCompletion expiryResult;
     private ExpiryObservation expiryProof;
@@ -126,6 +134,7 @@ final class InspectAcceptanceDriver {
         this(commands::observeInspect, new NativeChat(client,commands::observeForeignAcceptance), System::nanoTime, InspectAcceptanceDriver::enabled,
                 message -> System.out.println(message), completion -> commands.requireAcceptanceIdle(client, completion),
                 completion -> commands.observeAcceptanceIdle(client, completion));
+        n1Observations=commands::observeN1Acceptance;
         foreignClaims=new ForeignClaims() {
             public ForeignObservation observe() { return commands.observeForeignAcceptance(); }
             public boolean release(MinecraftClient current) { return commands.releaseForeignAcceptanceBoundary(current); }
@@ -166,6 +175,14 @@ final class InspectAcceptanceDriver {
         this(observations,input,clock,enabled,log); this.expiryClaims=expiryClaims;
     }
 
+    InspectAcceptanceDriver(Supplier<InspectObservation> observations, ChatBoundary input, LongSupplier clock,
+                            BooleanSupplier enabled, Consumer<String> log, Consumer<PublishedCompletion> idleGuard,
+                            Function<PublishedCompletion,ScenarioRunner.InspectIdleObservation> idleObservation,
+                            Supplier<ScenarioRunner.N1Observation> n1Observations) {
+        this(observations,input,clock,enabled,log,idleGuard,idleObservation);
+        this.n1Observations=n1Observations;
+    }
+
     static boolean enabled() {
         return enabled(System.getProperty("mapart.test.inspect"), System.getProperty("mapart.test.inspect.acceptance"),
                 System.getProperty("fabric.client.gametest"));
@@ -176,8 +193,8 @@ final class InspectAcceptanceDriver {
 
     void tick(MinecraftClient current) {
         if (advancing) return;
-        if (stopping && workExpiry) return;
-        if (!enabled.getAsBoolean() && heldForward == null && idle == null && foreign==null && !workExpiry && !failed) return;
+        if (stopping && (workExpiry || n1Case!=null)) return;
+        if (!enabled.getAsBoolean() && heldForward == null && idle == null && foreign==null && !workExpiry && n1Case==null && !failed) return;
         boolean validEntry = false;
         advancing = true;
         try {
@@ -185,11 +202,12 @@ final class InspectAcceptanceDriver {
             require(enabled.getAsBoolean(), "Acceptance gate disabled during driver activity");
             if (!selected) {
                 var value = System.getProperty("mapart.test.inspect.acceptance.case", "baseline");
-                require(Set.of("baseline","displaced","reset-archive","foreign-world","work-expiry").contains(value), "Unknown acceptance case: " + value);
-                displaced = value.equals("displaced"); resetArchive = value.equals("reset-archive"); foreignCase=value.equals("foreign-world"); workExpiry=value.equals("work-expiry"); selected = true;
+                require(Set.of("baseline","displaced","reset-archive","foreign-world","work-expiry","n1-header","n1-post-link").contains(value), "Unknown acceptance case: " + value);
+                displaced = value.equals("displaced"); resetArchive = value.equals("reset-archive"); foreignCase=value.equals("foreign-world"); workExpiry=value.equals("work-expiry"); n1Case=value.startsWith("n1-")?value:null; selected = true;
             }
             if(resetArchive) require("reset-archive".equals(System.getProperty("mapart.test.inspect.acceptance.case")),"Reset-archive acceptance case changed");
             if(workExpiry) require("work-expiry".equals(System.getProperty("mapart.test.inspect.acceptance.case")),"Expiry acceptance case changed");
+            if(n1Case!=null) requireN1Case();
             if (stage == Stage.STOPPED) { requestStop(current); return; }
             var observed = observations.get();
             if(foreignCase) {
@@ -208,6 +226,8 @@ final class InspectAcceptanceDriver {
                     }
                 }
             }
+            // Only the sent RESET3 role can enter this bounded failed-admission program.
+            if(n1Step!=null) { advanceN1(current,observed); return; }
             require(!observed.restartRequired(), "Inspect session unavailable; restart required");
             if (stage == Stage.WAIT_STARTUP) {
                 if (!observed.ready() || observed.busy()) return; // Original startup owner retains its bound.
@@ -241,11 +261,14 @@ final class InspectAcceptanceDriver {
                     input.requireChat(chat, "");
                     // Latch the whole send before any character/Enter callback; exceptions never retry it.
                     stage = Stage.WAIT_HANDOFF;
+                    if(n1Case!=null && index==2) n1Step=N1Step.WAIT_ADMISSION;
                     var text = commandText();
                     for (int i = 0; i < text.length(); i++) {
+                        if(n1Case!=null) requireN1PreludeInput();
                         inputDeadline(); input.requireChat(chat, text.substring(0, i));
                         input.character(text.charAt(i));
                     }
+                    if(n1Case!=null) requireN1PreludeInput();
                     inputDeadline(); input.requireChat(chat, text);
                     pairedKey(ENTER, chat);
                     marker("ENTER delivered; awaiting natural handoff/admission");
@@ -282,6 +305,102 @@ final class InspectAcceptanceDriver {
             fail(failure, validEntry);
             if (validEntry) requestStop(current);
         } finally { advancing = false; }
+    }
+
+    private void requireN1Case() {
+        require(enabled.getAsBoolean() && n1Case.equals(System.getProperty("mapart.test.inspect.acceptance.case")),"N1 gate/case changed");
+    }
+
+    private void requireN1PreludeInput() {
+        requireN1Case(); input.requireBinding();
+        var observed=observations.get(); requireUnchanged(observed);
+        require(observed.ready() && !observed.restartRequired() && !observed.busy(),"N1 prelude input unavailable");
+    }
+
+    /** The first immutable admission value survives all four refused chats; it grants no owner authority. */
+    private void authenticateN1(ScenarioRunner.N1Observation proof) {
+        require(proof!=null && "ADMISSION_FAILED".equals(proof.state()) && proof.admission()!=null
+                && proof.intent()==null && proof.close()==null && !proof.outputAttempted() && proof.outputSucceeded()==null,"N1 admission envelope invalid");
+        var a=proof.admission(); var t=a.trigger(); var h=a.host(); var p=a.prior(); var f=a.failure();
+        require(retained!=null && retained.ordinal()==2 && retained.command()==Command.RUN && "PASS".equals(retained.verdict())
+                && retained.runId().isPresent() && retained.failure().isEmpty() && retained.evidenceComplete() && retained.cleanupSettled()
+                && "RELEASED".equals(retained.cleanupStatus()),"N1 requires successful retained RUN2");
+        require(n1Case.equals(a.selected()) && Objects.equals(session,a.sessionId()) && a.operationId()!=null
+                && !operations.contains(a.operationId()) && a.operationDirectory()!=null && !a.operationDirectory().isBlank()
+                && ScenarioRunner.n1Text(a.operationDirectory(),1024)!=null && !directories.contains(a.operationDirectory())
+                && a.reservedOrdinal()==3 && a.resetOrdinal()==1 && a.countedStarts()==1,"N1 admission identity/counters invalid");
+        boolean header=n1Case.equals("n1-header");
+        require(t!=null && t.attempts()==1 && t.headerWriteEntered() && t.collisionCreated()==header && t.afterLinkReached()!=header
+                && h!=null && !h.ordinaryScopeIssued() && h.currentScopeAbsent() && h.cancelled() && h.lastOrdinal()==2,"N1 trigger/Host invalid");
+        require(p!=null && retained.operationId().equals(p.operationId()) && retained.runId().orElseThrow().equals(p.runId())
+                && p.summarySha256()!=null && p.summarySha256().matches("[0-9a-fA-F]{64}") && p.closedFilesVerified() && p.lastSame()
+                && p.watchSame() && p.samples()>0 && p.witnesses()>0,"N1 prior evidence invalid");
+        require(a.diagnosticsComplete() && a.primaryIdentityRetained() && f!=null,"N1 diagnostics/primary invalid");
+        ScenarioRunner.n1Text(f.className(),256); ScenarioRunner.n1Text(f.message(),512);
+        ScenarioRunner.n1Text(f.causeClassName(),256); ScenarioRunner.n1Text(f.causeMessage(),512);
+        require(header ? "java.io.UncheckedIOException".equals(f.className()) && f.causeClassName()!=null && !f.causeClassName().isBlank()
+                : "com.mapartrunner.fabric.scenario.ScenarioLaunchReceipt$SimulatedN1PostLinkFailure".equals(f.className())
+                && "SIMULATED_N1_AFTER_BEGIN_LINK_BEFORE_RETURN".equals(f.message()) && f.causeClassName()==null && f.causeMessage()==null,
+                "N1 primary failure invalid");
+        require(n1Proof==null || n1Proof.equals(proof),"N1 authenticated admission changed");
+        if(n1Proof==null) n1Proof=proof;
+    }
+
+    private void requireN1Terminal(InspectObservation observed) {
+        requireN1Case(); input.requireBinding(); requireUnchanged(observed);
+        authenticateN1(n1Observations.get());
+        require(!observed.ready() && observed.restartRequired() && !observed.busy(),"N1 terminal worker not settled");
+        require(heldKey==-1 && heldForward==null,"N1 input debt remains");
+    }
+
+    private void requireN1ChatBoundary(String draft) {
+        inputDeadline(); requireN1Terminal(observations.get()); input.requireChat(chat,draft);
+    }
+
+    private void advanceN1(MinecraftClient current,InspectObservation observed) {
+        require(index==2 && stage==Stage.WAIT_HANDOFF,"N1 failed RESET3 role changed");
+        if(n1Step==N1Step.WAIT_ADMISSION) {
+            inputDeadline(); requireN1Case(); input.requireBinding(); requireUnchanged(observed);
+            if(input.screen()!=null) input.requireChat(chat,commandText()); else input.requireNeutral();
+            var proof=n1Observations.get();
+            if(proof!=null && "ADMISSION_FAILED".equals(proof.state()) || observed.restartRequired() || n1Proof!=null) authenticateN1(proof);
+            // Commands and Runner publish separately: a matching snapshot while queued is not settlement.
+            if(observed.busy() || !observed.restartRequired()) return;
+            requireN1Terminal(observed);
+            if(input.screen()!=null) return;
+            marker("N1_RESET3_HANDOFF authenticated failed admission; no third completion");
+            n1Step=N1Step.NEXT_CHAT; chat=null; return;
+        }
+        requireN1Terminal(observed);
+        switch(n1Step) {
+            case NEXT_CHAT -> {
+                input.requireNeutral(); inputStarted=clock.getAsLong(); inputDeadline();
+                chat=null; n1Step=N1Step.OPEN_CHAT;
+                marker("N1_CHAT_OPEN request="+n1Chat); pairedKey(input.chatKey(),null);
+            }
+            case OPEN_CHAT -> {
+                inputDeadline(); chat=input.screen(); if(chat==null) return;
+                input.requireChat(chat,"");
+                // Consume send before callbacks, including apply-then-throw and recursive END/STOP.
+                n1Step=N1Step.WAIT_HANDOFF;
+                var text=commandText();
+                for(int i=0;i<text.length();i++) { requireN1ChatBoundary(text.substring(0,i)); input.character(text.charAt(i)); }
+                requireN1ChatBoundary(text); pairedKey(ENTER,chat);
+                marker("N1_CHAT_REQUESTED request="+n1Chat+"; actual retained CHAT remains external");
+            }
+            case WAIT_HANDOFF -> {
+                inputDeadline();
+                if(input.screen()!=null) { input.requireChat(chat,commandText()); return; }
+                input.requireNeutral();
+                marker("N1_CHAT_HANDOFF request="+n1Chat+"; no output acknowledgement");
+                chat=null; n1Chat++; n1Step=n1Chat==N1_CHATS.length?N1Step.STOP_READY:N1Step.NEXT_CHAT;
+            }
+            case STOP_READY -> {
+                input.requireNeutral(); marker("N1_SEQUENCE_COMPLETE application stop requested; native proof remains external");
+                stage=Stage.STOPPED; requestStop(current);
+            }
+            default -> throw new IllegalStateException("Unexpected N1 step");
+        }
     }
 
     private void beginInput(InspectObservation observed) {
@@ -350,6 +469,7 @@ final class InspectAcceptanceDriver {
         try {
             input.requireClient(current); validEntry = true; stopping=true;
             if(foreign!=null) foreign.dispose();
+            if(n1Case!=null) { n1Step=null; chat=null; stage=Stage.STOPPED; releaseKey(); }
             if(workExpiry) { if(expiry!=null) expiry.dispose(); stage=Stage.STOPPED; releaseKey(); }
             releaseForward();
         }
@@ -381,7 +501,10 @@ final class InspectAcceptanceDriver {
                 && completion.evidenceComplete() && completion.cleanupSettled() && "RELEASED".equals(completion.cleanupStatus()),
                 "Invalid completion identity/evidence/cleanup");
         boolean expected;
-        if (workExpiry) {
+        if(n1Case!=null) {
+            expected="PASS".equals(completion.verdict()) && completion.failure().isEmpty()
+                    && (index==0?completion.runId().isEmpty():completion.runId().filter(id -> !runs.contains(id)).isPresent());
+        } else if (workExpiry) {
             expected = index==1 ? expiryResultMatches(completion)
                     : "PASS".equals(completion.verdict()) && completion.runId().isEmpty() && completion.failure().isEmpty();
         } else if (resetArchive && (index == 0 || index == 4)) {
@@ -535,11 +658,12 @@ final class InspectAcceptanceDriver {
     }
 
     private String commandText() {
+        if(n1Step!=null && n1Step!=N1Step.WAIT_ADMISSION) return N1_CHATS[Math.min(n1Chat,N1_CHATS.length-1)];
         return isLast() ? "/maparttest last" : "/maparttest "
                 + mutations()[index].name().toLowerCase(Locale.ROOT) + " grounded-two-lane";
     }
 
-    private Command[] mutations() { return workExpiry ? WORK_EXPIRY : foreignCase ? FOREIGN : resetArchive ? RESET_ARCHIVE : displaced ? DISPLACED : MUTATIONS; }
+    private Command[] mutations() { return n1Case!=null ? WORK_EXPIRY : workExpiry ? WORK_EXPIRY : foreignCase ? FOREIGN : resetArchive ? RESET_ARCHIVE : displaced ? DISPLACED : MUTATIONS; }
     private boolean isLast() { return index == mutations().length || displaced && index == 3 && !middleLast
             || resetArchive && (index == 1 || index == 4 || index == 5) && resetArchiveLast != index; }
 

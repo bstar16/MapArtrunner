@@ -78,6 +78,145 @@ import static com.mapartrunner.fabric.scenario.ScenarioHost.*;
 
 /** Closed-profile fixture owner. No production reset API and no observation-time repairs. */
 final class ScenarioRunner implements AutoCloseable {
+    static boolean n1Selected(String selected) {
+        return Boolean.getBoolean("mapart.test.inspect") && Boolean.getBoolean("mapart.test.inspect.acceptance")
+                && System.getProperty("fabric.client.gametest")==null
+                && selected.equals(System.getProperty("mapart.test.inspect.acceptance.case"));
+    }
+    private enum N1Case { HEADER, POST_LINK;
+        String label() { return this==HEADER?"n1-header":"n1-post-link"; }
+    }
+    enum N1Guard { UNOBSERVED, PASSED, REFUSED }
+    record N1Failure(String className,String message,String causeClassName,String causeMessage) {
+        static N1Failure of(Throwable error) {
+            if(error==null) return null;
+            var cause=error.getCause();
+            return new N1Failure(n1Text(error.getClass().getName(),256),n1Text(error.getMessage(),512),
+                    cause==null?null:n1Text(cause.getClass().getName(),256),cause==null?null:n1Text(cause.getMessage(),512));
+        }
+    }
+    record N1Trigger(int attempts,boolean collisionCreated,boolean headerWriteEntered,boolean afterLinkReached) { }
+    record N1Host(boolean ordinaryScopeIssued,boolean currentScopeAbsent,boolean cancelled,int lastOrdinal) { }
+    record N1Prior(UUID operationId,UUID runId,String summarySha256,boolean closedFilesVerified,boolean lastSame,
+                   boolean watchSame,int samples,int witnesses) { }
+    record N1Admission(String selected,UUID sessionId,UUID operationId,String operationDirectory,long occurredNanos,
+                       int reservedOrdinal,int resetOrdinal,int countedStarts,N1Trigger trigger,N1Host host,N1Prior prior,
+                       N1Failure failure,boolean primaryIdentityRetained,boolean diagnosticsComplete) { }
+    record N1Intent(String selected,UUID sessionId,UUID operationId,long intentNanos,long deadlineNanos,boolean workerIdle) { }
+    record N1Issue(UUID operationId,String kind,int issues,Long issuedNanos,Long deadlineNanos) {
+        static N1Issue absent() { return new N1Issue(null,null,0,null,null); }
+    }
+    record N1Release(int invocations,N1Guard guard,Integer beforeKeys,Integer afterKeys,String beforeOwner,String afterOwner,N1Failure error) { }
+    record N1Freeze(int invocations,N1Guard guard,Boolean watchSame,N1Failure error) { }
+    record N1Options(int helperInvocations,int autoJumpSetCalls,int viewDistanceSetCalls,int settingsSendCalls,N1Guard guard,
+                     Boolean ownedBefore,Boolean ownedAfter,Boolean savedAutoJump,Integer savedViewDistance,
+                     Boolean beforeAutoJump,Boolean afterAutoJump,Integer beforeViewDistance,Integer afterViewDistance,N1Failure error) { }
+    record N1Close(int invocations,N1Guard guard,N1Guard serverCheckpoint,boolean returned,boolean worldCleared,N1Failure error) { }
+    record N1Final(long occurredNanos,N1Issue shutdown,int reservedOrdinal,int resetOrdinal,int countedStarts,
+                   boolean retainedLastSame,boolean primaryIdentityRetained,N1Release release,N1Freeze freeze,
+                   N1Options options,N1Close close,N1Failure failure,boolean diagnosticsComplete) { }
+    record N1Observation(String state,N1Admission admission,N1Intent intent,N1Final close,boolean outputAttempted,Boolean outputSucceeded) { }
+    // A single session diagnostic is never rearmed or used as a cleanup permission. Only detached records are published.
+    private static final class N1Diagnostic {
+        final N1Case selected; final Operation operation; final InspectCompletion prior; final InspectIdleObservation watch;
+        boolean collision,headerEntered; volatile boolean complete=true; int attempts;
+        N1Admission admission; N1Options options; N1Final close;
+        Throwable primary;
+        N1Guard checkpoint=N1Guard.UNOBSERVED,closeGuard=N1Guard.UNOBSERVED;
+        N1Failure closeError;
+        N1Diagnostic(N1Case selected,Operation operation,InspectCompletion prior,InspectIdleObservation watch) {
+            this.selected=selected; this.operation=operation; this.prior=prior; this.watch=watch;
+        }
+    }
+    private N1Diagnostic n1;
+    private volatile N1Observation n1Observation;
+    N1Observation observeN1Acceptance() { return n1Observation; }
+    static int n1Increment(int value) { return value>=2?2:value+1; }
+    static String n1Text(String value,int maximum) {
+        if(value==null) return null;
+        for(int i=0;i<value.length();i++) {
+            char c=value.charAt(i);
+            if(Character.isHighSurrogate(c)) {
+                require(i+1<value.length() && Character.isLowSurrogate(value.charAt(++i)),"N1 invalid Unicode");
+            } else require(!Character.isLowSurrogate(c),"N1 invalid Unicode");
+        }
+        require(value.getBytes(StandardCharsets.UTF_8).length<=maximum,"N1 string limit"); return value;
+    }
+    private void n1Diagnostic(Runnable observation) {
+        if(n1==null) return;
+        try { observation.run(); }
+        catch(RuntimeException | Error error) { n1.complete=false; if(inspectAdmissionFailure!=null) retain(inspectAdmissionFailure,error); }
+    }
+    private static N1Failure safeN1Failure(Throwable error) {
+        try { return N1Failure.of(error); } catch(RuntimeException | Error invalid) { return null; }
+    }
+    private static int n1Keys(MinecraftClient c) {
+        var values=List.of(c.options.forwardKey,c.options.backKey,c.options.leftKey,c.options.rightKey,c.options.jumpKey,
+                c.options.sneakKey,c.options.sprintKey,c.options.useKey,c.options.attackKey);
+        int mask=0; for(int i=0;i<values.size();i++) if(values.get(i).isPressed()) mask|=1<<i; return mask;
+    }
+    private void freezeN1(Scope cleanup,boolean stopping) {
+        try {
+            if(stopping) ((Inspect)host).requireStoppingScope(cleanup);
+        } catch(RuntimeException | Error error) {
+            n1Diagnostic(() -> inspectEffects.freezeGuard(N1Guard.REFUSED)); throw error;
+        }
+        n1Diagnostic(() -> inspectEffects.freezeGuard(N1Guard.PASSED));
+        n1Diagnostic(inspectEffects::freezeInvocation);
+        watch.freeze();
+        n1Diagnostic(() -> inspectEffects.freezeAfter(n1.watch.equals(new InspectIdleObservation(watch.retained()))));
+    }
+
+    private void prepareN1(Operation operation) throws IOException {
+        N1Case selected=n1Selected("n1-header")?N1Case.HEADER:n1Selected("n1-post-link")?N1Case.POST_LINK:null;
+        if(selected==null || operation.ordinal()!=3) return;
+        require(host instanceof InspectScenarioHost concrete && concrete.nativeN1Owner(),"N1 requires installed native inspect owner");
+        require(n1==null && operation==inspectOperation && operation.command()==Command.RESET && resetOrdinal==1 && countedStarts==1
+                && worldCreated && !closed && inspectAdmissionFailure==null
+                && inspectLast!=null && inspectLast.ordinal()==2 && inspectLast.command()==Command.RUN
+                && inspectLast.sessionId().equals(invocation) && inspectLast.verdict().equals("PASS") && inspectLast.failure()==null
+                && inspectLast.evidenceComplete() && inspectLast.cleanupSettled() && inspectLast.cleanupStatus().equals("RELEASED")
+                && previous!=null && inspectLast.runId().filter(previous.runId()::equals).isPresent()
+                && previous.artifacts().equals(inspectLast.evidenceDirectory()) && priorCountedSuccess==previous
+                && assertedSuccesses.stream().anyMatch(result -> result==previous),"N1 requires retained successful RUN2");
+        verifyInspectPriorEvidence();
+        var retained=watch.retained();
+        require(retained.binding()!=null && retained.binding().context().runId().equals(previous.runId())
+                && !retained.samples().isEmpty() && !retained.witnesses().isEmpty(),"N1 lacks retained RUN2 Watch");
+        n1=new N1Diagnostic(selected,operation,inspectLast,new InspectIdleObservation(retained));
+        n1Observation=new N1Observation("PREPARED",null,null,null,false,null);
+        n1.attempts=1;
+        n1Observation=new N1Observation("TRIGGER_ATTEMPTED",null,null,null,false,null);
+        if(selected==N1Case.HEADER) { createN1HeaderCollision(roots,operation); n1.collision=true; }
+        else ((InspectScenarioHost)host).armN1PostLink(operation,inspectLast.operationId(),previous.runId());
+    }
+    static void createN1HeaderCollision(Roots roots,Operation operation) throws IOException {
+        checkRoots(roots);
+        require(real(operation.evidenceDirectory()).equals(operation.evidenceDirectory())
+                && operation.evidenceDirectory().startsWith(roots.evidence),"N1 header collision escaped");
+        Files.createDirectory(operation.evidenceDirectory().resolve("operation.json"));
+    }
+    private void captureN1Admission(Operation operation,Throwable primary,long occurred) {
+        if(n1==null || n1.operation!=operation) return;
+        n1.primary=primary;
+        try {
+            var d=n1; var concrete=(InspectScenarioHost)host;
+            var hostFacts=concrete.captureN1Admission(operation);
+            boolean linked=concrete.n1AfterLink(operation);
+            boolean triggered=d.selected==N1Case.HEADER
+                    ? d.collision && d.headerEntered && primary instanceof UncheckedIOException io
+                      && io.getCause() instanceof FileSystemException fs && fs.getFile()!=null
+                      && Path.of(fs.getFile()).equals(operation.evidenceDirectory().resolve("operation.json"))
+                    : linked && ScenarioLaunchReceipt.isN1PostLinkFailure(primary,operation);
+            d.complete &= triggered && n1Selected(d.selected.label());
+            d.admission=new N1Admission(d.selected.label(),invocation,operation.operationId(),n1Text(operation.evidenceDirectory().toString(),1024),occurred,
+                    inspectOrdinal,resetOrdinal,countedStarts,new N1Trigger(d.attempts,d.collision,d.headerEntered,linked),hostFacts,
+                    new N1Prior(d.prior.operationId(),d.prior.runId().orElseThrow(),inspectLastSummaryHash,true,inspectLast==d.prior,
+                            d.watch.equals(new InspectIdleObservation(watch.retained())),d.watch.samples(),d.watch.witnesses()),
+                    N1Failure.of(primary),inspectAdmissionFailure==primary,d.complete);
+            n1Observation=new N1Observation("ADMISSION_FAILED",d.admission,null,null,false,null);
+        } catch(RuntimeException | Error diagnostic) { n1.complete=false; retain(primary,diagnostic); }
+    }
     private enum SupportCase {
         ORDINARY, CONTROLLED;
         static SupportCase parse(String value) {
@@ -242,13 +381,46 @@ final class ScenarioRunner implements AutoCloseable {
                                PredictionFaults.SupportArmIdentity arm) { }
 
     record InspectEffectResult(String before, String after, Throwable observationFailure, Throwable releaseFailure,
-                               Throwable freezeFailure, Throwable aftermathFailure,int releaseAttempts,int freezeAttempts) { }
+                               Throwable freezeFailure, Throwable aftermathFailure,int releaseAttempts,int freezeAttempts,
+                               N1Release n1Release,N1Freeze n1Freeze) {
+        InspectEffectResult(String before,String after,Throwable observationFailure,Throwable releaseFailure,
+                            Throwable freezeFailure,Throwable aftermathFailure,int releaseAttempts,int freezeAttempts) {
+            this(before,after,observationFailure,releaseFailure,freezeFailure,aftermathFailure,releaseAttempts,freezeAttempts,null,null);
+        }
+    }
 
     /** Client-owned effects are attempted once per identity; the worker seals their immutable result before files. */
     static final class InspectEffects {
         private Scope scope;
         private InspectEffectResult result;
         private boolean sealed;
+        private N1Release n1Release=emptyN1Release();
+        private N1Freeze n1Freeze=emptyN1Freeze();
+        synchronized InspectEffectResult sealedN1(Operation operation) {
+            return scope!=null && scope.operation()==operation && sealed?result:null;
+        }
+        private static N1Release emptyN1Release() { return new N1Release(0,N1Guard.UNOBSERVED,null,null,null,null,null); }
+        private static N1Freeze emptyN1Freeze() { return new N1Freeze(0,N1Guard.UNOBSERVED,null,null); }
+        synchronized void releaseGuard(N1Guard guard,Integer keys,String owner) {
+            if(sealed) return;
+            n1Release=new N1Release(n1Release.invocations,guard,keys,n1Release.afterKeys,owner,n1Release.afterOwner,n1Release.error);
+        }
+        synchronized void releaseInvocation() {
+            if(!sealed) n1Release=new N1Release(n1Increment(n1Release.invocations),n1Release.guard,n1Release.beforeKeys,
+                    n1Release.afterKeys,n1Release.beforeOwner,n1Release.afterOwner,n1Release.error);
+        }
+        synchronized void releaseAfter(int keys,String owner) {
+            if(!sealed) n1Release=new N1Release(n1Release.invocations,n1Release.guard,n1Release.beforeKeys,keys,n1Release.beforeOwner,owner,n1Release.error);
+        }
+        synchronized void freezeGuard(N1Guard guard) {
+            if(!sealed) n1Freeze=new N1Freeze(n1Freeze.invocations,guard,n1Freeze.watchSame,n1Freeze.error);
+        }
+        synchronized void freezeInvocation() {
+            if(!sealed) n1Freeze=new N1Freeze(n1Increment(n1Freeze.invocations),n1Freeze.guard,n1Freeze.watchSame,n1Freeze.error);
+        }
+        synchronized void freezeAfter(boolean same) {
+            if(!sealed) n1Freeze=new N1Freeze(n1Freeze.invocations,n1Freeze.guard,same,n1Freeze.error);
+        }
         synchronized InspectEffectResult attempt(Scope cleanup, java.util.function.Supplier<String> observe,
                                                   Runnable release, Runnable freeze, java.util.function.Supplier<String> after) {
             bind(cleanup);
@@ -260,13 +432,16 @@ final class ScenarioRunner implements AutoCloseable {
             try { releaseAttempts++; release.run(); } catch (RuntimeException | Error error) { releaseError = error; }
             try { aftermath = after.get(); } catch (RuntimeException | Error error) { aftermathError=error; }
             try { freezeAttempts++; freeze.run(); } catch (RuntimeException | Error error) { freezeError = error; }
-            return result = new InspectEffectResult(before,aftermath,observation,releaseError,freezeError,aftermathError,releaseAttempts,freezeAttempts);
+            if(releaseError!=null) n1Release=new N1Release(n1Release.invocations,n1Release.guard,n1Release.beforeKeys,n1Release.afterKeys,
+                    n1Release.beforeOwner,n1Release.afterOwner,safeN1Failure(releaseError));
+            if(freezeError!=null) n1Freeze=new N1Freeze(n1Freeze.invocations,n1Freeze.guard,n1Freeze.watchSame,safeN1Failure(freezeError));
+            return result = new InspectEffectResult(before,aftermath,observation,releaseError,freezeError,aftermathError,releaseAttempts,freezeAttempts,n1Release,n1Freeze);
         }
         synchronized InspectEffectResult seal(Scope cleanup, Throwable unavailable) {
             bind(cleanup);
             if (result == null) {
                 require(unavailable != null,"Cannot seal unattempted cleanup as healthy");
-                result = new InspectEffectResult(null,null,unavailable,unavailable,unavailable,null,0,0);
+                result = new InspectEffectResult(null,null,unavailable,unavailable,unavailable,null,0,0,n1Release,n1Freeze);
             }
             sealed = true; return result;
         }
@@ -274,7 +449,7 @@ final class ScenarioRunner implements AutoCloseable {
             require(cleanup.kind()==Kind.CLEANUP,"Effects require CLEANUP");
             if (scope != cleanup) {
                 require(scope==null || sealed && scope.operation()!=cleanup.operation(),"Foreign cleanup handle");
-                scope=cleanup; result=null; sealed=false;
+                scope=cleanup; result=null; sealed=false; n1Release=emptyN1Release(); n1Freeze=emptyN1Freeze();
             }
         }
     }
@@ -344,8 +519,11 @@ final class ScenarioRunner implements AutoCloseable {
         try {
             checkedDirectory(roots,artifacts.getParent());
             Files.createDirectory(artifacts); // Existing destinations never become a new operation.
+            prepareN1(operation);
             beforeInspectHeader.accept(operation); // Tests inject a real header collision at this filesystem boundary.
-            writeNew(roots,artifacts.resolve("operation.json"),operationIdentity(operation).toString());
+            writeNew(roots,artifacts.resolve("operation.json"),operationIdentity(operation).toString(),() -> {
+                if(n1!=null && n1.operation==operation) n1.headerEntered=true;
+            });
         } catch(IOException | RuntimeException | Error error) {
             var cause=error instanceof IOException io ? new UncheckedIOException(io) : error;
             if(command==Command.STARTUP) {
@@ -368,8 +546,10 @@ final class ScenarioRunner implements AutoCloseable {
             return;
         }
         inspectAdmissionFailure=primary; failedInspectAdmission=operation;
+        long occurred=System.nanoTime();
         // Latch first; a failing transport cancellation cannot restore mutation admission.
         capture(primary,() -> ((Inspect)host).cancelSession(primary));
+        captureN1Admission(operation,primary,occurred);
         } finally { inspectResetDiagnostic=null; }
     }
 
@@ -556,7 +736,7 @@ final class ScenarioRunner implements AutoCloseable {
     static ResetFault selectResetFault(boolean inspect, String inspectGate, String acceptance, String automatic,
                                        String selection, Command command, int ordinal, int resets, boolean predecessor) {
         if(!inspect || !Boolean.parseBoolean(inspectGate) || !Boolean.parseBoolean(acceptance) || automatic!=null) return null;
-        require(Set.of("baseline","displaced","reset-archive","foreign-world","work-expiry").contains(selection),"Unknown acceptance case: "+selection);
+        require(Set.of("baseline","displaced","reset-archive","foreign-world","work-expiry","n1-header","n1-post-link").contains(selection),"Unknown acceptance case: "+selection);
         if(!selection.equals("reset-archive") || command!=Command.RESET) return null;
         if(ordinal==1 || ordinal==5) {
             require(resets==(ordinal==1?0:2) && predecessor,"Invalid reset fault counter/predecessor");
@@ -872,7 +1052,7 @@ final class ScenarioRunner implements AutoCloseable {
             requireServerCheckpoint();
             return host.computeOnClient(c -> {
                 inspectEffects.attempt(cleanup,() -> { requireClient(c); return inspectObservations(c); },
-                        () -> releaseInspectOnClient(c,false,cleanup),() -> watch.freeze(),() -> {
+                        () -> releaseInspectOnClient(c,false,cleanup),() -> freezeN1(cleanup,false),() -> {
                             requireClient(c); return MapArtClient.status()+";keys="+keys(c);
                         });
                 return inspectEffects.seal(cleanup,null);
@@ -910,12 +1090,21 @@ final class ScenarioRunner implements AutoCloseable {
     }
 
     private void releaseInspectOnClient(MinecraftClient c,boolean stopping,Scope cleanup) {
+        try {
         foreignGuard("CLEANUP_RELEASE",() -> {
             if(stopping) requireInspectStopClient(c,cleanup); else requireClient(c);
             require(MapArtClient.status().engine().lifecycle().context().map(context -> runs.contains(context.runId())).orElse(true),
                     "Cleanup refuses another run's controls");
         });
-        foreignEffect("CLEANUP_STOP"); MapArtClient.stop(); requireReleased(c);
+        foreignEffect("CLEANUP_STOP");
+        } catch(RuntimeException | Error error) {
+            n1Diagnostic(() -> inspectEffects.releaseGuard(N1Guard.REFUSED,null,null)); throw error;
+        }
+        n1Diagnostic(() -> inspectEffects.releaseGuard(N1Guard.PASSED,null,null));
+        n1Diagnostic(() -> inspectEffects.releaseGuard(N1Guard.PASSED,n1Keys(c),MapArtClient.status().controlOwner().name()));
+        n1Diagnostic(inspectEffects::releaseInvocation);
+        MapArtClient.stop(); requireReleased(c);
+        n1Diagnostic(() -> inspectEffects.releaseAfter(n1Keys(c),MapArtClient.status().controlOwner().name()));
         if(expiryProof!=null) {
             var p=expiryProof; var status=MapArtClient.status();
             require(status.engine().lifecycle().context().filter(p.identity.context()::equals).isPresent()
@@ -940,7 +1129,7 @@ final class ScenarioRunner implements AutoCloseable {
         ((Inspect)host).requireStoppingScope(cleanup);
         inspectEffects.attempt(cleanup,() -> { requireInspectStopClient(c,cleanup); return inspectObservations(c); },
                 () -> releaseInspectOnClient(c,true,cleanup),() -> {
-                    ((Inspect)host).requireStoppingScope(cleanup); watch.freeze();
+                    freezeN1(cleanup,true);
                 },() -> { requireInspectStopClient(c,cleanup); return MapArtClient.status()+";keys="+keys(c); });
     }
 
@@ -5015,12 +5204,236 @@ final class ScenarioRunner implements AutoCloseable {
     private void restoreCallerOptions(MinecraftClient c) {
         if(!optionsOwned) return;
         foreignEffect("CLOSE_OPTIONS");
+        n1Diagnostic(() -> n1OptionCall(1));
         c.options.getAutoJump().setValue(callerAutoJump);
-        if(!baseline()) { c.options.getViewDistance().setValue(callerViewDistance); c.options.sendClientSettings(); }
+        if(!baseline()) {
+            n1Diagnostic(() -> n1OptionCall(2)); c.options.getViewDistance().setValue(callerViewDistance);
+            n1Diagnostic(() -> n1OptionCall(3)); c.options.sendClientSettings();
+        }
         optionsOwned=false;
     }
 
+    private static N1Options emptyN1Options(N1Guard guard) {
+        return new N1Options(0,0,0,0,guard,null,null,null,null,null,null,null,null,null);
+    }
+    private void n1OptionCall(int site) {
+        var o=n1.options; if(o==null) return;
+        n1.options=new N1Options(site==0?n1Increment(o.helperInvocations):o.helperInvocations,
+                site==1?n1Increment(o.autoJumpSetCalls):o.autoJumpSetCalls,
+                site==2?n1Increment(o.viewDistanceSetCalls):o.viewDistanceSetCalls,
+                site==3?n1Increment(o.settingsSendCalls):o.settingsSendCalls,o.guard,o.ownedBefore,o.ownedAfter,
+                o.savedAutoJump,o.savedViewDistance,o.beforeAutoJump,o.afterAutoJump,o.beforeViewDistance,o.afterViewDistance,o.error);
+    }
+    private void restoreN1Options(MinecraftClient c) {
+        try { foreignGuard("CLOSE_OPTIONS",() -> requireClient(c)); }
+        catch(RuntimeException | Error error) {
+            n1Diagnostic(() -> n1.options=emptyN1Options(N1Guard.REFUSED)); throw error;
+        }
+        n1Diagnostic(() -> n1.options=emptyN1Options(N1Guard.PASSED));
+        n1Diagnostic(() -> n1.options=new N1Options(0,0,0,0,N1Guard.PASSED,optionsOwned,null,callerAutoJump,callerViewDistance,
+                c.options.getAutoJump().getValue(),null,c.options.getViewDistance().getValue(),null,null));
+        n1Diagnostic(() -> n1OptionCall(0));
+        try { restoreCallerOptions(c); }
+        catch(RuntimeException | Error error) {
+            n1Diagnostic(() -> {
+                var o=n1.options; n1.options=new N1Options(o.helperInvocations,o.autoJumpSetCalls,o.viewDistanceSetCalls,o.settingsSendCalls,
+                        o.guard,o.ownedBefore,o.ownedAfter,o.savedAutoJump,o.savedViewDistance,o.beforeAutoJump,o.afterAutoJump,
+                        o.beforeViewDistance,o.afterViewDistance,N1Failure.of(error));
+            }); throw error;
+        }
+        n1Diagnostic(() -> {
+            var o=n1.options; n1.options=new N1Options(o.helperInvocations,o.autoJumpSetCalls,o.viewDistanceSetCalls,o.settingsSendCalls,
+                    o.guard,o.ownedBefore,optionsOwned,o.savedAutoJump,o.savedViewDistance,o.beforeAutoJump,c.options.getAutoJump().getValue(),
+                    o.beforeViewDistance,c.options.getViewDistance().getValue(),o.error);
+        });
+    }
+
+    private void captureN1Final() {
+        if(n1==null || n1.close!=null) return;
+        long occurred=System.nanoTime();
+        n1Diagnostic(() -> {
+            var d=n1; var effects=inspectEffects.sealedN1(d.operation);
+            var release=effects==null?InspectEffects.emptyN1Release():effects.n1Release();
+            var freeze=effects==null?InspectEffects.emptyN1Freeze():effects.n1Freeze();
+            d.complete &= effects!=null && effects.observationFailure()==null && effects.aftermathFailure()==null
+                    && effects.releaseFailure()==null && effects.freezeFailure()==null;
+            d.close=new N1Final(occurred,((InspectScenarioHost)host).observeN1Issue(),inspectOrdinal,resetOrdinal,countedStarts,
+                    inspectLast==d.prior,inspectAdmissionFailure==d.primary && failedInspectAdmission==d.operation,
+                    release,freeze,d.options==null?emptyN1Options(N1Guard.UNOBSERVED):d.options,
+                    new N1Close(((InspectScenarioHost)host).n1Disconnects(),d.closeGuard,d.checkpoint,normalClose,normalClose && closed,d.closeError),
+                    N1Failure.of(inspectAdmissionFailure),d.complete);
+            n1Observation=new N1Observation(normalClose && d.complete?"CLOSED":"INCOMPLETE",d.admission,null,d.close,false,null);
+        });
+    }
+
+    void emitN1Acceptance(N1Intent intent) {
+        var observed=n1Observation;
+        if(observed==null || observed.outputAttempted()) return;
+        n1Observation=new N1Observation(observed.state(),observed.admission(),intent,observed.close(),true,null);
+        boolean success=false;
+        try {
+            success=emitN1Rows(observed.admission(),intent,observed.close(),System.out,System.err,System::nanoTime);
+            if(!success && inspectAdmissionFailure!=null) retain(inspectAdmissionFailure,new IllegalStateException("N1_PROOF_OUTPUT_FAILED"));
+        } catch(RuntimeException | Error error) {
+            if(n1!=null) n1.complete=false;
+            if(inspectAdmissionFailure!=null) retain(inspectAdmissionFailure,error);
+            System.err.println("N1_PROOF_OUTPUT_FAILED");
+        } finally {
+            n1Observation=new N1Observation(observed.state(),observed.admission(),intent,observed.close(),true,success);
+        }
+    }
+
+    private static final String N1_MARKER="MAPART_N1_V1 ";
+    // Closed, typed records above define the entire wire shape; this helper only inserts their listed scalar fields.
+    private static JsonObject n1Object(Object... fields) {
+        var out=new JsonObject();
+        for(int i=0;i<fields.length;i+=2) {
+            String key=(String)fields[i]; Object value=fields[i+1];
+            require(!out.has(key),"N1 duplicate key");
+            if(value==null) out.add(key,JsonNull.INSTANCE);
+            else if(value instanceof JsonElement json) out.add(key,json);
+            else if(value instanceof Boolean bool) out.addProperty(key,bool);
+            else if(value instanceof Integer integer) {
+                if(Set.of("attempts","issues","invocations","helperInvocations","autoJumpSetCalls","viewDistanceSetCalls","settingsSendCalls").contains(key))
+                    require(integer>=0 && integer<=2,"N1 counter limit");
+                if(key.equals("samples") || key.equals("witnesses")) require(integer>=0,"N1 negative count");
+                if(key.equals("beforeKeys") || key.equals("afterKeys")) require(integer>=0 && integer<=511,"N1 key mask");
+                out.addProperty(key,integer);
+            } else {
+                require(value instanceof String || value instanceof UUID || value instanceof N1Guard,"N1 scalar type");
+                String text=value.toString();
+                int cap=key.equals("operationDirectory")?1024:key.endsWith("ClassName")||key.equals("className")?256:
+                        key.equals("message")||key.equals("causeMessage")?512:value instanceof UUID?36:64;
+                n1Text(text,cap);
+                if(key.endsWith("Nanos")) require(Long.toString(Long.parseLong(text)).equals(text),"N1 noncanonical time");
+                if(key.equals("summarySha256")) require(text.matches("[0-9a-fA-F]{64}"),"N1 invalid SHA256");
+                if(key.equals("beforeOwner") || key.equals("afterOwner")) BuildEngine.ControlOwner.valueOf(text);
+                out.addProperty(key,text);
+            }
+        }
+        return out;
+    }
+    private static JsonElement n1FailureJson(N1Failure f) {
+        if(f==null) return JsonNull.INSTANCE;
+        require(f.className!=null && (f.causeClassName!=null || f.causeMessage==null),"N1 failure shape");
+        return n1Object("className",f.className,"message",f.message,"causeClassName",f.causeClassName,"causeMessage",f.causeMessage);
+    }
+    private static JsonObject n1TriggerJson(N1Trigger t) {
+        return n1Object("attempts",t.attempts,"collisionCreated",t.collisionCreated,"headerWriteEntered",t.headerWriteEntered,"afterLinkReached",t.afterLinkReached);
+    }
+    private static JsonObject n1HostJson(N1Host h) {
+        require(h.lastOrdinal>=0,"N1 negative ordinal");
+        return n1Object("ordinaryScopeIssued",h.ordinaryScopeIssued,"currentScopeAbsent",h.currentScopeAbsent,"cancelled",h.cancelled,"lastOrdinal",h.lastOrdinal);
+    }
+    private static JsonObject n1PriorJson(N1Prior p) {
+        require(p.operationId!=null && p.runId!=null && p.summarySha256!=null,"N1 prior shape");
+        return n1Object("operationId",p.operationId,"runId",p.runId,"summarySha256",p.summarySha256,"closedFilesVerified",p.closedFilesVerified,
+                "lastSame",p.lastSame,"watchSame",p.watchSame,"samples",p.samples,"witnesses",p.witnesses);
+    }
+    private static JsonObject n1ReleaseJson(N1Release r) {
+        return n1Object("invocations",r.invocations,"guard",Objects.requireNonNull(r.guard),"beforeKeys",r.beforeKeys,"afterKeys",r.afterKeys,
+                "beforeOwner",r.beforeOwner,"afterOwner",r.afterOwner,"error",n1FailureJson(r.error));
+    }
+    private static JsonObject n1FreezeJson(N1Freeze f) {
+        return n1Object("invocations",f.invocations,"guard",Objects.requireNonNull(f.guard),"watchSame",f.watchSame,"error",n1FailureJson(f.error));
+    }
+    private static JsonObject n1OptionsJson(N1Options o) {
+        return n1Object("helperInvocations",o.helperInvocations,"autoJumpSetCalls",o.autoJumpSetCalls,"viewDistanceSetCalls",o.viewDistanceSetCalls,
+                "settingsSendCalls",o.settingsSendCalls,"guard",Objects.requireNonNull(o.guard),"ownedBefore",o.ownedBefore,"ownedAfter",o.ownedAfter,
+                "savedAutoJump",o.savedAutoJump,"savedViewDistance",o.savedViewDistance,"beforeAutoJump",o.beforeAutoJump,"afterAutoJump",o.afterAutoJump,
+                "beforeViewDistance",o.beforeViewDistance,"afterViewDistance",o.afterViewDistance,"error",n1FailureJson(o.error));
+    }
+    private static JsonObject n1CloseJson(N1Close c) {
+        return n1Object("invocations",c.invocations,"guard",Objects.requireNonNull(c.guard),"serverCheckpoint",Objects.requireNonNull(c.serverCheckpoint),
+                "returned",c.returned,"worldCleared",c.worldCleared,"error",n1FailureJson(c.error));
+    }
+    private static String n1Time(Long value) { return value==null?null:Long.toString(value); }
+    static byte[] encodeN1Row(N1Admission a,N1Intent i,N1Final f,int seq,long emitted,boolean priorOutputChecked) {
+        require(a!=null && i!=null && f!=null && seq>=1 && seq<=3 && a.failure!=null && f.failure!=null
+                && a.sessionId!=null && a.operationId!=null && a.operationDirectory!=null
+                && Set.of("n1-header","n1-post-link").contains(a.selected)
+                && a.selected.equals(i.selected) && a.sessionId.equals(i.sessionId) && a.operationId.equals(i.operationId),"N1 identity/schema");
+        require(a.reservedOrdinal>=0 && a.resetOrdinal>=0 && a.countedStarts>=0
+                && f.reservedOrdinal>=0 && f.resetOrdinal>=0 && f.countedStarts>=0,"N1 negative count");
+        var issue=f.shutdown;
+        require(issue!=null && (issue.issues==0 && issue.operationId==null && issue.kind==null && issue.issuedNanos==null && issue.deadlineNanos==null
+                || issue.issues>=1 && issue.operationId!=null && "CLEANUP".equals(issue.kind) && issue.issuedNanos!=null && issue.deadlineNanos!=null),"N1 shutdown shape");
+        String event=seq==1?"ADMISSION_FAILED":seq==2?"EXIT_REQUESTED":"CLOSE_FINAL";
+        long occurred=seq==1?a.occurredNanos:seq==2?i.intentNanos:f.occurredNanos;
+        boolean complete=a.diagnosticsComplete && f.diagnosticsComplete && n1Positive(a,i,f,emitted);
+        var row=n1Object("schema","mapartrunner-n1-native-proof-v1","event",event,"seq",seq,"case",a.selected,"sessionId",a.sessionId,
+                "operationId",a.operationId,"ordinal",3,"command","RESET","occurredNanos",Long.toString(occurred),
+                "emittedNanos",Long.toString(emitted),"diagnosticsComplete",complete);
+        if(seq==1) {
+            row.add("operationDirectory",n1Object("operationDirectory",a.operationDirectory).get("operationDirectory"));
+            row.addProperty("reservedOrdinal",a.reservedOrdinal); row.addProperty("resetOrdinal",a.resetOrdinal); row.addProperty("countedStarts",a.countedStarts);
+            row.add("trigger",n1TriggerJson(a.trigger)); row.add("host",n1HostJson(a.host)); row.add("prior",n1PriorJson(a.prior));
+            row.add("failure",n1FailureJson(a.failure)); row.addProperty("primaryIdentityRetained",a.primaryIdentityRetained);
+        } else if(seq==2) {
+            row.addProperty("workerIdleAtIntent",i.workerIdle); row.addProperty("exitDeadlineNanos",Long.toString(i.deadlineNanos));
+            row.addProperty("primaryIdentityRetained",a.primaryIdentityRetained && f.primaryIdentityRetained);
+        } else {
+            row.addProperty("intentNanos",Long.toString(i.intentNanos)); row.addProperty("exitDeadlineNanos",Long.toString(i.deadlineNanos));
+            row.addProperty("cleanupIssuedNanos",n1Time(issue.issuedNanos)); row.addProperty("cleanupDeadlineNanos",n1Time(issue.deadlineNanos));
+            row.add("shutdown",n1Object("operationId",issue.operationId,"kind",issue.kind,"issues",issue.issues));
+            row.addProperty("reservedOrdinal",f.reservedOrdinal); row.addProperty("resetOrdinal",f.resetOrdinal); row.addProperty("countedStarts",f.countedStarts);
+            row.addProperty("retainedLastSame",f.retainedLastSame); row.addProperty("primaryIdentityRetained",f.primaryIdentityRetained);
+            row.add("release",n1ReleaseJson(f.release)); row.add("freeze",n1FreezeJson(f.freeze)); row.add("options",n1OptionsJson(f.options));
+            row.add("close",n1CloseJson(f.close)); row.add("failure",n1FailureJson(f.failure)); row.addProperty("priorRowsOutputChecked",priorOutputChecked);
+        }
+        byte[] bytes=(N1_MARKER+row+"\n").getBytes(StandardCharsets.UTF_8);
+        require(bytes.length<=8192,"N1 row byte limit"); return bytes;
+    }
+    static boolean n1Elapsed(long earlier,long later) { long elapsed=later-earlier; return elapsed>=0 && elapsed<=3_800_000_000_000L; }
+    static boolean n1OptionsPositive(N1Options o) {
+        if(o==null || o.guard!=N1Guard.PASSED || o.helperInvocations!=1 || o.error!=null || o.ownedBefore==null || o.ownedAfter==null
+                || o.savedAutoJump==null || o.savedViewDistance==null || o.beforeAutoJump==null || o.afterAutoJump==null
+                || o.beforeViewDistance==null || o.afterViewDistance==null || o.ownedAfter || !o.afterViewDistance.equals(o.beforeViewDistance)) return false;
+        return o.ownedBefore?o.autoJumpSetCalls==1 && o.viewDistanceSetCalls==0 && o.settingsSendCalls==0 && o.afterAutoJump.equals(o.savedAutoJump)
+                :o.autoJumpSetCalls==0 && o.viewDistanceSetCalls==0 && o.settingsSendCalls==0 && o.afterAutoJump.equals(o.beforeAutoJump);
+    }
+    static boolean n1Positive(N1Admission a,N1Intent i,N1Final f,long emitted) {
+        if(a==null || i==null || f==null || !a.diagnosticsComplete || !f.diagnosticsComplete
+                || a.host==null || a.prior==null || a.trigger==null || f.shutdown==null || f.release==null || f.freeze==null || f.close==null) return false;
+        var h=a.host; var p=a.prior; var t=a.trigger; var s=f.shutdown; var r=f.release; var z=f.freeze; var c=f.close;
+        return a.reservedOrdinal==3 && a.resetOrdinal==1 && a.countedStarts==1 && f.reservedOrdinal==3 && f.resetOrdinal==1 && f.countedStarts==1
+                && a.primaryIdentityRetained && f.primaryIdentityRetained && f.retainedLastSame && i.workerIdle
+                && a.failure!=null && a.failure.equals(f.failure)
+                && (a.selected.equals("n1-header")?a.failure.className.equals(UncheckedIOException.class.getName()) && a.failure.causeClassName!=null
+                    : a.failure.className.equals(ScenarioLaunchReceipt.class.getName()+"$SimulatedN1PostLinkFailure")
+                      && "SIMULATED_N1_AFTER_BEGIN_LINK_BEFORE_RETURN".equals(a.failure.message))
+                && !h.ordinaryScopeIssued && h.currentScopeAbsent && h.cancelled && h.lastOrdinal==2
+                && p.closedFilesVerified && p.lastSame && p.watchSame && p.samples>0 && p.witnesses>0 && t.attempts==1 && t.headerWriteEntered
+                && (a.selected.equals("n1-header")?t.collisionCreated && !t.afterLinkReached:!t.collisionCreated && t.afterLinkReached)
+                && a.selected.equals(i.selected) && a.sessionId.equals(i.sessionId) && a.operationId.equals(i.operationId)
+                && s.issues==1 && a.operationId.equals(s.operationId) && "CLEANUP".equals(s.kind) && s.issuedNanos!=null && s.deadlineNanos!=null
+                && i.deadlineNanos==i.intentNanos+10_000_000_000L && s.deadlineNanos==s.issuedNanos+10_000_000_000L
+                && n1Elapsed(a.occurredNanos,i.intentNanos) && n1Elapsed(i.intentNanos,s.issuedNanos) && n1Elapsed(s.issuedNanos,f.occurredNanos)
+                && n1Elapsed(f.occurredNanos,emitted) && f.occurredNanos-i.deadlineNanos<0 && f.occurredNanos-s.deadlineNanos<0
+                && r.invocations==1 && r.guard==N1Guard.PASSED && r.beforeKeys!=null && r.beforeOwner!=null
+                && Integer.valueOf(0).equals(r.afterKeys) && "NONE".equals(r.afterOwner)
+                && r.error==null && z.invocations==1 && z.guard==N1Guard.PASSED && Boolean.TRUE.equals(z.watchSame) && z.error==null
+                && n1OptionsPositive(f.options) && c.invocations==1 && c.guard==N1Guard.PASSED && c.serverCheckpoint==N1Guard.PASSED
+                && c.returned && c.worldCleared && c.error==null;
+    }
+    static boolean emitN1Rows(N1Admission a,N1Intent intent,N1Final close,java.io.PrintStream out,java.io.PrintStream err,
+                              java.util.function.LongSupplier clock) {
+        try {
+            // Validate the whole set before a single byte is emitted; bounded times and boolean substitutions are rechecked below.
+            for(int seq=1;seq<=3;seq++) encodeN1Row(a,intent,close,seq,Long.MIN_VALUE,false);
+            for(int seq=1;seq<=2;seq++) out.write(encodeN1Row(a,intent,close,seq,clock.getAsLong(),false));
+            out.flush(); if(out.checkError()) throw new IOException("N1 output error");
+            out.write(encodeN1Row(a,intent,close,3,clock.getAsLong(),true)); out.flush();
+            if(out.checkError()) throw new IOException("N1 output error");
+            return true;
+        } catch(IOException | RuntimeException | Error failure) { err.println("N1_PROOF_OUTPUT_FAILED"); return false; }
+    }
+
     private void closeInspect() {
+        if(n1Observation!=null && n1Observation.close()==null && !n1Observation.outputAttempted()) {
+            var observed=n1Observation;
+            n1Observation=new N1Observation("CLOSE_ATTEMPTED",observed.admission(),observed.intent(),observed.close(),false,null);
+        }
         try {
         require(inspectUnresolvedCleanupFailure==null,"Owned inspect cleanup is unresolved; cannot renew its cleanup scope");
         var transport=(Inspect)host;
@@ -5033,7 +5446,10 @@ final class ScenarioRunner implements AutoCloseable {
             var cleanup=transport.requireScope(inspectOperation,Kind.CLEANUP);
             closeInspectOwned(inspectOperation,cleanup);
         }
-        } finally { inspectResetDiagnostic=null; inspectForeignPrior=null; inspectForeignOperation=null; }
+        } finally {
+            captureN1Final();
+            inspectResetDiagnostic=null; inspectForeignPrior=null; inspectForeignOperation=null;
+        }
     }
 
     private void closeInspectOwned(Operation operation, Scope cleanup) {
@@ -5050,23 +5466,30 @@ final class ScenarioRunner implements AutoCloseable {
                     }));
                 } catch(RuntimeException | Error error) { failure=retain(failure,error); }
             }
-            var effects=finishInspectEffects(cleanup);
-            if(effects.releaseFailure()!=null) failure=retain(failure,effects.releaseFailure());
-            if(effects.freezeFailure()!=null) failure=retain(failure,effects.freezeFailure());
-            if(effects.observationFailure()!=null) failure=retain(failure,effects.observationFailure());
-            if(effects.aftermathFailure()!=null) failure=retain(failure,effects.aftermathFailure());
-            if(effects.releaseFailure()!=null || effects.freezeFailure()!=null) inspectUnresolvedCleanupFailure=failure;
-            try { host.runOnClient(c -> {
-                foreignGuard("CLOSE_OPTIONS",() -> requireClient(c));
-                restoreCallerOptions(c);
-            }); }
+            try {
+                var effects=finishInspectEffects(cleanup);
+                if(effects.releaseFailure()!=null) failure=retain(failure,effects.releaseFailure());
+                if(effects.freezeFailure()!=null) failure=retain(failure,effects.freezeFailure());
+                if(effects.observationFailure()!=null) failure=retain(failure,effects.observationFailure());
+                if(effects.aftermathFailure()!=null) failure=retain(failure,effects.aftermathFailure());
+                if(effects.releaseFailure()!=null || effects.freezeFailure()!=null) inspectUnresolvedCleanupFailure=failure;
+            } catch(RuntimeException | Error error) {
+                if(n1==null) throw error;
+                n1.complete=false; failure=retain(failure,error); inspectUnresolvedCleanupFailure=failure;
+            }
+            try { host.runOnClient(this::restoreN1Options); }
             catch(RuntimeException | Error error) { failure=retain(failure,error); }
             try {
-                requireServerCheckpoint(); host.runOnClient(this::requireClient);
-                ((Inspect)host).closeWorld(c -> foreignGuard("CLOSE_NATIVE",() -> requireClient(c))); closed=true; normalClose=true;
+                try { requireServerCheckpoint(); n1Diagnostic(() -> n1.checkpoint=N1Guard.PASSED); }
+                catch(RuntimeException | Error error) { n1Diagnostic(() -> n1.checkpoint=N1Guard.REFUSED); throw error; }
+                host.runOnClient(this::requireClient);
+                ((Inspect)host).closeWorld(c -> {
+                    try { foreignGuard("CLOSE_NATIVE",() -> requireClient(c)); n1Diagnostic(() -> n1.closeGuard=N1Guard.PASSED); }
+                    catch(RuntimeException | Error error) { n1Diagnostic(() -> n1.closeGuard=N1Guard.REFUSED); throw error; }
+                }); closed=true; normalClose=true;
                 if(inspectAdmissionFailure==null)
                     writeNew(roots,artifacts.resolve("world-closed.txt"),"WORLD CLOSED normally; session="+invocation+"; operation="+operation.operationId());
-            } catch(RuntimeException | Error error) { failure=retain(failure,error); }
+            } catch(RuntimeException | Error error) { n1Diagnostic(() -> n1.closeError=N1Failure.of(error)); failure=retain(failure,error); }
         } else {
             inspectEffects.attempt(cleanup,() -> null,() -> { },watch::freeze,() -> null);
             var effects=inspectEffects.seal(cleanup,null);
@@ -5339,8 +5762,11 @@ final class ScenarioRunner implements AutoCloseable {
         } catch (IOException e) { throw new UncheckedIOException(e); }
     }
     private static void writeNew(Roots r, Path file, String text) {
+        writeNew(r,file,text,() -> { });
+    }
+    private static void writeNew(Roots r, Path file, String text,Runnable writeEntered) {
         checkRoots(r); require(real(file.getParent()).equals(file.getParent()) && file.startsWith(r.evidence),"Archive write escaped");
-        try { Files.writeString(file,text,StandardCharsets.UTF_8,StandardOpenOption.CREATE_NEW); }
+        try { writeEntered.run(); Files.writeString(file,text,StandardCharsets.UTF_8,StandardOpenOption.CREATE_NEW); }
         catch (IOException e) { throw new UncheckedIOException(e); }
     }
     private void writeLinesNew(Path file,Iterable<String> lines) {

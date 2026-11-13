@@ -74,6 +74,32 @@ final class InspectScenarioHost implements Inspect {
     private volatile boolean cancelled, stopped;
     private volatile MinecraftServer server;
     private volatile Path save;
+    private Operation n1Operation;
+    private volatile ScenarioRunner.N1Issue n1Issue=ScenarioRunner.N1Issue.absent();
+    private int n1Disconnects;
+    boolean nativeN1Owner() { return client!=null && receipts!=null; }
+    void armN1PostLink(Operation operation,UUID priorOperation,UUID priorRun) {
+        rejectNativeWait(); lock.lock();
+        try {
+            check(nativeN1Owner() && ScenarioRunner.n1Selected("n1-post-link") && !cancelled && !stopped && current==null
+                    && n1Operation==null && operation.ordinal()==3 && operation.command()==Command.RESET
+                    && lastOrdinal==2 && operation.sessionId().equals(session)
+                    && issued.stream().anyMatch(prior -> prior.ordinal()==2 && prior.command()==Command.RUN
+                    && prior.sessionId().equals(session) && prior.operationId().equals(priorOperation)),"Invalid N1 Host arm");
+            n1Operation=operation; receipts.armN1PostLink(operation,priorOperation,priorRun);
+        } finally { lock.unlock(); }
+    }
+    ScenarioRunner.N1Host captureN1Admission(Operation operation) {
+        rejectNativeWait(); lock.lock();
+        try {
+            if(n1Operation==null) n1Operation=operation;
+            check(n1Operation==operation,"Foreign N1 diagnostic");
+            return new ScenarioRunner.N1Host(issued.contains(operation),current==null,cancelled,lastOrdinal);
+        } finally { lock.unlock(); }
+    }
+    boolean n1AfterLink(Operation operation) { return receipts!=null && receipts.n1AfterLink(operation); }
+    ScenarioRunner.N1Issue observeN1Issue() { return n1Issue; }
+    int n1Disconnects() { return n1Disconnects; }
 
     // WORK owns wrapper/read retirement; A owns suppression until actual terminal release. CLEANUP owns only the busy rendezvous.
     private static final class ExpiryBoundary {
@@ -612,7 +638,10 @@ final class InspectScenarioHost implements Inspect {
             issued.add(operation); session = operation.sessionId(); lastOrdinal = operation.ordinal(); settlementAttempted=false;
             lineage=Lineage.FAILED_ADMISSION;
             shutdownIssued=true;
-            return current = new Scope(operation, Kind.CLEANUP, clock.getAsLong() + CLEANUP_NANOS);
+            long issuedNanos=clock.getAsLong();
+            current = new Scope(operation, Kind.CLEANUP, issuedNanos + CLEANUP_NANOS);
+            if(n1Operation==operation) n1Issue=new ScenarioRunner.N1Issue(operation.operationId(),"CLEANUP",1,issuedNanos,current.deadlineNanos());
+            return current;
         } finally { lock.unlock(); }
     }
     @Override public void settleStartup(Scope scope) {
@@ -903,7 +932,9 @@ final class InspectScenarioHost implements Inspect {
                 System.out.println("INSPECT_NATIVE_CLOSE ENTER; "+operation+"; world="+System.identityHashCode(c.world)
                         +"; server="+System.identityHashCode(c.getServer())+"; connection="+System.identityHashCode(connection)
                         +"; connectionOpen="+connection.isOpen());
-            },() -> { foreignEffect("CLOSE_NATIVE_WORLD"); c.world.disconnect(Text.translatable("menu.savingLevel")); },
+            },() -> { foreignEffect("CLOSE_NATIVE_WORLD");
+                        if(n1Operation==scope.operation()) n1Disconnects=ScenarioRunner.n1Increment(n1Disconnects);
+                        c.world.disconnect(Text.translatable("menu.savingLevel")); },
                     () -> { foreignEffect("CLOSE_NATIVE_CLIENT"); c.disconnect(new TitleScreen(), false); });
             var connection=c.getNetworkHandler()==null?null:c.getNetworkHandler().getConnection();
             System.out.println("INSPECT_NATIVE_CLOSE RETURN; "+operation+"; world="+System.identityHashCode(c.world)
