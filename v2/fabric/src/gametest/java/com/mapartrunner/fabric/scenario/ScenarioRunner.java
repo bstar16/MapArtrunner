@@ -61,6 +61,8 @@ import java.io.BufferedWriter;
 import java.io.OutputStreamWriter;
 import java.io.Writer;
 import java.io.PrintWriter;
+import java.lang.management.GarbageCollectorMXBean;
+import java.lang.management.ManagementFactory;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.security.MessageDigest;
@@ -4788,13 +4790,18 @@ final class ScenarioRunner implements AutoCloseable {
 
     private void createOwnedWorld() {
         checkRoots(roots);
-        host.runOnClient(this::requireUncreatedClient);
+        var preCreateSettings=new JsonObject();
+        host.runOnClient(c -> {
+            requireUncreatedClient(c);
+            if(!inspectMode) captureAutomaticCreationSettings(c,preCreateSettings);
+        });
         // WorldCreator's constructor already probes save names: guard the entire builder entry.
         try {
             if (!Files.exists(roots.saves,LinkOption.NOFOLLOW_LINKS)) Files.createDirectory(roots.saves);
         } catch (IOException e) { throw new UncheckedIOException(e); }
         guardedWorldCreation(roots,roots.saves,real(roots.saves),() -> {
-            if(inspectMode) ((Inspect)host).createWorld(this::requireProspectiveInspectSave); else host.createWorld();
+            if(inspectMode) ((Inspect)host).createWorld(this::requireProspectiveInspectSave);
+            else createAutomaticWorld(host,invocation,fixture,preCreateSettings);
             worldCreated=true;
         });
         server = host.computeOnServer(s -> {
@@ -4819,6 +4826,81 @@ final class ScenarioRunner implements AutoCloseable {
                 + "; server=" + System.identityHashCode(server) + "; serverPlayer=" + System.identityHashCode(serverPlayer)
                 + "; clientWorld=" + System.identityHashCode(clientWorld) + "; clientPlayer=" + System.identityHashCode(clientPlayer)
                 + "; handler=" + System.identityHashCode(handler) + "; connection=" + System.identityHashCode(connection));
+    }
+
+    static void createAutomaticWorld(ScenarioHost host,UUID invocation,ScenarioDefinition.Fixture fixture,JsonObject preCreateSettings) {
+        automaticCreationObservation(invocation,fixture,preCreateSettings,"BEGIN",-1);
+        boolean returned=false;
+        long started=System.nanoTime();
+        try {
+            host.createWorld();
+            returned=true;
+        } finally {
+            long elapsed=System.nanoTime()-started;
+            automaticCreationObservation(invocation,fixture,preCreateSettings,returned?"RETURNED":"THREW",elapsed);
+        }
+    }
+
+    static void captureAutomaticCreationSettings(MinecraftClient client,JsonObject settings) {
+        try {
+            for(var key:List.of("viewDistanceRaw","viewDistanceClamped","simulationDistanceRaw")) settings.add(key,JsonNull.INSTANCE);
+            settings.addProperty("viewDistanceRaw",client.options.getViewDistance().getValue());
+            settings.addProperty("viewDistanceClamped",client.options.getClampedViewDistance());
+            settings.addProperty("simulationDistanceRaw",client.options.getSimulationDistance().getValue());
+        } catch(RuntimeException | Error unavailable) { /* Diagnostics never grant or deny creation. */ }
+    }
+
+    private static void automaticCreationObservation(UUID invocation,ScenarioDefinition.Fixture fixture,JsonObject settings,String outcome,long elapsed) {
+        try {
+            var row=new JsonObject();
+            row.addProperty("entryPoint","automatic"); row.addProperty("invocation",invocation.toString());
+            row.addProperty("fixture",fixture.name()); row.addProperty("outcome",outcome);
+            row.add("settings",settings); row.addProperty("elapsedNs",elapsed<0?null:Long.toString(elapsed));
+            row.add("resources",automaticCreationResources());
+            String payload="MAPART_AUTOMATIC_CREATION "+row;
+            if((payload+System.lineSeparator()).getBytes(StandardCharsets.UTF_8).length<=2048) System.out.println(payload);
+        } catch(RuntimeException | Error unavailable) { /* Never replace a native throwable or change handle retention. */ }
+    }
+
+    private static JsonObject automaticCreationResources() {
+        var metrics=new JsonObject();
+        for(var key:List.of("uptimeMs","heapUsedBytes","heapCommittedBytes","heapMaxBytes","gcCount","gcTimeMs","processCpuNs"))
+            metrics.add(key,JsonNull.INSTANCE);
+        try { automaticLong(metrics,"uptimeMs",ManagementFactory.getRuntimeMXBean().getUptime()); }
+        catch(RuntimeException | Error unavailable) { }
+        try {
+            var heap=ManagementFactory.getMemoryMXBean().getHeapMemoryUsage();
+            automaticLong(metrics,"heapUsedBytes",heap.getUsed()); automaticLong(metrics,"heapCommittedBytes",heap.getCommitted());
+            automaticLong(metrics,"heapMaxBytes",heap.getMax());
+        } catch(RuntimeException | Error unavailable) { }
+        try {
+            var gc=automaticGcCounters(ManagementFactory.getGarbageCollectorMXBeans());
+            metrics.add("gcCount",gc.get("gcCount")); metrics.add("gcTimeMs",gc.get("gcTimeMs"));
+        } catch(RuntimeException | Error unavailable) { }
+        try {
+            var cpu=ProcessHandle.current().info().totalCpuDuration();
+            if(cpu.isPresent()) automaticLong(metrics,"processCpuNs",cpu.get().toNanos());
+        } catch(RuntimeException | Error unavailable) { }
+        return metrics;
+    }
+
+    static JsonObject automaticGcCounters(List<? extends GarbageCollectorMXBean> collectors) {
+        var metrics=new JsonObject(); metrics.add("gcCount",JsonNull.INSTANCE); metrics.add("gcTimeMs",JsonNull.INSTANCE);
+        try {
+            if(collectors.isEmpty() || collectors.size()>16) return metrics;
+            long count=0,time=0;
+            for(var collector:collectors) {
+                long nextCount=collector.getCollectionCount(),nextTime=collector.getCollectionTime();
+                if(nextCount<0 || nextTime<0) return metrics;
+                count=Math.addExact(count,nextCount); time=Math.addExact(time,nextTime);
+            }
+            automaticLong(metrics,"gcCount",count); automaticLong(metrics,"gcTimeMs",time);
+        } catch(RuntimeException | Error unavailable) { }
+        return metrics;
+    }
+
+    private static void automaticLong(JsonObject metrics,String key,long value) {
+        metrics.addProperty(key,value<0?null:Long.toString(value));
     }
 
     private void preflight(ScenarioDefinition d) {
