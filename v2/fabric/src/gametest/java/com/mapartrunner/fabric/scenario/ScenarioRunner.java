@@ -1037,8 +1037,13 @@ final class ScenarioRunner implements AutoCloseable {
         return gson.toJson(proof);
     }
 
-    private String inspectObservations(MinecraftClient client) {
-        return MapArtClient.status()+"\nkeys="+keys(client)+"\n"+watch.retained()+"\n"+PredictionFaults.snapshot()+"\n"+PredictionFaults.stateSnapshot();
+    private String inspectObservations(MinecraftClient client,Command command) {
+        return MapArtClient.status()+"\nkeys="+keys(client)+"\n"+inspectObserverDescription(command,watch.retained())+"\n"+PredictionFaults.snapshot()+"\n"+PredictionFaults.stateSnapshot();
+    }
+
+    static String inspectObserverDescription(ScenarioHost.Command command,ScenarioObserver.Watch.Retained retained) {
+        // RESET's ended prior WORK cannot record/commit; archive-before-clear or failure capture keeps its full samples.
+        return command==Command.RESET?"samples="+retained.samples().size()+"\n"+pairedEvidence(retained):String.valueOf(retained);
     }
 
     private InspectEffectResult finishInspectEffects(Scope cleanup) {
@@ -1051,7 +1056,7 @@ final class ScenarioRunner implements AutoCloseable {
             host.runOnClient(c -> foreignGuard("CLEANUP_PREFLIGHT",() -> requireClient(c)));
             requireServerCheckpoint();
             return host.computeOnClient(c -> {
-                inspectEffects.attempt(cleanup,() -> { requireClient(c); return inspectObservations(c); },
+                inspectEffects.attempt(cleanup,() -> { requireClient(c); return inspectObservations(c,cleanup.operation().command()); },
                         () -> releaseInspectOnClient(c,false,cleanup),() -> freezeN1(cleanup,false),() -> {
                             requireClient(c); return MapArtClient.status()+";keys="+keys(c);
                         });
@@ -1127,7 +1132,7 @@ final class ScenarioRunner implements AutoCloseable {
 
     private void stopInspectOnClient(MinecraftClient c,Scope cleanup) {
         ((Inspect)host).requireStoppingScope(cleanup);
-        inspectEffects.attempt(cleanup,() -> { requireInspectStopClient(c,cleanup); return inspectObservations(c); },
+        inspectEffects.attempt(cleanup,() -> { requireInspectStopClient(c,cleanup); return inspectObservations(c,cleanup.operation().command()); },
                 () -> releaseInspectOnClient(c,true,cleanup),() -> {
                     freezeN1(cleanup,true);
                 },() -> { requireInspectStopClient(c,cleanup); return MapArtClient.status()+";keys="+keys(c); });

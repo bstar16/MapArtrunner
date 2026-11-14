@@ -266,6 +266,35 @@ class ScenarioInspectLifecycleTest {
         finally { names.forEach(name -> { if(old.get(name)==null) System.clearProperty(name); else System.setProperty(name,old.get(name)); }); }
     }
 
+    @Test void resetReleaseObserverDescriptionKeepsPairedEvidenceWithoutExpandingHistory() throws Exception {
+        var schedule=scheduledResume(true,6.165848892158152,6.415356906947316);
+        var original=schedule.watch().retained(); var source=original.samples().getFirst();
+        var payload="RESET_RELEASE_EXPANDED_SAMPLE_PAYLOAD";
+        var distinctive=new ScenarioObserver.Sample(999,payload,source.worldIdentity(),source.originalWorld(),source.pose(),
+                source.keys(),source.paused(),source.status(),source.observations());
+        var samples=new java.util.ArrayList<>(original.samples()); samples.add(distinctive);
+        var failure=new IllegalStateException("retained first failure");
+        var retained=new ScenarioObserver.Watch.Retained(samples,failure,original.binding(),original.witnesses(),original.resume(),original.lower());
+        var full=retained.toString(); var sampleHistory=retained.samples(); var witnesses=retained.witnesses();
+
+        var reset=ScenarioRunner.inspectObserverDescription(Command.RESET,retained);
+        assertFalse(reset.contains(payload),"RESET must not expand the retained sample history again");
+        assertTrue(reset.startsWith("samples="+samples.size()+"\n"));
+        var paired=ScenarioRunner.class.getDeclaredMethod("pairedEvidence",ScenarioObserver.Watch.Retained.class);
+        paired.setAccessible(true);
+        assertTrue(reset.endsWith((String)paired.invoke(null,retained)),"Complete existing paired evidence must remain");
+        for(var evidence:List.of(retained.binding(),failure,retained.resume(),retained.lower()))
+            assertTrue(reset.contains(evidence.toString()));
+        for(var witness:witnesses) assertTrue(reset.contains(witness.toString()));
+        for(var command:Command.values()) if(command!=Command.RESET)
+            assertEquals(full,ScenarioRunner.inspectObserverDescription(command,retained),command.name());
+
+        assertSame(sampleHistory,retained.samples()); assertEquals(samples,retained.samples());
+        assertSame(distinctive,retained.samples().getLast()); assertTrue(distinctive.line().contains(payload));
+        assertSame(witnesses,retained.witnesses()); assertEquals(original.witnesses(),retained.witnesses());
+        assertEquals(full,retained.toString()); assertEquals(original,schedule.watch().retained());
+    }
+
     @Test void opaqueIdleValueComparesWholeHistoryBindingAndFirstFailureDespiteEqualCounts() {
         var context=witnessContext(); var watch=pairedWatch(context,witnessSamples(context),null,null);
         var retained=watch.retained(); var before=new ScenarioRunner.InspectIdleObservation(retained);
