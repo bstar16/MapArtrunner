@@ -1,5 +1,7 @@
 package com.mapartrunner.fabric.scenario;
 
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 import com.mapartrunner.fabric.scenario.threading.PacketHandlerAwait;
 import com.mapartrunner.fabric.scenario.threading.RegistrationAcknowledgement;
 import net.fabricmc.fabric.api.client.gametest.v1.context.ClientGameTestContext;
@@ -14,7 +16,12 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.junit.jupiter.api.parallel.Isolated;
 
+import java.io.ByteArrayOutputStream;
+import java.io.PrintStream;
+import java.nio.charset.StandardCharsets;
+import java.lang.management.GarbageCollectorMXBean;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Proxy;
 import java.nio.file.Path;
@@ -31,6 +38,7 @@ import static com.mapartrunner.fabric.scenario.ScenarioHost.*;
 
 import static org.junit.jupiter.api.Assertions.*;
 
+@Isolated("Temporarily replaces process stdout for creation diagnostics")
 class ScenarioHostTest {
     @BeforeAll static void bootstrap() {
         net.minecraft.SharedConstants.createGameVersion();
@@ -888,6 +896,150 @@ class ScenarioHostTest {
         void nativeCall(Runnable action) { clientThread.set(true); try { action.run(); } finally { clientThread.remove(); } }
         @Override public void close() { worker.shutdownNow(); }
     }
+    @Test void automaticCreationEmitsBoundedCorrelatedEndpointsAndPreservesNativeRoutes() {
+        var nativeHost = new NativeContext();
+        var host = ScenarioHost.automatic(nativeHost.client);
+        var invocation = UUID.randomUUID();
+        var output = new ByteArrayOutputStream(); var previous = System.out;
+        try (var captured = new PrintStream(output, true, StandardCharsets.UTF_8)) {
+            System.setOut(captured);
+            ScenarioRunner.createAutomaticWorld(host, invocation, ScenarioDefinition.Fixture.TWO_LANE, new JsonObject());
+        } finally { System.setOut(previous); }
+        var rows = creationRows(output, invocation, "RETURNED");
+        assertTrue(Long.parseLong(rows.getLast().get("elapsedNs").getAsString()) >= 0);
+        assertTrue(rows.getFirst().get("elapsedNs").isJsonNull());
+        assertSame(nativeHost.saveDirectory, host.saveDirectory()); host.closeWorld();
+        assertEquals(List.of("ClientGameTestContext.worldBuilder", "TestWorldBuilder.create",
+                "TestSingleplayerContext.getWorldSave", "TestWorldSave.getSaveDirectory", "TestSingleplayerContext.close"), nativeHost.calls);
+    }
+
+    @Test void failedSettingsCaptureOnExistingCallbackStillCreatesExactlyOnce() {
+        var nativeHost = new NativeContext(); var host = ScenarioHost.automatic(nativeHost.client);
+        var settings = new JsonObject(); var output = new ByteArrayOutputStream(); var previous = System.out;
+        var invocation = UUID.randomUUID();
+        try (var captured = new PrintStream(output, true, StandardCharsets.UTF_8)) {
+            System.setOut(captured);
+            host.runOnClient(client -> ScenarioRunner.captureAutomaticCreationSettings(client, settings));
+            ScenarioRunner.createAutomaticWorld(host, invocation, ScenarioDefinition.Fixture.TWO_LANE, settings);
+        } finally { System.setOut(previous); }
+        var observed = creationRows(output, invocation, "RETURNED").getFirst().getAsJsonObject("settings");
+        assertEquals(3, observed.size()); observed.entrySet().forEach(entry -> assertTrue(entry.getValue().isJsonNull()));
+        assertEquals(List.of("ClientGameTestContext.runOnClient", "ClientGameTestContext.worldBuilder", "TestWorldBuilder.create"), nativeHost.calls);
+    }
+
+    @Test void diagnosticOutputRuntimeExceptionAndErrorCannotChangeNativeSuccessOrFailure() {
+        for (Throwable diagnostic : List.of(new IllegalStateException("stdout"), new AssertionError("stdout"))) {
+            for (String boundary : List.of("success", "ClientGameTestContext.worldBuilder", "TestWorldBuilder.create")) {
+                for (Throwable nativeFailure : List.of(new IllegalStateException("native"), new AssertionError("native"))) {
+                    var nativeHost = new NativeContext(); var host = ScenarioHost.automatic(nativeHost.client);
+                    if (!boundary.equals("success")) { nativeHost.failureAt = boundary; nativeHost.failure = nativeFailure; }
+                    var writes = new AtomicInteger(); var previous = System.out;
+                    try (var throwing = new PrintStream(new ByteArrayOutputStream()) {
+                        @Override public void println(String value) { writes.incrementAndGet(); rethrow(diagnostic); }
+                    }) {
+                        System.setOut(throwing);
+                        if (boundary.equals("success")) {
+                            ScenarioRunner.createAutomaticWorld(host, UUID.randomUUID(), ScenarioDefinition.Fixture.TWO_LANE, new JsonObject());
+                            assertSame(nativeHost.saveDirectory, host.saveDirectory()); host.closeWorld();
+                        } else {
+                            assertSame(nativeFailure, assertThrows(Throwable.class, () -> ScenarioRunner.createAutomaticWorld(
+                                    host, UUID.randomUUID(), ScenarioDefinition.Fixture.TWO_LANE, new JsonObject())));
+                            assertEquals(0, nativeFailure.getSuppressed().length);
+                        }
+                    } finally { System.setOut(previous); }
+                    assertEquals(2, writes.get());
+                    assertEquals(boundary.equals("success") ? List.of("ClientGameTestContext.worldBuilder", "TestWorldBuilder.create",
+                            "TestSingleplayerContext.getWorldSave", "TestWorldSave.getSaveDirectory", "TestSingleplayerContext.close")
+                            : boundary.equals("ClientGameTestContext.worldBuilder") ? List.of(boundary)
+                            : List.of("ClientGameTestContext.worldBuilder", boundary), nativeHost.calls);
+                }
+            }
+        }
+    }
+
+    @Test void creationPayloadOverCapIsDroppedWithoutRetryOrNativeChanges() {
+        var nativeHost = new NativeContext(); var host = ScenarioHost.automatic(nativeHost.client);
+        var settings = new JsonObject(); settings.addProperty("oversized", "x".repeat(2048));
+        var output = new ByteArrayOutputStream(); var previous = System.out;
+        try (var captured = new PrintStream(output, true, StandardCharsets.UTF_8)) {
+            System.setOut(captured);
+            ScenarioRunner.createAutomaticWorld(host, UUID.randomUUID(), ScenarioDefinition.Fixture.TWO_LANE, settings);
+        } finally { System.setOut(previous); }
+        assertEquals(0, output.size());
+        assertEquals(List.of("ClientGameTestContext.worldBuilder", "TestWorldBuilder.create"), nativeHost.calls);
+    }
+
+    @Test void gcEndpointsKeepUnknownOverflowFailureAndCollectorLimitUnknown() {
+        var known = gcCollector(3, 5); var sum = ScenarioRunner.automaticGcCounters(List.of(known, known));
+        assertEquals("6", sum.get("gcCount").getAsString()); assertEquals("10", sum.get("gcTimeMs").getAsString());
+        var failed = (GarbageCollectorMXBean) Proxy.newProxyInstance(GarbageCollectorMXBean.class.getClassLoader(),
+                new Class<?>[]{GarbageCollectorMXBean.class}, (proxy, method, args) -> { throw new AssertionError("unavailable"); });
+        var reads = new AtomicInteger();
+        var unread = (GarbageCollectorMXBean) Proxy.newProxyInstance(GarbageCollectorMXBean.class.getClassLoader(),
+                new Class<?>[]{GarbageCollectorMXBean.class}, (proxy, method, args) -> { reads.incrementAndGet(); return 0L; });
+        for (var collectors : List.of(List.<GarbageCollectorMXBean>of(), List.of(gcCollector(-1, 0)),
+                List.of(gcCollector(0, -1)), List.of(gcCollector(Long.MAX_VALUE, 1), known),
+                List.of(gcCollector(1, Long.MAX_VALUE), known), List.of(failed), Collections.nCopies(17, failed))) {
+            var unknown = ScenarioRunner.automaticGcCounters(collectors);
+            assertTrue(unknown.get("gcCount").isJsonNull()); assertTrue(unknown.get("gcTimeMs").isJsonNull());
+        }
+        var sixteen = ScenarioRunner.automaticGcCounters(Collections.nCopies(16, known));
+        assertEquals("48", sixteen.get("gcCount").getAsString());
+        assertTrue(ScenarioRunner.automaticGcCounters(Collections.nCopies(17, unread)).get("gcCount").isJsonNull());
+        assertEquals(0, reads.get(), "Over-limit collector sets must not be sampled");
+    }
+
+    private static GarbageCollectorMXBean gcCollector(long count, long time) {
+        return (GarbageCollectorMXBean) Proxy.newProxyInstance(GarbageCollectorMXBean.class.getClassLoader(),
+                new Class<?>[]{GarbageCollectorMXBean.class}, (proxy, method, args) -> switch (method.getName()) {
+                    case "getCollectionCount" -> count; case "getCollectionTime" -> time;
+                    default -> throw new AssertionError("Unexpected collector call");
+                });
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"ClientGameTestContext.worldBuilder", "TestWorldBuilder.create"})
+    void automaticCreationObservesOriginalNativeRuntimeExceptionAndError(String boundary) {
+        for (Throwable failure : List.of(new IllegalStateException("native sentinel"), new AssertionError("native sentinel"))) {
+            var nativeHost = new NativeContext(); var host = ScenarioHost.automatic(nativeHost.client);
+            nativeHost.failureAt = boundary; nativeHost.failure = failure;
+            var invocation = UUID.randomUUID(); var output = new ByteArrayOutputStream(); var previous = System.out;
+            try (var captured = new PrintStream(output, true, StandardCharsets.UTF_8)) {
+                System.setOut(captured);
+                assertSame(failure, assertThrows(Throwable.class, () -> ScenarioRunner.createAutomaticWorld(
+                        host, invocation, ScenarioDefinition.Fixture.TWO_LANE, new JsonObject())));
+            } finally { System.setOut(previous); }
+            creationRows(output, invocation, "THREW");
+            assertEquals(boundary.equals("ClientGameTestContext.worldBuilder") ? List.of(boundary)
+                    : List.of("ClientGameTestContext.worldBuilder", boundary), nativeHost.calls);
+            assertEquals(0, failure.getSuppressed().length);
+        }
+    }
+
+    private static List<JsonObject> creationRows(ByteArrayOutputStream output, UUID invocation, String outcome) {
+        var lines = output.toString(StandardCharsets.UTF_8).lines().toList();
+        assertEquals(2, lines.size(), "Creation needs two diagnostic rows");
+        var rows = new ArrayList<JsonObject>();
+        for (var line : lines) {
+            assertTrue((line + System.lineSeparator()).getBytes(StandardCharsets.UTF_8).length <= 2048);
+            assertTrue(line.startsWith("MAPART_AUTOMATIC_CREATION "));
+            var row = JsonParser.parseString(line.substring("MAPART_AUTOMATIC_CREATION ".length())).getAsJsonObject();
+            assertEquals("automatic", row.get("entryPoint").getAsString());
+            assertEquals(invocation.toString(), row.get("invocation").getAsString());
+            assertEquals("TWO_LANE", row.get("fixture").getAsString()); rows.add(row);
+            var metrics = row.getAsJsonObject("resources");
+            assertEquals(7, metrics.size());
+            metrics.entrySet().forEach(entry -> {
+                var value = entry.getValue();
+                assertTrue(value.isJsonNull() || value.getAsJsonPrimitive().isString()
+                        && value.getAsString().matches("0|[1-9][0-9]*"), entry.getKey());
+            });
+        }
+        assertEquals("BEGIN", rows.getFirst().get("outcome").getAsString());
+        assertEquals(outcome, rows.getLast().get("outcome").getAsString());
+        return rows;
+    }
+
     @Test void automaticClientAndServerCallbacksKeepResultsAndCallOrder() {
         var nativeHost = new NativeContext();
         var host = ScenarioHost.automatic(nativeHost.client);
@@ -930,7 +1082,7 @@ class ScenarioHostTest {
         var nativeHost = new NativeContext();
         var host = ScenarioHost.automatic(nativeHost.client);
         var failure = new AssertionError("first server validation");
-        host.createWorld();
+        ScenarioRunner.createAutomaticWorld(host, UUID.randomUUID(), ScenarioDefinition.Fixture.TWO_LANE, new JsonObject());
         assertSame(failure, assertThrows(AssertionError.class, () -> host.computeOnServer(server -> { throw failure; })));
         assertSame(nativeHost.saveDirectory, host.saveDirectory());
         host.closeWorld();
