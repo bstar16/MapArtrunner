@@ -41,13 +41,15 @@
 - Produces: package-private static `createAutomaticWorld(ScenarioHost host, UUID invocation, ScenarioDefinition.Fixture fixture, JsonObject preCreateSettings)` used by the actual automatic branch. Local settings capture returns needed scalars through the existing callback; no new public/interface contract.
 - Output: fixed `MAPART_AUTOMATIC_CREATION ` prefix with bounded JSON BEGIN then RETURNED/THREW, as specified above; no parser or sidecar.
 
-- [ ] Search all touched callers and inspect existing NativeContext tests. Preserve the independent Inspect branch and guard ordering.
-- [ ] Add focused RED tests calling the real-used helper through `ScenarioHost.automatic(nativeHost.client)`. Pin success and builder/create RuntimeException/Error identity; two correlated bounded rows; no added transport; retained successful handle after later validation error.
-- [ ] Add diagnostic-failure regressions: actual settings collector failure still permits creation; RuntimeException/Error from a temporary throwing PrintStream cannot mask native failure or change success. Restore/serialize global stdout safely. Cover unknown/overflow and cap behavior through actual-used helpers where introduced, without a general sampler abstraction.
-- [ ] Run focused tests and retain meaningful compiled assertion failures; do not mistake missing signatures for behavioral RED. A detached temporary harness or test-local seam may establish old-path behavior before the new signature exists.
-- [ ] Implement the smallest local settings/resource/output helpers and the automatic wrapper. Use the existing client callback after `requireUncreatedClient`, worker-only JDK metrics, local JSON and stopwatch. Record elapsed before final sampling/output; contain only diagnostic failures. Host assignment remains where it is.
-- [ ] Run focused `ScenarioHostTest`, gametest compilation and one covering Fabric test aggregate using configured JDK21 and the existing low-memory/single-worker build profile. No native run, unchanged baseline rerun or operational/proof mutation.
+- [x] Search all touched callers and inspect existing NativeContext tests. Preserve the independent Inspect branch and guard ordering.
+- [x] Add focused RED tests calling the real-used helper through `ScenarioHost.automatic(nativeHost.client)`. Pin success and builder/create RuntimeException/Error identity; two correlated bounded rows; no added transport; retained successful handle after later validation error.
+- [x] Add diagnostic-failure regressions: actual settings collector failure still permits creation; RuntimeException/Error from a temporary throwing PrintStream cannot mask native failure or change success. Restore/serialize global stdout safely. Cover unknown/overflow and cap behavior through actual-used helpers where introduced, without a general sampler abstraction.
+- [x] Run focused tests and retain meaningful compiled assertion failures; do not mistake missing signatures for behavioral RED. A detached temporary harness or test-local seam may establish old-path behavior before the new signature exists.
+- [x] Implement the smallest local settings/resource/output helpers and the automatic wrapper. Use the existing client callback after `requireUncreatedClient`, worker-only JDK metrics, local JSON and stopwatch. Record elapsed before final sampling/output; contain only diagnostic failures. Host assignment remains where it is.
+- [x] Run focused `ScenarioHostTest`, gametest compilation and one covering Fabric test aggregate using configured JDK21 and the existing low-memory/single-worker build profile. No native run, unchanged baseline rerun or operational/proof mutation.
 - [ ] Report commands/results, caller and release-path inspection, final diff and limitations. Root independently reviews, commits and opens a draft stacked PR; author does not perform Git mutations.
+
+Source implementation `30aac6a` passed independent spec and quality review. The compiled regression first failed on three missing-record assertions; final focused checks passed 70/70 and the covering Fabric aggregate passed 656/656, with no failures, errors or skips. Native observations and the full automatic suite remain unverified.
 
 ### Later runtime gate
 
