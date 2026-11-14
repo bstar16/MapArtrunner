@@ -65,6 +65,138 @@ class ScenarioClientTransitionTest {
         });
     }
 
+    private static ScenarioRunner.ClientTransition armResume(QueueFixture h) {
+        h.engine.pause(); var paused=h.sample();
+        var transition=h.host.inScope(h.scope,() -> ScenarioRunner.resumeShift(h.host,c -> h.sample(),c -> h.engine.resume(h.context),
+                paused,h.context.runId(),java.util.function.Function.identity(),(c,r) -> {
+                    assertTrue(h.onClient); assertFalse(h.onServer);
+                    h.watch.armResume(h.binding,r,h.binding.client());
+                }));
+        assertSame(transition.after().sample(),h.watch.retained().resume().transition().after().sample());
+        return h.watch.retained().resume().transition();
+    }
+
+    @Test void freshMarkerOnlyClaimCapturesOnceAndCannotBeForgedReplayedOrRearmed() {
+        var h=new QueueFixture(); assertNull(h.watch.beginServerRead());
+        var transition=armResume(h); var marker=h.watch.retained().resume();
+        assertSame(transition,marker.transition());
+        var claim=h.watch.beginServerRead(); assertNotNull(claim); assertTrue(claim.publications().isEmpty()); assertSame(marker,claim.resume());
+        assertNull(h.watch.beginServerRead());
+        var forged=new ScenarioObserver.ServerRead(claim.binding(),claim.publications(),claim.callback(),claim.resume());
+        var before=h.watch.retained(); h.commit(forged,6.1,710); h.watch.failRead(forged,new AssertionError("forged"));
+        assertEquals(before,h.watch.retained());
+        h.commit(claim,6.1,710); var retained=h.watch.retained();
+        assertEquals(6.1,retained.lower().reading().z()); assertTrue(retained.samples().isEmpty()); assertTrue(retained.witnesses().isEmpty());
+        assertSame(marker,retained.lower().marker()); assertEquals(claim.callback(),retained.lower().callback());
+        h.commit(claim,7,711); h.watch.failRead(claim,new AssertionError("replay")); assertEquals(retained,h.watch.retained());
+        assertNull(h.watch.beginServerRead());
+        assertThrows(IllegalStateException.class,() -> h.watch.armResume(h.binding,transition,h.binding.client()));
+        assertEquals(retained,h.watch.retained());
+    }
+
+    @Test void preArmInflightReadCannotAcquireResumeAndEndsDuringLowerReadWaitForNextClaim() {
+        var h=new QueueFixture(); h.publishEnd(); var old=h.watch.beginServerRead();
+        var transition=armResume(h); assertNull(old.resume()); h.commit(old,6.0,709);
+        assertNull(h.watch.retained().lower());
+        var lower=h.watch.beginServerRead(); assertSame(transition,h.watch.retained().resume().transition());
+        assertNotNull(lower.resume()); assertTrue(lower.publications().isEmpty());
+        h.step(); var end=h.publishEnd(); h.commit(lower,6.1,710);
+        assertEquals(1,h.watch.retained().witnesses().size());
+        var upper=h.watch.beginServerRead(); assertNull(upper.resume()); assertSame(end,upper.publications().getFirst().sample());
+        h.commit(upper,6.2,713);
+        assertNotSame(h.watch.retained().lower().reading(),h.watch.retained().witnesses().getLast().reading());
+        assertNull(h.watch.retained().failure());
+    }
+
+    @Test void realPendingEndsShareLowerPhysicalReadWithoutBecomingAFreshUpper() {
+        var h=new QueueFixture(); armResume(h); h.step(); var end=h.publishEnd();
+        var lower=h.watch.beginServerRead(); assertSame(end,lower.publications().getFirst().sample());
+        h.commit(lower,6.1,710); var retained=h.watch.retained();
+        assertSame(retained.lower().reading(),retained.witnesses().getFirst().reading());
+        assertEquals(retained.lower().callback(),retained.witnesses().getFirst().callback());
+        assertNull(h.watch.beginServerRead());
+    }
+
+    @Test void resumeCaptureRejectsWrongGenerationNativeIdentityInvalidScopeAndRenewedProgress() {
+        var seed=new QueueFixture(); var transition=armResume(seed);
+        for(String change:List.of("unbound","generation","world","player","handler","connection","off-client","expiry","cancel","frozen","failure","context","clocks")) {
+            var h=new QueueFixture(); var b=h.binding; var client=b.client(); var r=transition;
+            // Use this run's valid atomic R before checking individual refusals on a fresh Watch.
+            var own=armResume(h); h.watch.clear(); h.watch.bind(b); r=own;
+            switch(change) {
+                case "unbound" -> h.watch.clear();
+                case "generation" -> b=new ScenarioObserver.Binding(UUID.randomUUID(),b.context(),b.client(),b.server(),b.inspect(),b.scope());
+                case "world","player","handler","connection","off-client" -> client=new ScenarioObserver.ClientBinding(
+                        change.equals("world")?new Object():client.world(),change.equals("player")?new Object():client.player(),
+                        change.equals("handler")?new Object():client.handler(),change.equals("connection")?new Object():client.connection(),
+                        client.playerId(),client.dimension(),!change.equals("off-client"),true,true);
+                case "expiry" -> h.now=h.scope.deadlineNanos();
+                case "cancel" -> h.host.cancelSession(new IllegalStateException("cancelled"));
+                case "frozen" -> h.watch.freeze();
+                case "failure" -> { h.publishEnd(); h.watch.failRead(h.watch.beginServerRead(),new AssertionError("first")); }
+                case "context" -> r=transition;
+                case "clocks" -> {
+                    var after=own.after(); var sample=after.sample(); var e=sample.status().engine();
+                    var changed=new BuildEngine.Snapshot(e.lifecycle(),e.eligibleTicks()+1,e.verifyTicks(),e.traversal(),e.unfinishedTargetIds(),e.pendingTargetIds(),e.diagnostic(),e.effectResults());
+                    r=new ScenarioRunner.ClientTransition(own.before(),sample(after,new FabricBuildAdapter.Status(changed,after.sample().status().controlOwner(),Optional.empty()),sample.keys(),false,true,after.nativeSequence()));
+                }
+            }
+            var expected=b; var facts=client; var changed=r; var before=h.watch.retained();
+            assertThrows(IllegalStateException.class,() -> h.watch.armResume(expected,changed,facts),change);
+            assertEquals(before,h.watch.retained(),change);
+        }
+    }
+
+    @Test void resumeReadFailureAndInvalidScalarsLatchFirstCauseWithoutRetry() {
+        for(String failure:List.of("throw","world","player","thread","nan","infinite","reach")) {
+            var h=new QueueFixture(); armResume(h); var read=h.watch.beginServerRead();
+            var b=h.binding.server();
+            if(failure.equals("throw")) h.watch.failRead(read,new AssertionError("first read failure"));
+            else {
+                var facts=new ScenarioObserver.ServerBinding(b.server(),failure.equals("world")?new Object():b.world(),
+                        failure.equals("player")?new Object():b.player(),b.playerId(),b.dimension(),!failure.equals("thread"),true);
+                h.watch.commitServer(read,new ScenarioObserver.ServerReading(facts,11.5,66,failure.equals("nan")?Double.NaN:
+                        failure.equals("infinite")?Double.POSITIVE_INFINITY:6.1,failure.equals("reach")?0:4.5,710,710,710));
+            }
+            var retained=h.watch.retained(); assertNotNull(retained.failure()); assertNull(retained.lower());
+            h.commit(read,6.2,711); h.watch.failRead(read,new AssertionError("second cause"));
+            assertNull(h.watch.beginServerRead()); assertEquals(retained,h.watch.retained());
+        }
+    }
+
+    @Test void resumeCaptureDisarmsOnFreezeCloseClearExpiryAndCancellationBeforeOrDuringRead() {
+        for(String ending:List.of("freeze","close","clear","expiry","cancel")) for(boolean claimed:List.of(false,true)) {
+            var h=new QueueFixture(); armResume(h); var read=claimed?h.watch.beginServerRead():null;
+            switch(ending) {
+                case "freeze" -> h.watch.freeze();
+                case "close" -> h.watch.closeWorld();
+                case "clear" -> h.watch.clear();
+                case "expiry" -> h.now=h.scope.deadlineNanos();
+                case "cancel" -> h.host.cancelSession(new IllegalStateException("cancelled"));
+            }
+            var retained=h.watch.retained();
+            if(read!=null) { h.commit(read,6.1,710); h.watch.failRead(read,new AssertionError("late")); }
+            assertNull(h.watch.beginServerRead()); assertEquals(retained,h.watch.retained());
+            if(ending.equals("clear")) {
+                assertNull(retained.resume()); assertNull(retained.lower());
+                var b=h.binding; var fresh=new ScenarioObserver.Binding(UUID.randomUUID(),b.context(),b.client(),b.server(),b.inspect(),b.scope());
+                h.watch.bind(fresh); var current=h.watch.retained();
+                if(read!=null) h.commit(read,7,711);
+                assertEquals(current,h.watch.retained()); assertNull(h.watch.beginServerRead());
+            }
+        }
+    }
+
+    @Test void acceptedLowerAndFirstFailureSurviveArchiveFreezeAndCloseUntilClear() {
+        var h=new QueueFixture(); armResume(h); h.commit(h.watch.beginServerRead(),6.1,710);
+        var lower=h.watch.retained().lower(); h.step(); h.publishEnd(); var claim=h.watch.beginServerRead();
+        var failure=new AssertionError("first after lower"); h.watch.failRead(claim,failure);
+        h.watch.freeze(); h.watch.closeWorld(); var archived=h.watch.retained();
+        assertSame(lower,archived.lower()); assertSame(failure,archived.failure()); assertNotNull(archived.resume());
+        h.commit(claim,7,713); h.watch.failRead(claim,new AssertionError("late")); assertEquals(archived,h.watch.retained());
+        h.watch.clear(); assertNull(h.watch.retained().lower()); assertNull(h.watch.retained().resume()); assertNull(h.watch.retained().failure());
+    }
+
     @Test void staleWorkerShiftCannotSilentlySkipTheRequiredPause() {
         var h=new QueueFixture(); h.player=new PlayerObservation(11.5,1,7.5,0); h.queue.add(h::step);
         h.host.inScope(h.scope,() -> {
@@ -264,26 +396,26 @@ class ScenarioClientTransitionTest {
         var copiedBinding=new ScenarioObserver.Binding(binding.generation(),binding.context(),binding.client(),binding.server(),binding.inspect(),binding.scope());
         var foreignServer=new ScenarioObserver.ServerBinding(new Object(),reading.binding().world(),reading.binding().player(),reading.binding().playerId(),reading.binding().dimension(),true,true);
         var invalid=new ArrayList<ScenarioObserver.Watch.Retained>();
-        invalid.add(new ScenarioObserver.Watch.Retained(good.samples(),null,null,good.witnesses()));
-        invalid.add(new ScenarioObserver.Watch.Retained(good.samples(),null,copiedBinding,good.witnesses()));
-        invalid.add(new ScenarioObserver.Watch.Retained(good.samples(),new IllegalStateException("latched"),binding,good.witnesses()));
-        invalid.add(new ScenarioObserver.Watch.Retained(List.of(copy),null,binding,good.witnesses()));
+        invalid.add(new ScenarioObserver.Watch.Retained(good.samples(),null,null,good.witnesses(),null,null));
+        invalid.add(new ScenarioObserver.Watch.Retained(good.samples(),null,copiedBinding,good.witnesses(),null,null));
+        invalid.add(new ScenarioObserver.Watch.Retained(good.samples(),new IllegalStateException("latched"),binding,good.witnesses(),null,null));
+        invalid.add(new ScenarioObserver.Watch.Retained(List.of(copy),null,binding,good.witnesses(),null,null));
         var wrongContext=new Context(h.context.runId(),h.context.connectionId(),h.context.worldId(),h.context.dimension(),
                 h.context.planFingerprint(),new GridPos(1,65,0),h.context.settingsFingerprint());
         var foreign=state(h.sample(),new com.mapartrunner.core.run.RunLifecycle.Snapshot(Phase.RUNNING,Optional.of(wrongContext),Optional.of(Activity.SHIFT),Optional.empty()),null,null,null).sample();
-        invalid.add(new ScenarioObserver.Watch.Retained(List.of(foreign),null,binding,good.witnesses()));
+        invalid.add(new ScenarioObserver.Watch.Retained(List.of(foreign),null,binding,good.witnesses(),null,null));
         var nonEnd=new ScenarioObserver.Sample(end.tick(),"START",end.worldIdentity(),true,end.pose(),end.keys(),false,end.status(),end.observations());
         invalid.add(new ScenarioObserver.Watch.Retained(List.of(nonEnd),null,binding,
-                List.of(new ScenarioObserver.ServerWitness(new ScenarioObserver.EndPublication(binding,nonEnd,4.5),anchor.callback(),reading))));
+                List.of(new ScenarioObserver.ServerWitness(new ScenarioObserver.EndPublication(binding,nonEnd,4.5),anchor.callback(),reading)),null,null));
         var publications=List.of(new ScenarioObserver.EndPublication(copiedBinding,end,4.5),new ScenarioObserver.EndPublication(binding,copy,4.5),
                 new ScenarioObserver.EndPublication(binding,end,Double.NaN),new ScenarioObserver.EndPublication(binding,end,0));
         for(var publication:publications) invalid.add(new ScenarioObserver.Watch.Retained(good.samples(),null,binding,
-                List.of(new ScenarioObserver.ServerWitness(publication,anchor.callback(),reading))));
+                List.of(new ScenarioObserver.ServerWitness(publication,anchor.callback(),reading)),null,null));
         for(var badReading:List.of(new ScenarioObserver.ServerReading(foreignServer,11.5,1,2.5,4.5,1,1,1),
                 new ScenarioObserver.ServerReading(binding.server(),11.5,1,2.5,Double.POSITIVE_INFINITY,1,1,1)))
-            invalid.add(new ScenarioObserver.Watch.Retained(good.samples(),null,binding,List.of(new ScenarioObserver.ServerWitness(anchor.publication(),anchor.callback(),badReading))));
-        invalid.add(new ScenarioObserver.Watch.Retained(good.samples(),null,binding,List.of(anchor,anchor)));
-        invalid.add(new ScenarioObserver.Watch.Retained(good.samples(),null,binding,List.of(new ScenarioObserver.ServerWitness(anchor.publication(),0,reading))));
+            invalid.add(new ScenarioObserver.Watch.Retained(good.samples(),null,binding,List.of(new ScenarioObserver.ServerWitness(anchor.publication(),anchor.callback(),badReading)),null,null));
+        invalid.add(new ScenarioObserver.Watch.Retained(good.samples(),null,binding,List.of(anchor,anchor),null,null));
+        invalid.add(new ScenarioObserver.Watch.Retained(good.samples(),null,binding,List.of(new ScenarioObserver.ServerWitness(anchor.publication(),0,reading)),null,null));
         h.host.inScope(h.scope,() -> {
             for(var retained:invalid) {
                 var error=assertThrows(AssertionError.class,() -> ScenarioRunner.constructionCapture(h.host,c -> fail("Malformed history must fail before capture"),
@@ -515,12 +647,13 @@ class ScenarioClientTransitionTest {
     @Test void aReplacementEngineDuringResumeStillRejectsRenewedClocksAndTraversal() {
         var h=new QueueFixture(); h.engine.pause(); var paused=h.sample();
         h.host.inScope(h.scope,() -> {
-            var error=assertThrows(AssertionError.class,() -> ScenarioRunner.resumeOnClient(h.host,c -> h.sample(),c -> {
+            var error=assertThrows(AssertionError.class,() -> ScenarioRunner.resumeShift(h.host,c -> h.sample(),c -> {
                 h.engine=new BuildEngine(); h.engine.start(h.plan,h.context,h.settings);
-            },paused,h.context.runId()));
+            },paused,h.context.runId(),java.util.function.Function.identity(),(c,r) -> fail("Invalid R must not arm capture")));
             assertEquals("Manual resume renewed traversal or clocks",error.getMessage());
             assertEquals(0,h.engine.snapshot().eligibleTicks());
             assertEquals(0,h.engine.snapshot().traversal().orElseThrow().transitionTicks());
+            assertNull(h.watch.retained().resume());
         });
     }
 

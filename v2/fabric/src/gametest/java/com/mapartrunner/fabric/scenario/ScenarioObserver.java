@@ -118,7 +118,9 @@ final class ScenarioObserver {
     }
     record ServerReading(ServerBinding binding, double x, double y, double z, double reach,
                          int age, long worldTime, int serverTick) { }
-    record ServerRead(Binding binding, List<EndPublication> publications, long callback) {
+    record ResumeMarker(Binding binding, ScenarioRunner.ClientTransition transition) { }
+    record ResumeLower(ResumeMarker marker, long callback, ServerReading reading) { }
+    record ServerRead(Binding binding, List<EndPublication> publications, long callback, ResumeMarker resume) {
         ServerRead { publications=List.copyOf(publications); }
     }
     record ServerWitness(EndPublication publication, long callback, ServerReading reading) { }
@@ -147,6 +149,9 @@ final class ScenarioObserver {
         private Binding binding;
         private final List<EndPublication> pending=new ArrayList<>();
         private ServerRead inFlight;
+        private ResumeMarker resume;
+        private ResumeLower lower;
+        private boolean resumePending;
         private long lastPublishedFrame=-1;
         private long serverCallbacks;
         private BuildPlan plan;
@@ -163,14 +168,32 @@ final class ScenarioObserver {
         private boolean releaseEndRequested;
         private volatile boolean frozen;
 
-        record Retained(List<Sample> samples, Throwable failure, Binding binding, List<ServerWitness> witnesses) {
+        record Retained(List<Sample> samples, Throwable failure, Binding binding, List<ServerWitness> witnesses,
+                        ResumeMarker resume, ResumeLower lower) {
             Retained { samples = List.copyOf(samples); witnesses=List.copyOf(witnesses); }
         }
 
         // Inspect settlement retains the original binding and failure until archive-before-clear/arm.
-        void freeze() { synchronized(gate) { frozen = true; pending.clear(); inFlight=null; } }
+        void freeze() { synchronized(gate) { frozen = true; pending.clear(); inFlight=null; resumePending=false; } }
 
-        Retained retained() { synchronized(gate) { return new Retained(samples, failure,binding,witnesses); } }
+        Retained retained() { synchronized(gate) { return new Retained(samples, failure,binding,witnesses,resume,lower); } }
+
+        void armResume(Binding expected,ScenarioRunner.ClientTransition transition,ClientBinding facts) {
+            synchronized(gate) {
+                if(expected==null || binding!=expected || frozen || failure!=null || resume!=null
+                        || !expected.currentScope() || !expected.client.matches(facts))
+                    throw new IllegalStateException("Resume capture lost exact active native binding/scope");
+                var before=transition.before().sample(); var after=transition.after().sample();
+                if(!before.originalWorld || !after.originalWorld || after.pose==null || !Double.isFinite(after.pose.z)
+                        || before.tick!=after.tick || before.status.engine().lifecycle().phase()!=RunLifecycle.Phase.PAUSED
+                        || after.status.engine().lifecycle().phase()!=RunLifecycle.Phase.RUNNING
+                        || !after.status.engine().lifecycle().context().filter(expected.context::equals).isPresent()
+                        || !ScenarioRunner.retainedProgress(before.status.engine(),after.status.engine()))
+                    throw new IllegalStateException("Resume capture changed atomic transition/context/progress");
+                // Arm after R's validation, inside its client callback; an existing claim cannot inherit this marker.
+                resume=new ResumeMarker(expected,transition); resumePending=true;
+            }
+        }
 
         void armTraversal(MinecraftClient client, BuildPlan plan, TraversalCapture capture) {
             requireClientThread(client);
@@ -233,7 +256,8 @@ final class ScenarioObserver {
         void clear() {
             if(traversalCapture!=null) traversalCapture.requireSealedForClear();
             synchronized(gate) {
-                binding=null; pending.clear(); inFlight=null; // Invalidate claims/generation before histories; reopen last.
+                binding=null; pending.clear(); inFlight=null; resumePending=false; // Invalidate authority before histories; reopen last.
+                resume=null; lower=null;
                 witnesses.clear(); serverCallbacks=0; lastPublishedFrame=-1;
                 traversalCapture=null; originalPlayer=null; originalConnection=null;
                 traversalWriting=false; releaseEndRequested=false;
@@ -246,7 +270,7 @@ final class ScenarioObserver {
         void closeWorld() {
             if(traversalCapture!=null) traversalCapture.requireSealedForClear();
             synchronized(gate) {
-                if(binding!=null) { frozen=true; pending.clear(); inFlight=null; } // Disarm before automatic native close.
+                if(binding!=null) { frozen=true; pending.clear(); inFlight=null; resumePending=false; } // Disarm before automatic native close.
             }
             world = null; handler = null;
         }
@@ -293,11 +317,12 @@ final class ScenarioObserver {
         ServerRead beginServerRead() {
             synchronized(gate) {
                 if(frozen || failure!=null || binding==null) return null;
-                if(!binding.currentScope()) { pending.clear(); inFlight=null; return null; }
+                if(!binding.currentScope()) { pending.clear(); inFlight=null; resumePending=false; return null; }
                 long callback=++serverCallbacks; // Physical callback ordinal, including idle callbacks without a scalar read.
-                if(inFlight!=null || pending.isEmpty()) return null;
+                if(inFlight!=null || pending.isEmpty() && !resumePending) return null;
                 // Detach under the gate. ENDs published during the outside-gate read belong to the next callback.
-                inFlight=new ServerRead(binding,pending,callback);
+                inFlight=new ServerRead(binding,pending,callback,resumePending?resume:null);
+                resumePending=false; // One fresh claim owns L, including when no real END is waiting; never retry it.
                 pending.clear();
                 return inFlight;
             }
@@ -323,13 +348,16 @@ final class ScenarioObserver {
         void commitServer(ServerRead read, ServerReading reading) {
             synchronized(gate) {
                 if(!consume(read)) return;
-                if(read.publications.isEmpty() || read.publications.stream().anyMatch(p -> p.binding!=binding)) {
+                if(read.publications.isEmpty() && read.resume==null || read.publications.stream().anyMatch(p -> p.binding!=binding)
+                        || read.resume!=null && (read.resume!=resume || read.resume.binding!=binding || lower!=null)) {
                     latch(new IllegalStateException("Server claim lost exact publication binding")); return;
                 }
-                if(!binding.server.matches(reading.binding) || !Double.isFinite(reading.reach) || reading.reach<=0) {
+                if(!binding.server.matches(reading.binding) || !Double.isFinite(reading.reach) || reading.reach<=0
+                        || read.resume!=null && (!Double.isFinite(reading.x) || !Double.isFinite(reading.y) || !Double.isFinite(reading.z))) {
                     latch(new IllegalStateException("Native server END lost exact binding/reach")); return;
                 }
                 if(read.publications.size()>6000-witnesses.size()) { latch(new AssertionError("Server observer exceeded 6000 witnesses")); return; }
+                if(read.resume!=null) lower=new ResumeLower(read.resume,read.callback,reading);
                 for(var publication:read.publications) witnesses.add(new ServerWitness(publication,read.callback,reading));
             }
         }
@@ -337,13 +365,18 @@ final class ScenarioObserver {
         private boolean consume(ServerRead read) {
             if(read==null || inFlight!=read) return false;
             inFlight=null; // Exact one-use claim retires even when its original scope became unavailable.
-            return !frozen && failure==null && binding==read.binding && binding.currentScope();
+            if(frozen || failure!=null || binding!=read.binding) return false;
+            if(!binding.currentScope()) { pending.clear(); resumePending=false; return false; }
+            return true;
         }
         void failRead(ServerRead read, Throwable error) { synchronized(gate) { if(consume(read)) latch(error); } }
         private void fail(Binding armed, Throwable error) {
             synchronized(gate) { if(!frozen && binding==armed && (armed==null || armed.currentScope())) latch(error); }
         }
-        private void latch(Throwable error) { if(failure==null) failure=error; }
+        private void latch(Throwable error) {
+            if(failure==null) failure=error;
+            pending.clear(); inFlight=null; resumePending=false; // Retain accepted R/L and first failure until archive-before-clear.
+        }
 
         Sample sample(MinecraftClient client, String phase) {
             if(traversalCapture!=null) throw new IllegalStateException("Compact trace has no baseline Sample");
