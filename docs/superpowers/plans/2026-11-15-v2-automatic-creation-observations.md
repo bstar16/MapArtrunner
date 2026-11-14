@@ -47,9 +47,9 @@
 - [x] Run focused tests and retain meaningful compiled assertion failures; do not mistake missing signatures for behavioral RED. A detached temporary harness or test-local seam may establish old-path behavior before the new signature exists.
 - [x] Implement the smallest local settings/resource/output helpers and the automatic wrapper. Use the existing client callback after `requireUncreatedClient`, worker-only JDK metrics, local JSON and stopwatch. Record elapsed before final sampling/output; contain only diagnostic failures. Host assignment remains where it is.
 - [x] Run focused `ScenarioHostTest`, gametest compilation and one covering Fabric test aggregate using configured JDK21 and the existing low-memory/single-worker build profile. No native run, unchanged baseline rerun or operational/proof mutation.
-- [ ] Report commands/results, caller and release-path inspection, final diff and limitations. Root independently reviews, commits and opens a draft stacked PR; author does not perform Git mutations.
+- [x] Report commands/results, caller and release-path inspection, final diff and limitations. Root independently reviews, commits and opens a draft stacked PR; author does not perform Git mutations.
 
-Source implementation `30aac6a` passed independent spec and quality review. The compiled regression first failed on three missing-record assertions; final focused checks passed 70/70 and the covering Fabric aggregate passed 656/656, with no failures, errors or skips. Native observations and the full automatic suite remain unverified.
+Source implementation `30aac6a` passed independent spec and quality review and is available in [draft PR #275](https://github.com/bstar16/MapArtrunner/pull/275). The compiled regression first failed on three missing-record assertions; final focused checks passed 70/70 and the covering Fabric aggregate passed 656/656, with no failures, errors or skips. Native observations and the full automatic suite remain unverified.
 
 ### Later runtime gate
 
