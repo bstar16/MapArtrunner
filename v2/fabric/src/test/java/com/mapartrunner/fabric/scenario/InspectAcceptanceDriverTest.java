@@ -1861,6 +1861,6 @@ class InspectAcceptanceDriverTest {
         var witness = new ScenarioObserver.ServerWitness(new ScenarioObserver.EndPublication(binding,sample,4.5),1,
                 new ScenarioObserver.ServerReading(binding.server(),0,66,0,4.5,1,1,1));
         return new ScenarioRunner.InspectIdleObservation(new ScenarioObserver.Watch.Retained(missing.equals("samples")?List.of():List.of(sample),null,
-                missing.equals("binding")?null:binding,missing.equals("witnesses")?List.of():List.of(witness)));
+                missing.equals("binding")?null:binding,missing.equals("witnesses")?List.of():List.of(witness),null,null));
     }
 }

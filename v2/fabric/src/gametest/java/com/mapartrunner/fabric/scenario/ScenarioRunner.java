@@ -3590,15 +3590,21 @@ final class ScenarioRunner implements AutoCloseable {
             prior=next;
         }
         Live last=live(); requirePaused(paused,last,id);
-        var resume=resumeOnClient(host,this::clientLive,c -> {
+        var resumeBinding=watch.retained().binding();
+        var resume=resumeShift(host,this::clientLive,c -> {
             requireClient(c); requireReleased(c);
             require(MapArtClient.status().engine().lifecycle().phase()==Phase.PAUSED,"Not PAUSED immediately before manual resume");
             MapArtClient.resume();
-        },paused,id);
-        Live resumeBefore=withServer(resume.before);
-        Live resumed=withServer(resume.after);
-        writeNew(roots,stage.resolve("manual-resume.txt"),"lastPaused="+last+"\nimmediateBefore="+resumeBefore+"\nresumed="+resumed);
-        return resumed;
+        },paused,id,this::withServer,(c,transition) -> watch.armResume(resumeBinding,transition,ScenarioObserver.clientBinding(c)));
+        writeNew(roots,stage.resolve("manual-resume.txt"),"lastPaused="+last+"\nimmediateBefore="+resume.before+"\nresumed="+resume.after);
+        return resume.after;
+    }
+
+    static ClientTransition resumeShift(ScenarioHost host,Function<MinecraftClient,Live> capture,
+                                        Consumer<MinecraftClient> resume,Live paused,UUID id,Function<Live,Live> withServer,
+                                        java.util.function.BiConsumer<MinecraftClient,ClientTransition> arm) {
+        var transition=resumeOnClient(host,capture,resume,paused,id,arm);
+        return new ClientTransition(withServer.apply(transition.before),withServer.apply(transition.after));
     }
 
     record ClientTransition(Live before, Live after) { }
@@ -3788,6 +3794,12 @@ final class ScenarioRunner implements AutoCloseable {
 
     static ClientTransition resumeOnClient(ScenarioHost host, Function<MinecraftClient,Live> capture,
                                           Consumer<MinecraftClient> resume, Live paused, UUID id) {
+        return resumeOnClient(host,capture,resume,paused,id,(c,transition) -> { });
+    }
+
+    private static ClientTransition resumeOnClient(ScenarioHost host, Function<MinecraftClient,Live> capture,
+                                          Consumer<MinecraftClient> resume, Live paused, UUID id,
+                                          java.util.function.BiConsumer<MinecraftClient,ClientTransition> arm) {
         return host.computeOnClient(c -> {
             var before=capture.apply(c);
             requirePaused(paused,before,id);
@@ -3796,7 +3808,9 @@ final class ScenarioRunner implements AutoCloseable {
             requireRun(after.sample,id);
             require(retainedProgress(paused.sample.status().engine(),after.sample.status().engine())
                     && after.sample.status().engine().lifecycle().phase()==Phase.RUNNING,"Manual resume renewed traversal or clocks");
-            return new ClientTransition(before,after);
+            var transition=new ClientTransition(before,after);
+            arm.accept(c,transition);
+            return transition;
         });
     }
 
@@ -3862,7 +3876,8 @@ final class ScenarioRunner implements AutoCloseable {
     private static String pairedEvidence(ScenarioObserver.Watch.Retained retained) {
         return "pairingVersion=2; pair=actual client END publication precedes its first subsequent server END claim, then one independent read"
                 +"; equal callback/tick rows alias ONE physical ServerReading; clocks are distinct, no acknowledgement implied"
-                +"\nbinding="+retained.binding()+"\nfirstFailure="+retained.failure()+"\n"
+                +"\nbinding="+retained.binding()+"\nfirstFailure="+retained.failure()
+                +"\natomicResume="+retained.resume()+"\npostResumeLower="+retained.lower()+"\n"
                 +String.join("\n",retained.witnesses().stream().map(Object::toString).toList())+"\n";
     }
 
@@ -3972,12 +3987,21 @@ final class ScenarioRunner implements AutoCloseable {
         for (int k=1;k<inputs.size();k++) if (westInputs(inputs.get(k-1),inputs.get(k))) { first=inputs.get(k-1); second=inputs.get(k); break; }
         require(first!=null && second!=null && points.get(westEntry).publication().sample().tick()<=first.frame
                         && second.frame<=points.get(west).publication().sample().tick(),"Missing ordered full-entry/two distinct controller-certified WEST input callbacks: "+inputs);
-        if (resumed!=null) require(points.stream().anyMatch(p -> p.publication().sample().tick()>resumed.sample.tick()
-                && p.reading().serverTick()>resumed.server.serverTick
-                && substage(p.publication().sample(),ForwardTraversal.Substage.SHIFT) && nativeForward(p.publication().sample())
-                && distance(coordinate(resumed.client,"z"),p.publication().sample().pose().z(),0,1)
-                && distance(coordinate(resumed.server,"z"),p.reading().z(),0,1)),
-                "No actual independent SOUTH progress after manual resume");
+        if (resumed!=null) {
+            var marker=retained.resume(); var lower=retained.lower();
+            require(marker!=null && marker.binding()==retained.binding() && marker.transition().after().sample()==resumed.sample
+                    && lower!=null && lower.marker()==marker && lower.callback()>0
+                    && retained.binding().server().matches(lower.reading().binding())
+                    && Double.isFinite(lower.reading().z()),"Missing exact post-resume server lower reading");
+            var after=marker.transition().after();
+            require(points.stream().anyMatch(p -> p.publication().sample().tick()>after.sample.tick()
+                    && p.callback()>lower.callback() && p.reading().serverTick()>lower.reading().serverTick() && p.reading()!=lower.reading()
+                    && substage(p.publication().sample(),ForwardTraversal.Substage.SHIFT) && nativeForward(p.publication().sample())
+                    && p.publication().sample().status().engine().lifecycle().activity().orElse(null)==Activity.SHIFT
+                    && p.publication().sample().status().engine().traversal().orElseThrow().entry().lane().direction().name().equals("SOUTH")
+                    && distance(coordinate(after.client,"z"),p.publication().sample().pose().z(),0,1)
+                    && distance(lower.reading().z(),p.reading().z(),0,1)),"No actual independent SOUTH progress after manual resume");
+        }
         return new TraversalProof(chain,first,second);
     }
 

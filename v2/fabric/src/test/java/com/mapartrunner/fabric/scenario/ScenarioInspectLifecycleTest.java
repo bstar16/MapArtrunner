@@ -276,17 +276,17 @@ class ScenarioInspectLifecycleTest {
         witnesses.set(0,new ScenarioObserver.ServerWitness(first.publication(),first.callback(),
                 reading(retained.binding().server(),first.publication().sample(),4.5,999)));
         for(var changed:List.of(
-                new ScenarioObserver.Watch.Retained(samples,null,retained.binding(),retained.witnesses()),
-                new ScenarioObserver.Watch.Retained(retained.samples(),null,retained.binding(),witnesses),
-                new ScenarioObserver.Watch.Retained(retained.samples(),null,witnessBinding(context,null,null),retained.witnesses()),
-                new ScenarioObserver.Watch.Retained(retained.samples(),new AssertionError("new first failure"),retained.binding(),retained.witnesses()))) {
+                new ScenarioObserver.Watch.Retained(samples,null,retained.binding(),retained.witnesses(),null,null),
+                new ScenarioObserver.Watch.Retained(retained.samples(),null,retained.binding(),witnesses,null,null),
+                new ScenarioObserver.Watch.Retained(retained.samples(),null,witnessBinding(context,null,null),retained.witnesses(),null,null),
+                new ScenarioObserver.Watch.Retained(retained.samples(),new AssertionError("new first failure"),retained.binding(),retained.witnesses(),null,null))) {
             var after=new ScenarioRunner.InspectIdleObservation(changed);
             assertEquals(before.samples(),after.samples()); assertEquals(before.witnesses(),after.witnesses());
             assertEquals(before.bound(),after.bound()); assertNotEquals(before,after);
         }
         var a=new MutableFailure(); var b=new MutableFailure(); b.setStackTrace(a.getStackTrace());
-        assertNotEquals(new ScenarioRunner.InspectIdleObservation(new ScenarioObserver.Watch.Retained(List.of(),a,null,List.of())),
-                new ScenarioRunner.InspectIdleObservation(new ScenarioObserver.Watch.Retained(List.of(),b,null,List.of())),"First-failure identity matters");
+        assertNotEquals(new ScenarioRunner.InspectIdleObservation(new ScenarioObserver.Watch.Retained(List.of(),a,null,List.of(),null,null)),
+                new ScenarioRunner.InspectIdleObservation(new ScenarioObserver.Watch.Retained(List.of(),b,null,List.of(),null,null)),"First-failure identity matters");
     }
 
     @Test void opaqueIdleValueFreezesThrowableRenderingIncludingLaterMessageCauseStackAndSuppressedChanges() throws Exception {
@@ -459,7 +459,7 @@ class ScenarioInspectLifecycleTest {
             if(scalarFirst) scalar=reading(binding.server(),shift,4.5,105);
             watch.append(binding,later,binding.client(),4.5);
             if(!scalarFirst) scalar=reading(binding.server(),shift,4.5,105);
-            var forged=new ScenarioObserver.ServerRead(claim.binding(),claim.publications(),claim.callback());
+            var forged=new ScenarioObserver.ServerRead(claim.binding(),claim.publications(),claim.callback(),claim.resume());
             assertEquals(claim,forged); assertNotSame(claim,forged);
             var before=watch.retained(); watch.commitServer(forged,scalar); watch.failRead(forged,new AssertionError("forged"));
             assertEquals(before,watch.retained());
@@ -551,7 +551,7 @@ class ScenarioInspectLifecycleTest {
     }
 
     private static void assertRejectedBecause(ScenarioObserver.Watch.Retained original,List<ScenarioObserver.ServerWitness> witnesses,String reason) {
-        var retained=new ScenarioObserver.Watch.Retained(original.samples(),original.failure(),original.binding(),witnesses);
+        var retained=new ScenarioObserver.Watch.Retained(original.samples(),original.failure(),original.binding(),witnesses,null,null);
         var failure=assertThrows(AssertionError.class,() -> ScenarioRunner.evaluateTraversal(original.binding().context().runId(),retained,null));
         assertTrue(failure.getMessage().startsWith(reason),failure.getMessage());
     }
@@ -559,6 +559,229 @@ class ScenarioInspectLifecycleTest {
     private static RunLifecycle.Context witnessContext() {
         return new RunLifecycle.Context(UUID.randomUUID(),"paired-connection","paired-world","minecraft:overworld",
                 "paired-plan",new BuildPlan.GridPos(0,65,0),"paired-settings");
+    }
+
+    @Test void postResumeServerCallbackPrecedesDelayedWorkerDiagnostics() {
+        var result=scheduledResume(true,6.165848892158152,6.415356906947316);
+        assertEquals(716,result.resumed().server().serverTick());
+        assertDoesNotThrow(() -> ScenarioRunner.evaluateTraversal(result.context().runId(),result.watch().retained(),result.resumed()));
+        var lower=result.watch().retained().lower();
+        assertEquals(710,lower.callback()); assertEquals(710,lower.reading().serverTick()); assertEquals(6.165848892158152,lower.reading().z());
+        var uppers=result.watch().retained().witnesses().stream().filter(w -> w.publication().sample().tick()>=299 && w.publication().sample().tick()<=301).toList();
+        assertEquals(3,uppers.size()); assertEquals(713,uppers.getFirst().callback());
+        for(var upper:uppers) assertSame(uppers.getFirst().reading(),upper.reading());
+        assertNotSame(lower.reading(),uppers.getFirst().reading());
+    }
+
+    @Test void oldFailedWindowCannotInventAnEarlyLowerOrUseNextEntryAsUpper() {
+        var schedule=scheduledResume(false,6.165848892158152,6.415356906947316);
+        var r=schedule.watch().retained();
+        assertEquals(713,r.lower().callback()); assertEquals(713,r.lower().reading().serverTick());
+        assertEquals(6.415356906947316,r.lower().reading().z());
+        var next=r.witnesses().stream().filter(w -> w.callback()==727).findFirst().orElseThrow();
+        assertEquals(com.mapartrunner.core.run.ForwardTraversal.Substage.NEXT_ENTRY,next.publication().sample().status().engine().traversal().orElseThrow().substage());
+        assertPostResumeFailure(schedule,r,"No actual independent SOUTH progress after manual resume");
+    }
+
+    @Test void genuinePreResumeServerCatchUpIsNotPostResumeServerDisplacement() {
+        var schedule=scheduledResume(true,6.1,6.1); var r=schedule.watch().retained();
+        var before=r.witnesses().stream().filter(w -> w.publication().sample().tick()==297).findFirst().orElseThrow();
+        var caughtUp=r.witnesses().stream().filter(w -> w.publication().sample().tick()==298).findFirst().orElseThrow();
+        assertEquals(6.0,before.reading().z()); assertEquals(6.1,caughtUp.reading().z());
+        assertTrue(caughtUp.callback()<r.lower().callback()); assertTrue(caughtUp.reading().serverTick()<r.lower().reading().serverTick());
+        assertEquals(6.1,r.lower().reading().z());
+        var upper=r.witnesses().stream().filter(w -> w.publication().sample().tick()==299).findFirst().orElseThrow();
+        assertEquals(6.1,upper.reading().z()); assertTrue(upper.publication().sample().pose().z()>schedule.resumed().sample().pose().z());
+        assertPostResumeFailure(schedule,r,"No actual independent SOUTH progress after manual resume");
+    }
+
+    @Test void postResumeProofRequiresBothEndpointsStrictClocksIndependentReadAndFinitePositiveDisplacement() {
+        var schedule=scheduledResume(true,6.165848892158152,6.415356906947316); var r=schedule.watch().retained();
+        var missing=new ScenarioObserver.Watch.Retained(r.samples(),null,r.binding(),r.witnesses(),r.resume(),null);
+        assertPostResumeFailure(schedule,missing,"Missing exact post-resume server lower reading");
+        assertPostResumeFailure(schedule,new ScenarioObserver.Watch.Retained(r.samples(),null,r.binding(),r.witnesses(),null,r.lower()),
+                "Missing exact post-resume server lower reading");
+        var noUpper=r.witnesses().stream().filter(w -> w.publication().sample().tick()<299 || w.publication().sample().tick()>301).toList();
+        assertPostResumeFailure(schedule,new ScenarioObserver.Watch.Retained(r.samples(),null,r.binding(),noUpper,r.resume(),r.lower()),
+                "No actual independent SOUTH progress after manual resume");
+        var lower=r.lower(); var scalar=lower.reading();
+        for(double z:new double[]{Double.NaN,Double.POSITIVE_INFINITY,Double.NEGATIVE_INFINITY,6.415356906947316,6.5}) {
+            var reading=new ScenarioObserver.ServerReading(scalar.binding(),scalar.x(),scalar.y(),z,scalar.reach(),scalar.age(),scalar.worldTime(),scalar.serverTick());
+            var changed=new ScenarioObserver.Watch.Retained(r.samples(),null,r.binding(),r.witnesses(),r.resume(),new ScenarioObserver.ResumeLower(r.resume(),lower.callback(),reading));
+            assertPostResumeFailure(schedule,changed,Double.isFinite(z)?"No actual independent SOUTH progress after manual resume":"Missing exact post-resume server lower reading");
+        }
+        for(String change:List.of("equal-callback","older-callback","equal-tick","older-tick","alias","equal-z","decreased-z","nan","infinite")) {
+            var upper=r.witnesses().stream().filter(w -> w.publication().sample().tick()==299).findFirst().orElseThrow();
+            var old=upper.reading();
+            double z=switch(change) { case "equal-z" -> scalar.z(); case "decreased-z" -> 6.0; case "nan" -> Double.NaN; case "infinite" -> Double.POSITIVE_INFINITY; default -> old.z(); };
+            var value=change.equals("alias")?scalar:new ScenarioObserver.ServerReading(old.binding(),old.x(),old.y(),z,old.reach(),old.age(),old.worldTime(),
+                    change.equals("equal-tick")?scalar.serverTick():change.equals("older-tick")?scalar.serverTick()-1:old.serverTick());
+            long callback=change.equals("equal-callback")?lower.callback():change.equals("older-callback")?lower.callback()-1:upper.callback();
+            var points=r.witnesses().stream().map(w -> w.publication().sample().tick()>=299 && w.publication().sample().tick()<=301?
+                    new ScenarioObserver.ServerWitness(w.publication(),callback,value):w).toList();
+            assertPostResumeFailure(schedule,new ScenarioObserver.Watch.Retained(r.samples(),null,r.binding(),points,r.resume(),lower),
+                    "No actual independent SOUTH progress after manual resume");
+        }
+        for(long frame:List.of(301L,302L)) {
+            var marker=r.resume(); var transition=marker.transition(); var after=transition.after(); var s=after.sample();
+            var moved=new ScenarioRunner.Live(new ScenarioObserver.Sample(frame,s.phase(),s.worldIdentity(),s.originalWorld(),s.pose(),s.keys(),s.paused(),s.status(),s.observations()),
+                    after.client(),after.server(),after.fault(),after.pending(),after.nativeSequence(),after.nativeIdentities());
+            var changedMarker=new ScenarioObserver.ResumeMarker(r.binding(),new ScenarioRunner.ClientTransition(transition.before(),moved));
+            var changed=new ScenarioObserver.Watch.Retained(r.samples(),null,r.binding(),r.witnesses(),changedMarker,new ScenarioObserver.ResumeLower(changedMarker,lower.callback(),scalar));
+            var changedSchedule=new ResumeSchedule(schedule.context(),schedule.watch(),moved);
+            assertPostResumeFailure(changedSchedule,changed,"No actual independent SOUTH progress after manual resume");
+        }
+    }
+
+    @Test void upperMustBeNativeRunningForwardSouthShiftWithClientDisplacement() {
+        var schedule=scheduledResume(true,6.165848892158152,6.415356906947316); var r=schedule.watch().retained();
+        for(String change:List.of("client-equal","client-decreased","client-nan","client-infinite","paused","owner","forward","activity","NEXT_ENTRY","WEST")) {
+            var replacements=new java.util.IdentityHashMap<ScenarioObserver.Sample,ScenarioObserver.Sample>();
+            for(var w:r.witnesses()) {
+                var s=w.publication().sample(); if(s.tick()<299 || s.tick()>301) continue;
+                var e=s.status().engine(); var lifecycle=e.lifecycle(); var t=e.traversal().orElseThrow(); var entry=t.entry(); var lane=entry.lane(); var p=s.pose();
+                if(change.startsWith("client-")) {
+                    double z=switch(change) { case "client-equal" -> schedule.resumed().sample().pose().z(); case "client-decreased" -> 6.0; case "client-nan" -> Double.NaN; default -> Double.POSITIVE_INFINITY; };
+                    p=new ScenarioObserver.Pose(p.x(),p.y(),z,p.velocity(),p.eyes(),p.age(),p.worldTime(),p.yaw(),p.headYaw(),p.bodyYaw(),p.flying(),p.sprinting(),p.selectedSlot(),p.reserved(),p.usable());
+                }
+                if(change.equals("paused") || change.equals("activity")) lifecycle=new RunLifecycle.Snapshot(change.equals("paused")?RunLifecycle.Phase.PAUSED:lifecycle.phase(),
+                        lifecycle.context(),Optional.of(change.equals("activity")?RunLifecycle.Activity.BUILD:RunLifecycle.Activity.SHIFT),lifecycle.outcome());
+                if(change.equals("WEST")) {
+                    lane=new com.mapartrunner.core.traversal.LanePlanner.Lane(lane.id(),com.mapartrunner.core.traversal.LanePlanner.Direction.WEST,lane.start(),new BuildPlan.GridPos(0,lane.start().y(),lane.start().z()),lane.corridor(),lane.expectedFloor());
+                    entry=new com.mapartrunner.core.movement.MovementPolicy.LaneEntry(lane,entry.stage(),entry.stageElapsedTicks(),entry.entryElapsedTicks(),entry.consecutiveYawAlignedTicks(),entry.supportHoldTicks(),entry.yawHoldTicks(),entry.pendingTargetIds(),entry.constantSprint());
+                }
+                t=new com.mapartrunner.core.run.ForwardTraversal.Snapshot(t.laneIndex(),change.equals("NEXT_ENTRY")?com.mapartrunner.core.run.ForwardTraversal.Substage.NEXT_ENTRY:t.substage(),entry,t.transitionTicks(),t.transitionRegion(),t.pass(),t.walkNoProgressTicks());
+                e=new BuildEngine.Snapshot(lifecycle,e.eligibleTicks(),e.verifyTicks(),Optional.of(t),e.unfinishedTargetIds(),e.pendingTargetIds(),e.diagnostic(),e.effectResults());
+                replacements.put(s,new ScenarioObserver.Sample(s.tick(),s.phase(),s.worldIdentity(),s.originalWorld(),p,change.equals("forward")?java.util.Collections.nCopies(9,false):s.keys(),s.paused(),
+                        new com.mapartrunner.fabric.runtime.FabricBuildAdapter.Status(e,change.equals("owner")?BuildEngine.ControlOwner.NONE:s.status().controlOwner(),Optional.empty()),s.observations()));
+            }
+            var samples=r.samples().stream().map(s -> replacements.getOrDefault(s,s)).toList();
+            var points=r.witnesses().stream().map(w -> new ScenarioObserver.ServerWitness(new ScenarioObserver.EndPublication(r.binding(),replacements.getOrDefault(w.publication().sample(),w.publication().sample()),w.publication().reach()),w.callback(),w.reading())).toList();
+            assertPostResumeFailure(schedule,new ScenarioObserver.Watch.Retained(samples,null,r.binding(),points,r.resume(),r.lower()),"No actual independent SOUTH progress after manual resume");
+        }
+    }
+
+    @Test void resumeProofRefusesCopiedGenerationForeignServerAndReconstructedResumeIdentity() {
+        var schedule=scheduledResume(true,6.165848892158152,6.415356906947316); var r=schedule.watch().retained();
+        var b=r.binding(); var marker=r.resume(); var lower=r.lower(); var scalar=lower.reading();
+        var copied=new ScenarioObserver.Binding(b.generation(),b.context(),b.client(),b.server(),b.inspect(),b.scope());
+        var foreignMarker=new ScenarioObserver.ResumeMarker(copied,marker.transition());
+        assertPostResumeFailure(schedule,new ScenarioObserver.Watch.Retained(r.samples(),null,b,r.witnesses(),foreignMarker,
+                new ScenarioObserver.ResumeLower(foreignMarker,lower.callback(),scalar)),"Missing exact post-resume server lower reading");
+        var equalMarker=new ScenarioObserver.ResumeMarker(b,marker.transition());
+        assertPostResumeFailure(schedule,new ScenarioObserver.Watch.Retained(r.samples(),null,b,r.witnesses(),marker,
+                new ScenarioObserver.ResumeLower(equalMarker,lower.callback(),scalar)),"Missing exact post-resume server lower reading");
+        for(boolean world:List.of(false,true)) {
+            var server=b.server(); var changed=new ScenarioObserver.ServerBinding(server.server(),world?new Object():server.world(),
+                    world?server.player():new Object(),server.playerId(),server.dimension(),true,true);
+            var reading=new ScenarioObserver.ServerReading(changed,scalar.x(),scalar.y(),scalar.z(),scalar.reach(),scalar.age(),scalar.worldTime(),scalar.serverTick());
+            assertPostResumeFailure(schedule,new ScenarioObserver.Watch.Retained(r.samples(),null,b,r.witnesses(),marker,
+                    new ScenarioObserver.ResumeLower(marker,lower.callback(),reading)),"Missing exact post-resume server lower reading");
+        }
+        var s=schedule.resumed().sample();
+        var copy=new ScenarioObserver.Sample(s.tick(),s.phase(),s.worldIdentity(),s.originalWorld(),s.pose(),s.keys(),s.paused(),s.status(),s.observations());
+        var resumed=schedule.resumed(); var reconstructed=new ScenarioRunner.Live(copy,resumed.client(),resumed.server(),resumed.fault(),resumed.pending(),resumed.nativeSequence(),resumed.nativeIdentities());
+        assertPostResumeFailure(new ResumeSchedule(schedule.context(),schedule.watch(),reconstructed),r,"Missing exact post-resume server lower reading");
+    }
+
+    private static void assertPostResumeFailure(ResumeSchedule schedule,ScenarioObserver.Watch.Retained retained,String message) {
+        var failure=assertThrows(AssertionError.class,() -> ScenarioRunner.evaluateTraversal(schedule.context().runId(),retained,schedule.resumed()));
+        assertEquals(message,failure.getMessage());
+    }
+
+    private record ResumeSchedule(RunLifecycle.Context context,ScenarioObserver.Watch watch,ScenarioRunner.Live resumed) { }
+
+    private static ResumeSchedule scheduledResume(boolean earlyCallback,double lowerZ,double upperZ) {
+        var engine=new ScenarioClientTransitionTest.QueueFixture();
+        var context=engine.context; var watch=new ScenarioObserver.Watch();
+        var samples=resumeSamples(context,6.415356906947316);
+        boolean[] client={false},server={false};
+        ScenarioObserver.Binding[] binding={null};
+        Runnable afterResume=() -> {
+            assertFalse(client[0]); // Physical server callbacks can run before the worker dispatches diagnostics.
+            server[0]=true;
+            try {
+                if(earlyCallback) {
+                    var lower=watch.beginServerRead();
+                    if(lower!=null) watch.commitServer(lower,new ScenarioObserver.ServerReading(binding[0].server(),11.5,66,lowerZ,4.5,710,710,710));
+                    while(fieldCallbacks(watch)<712) assertNull(watch.beginServerRead());
+                } // With no early callback, the first actual post-R read is 713: no historical 710 is invented.
+                for(var sample:samples) if(sample.tick()>=299 && sample.tick()<=301) watch.append(binding[0],sample,binding[0].client(),4.5);
+                var upper=watch.beginServerRead(); assertNotNull(upper); assertEquals(713,upper.callback());
+                watch.commitServer(upper,new ScenarioObserver.ServerReading(binding[0].server(),11.5,66,upperZ,4.5,713,713,713));
+            } finally { server[0]=false; }
+        };
+        var host=new InspectScenarioHost(() -> 1L,() -> client[0],() -> server[0],action -> {
+            client[0]=true;
+            try { action.run(); } finally { client[0]=false; afterResume.run(); }
+        },action -> { server[0]=true; try { action.run(); } finally { server[0]=false; } },null);
+        var scope=host.beginWork(new Operation(UUID.randomUUID(),1,UUID.randomUUID(),Command.RUN,Path.of("simulated-resume")));
+        binding[0]=witnessBinding(context,host,scope); watch.bind(binding[0]);
+        for(var sample:samples) if(sample.tick()<=298) {
+            watch.append(binding[0],sample,binding[0].client(),4.5);
+            if(sample.phase().equals("END")) {
+                var read=watch.beginServerRead(); var scalar=reading(binding[0].server(),sample,4.5,(int)sample.tick()+400);
+                if(sample.tick()==298) scalar=new ScenarioObserver.ServerReading(scalar.binding(),scalar.x(),scalar.y(),6.1,scalar.reach(),scalar.age(),scalar.worldTime(),scalar.serverTick());
+                watch.commitServer(read,scalar);
+            }
+        }
+        while(fieldCallbacks(watch)<(earlyCallback?709:712)) assertNull(watch.beginServerRead());
+        engine.player=new com.mapartrunner.core.movement.MovementPolicy.PlayerObservation(11.5,66,6.165848892158152,0); engine.engine.pause();
+        Supplier<ScenarioRunner.Live> capture=() -> {
+            var live=engine.sample(); var s=live.sample();
+            return witnessLive(new ScenarioObserver.Sample(298,"TEST",s.worldIdentity(),true,s.pose(),s.keys(),false,s.status(),List.of()));
+        };
+        var paused=capture.get(); var diagnostics=new java.util.concurrent.atomic.AtomicInteger();
+        var transition=host.inScope(scope,() -> ScenarioRunner.resumeShift(host,c -> capture.get(),c -> engine.engine.resume(context),paused,context.runId(),local ->
+                host.computeOnServer(s -> {
+                    assertFalse(client[0]); diagnostics.incrementAndGet();
+                    var state=new com.google.gson.JsonObject(); state.addProperty("x",11.5); state.addProperty("z",upperZ);
+                    return new ScenarioRunner.Live(local.sample(),local.client(),new ScenarioRunner.Side(state,716,716,716,List.of()),null,List.of(),0,"");
+                }),(c,r) -> {
+                    assertTrue(client[0]); assertFalse(server[0]); assertEquals(0,diagnostics.get());
+                    watch.armResume(binding[0],r,binding[0].client());
+                    assertSame(r,watch.retained().resume().transition());
+                }));
+        assertEquals(2,diagnostics.get());
+        while(fieldCallbacks(watch)<726) assertNull(watch.beginServerRead());
+        for(var sample:samples) if(sample.tick()>=302) {
+            watch.append(binding[0],sample,binding[0].client(),4.5);
+            if(sample.phase().equals("END")) {
+                var read=watch.beginServerRead(); watch.commitServer(read,reading(binding[0].server(),sample,4.5,(int)sample.tick()+425));
+            }
+        }
+        assertNull(watch.retained().failure());
+        assertDoesNotThrow(() -> ScenarioRunner.evaluateTraversal(context.runId(),watch.retained(),null),"Surrounding traversal must independently pass");
+        return new ResumeSchedule(context,watch,transition.after());
+    }
+
+    private static long fieldCallbacks(ScenarioObserver.Watch watch) {
+        try { return field("serverCallbacks").getLong(watch); }
+        catch(Exception error) { throw new AssertionError(error); }
+    }
+
+    private static List<ScenarioObserver.Sample> resumeSamples(RunLifecycle.Context context,double upperZ) {
+        var lane=com.mapartrunner.core.run.ForwardTraversal.Substage.LANE;
+        var endpoint=com.mapartrunner.core.run.ForwardTraversal.Substage.ENDPOINT;
+        var shift=com.mapartrunner.core.run.ForwardTraversal.Substage.SHIFT;
+        var entry=com.mapartrunner.core.run.ForwardTraversal.Substage.NEXT_ENTRY;
+        var ends=List.of(witnessSample(context,292,lane,0,"EAST",.5,2.5,false,0,0),
+                witnessSample(context,293,lane,0,"EAST",.5,2.5,true,0,0),witnessSample(context,294,lane,0,"EAST",6,2.5,true,0,0),
+                witnessSample(context,295,endpoint,0,"EAST",11.5,2.5,false,0,1),witnessSample(context,296,shift,0,"SOUTH",11.5,2.5,true,0,2),
+                witnessSample(context,297,shift,0,"SOUTH",11.5,6.0,true,0,3),witnessSample(context,298,shift,0,"SOUTH",11.5,6.165848892158152,true,0,4),
+                witnessSample(context,299,shift,0,"SOUTH",11.5,upperZ,true,0,5),witnessSample(context,300,shift,0,"SOUTH",11.5,upperZ,true,0,6),
+                witnessSample(context,301,shift,0,"SOUTH",11.5,upperZ,true,0,7),witnessSample(context,302,entry,1,"WEST",11.5,7.5,false,0,8),
+                witnessSample(context,303,entry,1,"WEST",11.5,7.5,false,1,9),witnessSample(context,304,lane,1,"WEST",11.5,7.5,false,0,0),
+                witnessSample(context,305,lane,1,"WEST",11.5,7.5,true,0,0),witnessSample(context,306,lane,1,"WEST",5,7.5,true,0,0));
+        var result=new java.util.ArrayList<ScenarioObserver.Sample>(); var previous=ends.getFirst();
+        for(var end:ends) {
+            var e=previous.status().engine();
+            var before=new BuildEngine.Snapshot(e.lifecycle(),end.tick()-1,0,e.traversal(),List.of(),Set.of(),Optional.empty(),List.of());
+            result.add(new ScenarioObserver.Sample(end.tick(),"START",12,true,previous.pose(),previous.keys(),false,
+                    new com.mapartrunner.fabric.runtime.FabricBuildAdapter.Status(before,previous.status().controlOwner(),Optional.empty()),List.of()));
+            result.add(end); previous=end;
+        }
+        return result;
     }
 
     private static List<ScenarioObserver.Sample> witnessSamples(RunLifecycle.Context context) {
@@ -660,7 +883,7 @@ class ScenarioInspectLifecycleTest {
 
     private static void assertRejected(ScenarioObserver.Watch.Retained original,List<ScenarioObserver.ServerWitness> witnesses,
                                        List<ScenarioObserver.Sample> samples) {
-        var changed=new ScenarioObserver.Watch.Retained(samples,original.failure(),original.binding(),witnesses);
+        var changed=new ScenarioObserver.Watch.Retained(samples,original.failure(),original.binding(),witnesses,null,null);
         assertThrows(AssertionError.class,() -> ScenarioRunner.evaluateTraversal(original.binding().context().runId(),changed,null));
     }
 
@@ -740,13 +963,14 @@ class ScenarioInspectLifecycleTest {
         }
         var reverseInputs=new java.util.ArrayList<>(r.samples());
         java.util.Collections.swap(reverseInputs,15,17); assertRejected(r,r.witnesses(),reverseInputs);
-        var resumed=witnessLive(r.samples().get(9));
-        assertDoesNotThrow(() -> ScenarioRunner.evaluateTraversal(context.runId(),r,resumed));
-        var late=witnessLive(r.samples().get(11));
-        assertThrows(AssertionError.class,() -> ScenarioRunner.evaluateTraversal(context.runId(),r,late));
-        var serverAhead=witnessLive(r.samples().get(11));
-        var clientOnlyProgress=new ScenarioRunner.Live(resumed.sample(),resumed.client(),serverAhead.server(),null,List.of(),0,"");
-        assertThrows(AssertionError.class,() -> ScenarioRunner.evaluateTraversal(context.runId(),r,clientOnlyProgress));
+        var schedule=scheduledResume(true,6.165848892158152,6.415356906947316);
+        var resumed=schedule.resumed(); var history=schedule.watch().retained(); var run=schedule.context().runId();
+        assertDoesNotThrow(() -> ScenarioRunner.evaluateTraversal(run,history,resumed));
+        var late=witnessLive(history.samples().stream().filter(s -> s.tick()==301 && s.phase().equals("END")).findFirst().orElseThrow());
+        assertThrows(AssertionError.class,() -> ScenarioRunner.evaluateTraversal(run,history,late));
+        // Late diagnostics cannot replace L; client-only post-R progress still fails against the actual server lower.
+        var clientOnly=scheduledResume(true,6.415356906947316,6.415356906947316);
+        assertThrows(AssertionError.class,() -> ScenarioRunner.evaluateTraversal(clientOnly.context().runId(),clientOnly.watch().retained(),clientOnly.resumed()));
     }
 
     @Test void watchFreezeLinearizesAgainstInflightReadsAndMoreThan6000LateCallbacks() throws Exception {
